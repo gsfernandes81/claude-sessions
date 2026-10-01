@@ -1,19 +1,3 @@
-# THIS FILE IS NOT IN EFFECT. Move it to .github/workflows/ci.yml to turn it on.
-#
-# It sits here because the session that wrote it was authenticated with a token that had no
-# `workflow` scope, and GitHub refuses a push that creates or changes a workflow without it:
-#
-#   ! [remote rejected] main -> main (refusing to allow an OAuth App to create or update
-#     workflow `.github/workflows/ci.yml` without `workflow` scope)
-#
-# Committing it to a path GitHub does not police keeps the work rather than throwing it away.
-# To enable it, from a session whose token has the scope (`gh auth refresh -s workflow`):
-#
-#   git mv ci/github-actions-ci.yml .github/workflows/ci.yml && git commit && git push
-#
-# Nothing in the file needs changing first; it has not been run, so expect the first push to
-# find something.
-#
 # Tests and the release build, in one file.
 #
 # WHY MUSL EVERYWHERE: the consumer is a Dockerfile that downloads a release asset and checks
@@ -84,6 +68,19 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             cargo build --release --target "$target"
           done
+      # The consuming image runs `--version` as a fatal check and a person reads its answer to
+      # learn what is installed. A tag of v0.1.0 on a binary that says 0.0.0 is a release that
+      # lies about itself forever, because the tag can never be re-cut — so refuse to publish
+      # until Cargo.toml says the same thing as the tag.
+      - name: The binary says the version the tag says
+        run: |
+          set -eu
+          got=$(./target/x86_64-unknown-linux-musl/release/claude-sessions --version)
+          want="claude-sessions ${GITHUB_REF_NAME#v}"
+          if [ "$got" != "$want" ]; then
+            echo "tag ${GITHUB_REF_NAME} but the binary says '${got}'; bump Cargo.toml and cut a new tag" >&2
+            exit 1
+          fi
       # The hashes go in the release body, not just in a file beside the asset: the consuming
       # Dockerfile hard-codes them, and a person copying them wants them where they can see
       # which tag they belong to.
