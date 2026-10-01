@@ -4,7 +4,7 @@
 //! is here is the half that has to be right before a screen is worth drawing: the registry,
 //! the hook that feeds it, and the repair pass that makes it agree with reality.
 //!
-//! Arguments are parsed by hand. Six subcommands and two flags is not worth a parser, and
+//! Arguments are parsed by hand. Seven subcommands and three flags is not worth a parser, and
 //! this binary is on the ssh path in a container pulled by checksum — every dependency is one
 //! more thing to cross-compile for musl and one more thing to read before trusting.
 
@@ -16,8 +16,10 @@ mod json;
 mod live;
 mod lockfile;
 mod mem;
+mod offload;
 mod procinfo;
 mod registry;
+mod signal;
 
 use events::{Binding, Outcome};
 use registry::{SlotRecord, State};
@@ -56,10 +58,11 @@ fn main() -> ExitCode {
             Some(slot) => report(cmd_close(slot)),
             None => fail("close needs a slot name: claude-sessions close claude-1"),
         },
-        "offload" => fail(
-            "offload is not built yet — it replaces dev/offload-idle-claude.sh in infra, and \
-             until it exists that script is still the thing that stops an idle session",
-        ),
+        "offload" => match args.get(1).map(String::as_str) {
+            None => report(offload::run(false)),
+            Some("--dry-run") => report(offload::run(true)),
+            Some(other) => fail(&format!("offload takes only --dry-run, not {other:?}")),
+        },
         other => fail(&format!("unknown subcommand {other:?}\n\n{}", usage())),
     }
 }
@@ -74,6 +77,8 @@ fn usage() -> String {
   claude-sessions reconcile    make the registry agree with reality after a restart
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
+  claude-sessions offload      stop every slot idle 10 minutes past its Stop; run from a timer
+                  [--dry-run]  say what it would stop, and stop nothing
 
 The registry is {} — override with CLAUDE_SESSIONS_DIR.
 ",

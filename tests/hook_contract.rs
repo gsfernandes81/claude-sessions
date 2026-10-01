@@ -174,9 +174,11 @@ fn version_works_on_a_bare_binary() {
 #[test]
 fn an_unknown_subcommand_fails_loudly() {
     // The door falls through to a shell on a NON-ZERO exit, so a typo must not look like
-    // success — and `offload`, which is not built yet, must refuse rather than pretend.
-    for arg in ["frobnicate", "offload"] {
-        let out = Command::new(BIN).arg(arg).output().expect("runs");
+    // success — and neither may a flag `offload` does not know, which on a timer's command
+    // line would otherwise be a stop nobody asked for.
+    for args in [&["frobnicate"][..], &["offload", "--force"][..]] {
+        let arg = args.join(" ");
+        let out = Command::new(BIN).args(args).output().expect("runs");
         assert!(!out.status.success(), "{arg} should have failed");
         assert!(
             !String::from_utf8_lossy(&out.stderr).is_empty(),

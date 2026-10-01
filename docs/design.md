@@ -122,7 +122,50 @@ back to `MemAvailable` only when the limit reads `max`.
 **The orphan sweep** collects `daemon run --origin transient` trees whose spawning pid and
 start time are gone, with their `bg-pty-host` / `bg-spare` children. **It ships logging what
 it would kill and nothing else**, the owner reads a week of that log, and only then is it
-armed.
+armed. Arming it is a code change, not a flag, so a timer's command line cannot do it.
+
+### How `claude-sessions offload` reads those rules
+
+Built 2026-10-01 in `src/offload.rs`. One pass per invocation, run from the box's timer;
+`--dry-run` decides and reports without signalling. Where the rules above left a choice, this
+is the choice and why:
+
+- **"`Stop` is the latest event"** is `last_stop_ms >= last_activity_ms` and not `busy`.
+  `Stop` sets both to its own time, and everything after it — a prompt, a nested claude's
+  events, a `needs_you` notification, a `SessionStart` — moves `last_activity_ms` past it.
+  **Consequence worth knowing:** a slot that was resumed or started and then left without a
+  prompt has no `Stop` after its `SessionStart`, so it is never offloaded until it is used
+  once. That is the cautious reading of the rule; whether a bare `SessionStart` should count as
+  idle too is the owner's call, and is open.
+- **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
+  would be a close with extra steps. Registered and unregistered slots get the same rules, so
+  a `u` slot whose hooks did record those is offloadable and comes back as a registered one.
+- **Not being able to look keeps it.** No abduco socket (attached cannot be ruled out), a
+  `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
+  is a reason to keep, because the offloader needs evidence to act, never to hold off.
+- **"No non-`claude` descendants"** walks the whole tree under the slot's claude, through any
+  nested claude, and ignores zombies. **Check this on a box before trusting it:** a stdio MCP
+  server is a child of claude and not named `claude`, so in a container that runs one, no
+  slot would ever be offloaded. `offload --dry-run` names what is holding each slot.
+- **Memory is reported, not a gate.** The rules above do not make low memory a condition, so
+  the pass prints the cgroup headroom and stops what is idle regardless.
+- **Signals go through a pidfd**, opened before the start-time check, so a pid reused between
+  the check and the signal cannot be hit. `TERM`, 5 s, `KILL`, 3 s; a process still there is
+  reported and the slot left `offloading` for the next pass to decide again. Then the abduco
+  server, recorded at decision time and only if the claude's parent really is `abduco`, gets
+  2 s to exit by itself and a `TERM` if it does not; its socket is removed only once that
+  server is known dead.
+- **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
+  decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
+  offloader writes `offloaded` itself. A `hook.log` line per offload is expected.
+- **The sweep infers "spawner gone" from the parent**: a transient daemon whose parent is no
+  longer a `claude` has been reparented away from the session that started it. That inference
+  has not met a real daemon — none was running where this was written. If the daemon detaches
+  on purpose, every one will be listed, live or not; each log line carries the full command
+  line so a spawner pid in it, if there is one, can replace the inference before arming.
+- **Logged to `offload.log`** beside the registry: every stop, every failed stop, and every
+  would-be sweep kill. Slots kept are printed to stdout only, since a pass every few minutes
+  would otherwise bury the lines that matter.
 
 ## The menu
 

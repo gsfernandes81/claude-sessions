@@ -1,10 +1,10 @@
-# Handoff — 2026-10-01, the registry and the hook are built and tested
+# Handoff — 2026-10-01, the registry, the hook and the offloader are built and tested
 
 ## First orders
 
 **Read this, then [`../design.md`](../design.md), then [`../../CLAUDE.md`](../../CLAUDE.md).**
-Then do step 1, which is the only thing blocking the rest, and carry on down the list. There is
-nothing to review and nothing deployed, so there is no reason to stop and report first.
+Then do step 1 if you can, and carry on down the list. There is nothing deployed, so there is
+no reason to stop and report first — but **step 2 is waiting on one action by the owner**, below.
 
 Two things you are not to do, both inherited and both meant literally:
 
@@ -14,7 +14,7 @@ Two things you are not to do, both inherited and both meant literally:
 
 ## What is already done
 
-`cargo test` is **37 tests, green**, and `cargo clippy --all-targets -- -D warnings` and
+`cargo test` is **57 tests, green**, and `cargo clippy --all-targets -- -D warnings` and
 `cargo fmt --check` are clean. Built so far:
 
 - `src/json.rs` — a small dependency-free JSON reader and writer. Hand-rolled on purpose; see
@@ -30,7 +30,14 @@ Two things you are not to do, both inherited and both meant literally:
   whether a hook's claude is the slot's own or nested under it.
 - `src/abduco.rs`, `src/mem.rs`, `src/live.rs` — sockets and the attached bit, the cgroup
   ceiling, and Claude Code's own view of its live sessions.
-- `src/main.rs` — `hook`, `reconcile`, `doctor`, `list`, `close`, and `--version`.
+- `src/main.rs` — `hook`, `reconcile`, `doctor`, `list`, `close`, `offload`, and `--version`.
+- `src/offload.rs`, `src/signal.rs` — **the offloader**, step 4 below, with the orphan sweep
+  logging only. Signals go through a pidfd. `../design.md` § *How `claude-sessions offload`
+  reads those rules* records every judgement call it made.
+- `tests/offload.rs` — the offloader end to end against a stand-in abduco and claude: stopped
+  when idle, kept when attached, kept when something runs under it, untouched by `--dry-run`.
+- `.github/workflows/ci.yml` — moved into place from `ci/`, with a release-job check that the
+  binary's `--version` matches the tag.
 - `tests/hook_contract.rs` — the two promises, against the real binary: `hook` exits 0 on the
   blocking events whatever the payload, and several writers at once never leave a record
   half-written.
@@ -42,15 +49,29 @@ Two things you are not to do, both inherited and both meant literally:
    still open. **Write the answer into that section**, replacing it, and say how you established
    it. The grep findings already there narrow it: `allowManagedHooksOnly` and `disableAllHooks`
    both exist, and hooks do not run at all in safe, bare or diskless modes.
-2. **Turn CI on.** `ci/github-actions-ci.yml` is written and has never run. Move it to
-   `.github/workflows/ci.yml` — it is parked because this session's token had no `workflow`
-   scope and GitHub refuses such a push. Expect the first run to find something.
+   *Still open after the second session.* That one ran in a claude.ai cloud container as root
+   with Claude Code 2.1.287 installed, so it had the means, but its permission classifier
+   refused to let it inspect the Claude Code binary, and writing a managed-settings file to
+   test the dialog would have touched the controls of the very session doing the testing. It
+   was left for the owner: run it by hand in a scratch container, or grant the permission.
+2. **CI is in place and has not run yet.** `.github/workflows/ci.yml` triggers on pushes to
+   `main`, on tags and on pull requests. The second session worked on a session branch
+   (`ccr-5ed70169-0f7j7c`) and was not cleared to push to `main` or open a PR, so **the owner
+   merges that branch to `main`, or says to open a PR, and the first run happens then**. That
+   session's token did have `workflow` scope. The release builds for both architectures and the
+   test job's commands were run by hand in the cloud container first and were clean. Expect
+   the first real run to find something anyway.
 3. **Cut `v0.1.0`** once CI is green, and give the owner the tag and the two SHA-256 hashes.
    `infra`'s `Dockerfile.base` pins them, and that edit is a separate change in that repo.
-4. **`claude-sessions offload`** — the contract is in `../design.md`. It replaces
-   `dev/offload-idle-claude.sh` in `infra`, which is deleted in the same commit that lands this.
-   **The orphan sweep ships logging only**; the owner reads a week of that log before it is
-   armed.
+   **Bump `Cargo.toml` to `0.1.0` first**: it still says `0.0.0`, and the release job now
+   refuses to publish a tag whose binary reports a different version.
+4. **`claude-sessions offload` is built.** What is left is `infra`'s half: the commit there
+   that deletes `dev/offload-idle-claude.sh` and runs `claude-sessions offload` from the timer
+   instead. That is the owner's change in another repo. **Before it lands, run
+   `claude-sessions offload --dry-run` on a box**: a stdio MCP server is a non-`claude` child of
+   claude, and if the containers run one, no slot will ever be offloaded. The dry run names
+   what holds each slot. **The orphan sweep logs only**; the owner reads a week of
+   `offload.log` before it is armed, and arming it is a code change.
 5. **The TUI**, to the approved screens. Its first commit should record, in whatever this repo's
    decisions file turns out to be, that it renders to `../mockups.md` as approved on 2026-10-01.
 6. **`last_attach_ms` has no writer yet.** The menu is the only thing that can set it, so
@@ -74,6 +95,11 @@ Two things you are not to do, both inherited and both meant literally:
 
 ## Things worth knowing before you trust something
 
+- **A claude.ai cloud container is x86_64 and does have `cc`**, unlike the dev container. The
+  pinned aarch64 target still builds there but its tests cannot run, so use
+  `rustup target add x86_64-unknown-linux-musl` and pass `--target x86_64-unknown-linux-musl`
+  to `clippy` and `test`, as CI does.
+
 - **A killed abduco server leaves its socket with the attached bit still set.** The mode only
   answers *attached?* for a session already known alive by its pid. `reconcile` sweeps the
   orphans, and only when it could enumerate `/proc` at all.
@@ -86,6 +112,14 @@ Two things you are not to do, both inherited and both meant literally:
   rewrite) plus `GIT_ASKPASS` pointing at a script that echoes `gh auth token`.
 
 ## Open, besides step 1
+
+- **A slot opened and never prompted is never offloaded.** "`Stop` is the latest event" reads
+  a `SessionStart` with no `Stop` after it as not idle, so a resumed slot the owner looks at
+  and detaches from stays until it is used once. Cautious and literal; whether a bare
+  `SessionStart` should count as idle is the owner's call.
+- **Memory is not a gate on offloading.** The design lists the conditions without it, so the
+  pass stops anything idle 10 minutes and only prints the headroom. If the old script also
+  offloaded under memory pressure, or only under it, that is a decision to write down.
 
 - **A long-interval wake tool**, deferred and possibly unnecessary. `ScheduleWakeup` clamps at
   an hour, and since a pending timer pins a slot, a loop waiting longer holds its memory the

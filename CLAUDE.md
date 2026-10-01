@@ -61,7 +61,8 @@ product.
 release is a static musl build, so the thing under test is the thing published. CI names the
 target explicitly per job because the runner is x86_64.
 
-Two syscalls are declared directly in `src/lockfile.rs` rather than taken from `libc`.
+The syscalls are declared directly rather than taken from `libc`: `flock` in
+`src/lockfile.rs`, and `kill` plus the two pidfd calls in `src/signal.rs`.
 `src/json.rs` is a small reader and writer, which the hook path wants anyway: payloads must be
 read *tolerantly*, and a `Value` tree does that more honestly than a struct of twelve
 `Option`s pretending to know the shape of an interface that updates itself.
