@@ -1,0 +1,122 @@
+# THIS FILE IS NOT IN EFFECT. Move it to .github/workflows/ci.yml to turn it on.
+#
+# It sits here because the session that wrote it was authenticated with a token that had no
+# `workflow` scope, and GitHub refuses a push that creates or changes a workflow without it:
+#
+#   ! [remote rejected] main -> main (refusing to allow an OAuth App to create or update
+#     workflow `.github/workflows/ci.yml` without `workflow` scope)
+#
+# Committing it to a path GitHub does not police keeps the work rather than throwing it away.
+# To enable it, from a session whose token has the scope (`gh auth refresh -s workflow`):
+#
+#   git mv ci/github-actions-ci.yml .github/workflows/ci.yml && git commit && git push
+#
+# Nothing in the file needs changing first; it has not been run, so expect the first push to
+# find something.
+#
+# Tests and the release build, in one file.
+#
+# WHY MUSL EVERYWHERE: the consumer is a Dockerfile that downloads a release asset and checks
+# its SHA-256. A static musl binary has no runtime to match — the alternative is a glibc build
+# that works on the runner and fails on a box with an older libc, for a reason nobody would
+# connect back to CI. Both architectures are cross-compiled on the runner rather than built
+# under emulation, because the consuming image's arm64 leg runs under QEMU and a Rust compile
+# there is unusable.
+#
+# WHY A TAG IS NEVER RE-CUT: the consumer pins a tag AND a hash. Re-cutting a published tag
+# silently changes what a pinned, checksummed build gets, which is the one thing the checksum
+# exists to prevent. The release job therefore runs on a tag push only, and the upload step
+# refuses to clobber.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain and the musl target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+          rustup component add clippy rustfmt
+      # The target is pinned to aarch64 in .cargo/config.toml, because the container this is
+      # developed in has no C linker and musl + the toolchain's own rust-lld is the only
+      # self-contained way to build there. The runner is x86_64, so it says so explicitly;
+      # the tests then run natively here rather than needing emulation.
+      - run: cargo fmt --check
+      - run: cargo clippy --target x86_64-unknown-linux-musl --all-targets -- -D warnings
+      - run: cargo test --target x86_64-unknown-linux-musl
+      # The image's build runs this as a FATAL check on a bare static binary, so CI runs the
+      # same thing rather than trusting that it would work.
+      - name: --version answers on the built binary
+        run: ./target/x86_64-unknown-linux-musl/debug/claude-sessions --version
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain and both musl targets
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+      - name: Build both architectures
+        run: |
+          set -eu
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            cargo build --release --target "$target"
+          done
+      # The hashes go in the release body, not just in a file beside the asset: the consuming
+      # Dockerfile hard-codes them, and a person copying them wants them where they can see
+      # which tag they belong to.
+      - name: Name the assets and hash them
+        id: assets
+        run: |
+          set -eu
+          mkdir -p dist
+          {
+            echo "## claude-sessions ${GITHUB_REF_NAME}"
+            echo
+            echo 'Static musl binaries. `Dockerfile.base` pins this tag and checks these hashes.'
+            echo
+            echo '| asset | sha256 |'
+            echo '|---|---|'
+          } > dist/NOTES.md
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            arch="${target%%-*}"
+            name="claude-sessions-${GITHUB_REF_NAME}-${arch}-linux-musl"
+            cp "target/${target}/release/claude-sessions" "dist/${name}"
+            sum=$(sha256sum "dist/${name}" | cut -d' ' -f1)
+            printf '| `%s` | `%s` |\n' "$name" "$sum" >> dist/NOTES.md
+            printf '%s  %s\n' "$sum" "$name" >> dist/SHA256SUMS
+          done
+          cat dist/NOTES.md
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --fail-on-no-commits is not what this guards: `gh release create` refuses an existing
+        # tag's release on its own, which is the behaviour wanted here. A re-cut tag has to be
+        # a deliberate delete by a person, not something CI can do by being re-run.
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "claude-sessions $GITHUB_REF_NAME" \
+            --notes-file dist/NOTES.md \
+            dist/claude-sessions-* dist/SHA256SUMS
