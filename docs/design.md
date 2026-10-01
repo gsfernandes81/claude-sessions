@@ -4,6 +4,33 @@ Everything here was either measured or decided by the owner. Where a thing was m
 date and the method are given, because a fact nobody has run is not a measurement however
 long it has sat in a comment.
 
+## Why not just `claude --resume`
+
+The first question anyone should ask of this tool, and it deserves a direct answer: Claude
+Code already lists past conversations and reopens one, and
+`$CLAUDE_CONFIG_DIR/sessions/<pid>.json` already records the live ones. So what is left?
+
+**Three things, and each of them is a way to lose work rather than a convenience.**
+
+1. **`--resume` does not know what is running.** It lists conversations *on disk*. Pick one
+   that is already live in another process and you get a second process on the same
+   conversation, which forks it — two transcripts, diverging, and no warning. The first job of
+   a menu here is to know that a row is live and **attach** instead of resuming, and that is
+   the one thing neither `--resume` nor the sessions file will tell you.
+2. **What records a live session disappears exactly when it matters.**
+   `sessions/<pid>.json` is pid-keyed and exists only while the process does. Offload a slot
+   and its file is gone — and an offloaded slot is precisely when you need to know which
+   conversation belonged to it, in which directory, to bring it back.
+3. **Nothing anywhere records attention or absence.** That a permission prompt is waiting.
+   That a timer is pending, so the slot must not be stopped. And **when you last looked** —
+   which is the whole of `unread`, and cannot be derived from anything Claude Code keeps,
+   because it is a fact about the owner rather than about the session.
+
+What this tool does **not** do is keep its own copy of things that are cheaply readable while
+a process is alive. The title and the busy flag come from Claude Code's own file for a live
+slot; our stored copies are the last-known value, for when it is gone. See `src/live.rs`,
+which says the same thing beside the code that does it.
+
 ## Slots, conversations, and what is stored
 
 A **slot** is one `abduco` session named `claude-<n>`, i.e. one running `claude` process. A
@@ -181,13 +208,28 @@ it can connect to"*, an *"unchanged since your last approval"* memory, and the e
 `elidedCommandCount`, `elidedSandboxCount` and `elidedIsolationCount`, so those categories are
 certainly in scope. Found by grepping 2.1.286 on 2026-10-01.
 
-**Whether `hooks` in a managed settings file triggers it is not established**, and the plan is
-to put these hooks exactly there — in `/etc/claude-code/managed-settings.json`, so every repo
-gets them without touching its own `.claude/`. If it does trigger, every launch after a hook
-change blocks on a dialog: one keypress inside `abduco`, but any non-interactive path dies
-with that error string.
+**Whether `hooks` in a managed settings file triggers it is still not established**, and the
+plan is to put these hooks exactly there — in `/etc/claude-code/managed-settings.json`, so
+every repo gets them without touching its own `.claude/`. If it does trigger, every launch
+after a hook change blocks on a dialog: one keypress inside `abduco`, but any non-interactive
+path dies with that error string.
 
-**Establish this before deciding where the hooks live.** Add a hook to that file in a scratch
-container and start `claude -p`. The alternatives — the user settings file, or a
-`.claude/settings.json` per repo — both lose the property that the hooks cannot be switched
-off, which is the reason for choosing managed settings in the first place.
+**Establish it like this:** add a hook to that file in a scratch container and start
+`claude -p`. It needs root on the container, which is why it is still open — the session that
+wrote this had no way to write `/etc`.
+
+**What the same grep did settle**, all from 2.1.286 on 2026-10-01, and all of it bears on where
+the hooks go:
+
+- **`allowManagedHooksOnly` is a real policy setting.** A refusal reason reads
+  `managed_hooks_only: "the organization allows only managed hooks"`. So managed hooks are a
+  first-class concept rather than a side effect, which is an argument for putting them there.
+- **`disableAllHooks` is a user setting that turns every hook off** — refusal reason
+  `hooks_disabled_in_settings: "hooks are turned off in your settings (disableAllHooks)"`.
+  Worth knowing because it would make the registry go blind with no visible symptom; `doctor`
+  printing the age of each event is how that would be noticed. Whether a managed setting can
+  stop a user turning them off is untested.
+- **Hooks do not run at all in some modes.** There are refusals for `safe_mode`, `bare_mode`
+  and a `diskless` kind of cloud session. A session running in one of those will not feed the
+  registry, so it will show as a slot with no events — which `reconcile` and `doctor` have to
+  treat as "no evidence", not as "idle and offloadable".

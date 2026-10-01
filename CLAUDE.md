@@ -47,6 +47,28 @@ reads the registry and `abduco`, never guesses, and opens what the owner picks.
 - **Never start, stop or offload anything on the fleet on your own initiative.** Bring-up is
   the owner's. This applies to a cloud session too: you can build and test, you cannot deploy.
 
+## Building, and why there are no dependencies
+
+**This crate has no dependencies and that is load-bearing, not minimalism for its own sake.**
+The container it is developed in has **no C linker** — no `cc`, no libc-dev, no way to install
+either, and no `sudo` at all — so any crate with a build script or a proc macro cannot be
+compiled there. With nothing but `std`, the whole crate builds and its tests *run* against
+`aarch64-unknown-linux-musl` using the toolchain's own `rust-lld` and the bundled musl CRT.
+A dependency on `serde` would mean the tests could only ever run in CI, and the tests are the
+product.
+
+`.cargo/config.toml` pins that target for the same reason, and it is also what ships: the
+release is a static musl build, so the thing under test is the thing published. CI names the
+target explicitly per job because the runner is x86_64.
+
+Two syscalls are declared directly in `src/lockfile.rs` rather than taken from `libc`.
+`src/json.rs` is a small reader and writer, which the hook path wants anyway: payloads must be
+read *tolerantly*, and a `Value` tree does that more honestly than a struct of twelve
+`Option`s pretending to know the shape of an interface that updates itself.
+
+**Before every commit:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test`. All three are clean today; a commit that leaves one dirty is incomplete.
+
 ## Testing
 
 The state machine is the product, so it is tested as one. Over the event table in
