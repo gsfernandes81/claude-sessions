@@ -135,8 +135,7 @@ is the choice and why:
   events, a `needs_you` notification, a `SessionStart` — moves `last_activity_ms` past it.
   **Consequence worth knowing:** a slot that was resumed or started and then left without a
   prompt has no `Stop` after its `SessionStart`, so it is never offloaded until it is used
-  once. That is the cautious reading of the rule; whether a bare `SessionStart` should count as
-  idle too is the owner's call, and is open.
+  once. Owner, 2026-10-01: leave it so for now.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules, so
   a `u` slot whose hooks did record those is offloadable and comes back as a registered one.
@@ -144,11 +143,12 @@ is the choice and why:
   `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
   is a reason to keep, because the offloader needs evidence to act, never to hold off.
 - **"No non-`claude` descendants"** walks the whole tree under the slot's claude, through any
-  nested claude, and ignores zombies. **Check this on a box before trusting it:** a stdio MCP
-  server is a child of claude and not named `claude`, so in a container that runs one, no
-  slot would ever be offloaded. `offload --dry-run` names what is holding each slot.
-- **Memory is reported, not a gate.** The rules above do not make low memory a condition, so
-  the pass prints the cgroup headroom and stops what is idle regardless.
+  nested claude, and ignores zombies. A stdio MCP server would be such a descendant and would
+  pin its slot for good; the owner runs none (2026-10-01), so the rule stands as written. If
+  one is ever added, this is the line that has to learn about it — `offload --dry-run` names
+  what is holding each slot.
+- **Memory is reported, not a gate** (owner, 2026-10-01: no need to gate on it). The pass
+  prints the cgroup headroom and stops whatever is idle regardless.
 - **Signals go through a pidfd**, opened before the start-time check, so a pid reused between
   the check and the signal cannot be hit. `TERM`, 5 s, `KILL`, 3 s; a process still there is
   reported and the slot left `offloading` for the next pass to decide again. Then the abduco

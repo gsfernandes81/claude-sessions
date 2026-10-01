@@ -54,6 +54,13 @@ Two things you are not to do, both inherited and both meant literally:
    refused to let it inspect the Claude Code binary, and writing a managed-settings file to
    test the dialog would have touched the controls of the very session doing the testing. It
    was left for the owner: run it by hand in a scratch container, or grant the permission.
+   Asked to fetch a separate copy of the binary instead, it was refused again, as code from an
+   external source. The test, for whoever has the permission: in a scratch container as root,
+   `unshare -m`, bind-mount an empty directory over `/etc/claude-code`, write a
+   `managed-settings.json` there holding one hook that appends to a file, and start `claude`
+   under a pty and `claude -p` with a fresh `CLAUDE_CONFIG_DIR`. Then change the hook and do it
+   again — the dialog's "unchanged since your last approval" memory means only a *change*
+   tells you anything.
 2. **CI is in place and has not run yet.** `.github/workflows/ci.yml` triggers on pushes to
    `main`, on tags and on pull requests. The second session worked on a session branch
    (`ccr-5ed70169-0f7j7c`) and was not cleared to push to `main` or open a PR, so **the owner
@@ -69,8 +76,8 @@ Two things you are not to do, both inherited and both meant literally:
    that deletes `dev/offload-idle-claude.sh` and runs `claude-sessions offload` from the timer
    instead. That is the owner's change in another repo. **Before it lands, run
    `claude-sessions offload --dry-run` on a box**: a stdio MCP server is a non-`claude` child of
-   claude, and if the containers run one, no slot will ever be offloaded. The dry run names
-   what holds each slot. **The orphan sweep logs only**; the owner reads a week of
+   claude and would pin its slot; the owner runs none, but the dry run is still the first
+   look at the rules against real processes. **The orphan sweep logs only**; the owner reads a week of
    `offload.log` before it is armed, and arming it is a code change.
 5. **The TUI**, to the approved screens. Its first commit should record, in whatever this repo's
    decisions file turns out to be, that it renders to `../mockups.md` as approved on 2026-10-01.
@@ -113,13 +120,19 @@ Two things you are not to do, both inherited and both meant literally:
 
 ## Open, besides step 1
 
-- **A slot opened and never prompted is never offloaded.** "`Stop` is the latest event" reads
-  a `SessionStart` with no `Stop` after it as not idle, so a resumed slot the owner looks at
-  and detaches from stays until it is used once. Cautious and literal; whether a bare
-  `SessionStart` should count as idle is the owner's call.
-- **Memory is not a gate on offloading.** The design lists the conditions without it, so the
-  pass stops anything idle 10 minutes and only prints the headroom. If the old script also
-  offloaded under memory pressure, or only under it, that is a decision to write down.
+- **The orphan sweep is waiting on the owner.** It logs only. Once `offload` has run on a box
+  for a week, the owner reads `offload.log` and decides whether to arm it — remind them; they
+  asked to be reminded (2026-10-01).
+- **How a row is chosen is not specified.** The mockups number the rows and say `Enter open`,
+  but draw no cursor and no highlight, and nothing says whether a digit opens its row, moves a
+  cursor, or neither. The owner decides before the menu's input handling is written.
+- **Mockup 2 lists `q   a shell instead`**, while the design says `q` quits and is listed
+  nowhere, and `s` is the shell everywhere else. Flagged, not changed — the screens are
+  binding until the owner says otherwise.
+- **The first-prompt title fallback has no data.** Row titles come from Claude Code's session
+  title, else the first prompt truncated, but the hook does not record the prompt. A
+  `first_prompt` field written once by `UserPromptSubmit` is the fix, and belongs before the
+  menu.
 
 - **A long-interval wake tool**, deferred and possibly unnecessary. `ScheduleWakeup` clamps at
   an hour, and since a pending timer pins a slot, a loop waiting longer holds its memory the
