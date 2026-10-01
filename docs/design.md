@@ -242,37 +242,63 @@ session id to map to a transcript, so all there is to show is the `abduco` sessi
 Matching `cwd` and start time against transcripts would work and is guesswork; it is worth
 building only if those rows turn out to persist.
 
-## Open question that blocks where the hooks live
+## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 
-**Managed settings can make Claude Code stop and ask.** The binary carries a consent dialog —
-*"Managed settings require approval"*, with *"these can change where Claude Code runs or what
-it can connect to"*, an *"unchanged since your last approval"* memory, and the error string
-`Managed-settings consent dialog exited without an answer`. The counts it elides are
-`elidedCommandCount`, `elidedSandboxCount` and `elidedIsolationCount`, so those categories are
-certainly in scope. Found by grepping 2.1.286 on 2026-10-01.
+**Settled 2026-10-01 from the vendor documentation, not yet by a run.** The hooks go in a
+file-based managed settings drop-in, `/etc/claude-code/managed-settings.d/claude-sessions.json`,
+so every repo in a container gets them without touching its own `.claude/`. A drop-in rather
+than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
+then every `managed-settings.d/*.json` alphabetically, and `infra` can own one file for this
+tool without editing a shared one.
 
-**Whether `hooks` in a managed settings file triggers it is still not established**, and the
-plan is to put these hooks exactly there — in `/etc/claude-code/managed-settings.json`, so
-every repo gets them without touching its own `.claude/`. If it does trigger, every launch
-after a hook change blocks on a dialog: one keypress inside `abduco`, but any non-interactive
-path dies with that error string.
+**The question was whether that file makes Claude Code stop and ask.** The binary carries a
+consent dialog — *"Managed settings require approval"*, *"unchanged since your last
+approval"*, and the error `Managed-settings consent dialog exited without an answer` — found
+by grepping 2.1.286. Had hooks in a managed settings *file* triggered it, every launch after a
+hook change would block on a keypress inside `abduco`, and a non-interactive path would die.
 
-**Establish it like this:** add a hook to that file in a scratch container and start
-`claude -p`. It needs root on the container, which is why it is still open — the session that
-wrote this had no way to write `/etc`.
+**It does not, by the documentation's own scoping.** The dialog is a feature of
+*server-managed* settings, the ones fetched from the claude.ai admin console:
 
-**What the same grep did settle**, all from 2.1.286 on 2026-10-01, and all of it bears on where
-the hooks go:
+- `code.claude.com/docs/en/managed-settings` — the delivery table gives server-managed
+  settings as "Fetched at startup and polled hourly; see changes that need approval", and the
+  file-based mechanism as "Read at startup and reloaded when a file changes", with no approval.
+  Under *Where and when a policy applies*: "**Changes that need approval**: … a server-managed
+  change to a setting that needs approval, such as a hook or an `env` variable, waits for the
+  developer to accept the dialog in an interactive session".
+- `code.claude.com/docs/en/server-managed-settings` § *Security approval dialogs* lists hooks
+  ("any hook definition") among what needs approval, and every case it describes is about
+  *delivered* settings and the fetch's cache — approval memory is keyed by the credential the
+  settings fetch uses.
 
-- **`allowManagedHooksOnly` is a real policy setting.** A refusal reason reads
-  `managed_hooks_only: "the organization allows only managed hooks"`. So managed hooks are a
-  first-class concept rather than a side effect, which is an argument for putting them there.
-- **`disableAllHooks` is a user setting that turns every hook off** — refusal reason
-  `hooks_disabled_in_settings: "hooks are turned off in your settings (disableAllHooks)"`.
-  Worth knowing because it would make the registry go blind with no visible symptom; `doctor`
-  printing the age of each event is how that would be noticed. Whether a managed setting can
-  stop a user turning them off is untested.
-- **Hooks do not run at all in some modes.** There are refusals for `safe_mode`, `bare_mode`
-  and a `diskless` kind of cloud session. A session running in one of those will not feed the
-  registry, so it will show as a slot with no events — which `reconcile` and `doctor` have to
-  treat as "no evidence", not as "idle and offloadable".
+So the strings in the binary are that server-managed dialog, and a file written by root in the
+image is trusted because only root could write it. A non-interactive run would not have died
+anyway: for server-managed settings the documented behaviour is that `claude -p` "applies them
+for that run only".
+
+**What would still change this: the first start on a box.** Put the hooks in the drop-in, start
+`claude` in a slot, and see no dialog — that is the confirming run, and it costs nothing
+because it is the bring-up anyway. If a dialog does appear, the fallback is the user settings
+file, which `infra` also owns in these containers.
+
+**Do not also deliver these hooks through server-managed settings.** That *would* raise the
+dialog, and the managed tier uses the first source that delivers any policy key — server
+first — so a server-managed policy would also shadow this file entirely.
+
+**Facts from the same reading that bear on the hooks** (documentation, 2026-10-01):
+
+- **A user cannot turn them off by accident.** `docs/en/hooks`: "`disableAllHooks` set in user,
+  project, or local settings can't disable those managed hooks. Only `disableAllHooks` set at
+  the managed settings level can disable managed hooks."
+- **`allowManagedHooksOnly`** is a managed-only lock: "Your user, project, local, and plugin
+  hooks are blocked." Not needed here, and not ours to set — it is a policy about other hooks.
+- **Edits to the file are picked up without a restart** — the file-based mechanism is
+  "reloaded when a file changes" — so a hook change rolled out by `infra` reaches running
+  slots.
+- **Hooks do not run at all in some modes.** The 2.1.286 grep found refusals for `safe_mode`,
+  `bare_mode` and a `diskless` kind of cloud session. A session in one of those feeds the
+  registry nothing and shows as a slot with no events, which `reconcile` and `doctor` treat as
+  "no evidence", never as "idle and offloadable".
+- **An unreadable file is silently no policy.** If the OS denies the read, "every session
+  starts without that source's policies", recorded in `/status` and `claude doctor`. The
+  drop-in must be world-readable (`0644`), or the hooks vanish with no other symptom.

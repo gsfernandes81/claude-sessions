@@ -3,8 +3,8 @@
 ## First orders
 
 **Read this, then [`../design.md`](../design.md), then [`../../CLAUDE.md`](../../CLAUDE.md).**
-Then do step 1 if you can, and carry on down the list. There is nothing deployed, so there is
-no reason to stop and report first — but **step 2 is waiting on one action by the owner**, below.
+Then carry on down the list from step 3. There is nothing deployed, so there is no reason to
+stop and report first.
 
 Two things you are not to do, both inherited and both meant literally:
 
@@ -44,30 +44,13 @@ Two things you are not to do, both inherited and both meant literally:
 
 ## The order of work from here
 
-1. **Settle the managed-settings consent question** — `../design.md` § *Open question*. It needs
-   root on a container to write `/etc/claude-code/managed-settings.json`, which is why it is
-   still open. **Write the answer into that section**, replacing it, and say how you established
-   it. The grep findings already there narrow it: `allowManagedHooksOnly` and `disableAllHooks`
-   both exist, and hooks do not run at all in safe, bare or diskless modes.
-   *Still open after the second session.* That one ran in a claude.ai cloud container as root
-   with Claude Code 2.1.287 installed, so it had the means, but its permission classifier
-   refused to let it inspect the Claude Code binary, and writing a managed-settings file to
-   test the dialog would have touched the controls of the very session doing the testing. It
-   was left for the owner: run it by hand in a scratch container, or grant the permission.
-   Asked to fetch a separate copy of the binary instead, it was refused again, as code from an
-   external source. The test, for whoever has the permission: in a scratch container as root,
-   `unshare -m`, bind-mount an empty directory over `/etc/claude-code`, write a
-   `managed-settings.json` there holding one hook that appends to a file, and start `claude`
-   under a pty and `claude -p` with a fresh `CLAUDE_CONFIG_DIR`. Then change the hook and do it
-   again — the dialog's "unchanged since your last approval" memory means only a *change*
-   tells you anything.
-2. **CI is in place and has not run yet.** `.github/workflows/ci.yml` triggers on pushes to
-   `main`, on tags and on pull requests. The second session worked on a session branch
-   (`ccr-5ed70169-0f7j7c`) and was not cleared to push to `main` or open a PR, so **the owner
-   merges that branch to `main`, or says to open a PR, and the first run happens then**. That
-   session's token did have `workflow` scope. The release builds for both architectures and the
-   test job's commands were run by hand in the cloud container first and were clean. Expect
-   the first real run to find something anyway.
+1. ~~Settle the managed-settings consent question~~ **Settled from the vendor docs**, and
+   written into `../design.md` § *Where the hooks live*: the approval dialog belongs to
+   server-managed settings only, so hooks in a root-written file under
+   `/etc/claude-code/managed-settings.d/` do not raise it. What is left is the confirming run,
+   which is just the first start on a box with the hooks installed — no dialog means done.
+2. ~~Turn CI on~~ **Done: green on its first run**, on `main` at `d2ae511`, all 57 tests
+   run on the x86_64 runner. The release job has not run yet; it runs on the first tag.
 3. **Cut `v0.1.0`** once CI is green, and give the owner the tag and the two SHA-256 hashes.
    `infra`'s `Dockerfile.base` pins them, and that edit is a separate change in that repo.
    **Bump `Cargo.toml` to `0.1.0` first**: it still says `0.0.0`, and the release job now
