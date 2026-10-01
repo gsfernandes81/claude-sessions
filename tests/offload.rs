@@ -29,10 +29,12 @@ impl Drop for Slot {
         if let Some(grandchild) = child_of(self.claude) {
             let _ = Command::new("kill")
                 .args(["-9", &grandchild.to_string()])
+                .stderr(Stdio::null())
                 .status();
         }
         let _ = Command::new("kill")
             .args(["-9", &self.claude.to_string()])
+            .stderr(Stdio::null())
             .status();
         let _ = self.server.kill();
         let _ = self.server.wait();
@@ -92,6 +94,9 @@ fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
             root.join("bin/claude").display()
         ))
         .stdin(Stdio::null())
+        // The shell reports its child's signal ("Terminated", "Killed"), which is the test
+        // working, not failing; it would only be noise in the CI log.
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn the stand-in server");
     let deadline = Instant::now() + Duration::from_secs(5);
