@@ -25,6 +25,9 @@ mod offload;
 mod procinfo;
 mod registry;
 mod signal;
+// The menu's terminal; the menu wires it in next.
+#[allow(dead_code)]
+mod term;
 // The menu's shared contract. Its users land in the next commits; until then nothing reads it.
 #[allow(dead_code)]
 mod ui;
