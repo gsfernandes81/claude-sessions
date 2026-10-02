@@ -334,6 +334,13 @@ fn keyed(
 /// Hint items laid out greedily to `w`, `sep` between them. An item wider than the whole
 /// width is dropped rather than cut — that is why `Enter open` vanishes at 9 columns in
 /// mockup 8, while the shorter items wrap one to a line.
+/// How many lines the hint takes at `width` — for `menu.rs`, which has to know how many rows
+/// fit above it, and must count them the way they are drawn.
+pub fn hint_line_count(width: u16, empty: bool) -> usize {
+    let items: &[Hint] = if empty { &HINTS_EMPTY } else { &HINTS };
+    hint_lines(items, GAP, usize::from(width)).len()
+}
+
 fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut cur = Line::default();

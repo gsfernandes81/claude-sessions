@@ -74,11 +74,6 @@ pub struct Menu {
     status: Option<String>,
 }
 
-/// The hint line's items, as `render.rs` draws them, for counting how many lines the hint
-/// takes — which decides how many rows fit above it.
-const HINT: [&str; 5] = ["Enter open", "n new", "c close", "? keys", "s shell"];
-const HINT_EMPTY: [&str; 3] = ["n new", "? keys", "s shell"];
-
 impl Menu {
     pub fn new(width: u16, height: u16, header: Header, workspace: String, rows: Vec<Row>) -> Menu {
         let mut m = Menu {
@@ -155,31 +150,9 @@ impl Menu {
         self.keep_cursor_visible();
     }
 
-    /// How many lines the hint takes at this width — the same greedy wrap `render.rs` draws.
+    /// How many lines the hint takes at this width, counted by the renderer that draws it.
     fn hint_lines(&self) -> usize {
-        let items: &[&str] = if self.rows.is_empty() {
-            &HINT_EMPTY
-        } else {
-            &HINT
-        };
-        let width = usize::from(self.width);
-        let mut lines = 0;
-        let mut used = 0;
-        for item in items.iter().map(|i| i.chars().count()) {
-            if item > width {
-                continue;
-            }
-            if used == 0 {
-                lines += 1;
-                used = item;
-            } else if used + 3 + item <= width {
-                used += 3 + item;
-            } else {
-                lines += 1;
-                used = item;
-            }
-        }
-        lines
+        crate::render::hint_line_count(self.width, self.rows.is_empty())
     }
 
     /// Rows that fit between the header's rule and the closing rule.
