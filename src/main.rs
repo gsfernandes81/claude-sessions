@@ -222,7 +222,7 @@ fn slot_for_hook() -> Option<(String, bool)> {
     session_name_of_abduco(abduco).map(|name| (name, false))
 }
 
-/// The session name on an abduco server's command line: the argument after `-c`, `-A` or `-n`.
+/// The session name on an abduco process's command line, read the way abduco reads it.
 fn session_name_of_abduco(pid: u32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let argv: Vec<String> = raw
@@ -230,13 +230,7 @@ fn session_name_of_abduco(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).to_string())
         .collect();
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        if matches!(a.as_str(), "-c" | "-A" | "-n") {
-            return it.next().cloned();
-        }
-    }
-    None
+    abduco::session_name(&argv)
 }
 
 // ── reconcile ───────────────────────────────────────────────────────────────
@@ -289,14 +283,18 @@ fn cmd_reconcile() -> std::io::Result<()> {
             }
         }
     } else {
-        eprintln!("claude-sessions: could not enumerate /proc; no sockets swept");
+        eprintln!(
+            "claude-sessions: could not read /proc, or a live abduco's session could not be \
+             named; no sockets swept"
+        );
     }
 
     println!("reconcile: {moved} slot(s) offloaded, {swept} socket(s) swept");
     Ok(())
 }
 
-/// The session names of every live abduco server, or `None` if `/proc` could not be read.
+/// The session names of every live abduco process, or `None` if `/proc` could not be read or
+/// any live abduco's session could not be named — either way, nothing may be swept.
 fn abduco_session_names() -> Option<Vec<String>> {
     let entries = std::fs::read_dir("/proc").ok()?;
     let mut out = Vec::new();
@@ -309,9 +307,10 @@ fn abduco_session_names() -> Option<Vec<String>> {
         if procinfo::comm(pid).as_deref() != Some("abduco") {
             continue;
         }
-        if let Some(session) = session_name_of_abduco(pid) {
-            out.push(session);
-        }
+        // A live abduco whose session cannot be named might own any socket in the directory.
+        // Unknown means keep — the offloader's rule — so the whole sweep is off rather than
+        // one session made unreattachable (issue #3).
+        out.push(session_name_of_abduco(pid)?);
     }
     Some(out)
 }

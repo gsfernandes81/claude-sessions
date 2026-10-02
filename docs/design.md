@@ -302,6 +302,10 @@ source of truth.
   so renaming a container orphans every session in it.
 - **Two clients can attach to one session at once.** *Attached elsewhere* is not an exclusive
   lock, and opening a row must not assume it is alone at the terminal.
+- **A session's name is read from its abduco's command line the way abduco reads it** —
+  getopt-style, so `-fA work` names `work`, and only `-e` takes a value. `reconcile` sweeps a
+  socket only when every live abduco could be named and none names it; one it cannot name
+  turns the sweep off, because that process might own any socket in the directory (issue #3).
 - **A killed server leaves its socket behind with the attached bit still set.** This is the
   calibration catch: a menu built on the mode alone shows a dead session as attached and
   refuses to offer it. The liveness test is the pid plus its start time; the mode only ever
