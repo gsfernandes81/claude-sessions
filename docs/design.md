@@ -40,7 +40,7 @@ the same process, `--resume` re-enters an old one.
 The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
-`session_id` (current) · `cwd` · `title` · `state` · `last_activity` · `last_attach` ·
+`session_id` (current) · `cwd` · `title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
 `needs_you` · `timers` (each with its due time, and whether it recurs)
 
 **States:** `attached` / `detached` — read from `abduco`, never stored — plus `offloaded` and
@@ -82,8 +82,8 @@ from the hook upwards to the first `claude` whose parent is an `abduco` server.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live |
-| `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you` |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title` and `first_prompt`, so a new conversation never wears the old one's name |
+| `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
@@ -246,7 +246,19 @@ building only if those rows turn out to persist.
 
 **Settled 2026-10-01 from the vendor documentation, not yet by a run.** The hooks go in a
 file-based managed settings drop-in, `/etc/claude-code/managed-settings.d/claude-sessions.json`,
-so every repo in a container gets them without touching its own `.claude/`. A drop-in rather
+so every repo in a container gets them without touching its own `.claude/`. **The binary
+prints that file**, so the hooks installed and the events handled cannot drift apart:
+
+```
+claude-sessions hooks-config /usr/local/bin/claude-sessions \
+  > /etc/claude-code/managed-settings.d/claude-sessions.json
+chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
+```
+
+It installs the six events of the table, `PostToolUse` matched to exactly the three timer
+tools, with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
+every `SessionEnd` hook on the box shares. `src/hooks_config.rs` has the reasons and the tests
+that hold it to the state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
 then every `managed-settings.d/*.json` alphabetically, and `infra` can own one file for this
 tool without editing a shared one.

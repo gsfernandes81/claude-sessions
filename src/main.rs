@@ -4,7 +4,7 @@
 //! is here is the half that has to be right before a screen is worth drawing: the registry,
 //! the hook that feeds it, and the repair pass that makes it agree with reality.
 //!
-//! Arguments are parsed by hand. Seven subcommands and three flags is not worth a parser, and
+//! Arguments are parsed by hand. Eight subcommands and three flags is not worth a parser, and
 //! this binary is on the ssh path in a container pulled by checksum — every dependency is one
 //! more thing to cross-compile for musl and one more thing to read before trusting.
 
@@ -12,6 +12,7 @@ mod abduco;
 mod bind;
 mod clock;
 mod events;
+mod hooks_config;
 mod json;
 mod live;
 mod lockfile;
@@ -58,6 +59,24 @@ fn main() -> ExitCode {
             Some(slot) => report(cmd_close(slot)),
             None => fail("close needs a slot name: claude-sessions close claude-1"),
         },
+        "hooks-config" => {
+            // The path the hook command will name. Given explicitly by an image build that
+            // installs the binary somewhere other than where it runs it from; otherwise this
+            // binary's own path, which is right when it is run from where it is installed.
+            let exe = match args.get(1) {
+                Some(p) => p.clone(),
+                None => match std::env::current_exe() {
+                    Ok(p) => p.display().to_string(),
+                    Err(e) => {
+                        return fail(&format!(
+                            "cannot tell where this binary is ({e}); pass its path"
+                        ));
+                    }
+                },
+            };
+            println!("{}", json::to_string_pretty(&hooks_config::settings(&exe)));
+            ExitCode::SUCCESS
+        }
         "offload" => match args.get(1).map(String::as_str) {
             None => report(offload::run(false)),
             Some("--dry-run") => report(offload::run(true)),
@@ -79,6 +98,9 @@ fn usage() -> String {
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
   claude-sessions offload      stop every slot idle 10 minutes past its Stop; run from a timer
                   [--dry-run]  say what it would stop, and stop nothing
+  claude-sessions hooks-config [PATH]
+                               the Claude Code settings that install the hooks, naming PATH
+                               (default: this binary) — for /etc/claude-code/managed-settings.d/
 
 The registry is {} — override with CLAUDE_SESSIONS_DIR.
 ",
@@ -319,6 +341,7 @@ fn cmd_list() -> std::io::Result<()> {
             .and_then(live::for_pid)
             .and_then(|l| l.real_title().map(str::to_string))
             .or_else(|| r.title.clone())
+            .or_else(|| r.first_prompt.clone())
             .unwrap_or_else(|| "(no title yet)".into());
         println!(
             "{:<10} {:<4} {:<40} {}",

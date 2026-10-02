@@ -112,10 +112,10 @@ Two things you are not to do, both inherited and both meant literally:
 - **Mockup 2 lists `q   a shell instead`**, while the design says `q` quits and is listed
   nowhere, and `s` is the shell everywhere else. Flagged, not changed — the screens are
   binding until the owner says otherwise.
-- **The first-prompt title fallback has no data.** Row titles come from Claude Code's session
-  title, else the first prompt truncated, but the hook does not record the prompt. A
-  `first_prompt` field written once by `UserPromptSubmit` is the fix, and belongs before the
-  menu.
+- ~~The first-prompt title fallback has no data~~ — done: `first_prompt`, set by the first
+  `UserPromptSubmit` of each conversation. A resumed conversation's first prompt is not known
+  to the hook, so its fallback is the first prompt *after* the resume; Claude Code's own title
+  usually covers that row anyway.
 
 - **A long-interval wake tool**, deferred and possibly unnecessary. `ScheduleWakeup` clamps at
   an hour, and since a pending timer pins a slot, a loop waiting longer holds its memory the

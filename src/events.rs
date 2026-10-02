@@ -53,6 +53,9 @@ impl Event {
     pub fn session_title(&self) -> Option<&str> {
         self.s("session_title")
     }
+    pub fn prompt(&self) -> Option<&str> {
+        self.s("prompt")
+    }
     /// `SessionEnd`: clear | resume | logout | prompt_input_exit | other.
     pub fn reason(&self) -> Option<&str> {
         self.s("reason")
@@ -120,6 +123,14 @@ pub fn apply(
     let out = match ev.name() {
         "SessionStart" => {
             if let Some(id) = ev.session_id() {
+                // A different conversation in the same slot — after /clear, a resume, a fork.
+                // What described the old one must not describe the new one: the title and the
+                // first prompt start again, rather than the menu showing last task's name on
+                // this task's row.
+                if rec.session_id.as_deref() != Some(id) {
+                    rec.title = None;
+                    rec.first_prompt = None;
+                }
                 rec.session_id = Some(id.to_string());
             }
             if let Some(cwd) = ev.cwd() {
@@ -142,6 +153,9 @@ pub fn apply(
             Outcome::Changed
         }
         "UserPromptSubmit" => {
+            if rec.first_prompt.is_none() {
+                rec.first_prompt = ev.prompt().and_then(one_line);
+            }
             rec.busy = true;
             rec.needs_you = false;
             rec.last_activity_ms = now;
@@ -188,6 +202,10 @@ pub fn apply(
     }
     out
 }
+
+/// The tools whose `PostToolUse` sets or clears a timer. `hooks_config` installs the
+/// `PostToolUse` hook for exactly these, and its tests check each one really is handled below.
+pub const TIMER_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "CronDelete"];
 
 /// Timers, from `PostToolUse` on the tools that set them.
 ///
@@ -269,6 +287,22 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, now: Millis) -> Outcome {
         }
         _ => Outcome::Ignored("tool does not set a timer"),
     }
+}
+
+/// The longest first prompt kept. The 80-column row has 69 columns of title, so this is
+/// enough for any screen the menu draws, and keeps a pasted log out of the registry.
+pub const FIRST_PROMPT_CHARS: usize = 120;
+
+/// A prompt as a title: whitespace runs and control characters collapsed to single spaces,
+/// cut at `FIRST_PROMPT_CHARS` on a character boundary. `None` when nothing printable is left.
+fn one_line(prompt: &str) -> Option<String> {
+    let words: Vec<&str> = prompt
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = words.join(" ");
+    let cut: String = joined.chars().take(FIRST_PROMPT_CHARS).collect();
+    (!cut.is_empty()).then_some(cut)
 }
 
 fn upsert(rec: &mut SlotRecord, t: Timer) {
@@ -657,5 +691,97 @@ mod tests {
         );
         assert_eq!(rec.last_event_ms.get("Stop"), Some(&7_000));
         assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), Some(&8_000));
+    }
+
+    // ── titles: the first prompt, and a new conversation forgetting the old one ─
+
+    #[test]
+    fn the_first_prompt_is_kept_on_one_line_and_later_ones_are_not() {
+        let mut rec = slot();
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"  fix the\n\ttunnel  "}"#),
+            2_000,
+        );
+        assert_eq!(rec.first_prompt.as_deref(), Some("fix the tunnel"));
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"and then the dns"}"#),
+            3_000,
+        );
+        assert_eq!(
+            rec.first_prompt.as_deref(),
+            Some("fix the tunnel"),
+            "it is the FIRST prompt"
+        );
+    }
+
+    #[test]
+    fn a_long_or_empty_prompt_is_cut_or_skipped() {
+        let mut rec = slot();
+        let long = "é".repeat(FIRST_PROMPT_CHARS + 50);
+        let body = format!(r#"{{"hook_event_name":"UserPromptSubmit","prompt":"{long}"}}"#);
+        own(&mut rec, &ev(&body), 2_000);
+        assert_eq!(
+            rec.first_prompt.as_ref().map(|p| p.chars().count()),
+            Some(FIRST_PROMPT_CHARS),
+            "cut on a character boundary, multibyte included"
+        );
+        let mut rec = slot();
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":" \n "}"#),
+            2_000,
+        );
+        assert_eq!(rec.first_prompt, None, "nothing printable is no title");
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"now a real one"}"#),
+            3_000,
+        );
+        assert_eq!(rec.first_prompt.as_deref(), Some("now a real one"));
+    }
+
+    #[test]
+    fn a_new_conversation_does_not_inherit_the_old_ones_title() {
+        let mut rec = slot();
+        rec.title = Some("old task".into());
+        rec.first_prompt = Some("old prompt".into());
+        // Calibration: a SessionStart for the SAME conversation (compact) keeps both.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"compact","session_id":"first"}"#),
+            2_000,
+        );
+        assert_eq!(rec.title.as_deref(), Some("old task"));
+        assert_eq!(rec.first_prompt.as_deref(), Some("old prompt"));
+        // /clear: a new conversation in the same slot.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
+            3_000,
+        );
+        assert_eq!(rec.title, None);
+        assert_eq!(rec.first_prompt, None);
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"new task"}"#),
+            4_000,
+        );
+        assert_eq!(rec.first_prompt.as_deref(), Some("new task"));
+    }
+
+    #[test]
+    fn a_nested_claudes_prompt_is_not_the_slots_first_prompt() {
+        let mut rec = slot();
+        apply(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"subagent work"}"#),
+            2_000,
+            Binding::Nested,
+            None,
+            None,
+        );
+        assert_eq!(rec.first_prompt, None);
     }
 }

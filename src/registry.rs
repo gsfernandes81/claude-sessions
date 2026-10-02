@@ -86,6 +86,10 @@ pub struct SlotRecord {
     pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub title: Option<String>,
+    /// The current conversation's first prompt, on one line and cut short — the title of last
+    /// resort, for a conversation Claude Code has not named. Written once per conversation by
+    /// `UserPromptSubmit`.
+    pub first_prompt: Option<String>,
     pub state: State,
     pub busy: bool,
     pub needs_you: bool,
@@ -116,6 +120,7 @@ impl SlotRecord {
             session_id: None,
             cwd: None,
             title: None,
+            first_prompt: None,
             state: State::Live,
             busy: false,
             needs_you: false,
@@ -162,6 +167,7 @@ impl SlotRecord {
         set_opt_str(&mut o, "session_id", self.session_id.as_deref());
         set_opt_str(&mut o, "cwd", self.cwd.as_deref());
         set_opt_str(&mut o, "title", self.title.as_deref());
+        set_opt_str(&mut o, "first_prompt", self.first_prompt.as_deref());
         o.set("busy", Value::Bool(self.busy));
         o.set("needs_you", Value::Bool(self.needs_you));
         o.set("registered", Value::Bool(self.registered));
@@ -235,6 +241,7 @@ impl SlotRecord {
             session_id: str_of(v, "session_id"),
             cwd: str_of(v, "cwd"),
             title: str_of(v, "title"),
+            first_prompt: str_of(v, "first_prompt"),
             state: State::parse(v.get("state").and_then(Value::as_str).unwrap_or("live")),
             busy: v.get("busy").and_then(Value::as_bool).unwrap_or(false),
             needs_you: v.get("needs_you").and_then(Value::as_bool).unwrap_or(false),
@@ -340,6 +347,7 @@ mod tests {
         rec.proc_start = Some(99);
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
+        rec.first_prompt = Some("move the tunnel to the new box".into());
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
@@ -355,6 +363,7 @@ mod tests {
         assert_eq!(back.pid, Some(42));
         assert_eq!(back.proc_start, Some(99));
         assert_eq!(back.state, State::Offloaded);
+        assert_eq!(back.first_prompt, rec.first_prompt);
         assert!(back.needs_you);
         assert_eq!(back.timers, rec.timers);
         assert_eq!(back.last_event_ms.get("Stop"), Some(&2_000));

@@ -172,6 +172,32 @@ fn version_works_on_a_bare_binary() {
 }
 
 #[test]
+fn hooks_config_prints_settings_that_name_the_given_binary() {
+    // The image build pipes this into a managed-settings drop-in, so it has to work bare and
+    // print nothing but the document.
+    let out = Command::new(BIN)
+        .args(["hooks-config", "/usr/local/bin/claude-sessions"])
+        .env_clear()
+        .output()
+        .expect("runs");
+    assert!(out.status.success());
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.trim_start().starts_with('{') && body.trim_end().ends_with('}'),
+        "got {body}"
+    );
+    assert!(
+        body.contains(r#""command": "/usr/local/bin/claude-sessions hook""#),
+        "got {body}"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn an_unknown_subcommand_fails_loudly() {
     // The door falls through to a shell on a NON-ZERO exit, so a typo must not look like
     // success — and neither may a flag `offload` does not know, which on a timer's command
