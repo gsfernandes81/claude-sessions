@@ -157,7 +157,11 @@ impl Menu {
 
     /// Rows that fit between the header's rule and the closing rule.
     fn capacity(&self) -> usize {
-        let fixed = 3 + usize::from(self.status.is_some()) + self.hint_lines();
+        let status = self
+            .status
+            .as_deref()
+            .map_or(0, |s| crate::render::status_line_count(self.width, s));
+        let fixed = 3 + status + self.hint_lines();
         usize::from(self.height).saturating_sub(fixed).max(1)
     }
 

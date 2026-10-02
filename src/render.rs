@@ -98,6 +98,8 @@ pub fn render(view: &View) -> Result<Frame, TooNarrow> {
 impl Frame {
     /// The text alone: styles dropped, trailing spaces trimmed, lines joined with `\n`. What
     /// a pipe or a screen reader would get, and what the tests compare against the mockups.
+    // The tests' view of a frame — the live path only ever writes `ansi()`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn plain(&self) -> String {
         self.lines
             .iter()
@@ -438,17 +440,30 @@ fn list_screen(view: &View, w: usize, h: usize) -> Vec<Line> {
         out.extend(empty_body(view, w));
         hint_lines(&HINTS_EMPTY, GAP, w)
     } else {
-        let tail = 1 + usize::from(view.status.is_some()) + hints_len(w);
+        let tail = 1 + status_lines(view, w).len() + hints_len(w);
         let room = h.saturating_sub(out.len() + tail);
         out.extend(rows(view, w, view.scroll, room));
         hint_lines(&HINTS, GAP, w)
     };
     out.push(rule(w));
-    if let Some(status) = &view.status {
-        out.push(text(status, FG));
-    }
+    out.extend(status_lines(view, w).iter().map(|l| text(l, FG)));
     out.extend(hints);
     out
+}
+
+/// The status line, wrapped rather than cut: it is usually a reason something was refused,
+/// and a reason cut off at the edge of a phone screen is no reason at all. Mockup 6's fits on
+/// one line, as most do.
+fn status_lines(view: &View, w: usize) -> Vec<String> {
+    view.status
+        .as_deref()
+        .map(|s| wrap(s, w))
+        .unwrap_or_default()
+}
+
+/// How many lines a status takes at `width` — for `menu.rs`, which must leave room for it.
+pub fn status_line_count(width: u16, status: &str) -> usize {
+    wrap(status, usize::from(width)).len()
 }
 
 fn hints_len(w: usize) -> usize {
@@ -854,6 +869,37 @@ mod tests {
     #[test]
     fn mockup_5_a_resume_that_fails() {
         assert_mockup(5, mockup_5);
+    }
+
+    #[test]
+    fn a_long_status_wraps_and_loses_nothing() {
+        // A refusal's reason, at 40 columns: every word must reach the screen.
+        let reason = "5 ran in /home/owner/projects/old-thing, which is gone - claude --resume \
+                      would start somewhere else";
+        let mut v = View {
+            status: Some(reason.to_string()),
+            ..mockup_1(40)
+        };
+        v.rows.truncate(2);
+        let plain = render(&v).unwrap().plain();
+        let shown: Vec<&str> = plain.split_whitespace().collect();
+        for word in reason.split_whitespace() {
+            assert!(
+                shown.contains(&word),
+                "{word:?} was cut from the status line"
+            );
+        }
+        assert!(
+            status_line_count(40, reason) > 1,
+            "calibration: it does need wrapping"
+        );
+        // And the rows give way to it rather than the hint line falling off the bottom.
+        v.height = 9;
+        let frame = render(&v).unwrap();
+        assert!(
+            frame.plain().contains("s shell"),
+            "the hint must survive a long status"
+        );
     }
 
     #[test]
