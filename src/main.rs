@@ -15,6 +15,9 @@ mod events;
 mod fmt;
 mod hooks_config;
 mod json;
+// What a keypress does: attach, resume, start, close. The menu wires it in next.
+#[allow(dead_code)]
+mod launch;
 mod live;
 mod lockfile;
 mod mem;

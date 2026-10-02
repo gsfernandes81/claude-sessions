@@ -35,11 +35,11 @@ pub const IDLE_AFTER_STOP_MS: Millis = 10 * 60 * 1000;
 
 /// From `TERM` to `KILL`. Claude Code's `SessionEnd` hooks share a 1.5 s budget, so a clean
 /// exit is over well inside this; the margin is for a slow disk, not a slow process.
-const TERM_GRACE: Duration = Duration::from_secs(5);
+pub const TERM_GRACE: Duration = Duration::from_secs(5);
 
 /// From `KILL` to giving up and saying so. `KILL` cannot be caught, so a process still here
 /// after this is stuck in the kernel, and waiting longer will not change that.
-const KILL_GRACE: Duration = Duration::from_secs(3);
+pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// For the abduco server to notice its command has gone and exit on its own, which it does.
 const ABDUCO_GRACE: Duration = Duration::from_secs(2);
@@ -233,7 +233,7 @@ fn wait_gone(pid: u32, start: u64, within: Duration) -> bool {
 }
 
 /// The abduco server above a slot's claude, if that is what its parent is.
-fn abduco_server(table: Option<&[Proc]>, pid: u32) -> Option<(u32, u64)> {
+pub fn abduco_server(table: Option<&[Proc]>, pid: u32) -> Option<(u32, u64)> {
     let ppid = table?.iter().find(|p| p.pid == pid)?.ppid;
     let parent = table?.iter().find(|p| p.pid == ppid)?;
     (parent.comm == "abduco").then_some((parent.pid, parent.start))
@@ -246,7 +246,7 @@ fn abduco_server(table: Option<&[Proc]>, pid: u32) -> Option<(u32, u64)> {
 /// The socket is removed only once the recorded server is known dead — a killed server
 /// leaves its socket behind with the attached bit set, and a socket left like that would show
 /// the slot as attached to a menu that has not been taught otherwise.
-fn teardown_abduco(slot: &str, server: Option<(u32, u64)>) -> Vec<String> {
+pub fn teardown_abduco(slot: &str, server: Option<(u32, u64)>) -> Vec<String> {
     let mut notes = Vec::new();
     let Some((spid, sstart)) = server else {
         notes.push("no abduco server above it; socket left for reconcile".into());
@@ -328,8 +328,34 @@ pub fn run(dry_run: bool) -> io::Result<()> {
 
 /// Stop one slot whose decision has already been made, with its lock held by the caller.
 fn offload_one(rec: &mut SlotRecord, idle: Millis, table: Option<&[Proc]>) -> io::Result<bool> {
+    match offload_quiet(rec, idle, table)? {
+        Ok(line) => {
+            println!("{line}");
+            Ok(true)
+        }
+        Err(why) => {
+            println!("{why}");
+            Ok(false)
+        }
+    }
+}
+
+/// The stop itself, logged to `offload.log` and never printed: `Ok` is the line saying what
+/// was done, `Err` the line saying why the slot was left `offloading`.
+///
+/// Split from `offload_one` for the menu, which offloads a slot to make room when the owner
+/// accepts mockup 4's offer. It runs with the terminal in raw mode on the menu's own screen,
+/// where a stray `println!` would land in the middle of the drawing.
+pub fn offload_quiet(
+    rec: &mut SlotRecord,
+    idle: Millis,
+    table: Option<&[Proc]>,
+) -> io::Result<Result<String, String>> {
     let (Some(pid), Some(start)) = (rec.pid, rec.proc_start) else {
-        return Ok(false);
+        return Ok(Err(format!(
+            "{}: no pid recorded; nothing stopped",
+            rec.slot
+        )));
     };
     let server = abduco_server(table, pid);
 
@@ -343,9 +369,9 @@ fn offload_one(rec: &mut SlotRecord, idle: Millis, table: Option<&[Proc]>) -> io
         Err(e) => {
             // Left `offloading`: the next pass decides again, and reconcile finishes it if
             // the process does die.
-            log(&format!("{}: stop failed: {e}", rec.slot));
-            println!("{}: stop failed: {e}", rec.slot);
-            return Ok(false);
+            let line = format!("{}: stop failed: {e}", rec.slot);
+            log(&line);
+            return Ok(Err(line));
         }
     };
     let notes = teardown_abduco(&rec.slot, server);
@@ -368,8 +394,7 @@ fn offload_one(rec: &mut SlotRecord, idle: Millis, table: Option<&[Proc]>) -> io
         notes.join("; ")
     );
     log(&line);
-    println!("{line}");
-    Ok(true)
+    Ok(Ok(line))
 }
 
 // ── the orphan sweep: logging only ──────────────────────────────────────────
