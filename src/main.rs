@@ -458,8 +458,14 @@ fn cmd_doctor() -> std::io::Result<()> {
             rec.state,
             if rec.registered { "" } else { " (not ours)" }
         );
-        println!("  pid       : {:?} start {:?}", rec.pid, rec.proc_start);
-        println!("  session   : {:?}", rec.session_id);
+        // Plain values, not Rust's debug spelling: this is read by a person (issue #4).
+        let or_none = |v: Option<String>| v.unwrap_or_else(|| "none".into());
+        println!(
+            "  pid       : {} start {}",
+            or_none(rec.pid.map(|p| p.to_string())),
+            or_none(rec.proc_start.map(|s| s.to_string()))
+        );
+        println!("  session   : {}", or_none(rec.session_id.clone()));
         println!(
             "  flags     : busy={} needs_you={} unread={} timers={}",
             rec.busy,
@@ -471,10 +477,12 @@ fn cmd_doctor() -> std::io::Result<()> {
             println!("  events    : none seen — the hooks are not installed, or not firing");
         } else {
             for (name, at) in &rec.last_event_ms {
-                println!(
-                    "  {name:<10}: last seen {} ago",
-                    age(now.saturating_sub(*at))
-                );
+                // "last seen now", not "last seen now ago".
+                let when = match age(now.saturating_sub(*at)) {
+                    a if a == "now" => a,
+                    a => format!("{a} ago"),
+                };
+                println!("  {name:<10}: last seen {when}");
             }
         }
     }

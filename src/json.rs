@@ -63,6 +63,15 @@ impl Value {
             _ => None,
         }
     }
+    /// A count that may arrive as a number or as a string of digits. Claude Code writes
+    /// `procStart` as `"245606583"` — a string, in every sessions file seen (2.1.241 through
+    /// 2.1.287) — and reading it with `as_u64` alone silently got `None` every time.
+    pub fn as_u64_lenient(&self) -> Option<u64> {
+        match self {
+            Value::Str(s) => s.trim().parse().ok(),
+            _ => self.as_u64(),
+        }
+    }
     pub fn as_u32(&self) -> Option<u32> {
         self.as_u64().and_then(|n| u32::try_from(n).ok())
     }

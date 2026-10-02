@@ -14,12 +14,33 @@ use std::fs;
 /// parentheses and may itself contain spaces and parentheses, so splitting the line on
 /// whitespace from the left is wrong for any process whose name contains a space. Everything
 /// after the LAST `)` is fixed-width, so that is where the count starts.
+///
+/// **Only for a process, never for a thread.** `/proc/<tid>/stat` opens for any thread id even
+/// though threads are not listed in `/proc`, so a stored pid that has since been handed out as
+/// some other program's thread id would otherwise read as alive — found on infra-dev, where a
+/// dead session's pid 161 was a thread of cloudflared (issue #4). A thread's `Tgid` is its
+/// process's pid, not its own.
 pub fn start_time(pid: u32) -> Option<u64> {
+    if !is_process(pid) {
+        return None;
+    }
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = &stat[stat.rfind(')')? + 1..];
     // After `comm` the fields are: state(3) ppid(4) ... starttime(22). `tail` begins at
     // field 3, so starttime is the 20th whitespace-separated token in it.
     tail.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether `pid` names a process (its own thread-group leader) rather than a thread.
+fn is_process(pid: u32) -> bool {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Tgid:"))
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        == Some(pid)
 }
 
 /// Is this the same process we recorded, rather than a reuse of its pid?
@@ -162,6 +183,35 @@ mod tests {
         let start = start_time(me).expect("our own stat is readable");
         assert!(is_alive(me, start), "calibration: we are alive");
         assert!(!is_alive(me, start + 1), "a reused pid is not the original");
+    }
+
+    #[test]
+    fn a_thread_id_is_not_a_process() {
+        // A thread of this very test process, kept alive while we look at it.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel::<u32>();
+        let worker = std::thread::spawn(move || {
+            let tid = std::fs::read_link("/proc/thread-self")
+                .ok()
+                .and_then(|p| p.file_name()?.to_str()?.parse().ok())
+                .expect("thread-self names the thread");
+            tid_tx.send(tid).unwrap();
+            rx.recv().ok();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let me = std::process::id();
+        assert_ne!(tid, me, "calibration: a thread has its own id");
+        assert!(
+            std::fs::read_to_string(format!("/proc/{tid}/stat")).is_ok(),
+            "calibration: its stat opens, which is exactly the trap"
+        );
+        assert_eq!(start_time(tid), None, "a thread id is not a process");
+        assert!(
+            start_time(me).is_some(),
+            "calibration: the process itself is"
+        );
+        tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

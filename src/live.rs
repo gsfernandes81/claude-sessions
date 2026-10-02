@@ -49,10 +49,14 @@ pub struct LiveSession {
 impl LiveSession {
     fn from_json(v: &Value) -> Option<LiveSession> {
         Some(LiveSession {
-            pid: v.get("pid").and_then(Value::as_u32)?,
+            pid: v
+                .get("pid")
+                .and_then(Value::as_u64_lenient)
+                .and_then(|p| u32::try_from(p).ok())?,
             session_id: s(v, "sessionId"),
             cwd: s(v, "cwd"),
-            proc_start: v.get("procStart").and_then(Value::as_u64),
+            // A string in the files Claude Code writes (issue #4); a number would do too.
+            proc_start: v.get("procStart").and_then(Value::as_u64_lenient),
             kind: s(v, "kind"),
             name: s(v, "name"),
             name_source: s(v, "nameSource"),
@@ -102,18 +106,77 @@ pub fn all() -> Vec<LiveSession> {
         let Some(sess) = LiveSession::from_json(&v) else {
             continue;
         };
-        let fresh = match sess.proc_start {
-            Some(start) => crate::procinfo::is_alive(sess.pid, start),
-            // Without a start time the best available test is that the pid exists at all.
-            None => crate::procinfo::start_time(sess.pid).is_some(),
-        };
-        if fresh {
+        if sess.is_fresh() {
             out.push(sess);
         }
     }
     out
 }
 
+impl LiveSession {
+    /// Whether the process this file describes is still the one running under its pid.
+    fn is_fresh(&self) -> bool {
+        match self.proc_start {
+            Some(start) => crate::procinfo::is_alive(self.pid, start),
+            // Without a start time the best available test is that the pid is a process at
+            // all — `start_time` refuses a thread id, which a stale pid can turn into.
+            None => crate::procinfo::start_time(self.pid).is_some(),
+        }
+    }
+}
+
 pub fn for_pid(pid: u32) -> Option<LiveSession> {
     all().into_iter().find(|s| s.pid == pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sessions file in the shape Claude Code 2.1.287 writes it, read on 2026-10-02 —
+    /// field names and types as found, values made up. Note `procStart`: a STRING.
+    fn fixture(pid: u32, proc_start: &str) -> String {
+        format!(
+            r#"{{"pid":{pid},"sessionId":"1bad2ea9-0000-4000-8000-000000000000",
+            "cwd":"/workspace","startedAt":1790892170775,"procStart":"{proc_start}",
+            "version":"2.1.287","peerProtocol":1,"peerFeatures":[],"kind":"interactive",
+            "entrypoint":"cli","pidDomain":"x","messagingSocketPath":"/tmp/x.sock",
+            "name":"workspace-07","nameSource":"derived","nameSince":1790892170775,
+            "updatedAt":1790892170775,"status":"idle","statusUpdatedAt":1790892170775}}"#
+        )
+    }
+
+    fn parse(body: &str) -> LiveSession {
+        LiveSession::from_json(&json::parse(body).expect("fixture is json")).expect("a session")
+    }
+
+    #[test]
+    fn a_string_proc_start_is_read_and_compared() {
+        let me = std::process::id();
+        let start = crate::procinfo::start_time(me).unwrap();
+        let s = parse(&fixture(me, &start.to_string()));
+        assert_eq!(
+            s.proc_start,
+            Some(start),
+            "the string is read as the number it is"
+        );
+        assert!(
+            s.is_fresh(),
+            "calibration: our own process, our own start time"
+        );
+        let stale = parse(&fixture(me, &(start + 1).to_string()));
+        assert!(
+            !stale.is_fresh(),
+            "a live pid with another start time is a dead file whose pid was reused"
+        );
+    }
+
+    #[test]
+    fn the_fixture_reads_as_claude_code_wrote_it() {
+        let s = parse(&fixture(425, "503696084"));
+        assert_eq!(s.pid, 425);
+        assert_eq!(s.kind.as_deref(), Some("interactive"));
+        assert_eq!(s.status.as_deref(), Some("idle"));
+        assert_eq!(s.real_title(), None, "a derived name is not a title");
+    }
 }
