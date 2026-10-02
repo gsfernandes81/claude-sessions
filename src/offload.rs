@@ -290,10 +290,31 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         println!("memory: {} MB free in this container", free / (1024 * 1024));
     }
     let mut offloaded = 0usize;
+    // One snapshot of /proc for the whole pass, taken holding no lock. Reading every
+    // process's stat and cmdline is the slow part of a pass, and a hook that arrives while a
+    // slot's lock is held has to wait for it — issue #1: a prompt dropped that way leaves a
+    // busy claude reading as idle, and ten minutes later the offloader would stop it.
+    let table = procinfo::table();
     for listed in registry::all()? {
         if !matches!(listed.state, State::Live | State::Offloading) {
             continue;
         }
+        // First decision from the snapshot and the record as listed, holding nothing. Every
+        // slot that is kept — nearly all of them, nearly always — ends here.
+        let idle = match decide(&listed, clock::now(), &look(&listed, table.as_deref())) {
+            Ok(idle) => idle,
+            Err(hold) => {
+                println!("{}: kept — {hold}", listed.slot);
+                continue;
+            }
+        };
+        // A dry run writes nothing, so it has nothing to protect and takes no lock at all.
+        if dry_run {
+            println!("{}: would offload, idle {}m", listed.slot, idle / 60_000);
+            continue;
+        }
+        // A candidate. Now the lock, held from here through the kill as the design requires,
+        // and the decision made again from what is true under it.
         let slot = listed.slot;
         let _lock = match lockfile::SlotLock::acquire(
             &registry::lock_path(&slot),
@@ -307,24 +328,22 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             }
             Err(e) => return Err(e),
         };
-        // Re-read under the lock: the copy listed above may be minutes old by now.
+        // Re-read under the lock: the copy listed above may be stale by now. The snapshot is
+        // taken again too — a stop is about to follow, and it must not be decided on a
+        // process tree read before the lock. This one read under the lock is paid only by a
+        // slot that is about to be stopped, and the lock is held through the stop anyway.
         let Some(mut rec) = registry::load(&slot)? else {
             continue;
         };
-        let table = procinfo::table();
-        let now = clock::now();
-        let idle = match decide(&rec, now, &look(&rec, table.as_deref())) {
+        let fresh = procinfo::table();
+        let idle = match decide(&rec, clock::now(), &look(&rec, fresh.as_deref())) {
             Ok(idle) => idle,
             Err(hold) => {
                 println!("{slot}: kept — {hold}");
                 continue;
             }
         };
-        if dry_run {
-            println!("{slot}: would offload, idle {}m", idle / 60_000);
-            continue;
-        }
-        if offload_one(&mut rec, idle, table.as_deref())? {
+        if offload_one(&mut rec, idle, fresh.as_deref())? {
             offloaded += 1;
         }
     }

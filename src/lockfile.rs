@@ -29,8 +29,9 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-/// What a hook may spend waiting. `SessionEnd` hooks share 1.5 s across all of them, so a
-/// quarter of that is the most one write may risk.
+/// What a `SessionEnd` hook may spend waiting. `SessionEnd` hooks share 1.5 s across all of
+/// them, so a quarter of that is the most one write may risk. Every other hook event waits
+/// `INTERACTIVE_WAIT`, inside its 5 s timeout.
 pub const SESSION_END_WAIT: Duration = Duration::from_millis(400);
 
 /// What an interactive command may spend. Long enough to outlast a competing write, short

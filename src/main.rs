@@ -182,12 +182,19 @@ fn cmd_hook() -> std::io::Result<()> {
         .filter(|_| binding == Binding::Own);
     let own_start = own_pid.and_then(procinfo::start_time);
 
-    let _lock =
-        lockfile::SlotLock::acquire(&registry::lock_path(&slot), lockfile::SESSION_END_WAIT)
-            .map_err(|e| {
-                log(&format!("{slot}: lock: {e}"));
-                e
-            })?;
+    // SessionEnd hooks share a 1.5 s budget, so that one event may only risk SESSION_END_WAIT.
+    // Every other event has a 5 s hook timeout (hooks_config.rs) and waits longer: dropping a
+    // UserPromptSubmit because the lock was busy leaves a working claude reading as idle,
+    // which is the one mistake the offloader cannot survive (issue #1).
+    let wait = if ev.name() == "SessionEnd" {
+        lockfile::SESSION_END_WAIT
+    } else {
+        lockfile::INTERACTIVE_WAIT
+    };
+    let _lock = lockfile::SlotLock::acquire(&registry::lock_path(&slot), wait).map_err(|e| {
+        log(&format!("{slot}: lock: {e}"));
+        e
+    })?;
 
     let now = clock::now();
     let mut rec = registry::load(&slot)?.unwrap_or_else(|| {

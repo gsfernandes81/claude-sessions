@@ -163,6 +163,13 @@ is the choice and why:
   server, recorded at decision time and only if the claude's parent really is `abduco`, gets
   2 s to exit by itself and a `TERM` if it does not; its socket is removed only once that
   server is known dead.
+- **The lock is taken only by a slot about to be stopped** (issue #1). The pass reads `/proc`
+  once, holding no lock, and decides every slot from that and its record as listed; a slot
+  that is kept — nearly every slot, nearly always — never touches its lock, and `--dry-run`
+  takes none at all. A candidate then takes its lock, re-reads its record and `/proc`, and
+  decides again before anything is signalled. Hook events other than `SessionEnd` wait up to
+  2 s for a slot's lock (inside their 5 s timeout) rather than `SessionEnd`'s 400 ms, because a
+  dropped `UserPromptSubmit` leaves a working claude reading as idle.
 - **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
   offloader writes `offloaded` itself. A `hook.log` line per offload is expected.

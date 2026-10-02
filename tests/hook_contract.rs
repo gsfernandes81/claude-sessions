@@ -212,3 +212,54 @@ fn an_unknown_subcommand_fails_loudly() {
         );
     }
 }
+
+#[test]
+fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
+    // Issue #1: every event waited only SessionEnd's 400 ms. A UserPromptSubmit dropped that
+    // way leaves a working claude reading as idle. Hold the slot's lock for a second.
+    let dir = tmpdir("lockwait");
+    let slot = "claude-4";
+    let hold = |secs: &str| {
+        let child = Command::new("flock")
+            .arg(dir.join(format!("{slot}.lock")))
+            .args(["sleep", secs])
+            .spawn()
+            .expect("flock(1) runs");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        child
+    };
+    let mut holder = hold("1");
+    assert_eq!(
+        run_hook(
+            &dir,
+            Some(slot),
+            r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#
+        ),
+        0
+    );
+    holder.wait().ok();
+    // The hook runs outside any claude here, so it binds as nested and only the event's
+    // arrival is recorded — which is exactly the question: was it written, or dropped?
+    let body = std::fs::read_to_string(dir.join(format!("{slot}.json")))
+        .expect("the prompt waited out the lock and was recorded");
+    assert!(body.contains("\"UserPromptSubmit\""), "got {body}");
+
+    // Calibration: SessionEnd keeps its short wait, inside the 1.5 s budget all SessionEnd
+    // hooks share — so the same held lock makes it give up, and nothing is written.
+    let mut holder = hold("1");
+    assert_eq!(
+        run_hook(
+            &dir,
+            Some(slot),
+            r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#
+        ),
+        0,
+        "even a dropped event exits 0"
+    );
+    holder.wait().ok();
+    let body = std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
+    assert!(
+        !body.contains("\"SessionEnd\""),
+        "SessionEnd should have given up on the held lock: {body}"
+    );
+}

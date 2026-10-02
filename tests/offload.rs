@@ -215,3 +215,56 @@ fn work_running_under_the_slot_keeps_it() {
     assert!(alive(s.claude, s.claude_start));
     assert_eq!(state_of(&s.root), "live");
 }
+
+/// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.
+fn hold_lock(path: &Path, secs: f64) -> Child {
+    let child = Command::new("flock")
+        .arg(path)
+        .args(["sleep", &secs.to_string()])
+        .spawn()
+        .expect("flock(1) runs");
+    // Let it take the lock before the test goes on.
+    std::thread::sleep(Duration::from_millis(150));
+    child
+}
+
+#[test]
+fn a_dry_run_takes_no_lock_but_a_live_pass_does() {
+    // Issue #1: a pass held each slot's lock while it read /proc, and a hook arriving then
+    // was dropped. A dry run writes nothing, so it must not take the lock at all.
+    let s = idle_slot("drylock", 0o600, false);
+    let lock = s.root.join("registry/claude-1.lock");
+    let mut holder = hold_lock(&lock, 3.0);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "offload failed: {out}");
+    assert!(
+        out.contains("claude-1: would offload"),
+        "a dry run must decide without the lock: {out}"
+    );
+    // Calibration: the lock really is held — a live pass, which must take it, is kept off.
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "offload failed: {out}");
+    assert!(out.contains("its lock is busy"), "got: {out}");
+    assert!(alive(s.claude, s.claude_start), "nothing was stopped");
+    holder.kill().ok();
+    holder.wait().ok();
+}
+
+#[test]
+fn a_kept_slot_never_waits_for_its_lock() {
+    // The common case — a slot that is not idle — is decided from the snapshot and the
+    // record alone, so a held lock does not even slow it down.
+    let s = idle_slot("keptlock", 0o700, false);
+    let mut holder = hold_lock(&s.root.join("registry/claude-1.lock"), 3.0);
+    let started = Instant::now();
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "offload failed: {out}");
+    assert!(out.contains("claude-1: kept — attached"), "got: {out}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "it waited for a lock it had no need of: {:?}",
+        started.elapsed()
+    );
+    holder.kill().ok();
+    holder.wait().ok();
+}
