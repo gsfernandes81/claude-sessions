@@ -28,6 +28,9 @@ mod signal;
 // The menu's shared contract. Its users land in the next commits; until then nothing reads it.
 #[allow(dead_code)]
 mod ui;
+// The pure renderer for the menu; menu.rs wires it in next, so until then nothing calls it.
+#[allow(dead_code)]
+mod render;
 
 use events::{Binding, Outcome};
 use fmt::{age, human};
