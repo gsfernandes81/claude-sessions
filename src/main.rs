@@ -12,6 +12,7 @@ mod abduco;
 mod bind;
 mod clock;
 mod events;
+mod fmt;
 mod hooks_config;
 mod json;
 mod live;
@@ -21,8 +22,12 @@ mod offload;
 mod procinfo;
 mod registry;
 mod signal;
+// The menu's shared contract. Its users land in the next commits; until then nothing reads it.
+#[allow(dead_code)]
+mod ui;
 
 use events::{Binding, Outcome};
+use fmt::{age, human};
 use registry::{SlotRecord, State};
 use std::io::Read;
 use std::io::Write;
@@ -370,16 +375,6 @@ fn cmd_list() -> std::io::Result<()> {
     Ok(())
 }
 
-fn age(ms: u64) -> String {
-    let s = ms / 1000;
-    match s {
-        0..=59 => "now".to_string(),
-        60..=3599 => format!("{}m", s / 60),
-        3600..=86_399 => format!("{}h", s / 3600),
-        _ => format!("{}d", s / 86_400),
-    }
-}
-
 /// What is visible and what is not — per slot, per event.
 ///
 /// The event ages are the point. Claude Code updates itself in place in these containers, so
@@ -472,15 +467,6 @@ fn cmd_doctor() -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn human(bytes: u64) -> String {
-    let mb = bytes / (1024 * 1024);
-    if mb >= 1024 {
-        format!("{:.1}G", mb as f64 / 1024.0)
-    } else {
-        format!("{mb}M")
-    }
 }
 
 // ── close ───────────────────────────────────────────────────────────────────
