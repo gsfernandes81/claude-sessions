@@ -51,10 +51,12 @@ Two things you are not to do, both inherited and both meant literally:
    which is just the first start on a box with the hooks installed — no dialog means done.
 2. ~~Turn CI on~~ **Done: green on its first run**, on `main` at `d2ae511`, all 57 tests
    run on the x86_64 runner. The release job has not run yet; it runs on the first tag.
-3. **Cut `v0.1.0`** once CI is green, and give the owner the tag and the two SHA-256 hashes.
-   `infra`'s `Dockerfile.base` pins them, and that edit is a separate change in that repo.
-   **Bump `Cargo.toml` to `0.1.0` first**: it still says `0.0.0`, and the release job now
-   refuses to publish a tag whose binary reports a different version.
+3. **`v0.1.0` is released by CI**, not by a tag push: cloud sessions get a 403 pushing tags, so
+   the owner chose (2026-10-02) to have CI tag and release whenever `Cargo.toml`'s version on
+   `main` has no release yet — see *Release* in `../../CLAUDE.md`. Give the owner the tag and
+   the two SHA-256 hashes from the release notes; `infra`'s `Dockerfile.base` pins them, and
+   that edit is a separate change in that repo. The infra side also writes the hooks file with
+   `claude-sessions hooks-config` — `../design.md` § *Where the hooks live*.
 4. **`claude-sessions offload` is built.** What is left is `infra`'s half: the commit there
    that deletes `dev/offload-idle-claude.sh` and runs `claude-sessions offload` from the timer
    instead. That is the owner's change in another repo. **Before it lands, run

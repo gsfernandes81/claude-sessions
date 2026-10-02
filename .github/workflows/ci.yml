@@ -7,10 +7,16 @@
 # under emulation, because the consuming image's arm64 leg runs under QEMU and a Rust compile
 # there is unusable.
 #
+# A RELEASE IS CUT BY BUMPING THE VERSION IN Cargo.toml ON main (owner, 2026-10-02). Every
+# push to main whose version has no `v<version>` tag yet is built, tagged and released here,
+# by GitHub's own token — the sessions that develop this repo cannot push tags, so the tag is
+# made where the release is. A tag pushed by a person releases too, by the same job.
+#
 # WHY A TAG IS NEVER RE-CUT: the consumer pins a tag AND a hash. Re-cutting a published tag
 # silently changes what a pinned, checksummed build gets, which is the one thing the checksum
-# exists to prevent. The release job therefore runs on a tag push only, and the upload step
-# refuses to clobber.
+# exists to prevent. So a version whose tag exists is skipped, never rebuilt, and
+# `gh release create` refuses an existing release on its own. Releases are serialised, so two
+# quick pushes of one version cannot both try.
 name: ci
 
 on:
@@ -50,19 +56,54 @@ jobs:
         run: ./target/x86_64-unknown-linux-musl/debug/claude-sessions --version
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Only on a push: a pull request must never publish, and neither may a manual run of the
+    # tests.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
+      # Which tag this run would release, and whether it already exists. A version that is
+      # already released ends the job here, which is what every ordinary push to main does.
+      - name: Decide whether this push is a release
+        id: plan
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+            [ -n "$version" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
+            tag="v${version}"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released; nothing to do"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" != tag ] && git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            # A tag with no release, on a push to main: somebody made it by hand. Releasing
+            # main's commit under it would publish code the tag does not point at.
+            echo "$tag exists without a release; push that tag again or bump the version" >&2
+            exit 1
+          else
+            echo "releasing $tag"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Install the toolchain and both musl targets
+        if: steps.plan.outputs.release == 'true'
         run: |
           rustup update stable --no-self-update
           rustup default stable
           rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
       - name: Build both architectures
+        if: steps.plan.outputs.release == 'true'
         run: |
           set -eu
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
@@ -71,26 +112,32 @@ jobs:
       # The consuming image runs `--version` as a fatal check and a person reads its answer to
       # learn what is installed. A tag of v0.1.0 on a binary that says 0.0.0 is a release that
       # lies about itself forever, because the tag can never be re-cut — so refuse to publish
-      # until Cargo.toml says the same thing as the tag.
+      # until Cargo.toml says the same thing as the tag. On a push to main the tag came from
+      # Cargo.toml, so this guards the tag a person pushed.
       - name: The binary says the version the tag says
+        if: steps.plan.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
         run: |
           set -eu
           got=$(./target/x86_64-unknown-linux-musl/release/claude-sessions --version)
-          want="claude-sessions ${GITHUB_REF_NAME#v}"
+          want="claude-sessions ${TAG#v}"
           if [ "$got" != "$want" ]; then
-            echo "tag ${GITHUB_REF_NAME} but the binary says '${got}'; bump Cargo.toml and cut a new tag" >&2
+            echo "tag ${TAG} but the binary says '${got}'; bump Cargo.toml instead" >&2
             exit 1
           fi
       # The hashes go in the release body, not just in a file beside the asset: the consuming
       # Dockerfile hard-codes them, and a person copying them wants them where they can see
       # which tag they belong to.
       - name: Name the assets and hash them
-        id: assets
+        if: steps.plan.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
         run: |
           set -eu
           mkdir -p dist
           {
-            echo "## claude-sessions ${GITHUB_REF_NAME}"
+            echo "## claude-sessions ${TAG}"
             echo
             echo 'Static musl binaries. `Dockerfile.base` pins this tag and checks these hashes.'
             echo
@@ -99,21 +146,24 @@ jobs:
           } > dist/NOTES.md
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             arch="${target%%-*}"
-            name="claude-sessions-${GITHUB_REF_NAME}-${arch}-linux-musl"
+            name="claude-sessions-${TAG}-${arch}-linux-musl"
             cp "target/${target}/release/claude-sessions" "dist/${name}"
             sum=$(sha256sum "dist/${name}" | cut -d' ' -f1)
             printf '| `%s` | `%s` |\n' "$name" "$sum" >> dist/NOTES.md
             printf '%s  %s\n' "$sum" "$name" >> dist/SHA256SUMS
           done
           cat dist/NOTES.md
-      - name: Publish the release
+      # `--target` makes the tag at this run's commit when it does not exist yet, which is the
+      # push-to-main case; for a pushed tag it is ignored. `gh release create` refuses a
+      # release that already exists, so a re-run cannot replace published assets.
+      - name: Tag and publish the release
+        if: steps.plan.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        # --fail-on-no-commits is not what this guards: `gh release create` refuses an existing
-        # tag's release on its own, which is the behaviour wanted here. A re-cut tag has to be
-        # a deliberate delete by a person, not something CI can do by being re-run.
+          TAG: ${{ steps.plan.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "claude-sessions $GITHUB_REF_NAME" \
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "claude-sessions $TAG" \
             --notes-file dist/NOTES.md \
             dist/claude-sessions-* dist/SHA256SUMS

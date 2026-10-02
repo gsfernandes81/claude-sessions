@@ -89,6 +89,11 @@ does not read healthy against a working case first, the test is wrong.
 - **Static musl binaries, cross-compiled on the runner** — `aarch64-unknown-linux-musl` and
   `x86_64-unknown-linux-musl`. Never compiled in the consuming image: that build's arm64 leg
   runs under QEMU and a Rust compile there is unusable.
+- **A release is cut by bumping `version` in `Cargo.toml` on `main`** (owner, 2026-10-02).
+  CI builds, tags `v<version>` and publishes on the push that carries the bump; a push whose
+  version is already released does nothing. Cloud sessions cannot push tags, which is why
+  the tag is made by CI. So **a version bump is a publish**: bump only in a commit that is
+  ready to ship, and never bump to fix a typo in one.
 - **A release is immutable.** `infra` pins a tag and checks a per-arch SHA-256. Re-cutting a
   published tag silently changes what a pinned, checksummed consumer gets, which is the one
   thing the checksum exists to prevent. Cut a new tag instead.
