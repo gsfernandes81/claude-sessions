@@ -1,8 +1,8 @@
 //! claude-sessions — several Claude Code sessions per box, cheap when idle, findable again.
 //!
-//! One binary, subcommands. The TUI (the default with no arguments) is not written yet; what
-//! is here is the half that has to be right before a screen is worth drawing: the registry,
-//! the hook that feeds it, and the repair pass that makes it agree with reality.
+//! One binary, subcommands. With no arguments at a terminal it is the menu (`run.rs`, drawing
+//! `render.rs` from `menu.rs`'s state, acting through `launch.rs`); everything else here is
+//! the registry, the hook that feeds it, and the passes that keep it agreeing with reality.
 //!
 //! Arguments are parsed by hand. Eight subcommands and three flags is not worth a parser, and
 //! this binary is on the ssh path in a container pulled by checksum — every dependency is one
@@ -15,32 +15,24 @@ mod events;
 mod fmt;
 mod hooks_config;
 mod json;
-// What a keypress does: attach, resume, start, close. The menu wires it in next.
-#[allow(dead_code)]
 mod launch;
 mod live;
 mod lockfile;
 mod mem;
-// The menu's state; the loop that drives it lands with the terminal and launcher.
-#[allow(dead_code)]
 mod menu;
 mod offload;
 mod procinfo;
 mod registry;
-mod signal;
-// The menu's terminal; the menu wires it in next.
-#[allow(dead_code)]
-mod term;
-// The menu's shared contract. Its users land in the next commits; until then nothing reads it.
-#[allow(dead_code)]
-mod ui;
-// The pure renderer for the menu; menu.rs wires it in next, so until then nothing calls it.
-#[allow(dead_code)]
 mod render;
+mod run;
+mod signal;
+mod term;
+mod ui;
 
 use events::{Binding, Outcome};
 use fmt::{age, human};
 use registry::{SlotRecord, State};
+use std::io::IsTerminal;
 use std::io::Read;
 use std::io::Write;
 use std::process::ExitCode;
@@ -71,6 +63,14 @@ fn main() -> ExitCode {
         }
         "reconcile" => report(cmd_reconcile()),
         "doctor" => report(cmd_doctor()),
+        // The menu, when there is a person at a terminal to drive it; the plain list when the
+        // output is a pipe or a file, so `claude-sessions | grep` still answers.
+        "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+            match run::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         "list" | "" => report(cmd_list()),
         "close" => match args.get(1) {
             Some(slot) => report(cmd_close(slot)),
@@ -107,7 +107,7 @@ fn usage() -> String {
     format!(
         "claude-sessions {VERSION} — Claude Code sessions, per box
 
-  claude-sessions              the menu (not built yet; prints the list below)
+  claude-sessions              the menu; the list below when not at a terminal
   claude-sessions list         every slot, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart
@@ -334,7 +334,7 @@ fn cmd_list() -> std::io::Result<()> {
         .collect();
 
     if rows.is_empty() && unregistered.is_empty() {
-        println!("no slots. the menu is not built yet; start a session by hand for now");
+        println!("no slots. run claude-sessions at a terminal and press n to start one");
         return Ok(());
     }
     for r in rows {

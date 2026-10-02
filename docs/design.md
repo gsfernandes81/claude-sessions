@@ -62,10 +62,16 @@ across two simultaneous ssh logins rather than merely likely.
 The menu starts each slot as:
 
 ```
-abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> claude …
+abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> \
+  sh -c 'e=$1; shift; exec "$@" 2>>"$e"' sh <registry>/claude-<n>.stderr claude …
 ```
 
-so every hook inherits the name. **A hook binds to the slot only when its `claude` is the
+so every hook inherits the name. The `sh -c` captures claude's stderr to a file the
+failed-resume dialog reads (mockup 5), and **its `exec` is load-bearing**: it replaces the
+shell with claude, so claude is still the abduco server's direct child, which is the binding
+test below. Without it the shell stays in between and no hook ever binds — `tests/launch.rs`
+runs this exact line under the real hook to pin that. The capture path is an argument, not an
+environment variable, so nothing of ours leaks into claude's environment. **A hook binds to the slot only when its `claude` is the
 direct child of that slot's `abduco` server**, checked in `/proc`. A nested claude — a
 `claude -p` from a Bash tool call, or a subagent — inherits the variable too and must count
 as *work running under* the slot, never rebind its `session_id`. Hook payloads carry
@@ -174,7 +180,49 @@ is the choice and why:
 - **Opening a row:** live → `abduco -a`; offloaded → start a new slot running
   `claude --resume <session_id>` in its `cwd`. `abduco` runs as a **child**, so on detach the
   menu comes back rather than the login ending — a fresh login costs a Cloudflare Access
-  handshake on a metered link.
+  handshake on a metered link. Coming back from an attach is what writes `last_attach_ms`,
+  the only writer it has, so that is what clears `unread`.
+
+### How the menu acts, where the rules above left a choice
+
+Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco` and `claude`.
+
+- **A resume keeps the slot's name and row.** The record is reused — same title, same place in
+  the list — and marked registered, so a `u` slot comes back as one of ours.
+- **Deciding happens under the slot's lock; running happens after it.** Under the lock the
+  record is re-read, the conversation is checked not to be running anywhere — Claude Code's
+  own live-session files and every other record — and the record is marked live with its pid
+  cleared before the lock is let go. A second menu then sees a slot that is starting, not one
+  it may resume. If the conversation *is* running in another abduco slot, that slot is
+  attached instead; anywhere else, the resume is refused.
+- **A live record with no pid** is a slot starting elsewhere: attached if its socket exists,
+  refused for 30 s otherwise, and after that treated as a start that died and is resumable —
+  so a menu killed mid-start cannot strand a slot.
+- **A failed resume** is a start that ends within 10 s without a `SessionStart` binding it: the
+  record goes back to offloaded and mockup 5 shows the last lines of the captured stderr,
+  control characters removed. A start into a `cwd` that no longer exists is refused before it
+  runs, and a leftover socket of the same name is refused with a pointer to `reconcile`.
+- **New slots take the lowest free `claude-<n>`** under a registry-wide lock with a timeout,
+  writing the record before the lock goes; a closed record's name may be reused. A new slot
+  that dies before binding is marked closed and reported by name, since it has no row yet.
+- **Room is checked once.** After offloading to make room, the open goes ahead without asking
+  the cgroup again: its figure includes page cache that is not freed at once, and a second
+  check could refuse the room just made.
+- **`c` on a live slot stops it** with the offloader's own `TERM` → `KILL` path and abduco
+  teardown, pid and start time checked at each step, then marks it closed. A row with no record
+  at all is refused: there is nothing to identify its process by safely.
+- **The programs are overridable** for tests and odd installs: `CLAUDE_SESSIONS_ABDUCO` and
+  `CLAUDE_SESSIONS_CLAUDE` name `abduco` and `claude`; `CLAUDE_SESSIONS_WORKSPACE` names where
+  `n` and `s` start (default `/workspace` where it exists, else home).
+- **Ctrl-C quits the menu**, as `q` and `Esc` do; raw mode delivers it as a byte, and a menu
+  that ignored it would read as hung. While a child has the terminal, the menu itself ignores
+  SIGINT and SIGQUIT — by a handler, not `SIG_IGN`, so the child still gets the default.
+- **A status line that does not fit wraps** rather than being cut: it is usually the reason
+  something was refused.
+- **Wording the mockups did not draw**, written in their voice and the owner's to change:
+  closing an offloaded slot says "Offloaded. Hides the row, not the conversation — claude
+  --resume still finds it."; no room with nothing offloadable says "Nothing can be offloaded
+  right now. Close a slot to make room." with only `Esc back`.
 - **Nothing is ever resumed automatically.** Memory is spent on what the owner opens, in the
   order they open it. `Enter` on an offloaded row resumes immediately with no confirmation
   (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
