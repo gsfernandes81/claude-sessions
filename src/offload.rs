@@ -174,7 +174,7 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
     }
 }
 
-/// The first descendant of `pid` that is not a `claude`, described for a log line.
+/// The first descendant of `pid` that is not Claude Code's own, described for a log line.
 ///
 /// A zombie holds no memory and does no work, so it does not count. A nested `claude` does
 /// not either: it is the slot's own subagent or `claude -p`, and if it were doing anything
@@ -182,8 +182,19 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
 fn foreign_descendant(table: &[Proc], pid: u32) -> Option<String> {
     procinfo::descendants(table, pid)
         .into_iter()
-        .find(|p| p.comm != "claude" && p.state != 'Z')
+        .find(|p| !is_claude_machinery(&p.comm) && p.state != 'Z')
         .map(|p| format!("{} (pid {})", p.comm, p.pid))
+}
+
+/// Claude Code's own processes, which are the slot rather than work running under it.
+///
+/// `claude.exe` is the name its helper processes have carried (seen 2026-08-25 by infra's old
+/// offloader, which measured and exempted it). They are gone with the agent view off, but if
+/// they came back and counted as work, every slot would be held forever and nothing would
+/// ever be offloaded (issue #2). `node` is deliberately NOT here: it is how real work — a dev
+/// server, a build — shows up, and the old script dropped it for exactly that reason.
+fn is_claude_machinery(comm: &str) -> bool {
+    matches!(comm, "claude" | "claude.exe")
 }
 
 /// How a stop ended.
@@ -671,6 +682,25 @@ mod tests {
             foreign_descendant(&table, 100).as_deref(),
             Some("cargo (pid 103)"),
             "found under a nested claude, not just directly under the slot"
+        );
+    }
+
+    #[test]
+    fn claude_exe_helpers_are_the_slot_but_node_is_work() {
+        let mut table = vec![
+            proc(100, 50, "claude", "claude"),
+            proc(101, 100, "claude.exe", "claude.exe --helper"),
+        ];
+        assert_eq!(
+            foreign_descendant(&table, 100),
+            None,
+            "a claude.exe helper must not hold the slot (issue #2)"
+        );
+        // Calibration: real work beside it still holds the slot, and node counts as real work.
+        table.push(proc(102, 101, "node", "node server.js"));
+        assert_eq!(
+            foreign_descendant(&table, 100).as_deref(),
+            Some("node (pid 102)")
         );
     }
 

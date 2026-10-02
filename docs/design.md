@@ -149,7 +149,9 @@ is the choice and why:
   `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
   is a reason to keep, because the offloader needs evidence to act, never to hold off.
 - **"No non-`claude` descendants"** walks the whole tree under the slot's claude, through any
-  nested claude, and ignores zombies. A stdio MCP server would be such a descendant and would
+  nested claude, and ignores zombies. `claude.exe` counts as claude too — Claude Code's helper
+  processes have carried that name, and infra's old offloader measured and exempted them;
+  counted as work they would hold every slot forever. `node` is work (issue #2). A stdio MCP server would be such a descendant and would
   pin its slot for good; the owner runs none (2026-10-01), so the rule stands as written. If
   one is ever added, this is the line that has to learn about it — `offload --dry-run` names
   what is holding each slot.
