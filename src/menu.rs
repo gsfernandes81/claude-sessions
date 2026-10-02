@@ -264,8 +264,10 @@ impl Menu {
     }
 
     fn key_inner(&mut self, key: Key) -> Action {
-        if key == Key::Char('q') {
-            // Quits from anywhere and is listed nowhere (owner, 2026-10-01).
+        // `q` quits from anywhere and is listed nowhere (owner, 2026-10-01). Ctrl-C does too:
+        // raw mode delivers it as a byte rather than a signal, and a menu that ignored the
+        // one key everybody presses to get out would feel like a hang.
+        if matches!(key, Key::Char('q') | Key::Char('\u{3}')) {
             return Action::Quit;
         }
         if let Some((ask, _)) = self.ask.clone() {
@@ -604,6 +606,11 @@ mod tests {
         assert_eq!(m.view().screen, Screen::List);
         m.key(Key::Char('?'));
         assert_eq!(m.key(Key::Char('q')), Action::Quit, "q quits from anywhere");
+        assert_eq!(
+            m.key(Key::Char('\u{3}')),
+            Action::Quit,
+            "and so does Ctrl-C"
+        );
     }
 
     #[test]
