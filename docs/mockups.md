@@ -4,7 +4,11 @@
 > reviewed in.
 
 **These are binding.** Phase 4 renders to them; a change needs the owner, not a judgement
-call. They were drawn at **40 columns** — the phone in portrait, which is where this tool is
+call. One correction since approval, by the owner on 2026-10-02: mockup 2's way out read
+`q   a shell instead`, which was a mistake — `q` quits and `s` is the shell everywhere else —
+and now reads `s   a shell instead`, in both widths.
+
+They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
 not typed to look right. The 80-column set is in [`mockups-80.md`](mockups-80.md).
 
@@ -89,7 +93,7 @@ infra-dev · nothing open · 812M of 1.0G
   No claude session in this container.
 
   n   start one in /workspace
-  q   a shell instead
+  s   a shell instead
 
 ────────────────────────────────────────
 n new   ? keys   s shell

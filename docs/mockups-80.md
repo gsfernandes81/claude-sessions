@@ -28,7 +28,7 @@ infra-dev · nothing open · 812M of 1.0G
   No claude session in this container.
 
   n   start one in /workspace
-  q   a shell instead
+  s   a shell instead
 
 ────────────────────────────────────────────────────────────────────────────────
 n new   ? keys   s shell

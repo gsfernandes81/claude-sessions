@@ -108,12 +108,10 @@ Two things you are not to do, both inherited and both meant literally:
 - **The orphan sweep is waiting on the owner.** It logs only. Once `offload` has run on a box
   for a week, the owner reads `offload.log` and decides whether to arm it — remind them; they
   asked to be reminded (2026-10-01).
-- **How a row is chosen is not specified.** The mockups number the rows and say `Enter open`,
-  but draw no cursor and no highlight, and nothing says whether a digit opens its row, moves a
-  cursor, or neither. The owner decides before the menu's input handling is written.
-- **Mockup 2 lists `q   a shell instead`**, while the design says `q` quits and is listed
-  nowhere, and `s` is the shell everywhere else. Flagged, not changed — the screens are
-  binding until the owner says otherwise.
+- ~~How a row is chosen~~ — decided 2026-10-02: a highlighted row as the cursor, moved with
+  the arrow keys or mouse clicks. In `../design.md` § *The menu*.
+- ~~Mockup 2's `q   a shell instead`~~ — the owner confirmed it was a mistake; it now reads
+  `s`, recorded in `../mockups.md`.
 - ~~The first-prompt title fallback has no data~~ — done: `first_prompt`, set by the first
   `UserPromptSubmit` of each conversation. A resumed conversation's first prompt is not known
   to the hook, so its fallback is the first prompt *after* the resume; Claude Code's own title

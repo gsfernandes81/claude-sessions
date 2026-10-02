@@ -183,6 +183,12 @@ is the choice and why:
   `?` the keys. **`q` also quits and is listed nowhere** (owner, 2026-10-01): it is the first
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
+- **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys or the
+  mouse; `Enter` opens the highlighted row, and `c` closes it. The mockups draw no
+  highlight because they are plain text — the highlight is reverse video, which a monochrome
+  terminal shows too. Mouse input is **click reporting only** (`?1000` with SGR `?1006`),
+  never motion (`?1003`): motion reports would put bytes on the metered link every time a
+  pointer crossed the window, which is the idle traffic the menu exists not to make.
 - **Width:** usable from 40 columns up. Below the width of the shortest drawn way out the menu
   refuses to draw at all and the door falls through to a shell, saying why.
 - **Startup** is on the ssh path: target under 100 ms.
