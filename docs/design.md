@@ -189,6 +189,17 @@ is the choice and why:
   terminal shows too. Mouse input is **click reporting only** (`?1000` with SGR `?1006`),
   never motion (`?1003`): motion reports would put bytes on the metered link every time a
   pointer crossed the window, which is the idle traffic the menu exists not to make.
+- **Rows keep their places while the menu is open.** The order above is taken once, at
+  start; afterwards a row stays where it is and a new one joins at the bottom, so nothing
+  moves under the cursor. Mockup 6 is the evidence — back from slot 2, row 2 is no longer
+  unread and is the most recent, and is still second.
+- **Ages tick together, once a minute.** They are measured from a clock floored to the
+  minute, so rows that went idle at different seconds roll over in the same redraw rather
+  than one redraw each.
+- **A dialog draws two rows above itself**, as all three dialog mockups do: the row the
+  question is about and the one after it (mockups 4 and 5), or the last two when it is the
+  last row. Mockup 3 shows the row before instead; two of three agree, and the rule has to be
+  one rule.
 - **Width:** usable from 40 columns up. Below the width of the shortest drawn way out the menu
   refuses to draw at all and the door falls through to a shell, saying why.
 - **Startup** is on the ssh path: target under 100 ms.

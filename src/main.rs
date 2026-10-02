@@ -18,6 +18,9 @@ mod json;
 mod live;
 mod lockfile;
 mod mem;
+// The menu's state; the loop that drives it lands with the terminal and launcher.
+#[allow(dead_code)]
+mod menu;
 mod offload;
 mod procinfo;
 mod registry;
