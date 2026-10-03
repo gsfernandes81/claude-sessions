@@ -149,8 +149,6 @@ impl SlotRecord {
         }
     }
 
-    /// The title a row shows: what Claude Code's own session selector would — the custom
-    /// title, else the generated one — then the first prompt, then nothing yet.
     /// Where the current conversation's transcript is: the path the hooks reported, else —
     /// for a record written before 0.3.3 recorded it — where Claude Code puts one, under
     /// `projects/` named for the directory with every character that is not a letter, a
@@ -186,6 +184,8 @@ impl SlotRecord {
         self.conversation_path().is_some_and(|p| p.is_file())
     }
 
+    /// The title a row shows: what Claude Code's own session selector would — the custom
+    /// title, else the generated one — then the first prompt, then nothing yet.
     pub fn display_title(&self) -> String {
         self.title
             .clone()
