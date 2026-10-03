@@ -183,6 +183,14 @@ fn cmd_hook() -> std::io::Result<()> {
         .filter(|_| binding == Binding::Own);
     let own_start = own_pid.and_then(procinfo::start_time);
 
+    // A SessionEnd for /clear or /resume changes nothing — the same process goes on, and its
+    // SessionStart follows at once — so it takes no lock and writes nothing. It used to take
+    // the lock anyway and race that SessionStart for it, and the loser logged a lock failure
+    // indistinguishable from a real end being dropped (infra's Stage B review, 2026-10-03).
+    if ev.name() == "SessionEnd" && matches!(ev.reason(), Some("clear") | Some("resume")) {
+        return Ok(());
+    }
+
     // SessionEnd hooks share a 1.5 s budget, so that one event may only risk SESSION_END_WAIT.
     // Every other event has a 5 s hook timeout (hooks_config.rs) and waits longer: dropping a
     // UserPromptSubmit because the lock was busy leaves a working claude reading as idle,
@@ -202,7 +210,10 @@ fn cmd_hook() -> std::io::Result<()> {
         .map(|p| transcript::titles(std::path::Path::new(p)));
 
     let _lock = lockfile::SlotLock::acquire(&registry::lock_path(&slot), wait).map_err(|e| {
-        log(&format!("{slot}: lock: {e}"));
+        // Name the event, and a SessionEnd's reason: which event lost is the whole question
+        // when reading this log, and the wait in the message only hints at it.
+        let reason = ev.reason().map(|r| format!(" ({r})")).unwrap_or_default();
+        log(&format!("{slot}: {}{reason} dropped, lock: {e}", ev.name()));
         e
     })?;
 

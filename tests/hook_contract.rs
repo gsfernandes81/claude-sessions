@@ -263,3 +263,55 @@ fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
         "SessionEnd should have given up on the held lock: {body}"
     );
 }
+
+#[test]
+fn a_clear_end_takes_no_lock_and_a_dropped_event_says_which_it_was() {
+    // Infra's Stage B review found SessionEnd lock failures that could not be told apart: a
+    // /clear's end racing its own SessionStart, or a real end dropped. Now a clear or resume
+    // end takes no lock at all, and a drop names the event and reason.
+    let dir = tmpdir("namedrop");
+    let slot = "claude-6";
+    let hold = || {
+        let child = Command::new("flock")
+            .arg(dir.join(format!("{slot}.lock")))
+            .args(["sleep", "2"])
+            .spawn()
+            .expect("flock(1) runs");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        child
+    };
+    let log = || std::fs::read_to_string(dir.join("hook.log")).unwrap_or_default();
+
+    let mut holder = hold();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        run_hook(
+            &dir,
+            Some(slot),
+            r#"{"hook_event_name":"SessionEnd","reason":"clear"}"#
+        ),
+        0
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(300),
+        "a clear end must not wait for the lock: {:?}",
+        started.elapsed()
+    );
+    assert!(!log().contains("dropped"), "nothing was dropped: {}", log());
+
+    // Calibration: a real end, with the same lock held, does give up — and says what it was.
+    assert_eq!(
+        run_hook(
+            &dir,
+            Some(slot),
+            r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#
+        ),
+        0
+    );
+    assert!(
+        log().contains("claude-6: SessionEnd (logout) dropped, lock:"),
+        "got: {}",
+        log()
+    );
+    holder.wait().ok();
+}
