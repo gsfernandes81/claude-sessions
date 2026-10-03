@@ -26,10 +26,13 @@ Code already lists past conversations and reopens one, and
    which is the whole of `unread`, and cannot be derived from anything Claude Code keeps,
    because it is a fact about the owner rather than about the session.
 
-What this tool does **not** do is keep its own copy of things that are cheaply readable while
-a process is alive. The title and the busy flag come from Claude Code's own file for a live
-slot; our stored copies are the last-known value, for when it is gone. See `src/live.rs`,
-which says the same thing beside the code that does it.
+**A row's title is what Claude Code's own session selector shows**: the conversation's
+custom title (the owner's own name for it), else the title Claude Code generates, else the
+first prompt. Both titles are read from the end of the conversation's transcript — its
+`custom-title` and `ai-title` entries — by the hook, on `SessionStart` and `Stop`, before it
+takes the slot's lock (`src/transcript.rs`). Until 0.3.1 the menu preferred the `name` in
+Claude Code's live sessions file, which on the boxes showed one of Claude's long replies in
+place of a title (owner, 2026-10-03); that file is no longer read for titles at all.
 
 ## Slots, conversations, and what is stored
 
@@ -40,7 +43,7 @@ the same process, `--resume` re-enters an old one.
 The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
-`session_id` (current) · `cwd` · `title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
+`session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
 `needs_you` · `timers` (each with its due time, and whether it recurs)
 
 **States:** `attached` / `detached` — read from `abduco`, never stored — plus `offloaded` and
@@ -88,7 +91,7 @@ from the hook upwards to the first `claude` whose parent is an `abduco` server.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title` and `first_prompt`, so a new conversation never wears the old one's name. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title` and `first_prompt`, so a new conversation never wears the old one's name; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |

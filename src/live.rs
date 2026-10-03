@@ -22,9 +22,11 @@
 //!    the whole of `unread`. Those three are what the menu exists to show.
 //!
 //! It is also undocumented internal state that moves with a binary which updates itself in
-//! place, so a renamed field here must degrade to "no evidence". Read it for the title and
-//! busy flag of a live slot, because it is fresher and cheaper than anything we could keep;
-//! never depend on it being there.
+//! place, so a renamed field here must degrade to "no evidence". It is read to know which
+//! conversations are running — `doctor`, and the launcher's never-resume-a-running-
+//! conversation check — and never depended on being there. **It is not read for titles**:
+//! its `name` showed one of Claude's long replies on the boxes (0.3.1); titles come from the
+//! transcript, as Claude Code's own session selector takes them (`transcript.rs`).
 
 use crate::json::{self, Value};
 use std::path::PathBuf;
@@ -39,10 +41,6 @@ pub struct LiveSession {
     /// `interactive` or `bg`. A `bg` session is a background job, not a slot, and must never
     /// be listed as one.
     pub kind: Option<String>,
-    pub name: Option<String>,
-    /// `derived` means Claude Code made the name up from the directory (`workspace-07`), so it
-    /// is not worth showing in place of a first prompt.
-    pub name_source: Option<String>,
     pub status: Option<String>,
 }
 
@@ -58,20 +56,11 @@ impl LiveSession {
             // A string in the files Claude Code writes (issue #4); a number would do too.
             proc_start: v.get("procStart").and_then(Value::as_u64_lenient),
             kind: s(v, "kind"),
-            name: s(v, "name"),
-            name_source: s(v, "nameSource"),
             status: s(v, "status"),
         })
     }
     pub fn is_interactive(&self) -> bool {
         self.kind.as_deref() != Some("bg")
-    }
-    /// A title worth showing: a real one, not one Claude Code derived from the path.
-    pub fn real_title(&self) -> Option<&str> {
-        match (self.name.as_deref(), self.name_source.as_deref()) {
-            (Some(n), Some(src)) if src != "derived" && !n.is_empty() => Some(n),
-            _ => None,
-        }
     }
 }
 
@@ -125,10 +114,6 @@ impl LiveSession {
     }
 }
 
-pub fn for_pid(pid: u32) -> Option<LiveSession> {
-    all().into_iter().find(|s| s.pid == pid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +162,5 @@ mod tests {
         assert_eq!(s.pid, 425);
         assert_eq!(s.kind.as_deref(), Some("interactive"));
         assert_eq!(s.status.as_deref(), Some("idle"));
-        assert_eq!(s.real_title(), None, "a derived name is not a title");
     }
 }

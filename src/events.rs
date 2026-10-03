@@ -57,6 +57,10 @@ impl Event {
     pub fn session_title(&self) -> Option<&str> {
         self.s("session_title")
     }
+    /// Where Claude Code keeps this conversation's transcript, on every event.
+    pub fn transcript_path(&self) -> Option<&str> {
+        self.s("transcript_path")
+    }
     pub fn prompt(&self) -> Option<&str> {
         self.s("prompt")
     }
@@ -133,6 +137,7 @@ pub fn apply(
                 // this task's row.
                 if rec.session_id.as_deref() != Some(id) {
                     rec.title = None;
+                    rec.ai_title = None;
                     rec.first_prompt = None;
                 }
                 rec.session_id = Some(id.to_string());
@@ -306,13 +311,25 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, now: Millis) -> Outcome {
     }
 }
 
+/// Titles read from the conversation's transcript (`transcript.rs`), applied after the event
+/// itself so a new conversation's reset comes first. A title that was not found leaves what
+/// is recorded alone: the tail of a transcript does not always reach back to one.
+pub fn apply_titles(rec: &mut SlotRecord, titles: &crate::transcript::Titles) {
+    if let Some(t) = &titles.custom {
+        rec.title = Some(t.clone());
+    }
+    if let Some(t) = &titles.ai {
+        rec.ai_title = Some(t.clone());
+    }
+}
+
 /// The longest first prompt kept. The 80-column row has 69 columns of title, so this is
 /// enough for any screen the menu draws, and keeps a pasted log out of the registry.
 pub const FIRST_PROMPT_CHARS: usize = 120;
 
 /// A prompt as a title: whitespace runs and control characters collapsed to single spaces,
 /// cut at `FIRST_PROMPT_CHARS` on a character boundary. `None` when nothing printable is left.
-fn one_line(prompt: &str) -> Option<String> {
+pub fn one_line(prompt: &str) -> Option<String> {
     let words: Vec<&str> = prompt
         .split(|c: char| c.is_whitespace() || c.is_control())
         .filter(|w| !w.is_empty())
@@ -820,6 +837,30 @@ mod tests {
             4_000,
         );
         assert_eq!(rec.first_prompt.as_deref(), Some("new task"));
+    }
+
+    #[test]
+    fn titles_from_the_transcript_land_and_a_new_conversation_drops_them() {
+        use crate::transcript::Titles;
+        let mut rec = slot();
+        apply_titles(
+            &mut rec,
+            &Titles {
+                custom: None,
+                ai: Some("Retire the old tunnel".into()),
+            },
+        );
+        assert_eq!(rec.ai_title.as_deref(), Some("Retire the old tunnel"));
+        // A tail that found no title leaves the recorded one alone.
+        apply_titles(&mut rec, &Titles::default());
+        assert_eq!(rec.ai_title.as_deref(), Some("Retire the old tunnel"));
+        // /clear: a new conversation must not wear the old one's generated title.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
+            2_000,
+        );
+        assert_eq!(rec.ai_title, None);
     }
 
     #[test]

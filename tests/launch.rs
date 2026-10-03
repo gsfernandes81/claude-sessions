@@ -53,12 +53,24 @@ fn script(path: &Path, body: &str) {
 /// A stand-in abduco whose client detaches at once: a forked copy of itself — named `abduco`,
 /// as a real server is — runs the command, and the client returns 0. And a stand-in claude
 /// that fires a `SessionStart` through the real hook, says something on stderr, and stays up.
+/// Its transcript holds a long reply and an `ai-title`, so the title the hook records can be
+/// checked to be the title and never the reply (0.3.1).
 fn setup(tag: &str) -> Root {
     let root = std::env::temp_dir().join(format!("cs-launch-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["bin", "registry", "abduco", "work"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
+    std::fs::write(
+        root.join("transcript.jsonl"),
+        concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"A very long reply that must never be a title"}]}}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Retire the old tunnel","sessionId":"conv-e2e"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
     script(
         &root.join("bin/abduco"),
         &format!(
@@ -75,11 +87,12 @@ exit 0"#,
         &root.join("bin/claude"),
         &format!(
             r#"echo $$ >> "{pids}"
-printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s"}}' "$PWD" | "{bin}" hook
+printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook
 echo "claude said this on stderr" >&2
 exec sleep 600"#,
             pids = root.join("pids").display(),
             bin = BIN,
+            transcript = root.join("transcript.jsonl").display(),
         ),
     );
     Root(root)
@@ -154,6 +167,13 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     assert!(number(&body, "proc_start").is_some(), "with its start time");
     let stderr = std::fs::read_to_string(root.0.join("registry/claude-1.stderr")).unwrap();
     assert_eq!(stderr, "claude said this on stderr\n", "stderr is captured");
+    // The row's title is the transcript's title — what Claude Code's own selector shows —
+    // and never a reply (0.3.1).
+    assert!(
+        body.contains("\"ai_title\": \"Retire the old tunnel\""),
+        "{body}"
+    );
+    assert!(!body.contains("very long reply"), "{body}");
 }
 
 #[test]
@@ -167,4 +187,6 @@ fn the_same_line_without_exec_is_not_bound() {
         "a shell between the server and claude makes it look nested: {body}"
     );
     assert!(!body.contains("\"conv-e2e\""), "{body}");
+    // Calibration for the title: a nested claude's transcript names nothing about the slot.
+    assert!(!body.contains("ai_title"), "{body}");
 }

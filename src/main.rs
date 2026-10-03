@@ -27,6 +27,7 @@ mod render;
 mod run;
 mod signal;
 mod term;
+mod transcript;
 mod ui;
 
 use events::{Binding, Outcome};
@@ -191,6 +192,15 @@ fn cmd_hook() -> std::io::Result<()> {
     } else {
         lockfile::INTERACTIVE_WAIT
     };
+    // The conversation's titles, read before the lock — a transcript's tail is the slow part
+    // of this hook, and the lock is what other hooks wait on (issue #1). Only the slot's own
+    // claude names the slot, and only when a title can have changed: a conversation opening,
+    // and the end of each turn.
+    let titles = (binding == Binding::Own && matches!(ev.name(), "SessionStart" | "Stop"))
+        .then(|| ev.transcript_path())
+        .flatten()
+        .map(|p| transcript::titles(std::path::Path::new(p)));
+
     let _lock = lockfile::SlotLock::acquire(&registry::lock_path(&slot), wait).map_err(|e| {
         log(&format!("{slot}: lock: {e}"));
         e
@@ -202,7 +212,11 @@ fn cmd_hook() -> std::io::Result<()> {
         r.registered = registered;
         r
     });
-    match events::apply(&mut rec, &ev, now, binding, own_pid, own_start) {
+    let outcome = events::apply(&mut rec, &ev, now, binding, own_pid, own_start);
+    if let Some(titles) = &titles {
+        events::apply_titles(&mut rec, titles);
+    }
+    match outcome {
         Outcome::Changed => registry::store(&rec),
         Outcome::Ignored(_why) => Ok(()),
     }
@@ -359,13 +373,7 @@ fn cmd_list() -> std::io::Result<()> {
             },
             if r.state == State::Offloaded { "z" } else { "" },
         );
-        let title = r
-            .pid
-            .and_then(live::for_pid)
-            .and_then(|l| l.real_title().map(str::to_string))
-            .or_else(|| r.title.clone())
-            .or_else(|| r.first_prompt.clone())
-            .unwrap_or_else(|| "(no title yet)".into());
+        let title = r.display_title();
         println!(
             "{:<10} {:<4} {:<40} {}",
             r.slot,

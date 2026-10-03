@@ -85,7 +85,11 @@ pub struct SlotRecord {
     pub proc_start: Option<u64>,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+    /// The owner's own name for the current conversation (its custom title).
     pub title: Option<String>,
+    /// Claude Code's generated title for the current conversation — what its session
+    /// selector shows when there is no custom title.
+    pub ai_title: Option<String>,
     /// The current conversation's first prompt, on one line and cut short — the title of last
     /// resort, for a conversation Claude Code has not named. Written once per conversation by
     /// `UserPromptSubmit`.
@@ -125,6 +129,7 @@ impl SlotRecord {
             session_id: None,
             cwd: None,
             title: None,
+            ai_title: None,
             first_prompt: None,
             state: State::Live,
             busy: false,
@@ -138,6 +143,16 @@ impl SlotRecord {
             updated_ms: now,
             last_event_ms: BTreeMap::new(),
         }
+    }
+
+    /// The title a row shows: what Claude Code's own session selector would — the custom
+    /// title, else the generated one — then the first prompt, then nothing yet.
+    pub fn display_title(&self) -> String {
+        self.title
+            .clone()
+            .or_else(|| self.ai_title.clone())
+            .or_else(|| self.first_prompt.clone())
+            .unwrap_or_else(|| "(no title yet)".into())
     }
 
     /// Derived, never stored: it finished something while you were away.
@@ -173,6 +188,7 @@ impl SlotRecord {
         set_opt_str(&mut o, "session_id", self.session_id.as_deref());
         set_opt_str(&mut o, "cwd", self.cwd.as_deref());
         set_opt_str(&mut o, "title", self.title.as_deref());
+        set_opt_str(&mut o, "ai_title", self.ai_title.as_deref());
         set_opt_str(&mut o, "first_prompt", self.first_prompt.as_deref());
         o.set("busy", Value::Bool(self.busy));
         o.set("needs_you", Value::Bool(self.needs_you));
@@ -248,6 +264,7 @@ impl SlotRecord {
             session_id: str_of(v, "session_id"),
             cwd: str_of(v, "cwd"),
             title: str_of(v, "title"),
+            ai_title: str_of(v, "ai_title"),
             first_prompt: str_of(v, "first_prompt"),
             state: State::parse(v.get("state").and_then(Value::as_str).unwrap_or("live")),
             busy: v.get("busy").and_then(Value::as_bool).unwrap_or(false),
@@ -397,6 +414,26 @@ mod tests {
         // The direction matters: calling a live slot offloaded would have the menu resume it
         // into a second process on the same conversation, which forks it.
         assert_eq!(State::parse("something-new"), State::Live);
+    }
+
+    #[test]
+    fn a_row_shows_the_title_claude_codes_own_selector_would() {
+        let mut rec = SlotRecord::new("claude-1", 0);
+        assert_eq!(rec.display_title(), "(no title yet)");
+        rec.first_prompt = Some("fix the tunnel please".into());
+        assert_eq!(
+            rec.display_title(),
+            "fix the tunnel please",
+            "the last resort"
+        );
+        rec.ai_title = Some("Retire the old tunnel".into());
+        assert_eq!(
+            rec.display_title(),
+            "Retire the old tunnel",
+            "the generated title"
+        );
+        rec.title = Some("tunnel".into());
+        assert_eq!(rec.display_title(), "tunnel", "the owner's own name wins");
     }
 
     #[test]

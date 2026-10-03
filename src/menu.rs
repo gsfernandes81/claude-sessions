@@ -19,7 +19,6 @@
 use crate::abduco;
 use crate::clock::Millis;
 use crate::fmt;
-use crate::live;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
 use crate::ui::{Dialog, Header, Key, Row, RowKey, Screen, View};
@@ -375,12 +374,11 @@ pub fn gather(now: Millis) -> Vec<Row> {
     let clock = age_clock(now);
     let recs = registry::all().unwrap_or_default();
     let sockets = abduco::sockets();
-    let lives = live::all();
     // Closed slots too (owner, 2026-10-03): listed at the bottom, so a conversation that
     // ran in a slot can be resumed from the menu after it was closed.
     let mut slots: Vec<(&SlotRecord, Row)> = recs
         .iter()
-        .map(|r| (r, slot_row(r, now, clock, &sockets, &lives)))
+        .map(|r| (r, slot_row(r, now, clock, &sockets)))
         .collect();
     slots.sort_by_key(|(r, _)| std::cmp::Reverse(r.last_activity_ms));
     let mut rows: Vec<Row> = slots.into_iter().map(|(_, row)| row).collect();
@@ -411,20 +409,9 @@ pub fn gather(now: Millis) -> Vec<Row> {
     rows
 }
 
-fn slot_row(
-    r: &SlotRecord,
-    now: Millis,
-    clock: Millis,
-    sockets: &[abduco::Socket],
-    lives: &[live::LiveSession],
-) -> Row {
+fn slot_row(r: &SlotRecord, now: Millis, clock: Millis, sockets: &[abduco::Socket]) -> Row {
     let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
     let attached = alive && sockets.iter().any(|s| s.name == r.slot && s.attached_bit);
-    let live_title = r
-        .pid
-        .filter(|_| alive)
-        .and_then(|pid| lives.iter().find(|l| l.pid == pid))
-        .and_then(|l| l.real_title().map(str::to_string));
     Row {
         key: RowKey::Slot(r.slot.clone()),
         wants_you: r.needs_you,
@@ -438,10 +425,9 @@ fn slot_row(
             || (r.state == State::Live && r.pid.is_some() && !alive),
         unregistered: !r.registered,
         closed: r.state == State::Closed,
-        title: live_title
-            .or_else(|| r.title.clone())
-            .or_else(|| r.first_prompt.clone())
-            .unwrap_or_else(|| "(no title yet)".into()),
+        // What Claude Code's own session selector shows (`transcript.rs`), not the live
+        // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1).
+        title: r.display_title(),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
     }
 }
