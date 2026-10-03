@@ -55,11 +55,31 @@ jobs:
       - name: --version answers on the built binary
         run: ./target/x86_64-unknown-linux-musl/debug/claude-sessions --version
 
+  # The same tests, natively on arm64. Half of every release is an aarch64 binary — the one the
+  # Pi boxes run — and until this job it shipped cross-compiled with its tests never run on the
+  # architecture it ships for, except by hand in the arm64 dev container. The pinned target in
+  # .cargo/config.toml is aarch64 musl, so no --target is needed here.
+  test-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the toolchain and the musl target
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add aarch64-unknown-linux-musl
+          rustup component add clippy
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: --version answers on the built binary
+        run: ./target/aarch64-unknown-linux-musl/debug/claude-sessions --version
+
   release:
     # Only on a push: a pull request must never publish, and neither may a manual run of the
     # tests.
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: test
+    # Both architectures' tests, because the release publishes both architectures' binaries.
+    needs: [test, test-aarch64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
