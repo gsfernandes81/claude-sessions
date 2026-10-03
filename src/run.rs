@@ -12,13 +12,14 @@
 //!   that often. It is brought up to date when rows change, when a key is pressed, and when
 //!   the minute turns — the one tick the ages are allowed.
 
+use crate::archive::{self, Mark};
 use crate::clock;
 use crate::launch;
 use crate::mem;
 use crate::menu::{self, Action, Menu};
 use crate::render;
 use crate::term::{self, Input, RawTerminal};
-use crate::ui::{Header, Key, Outcome, TooNarrow};
+use crate::ui::{Header, Key, Outcome, RowKey, TooNarrow};
 use std::time::{Duration, Instant};
 
 /// How often the registry and abduco are looked at while nothing else happens.
@@ -108,9 +109,12 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
                     if action == Action::Quit {
                         return Ok(());
                     }
-                    if act(term, menu, action) {
+                    let done = act(term, menu, action);
+                    if done == Done::HandedOver {
                         // A child had the terminal: the alternate screen came back blank.
                         last = None;
+                    }
+                    if done != Done::Nothing {
                         let rows = menu::gather(clock::now(), menu.workspace());
                         menu.replace_rows(rows, false);
                         menu.set_header(header());
@@ -121,14 +125,54 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
     }
 }
 
-/// Do what a key asked. Returns whether the terminal was handed to something else, so the
-/// loop knows to redraw from nothing.
-fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> bool {
+/// What doing an action did, for the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Done {
+    Nothing,
+    /// The registry or the archive changed: read the rows again.
+    Changed,
+    /// The terminal was handed to something else: read the rows again and redraw from
+    /// nothing.
+    HandedOver,
+}
+
+/// Do what a key asked.
+fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> Done {
     let ws = menu.workspace().to_string();
     let rows = menu.rows().to_vec();
+    let id = |i: usize| match rows.get(i).map(|r| &r.key) {
+        Some(RowKey::Conversation { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
     let (outcome, then) = match action {
-        Action::None | Action::Redraw | Action::Quit => return false,
-        Action::Open(i) => (launch::open(&rows, i, &ws, term), Some(i)),
+        Action::None | Action::Redraw | Action::Quit => return Done::Nothing,
+        Action::Archive(i) | Action::Unarchive(i) => {
+            let archiving = matches!(action, Action::Archive(_));
+            let Some(id) = id(i) else {
+                return Done::Nothing;
+            };
+            let mark = if archiving {
+                Mark::Archived
+            } else {
+                Mark::Kept
+            };
+            menu.set_status(Some(match archive::set(&id, mark) {
+                Ok(()) if archiving => "archived · c under Archived undoes it".into(),
+                Ok(()) => "back under Closed".into(),
+                Err(e) => format!("could not change the archive: {e}"),
+            }));
+            return Done::Changed;
+        }
+        Action::Open(i) => {
+            // Resumed, it leaves the archive; marked kept first, so a resume that fails does
+            // not leave it folded away again by its age.
+            if rows.get(i).is_some_and(|r| r.archived) {
+                if let Some(id) = id(i) {
+                    let _ = archive::set(&id, Mark::Kept);
+                }
+            }
+            (launch::open(&rows, i, &ws, term), Some(i))
+        }
         Action::New => (launch::new_session(&rows, &ws, term), None),
         Action::Shell => (launch::shell(&ws, term), None),
         Action::Close(i) => (launch::close(&rows, i), None),
@@ -144,5 +188,9 @@ fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> bool {
         Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, then.unwrap_or(0)),
     }
     // Close never hands the terminal over; everything else might have.
-    !matches!(action, Action::Close(_))
+    if matches!(action, Action::Close(_)) {
+        Done::Changed
+    } else {
+        Done::HandedOver
+    }
 }

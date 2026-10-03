@@ -19,6 +19,12 @@ somewhere else is drawn dim ("Dim the row"), amber moved from `!` to the Needs-y
 the cursor only ever selects a session, and what does not fit folds into `… N more`. The
 dialogs name the session by its title, and the keys screen explains the groups instead of
 the marks. Mockups 1 and 3 to 7 were redrawn for it, in both widths; 2 and 8 are unchanged.
+Later on 2026-10-03 the owner chose, from three drawn options, **headings as labelled rules
+with a count** — `── Closed · 7 ────` — with the rows indented two columns under them from 60
+columns up, and added **the archive**: an Archived group last, folded shut until `Enter` on its
+heading opens it — the one line the cursor rests on that is not a session — filled by `c` on a
+closed row, with no question asked, and by 30 days unused. Mockups 1 and 3 to 7 were redrawn
+again for it, and mockup 9 is new.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -64,9 +70,10 @@ reads as a screen full of problems. **The base accent is blue; amber is left to 
 
 | where | style | because |
 |---|---|---|
-| the `Needs you` heading | amber, bold | the only group that is a *request*, and the only amber anywhere |
+| the `Needs you` heading, rule and name | amber, name bold | the only group that is a *request*, and the only amber anywhere |
 | a key you can press — the hint line, the keys screen | blue | actionable, not alarming |
-| every other group heading | foreground, bold | structure the eye can find |
+| every other group heading | rule dim, name bold | a divider the eye can find, and a glyph, so a monochrome terminal keeps it |
+| the Archived heading under the cursor | reverse video, like a row | the one heading the cursor can rest on |
 | an unread title | foreground, bold | news, not a problem |
 | a session attached somewhere else | dim, title and age | someone is in it; state, not news |
 | a dialog's first line | foreground, bold | it is the question, and a question is not a warning |
@@ -90,21 +97,21 @@ this table exists; the published page renders it.
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-Needs you
+── Needs you · 1 ───────────────────────
 permission: write hosts/one           2m
 
-Working
+── Working · 1 ─────────────────────────
 loop: watch the base build           now
 
-Idle
+── Idle · 3 ────────────────────────────
 retire the old tunnel                14m
 immich upgrade                        3m
 claude                                5h
 
-Offloaded
+── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-Closed
+── Closed · 7 ──────────────────────────
 fix the dns records                   3d
 tunnel cutover notes                  4d
 bcache register script                5d
@@ -132,7 +139,7 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-Idle
+── Idle · 3 ────────────────────────────
 retire the old tunnel                14m
 ╭──────────────────────────────────────╮
 │ Close this session?                  │
@@ -149,7 +156,7 @@ retire the old tunnel                14m
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────
-Idle
+── Idle · 3 ────────────────────────────
 retire the old tunnel                14m
 ╭──────────────────────────────────────╮
 │ No room for another claude           │
@@ -169,7 +176,7 @@ retire the old tunnel                14m
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-Offloaded
+── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 ╭──────────────────────────────────────╮
 │ This session did not resume          │
@@ -190,21 +197,21 @@ mount guards on one                   2d
 ```
 infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────
-Needs you
+── Needs you · 1 ───────────────────────
 permission: write hosts/one           2m
 
-Working
+── Working · 1 ─────────────────────────
 loop: watch the base build           now
 
-Idle
+── Idle · 3 ────────────────────────────
 retire the old tunnel                now
 immich upgrade                       12m
 claude                                5h
 
-Offloaded
+── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-Closed
+── Closed · 7 ──────────────────────────
 fix the dns records                   3d
 tunnel cutover notes                  4d
 … 5 more
@@ -221,7 +228,8 @@ infra-dev · keys
 Enter  open the session; resumes it
        if offloaded or closed
 n      new session in /workspace
-c      close the session
+c      close the session, or
+       archive a closed one
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
@@ -231,6 +239,9 @@ Working    claude is mid-turn
 Idle       at its prompt, waiting
 Offloaded  stopped to save memory
 Closed     ended; still resumable
+Archived   put away with c, or after
+           30 days unused; Enter on it
+           opens or shuts it
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
@@ -279,4 +290,25 @@ at 6 columns, the right edge marked:
   (the menu refuses to draw; the
    door execs a login shell and
    says why)
+```
+
+### Mockup 9 — The archive, opened
+```
+infra-dev · 2 open · 812M of 1.0G
+────────────────────────────────────────
+── Idle · 2 ────────────────────────────
+retire the old tunnel                14m
+claude                                5h
+
+── Closed · 2 ──────────────────────────
+fix the dns records                   3d
+tunnel cutover notes                  4d
+
+── Archived · 3 ────────────────────────
+bcache register script               41d
+syncthing share rename               52d
+smartd on one                        63d
+────────────────────────────────────────
+Enter open   n new   c close   ? keys
+s shell
 ```

@@ -23,12 +23,13 @@
 //! a metered link.
 
 use crate::abduco;
+use crate::archive;
 use crate::clock::Millis;
 use crate::fmt;
 use crate::live;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
-use crate::render::{self, Item};
+use crate::render;
 use crate::store;
 use crate::ui::{Dialog, Group, Header, Key, Row, RowKey, Screen, View};
 
@@ -51,6 +52,11 @@ pub enum Action {
         victim: usize,
         then: Option<usize>,
     },
+    /// `c` on a closed conversation: put it in the archive. No question asked (owner,
+    /// 2026-10-03): nothing is lost, and `c` on it under Archived brings it back.
+    Archive(usize),
+    /// `c` on an archived conversation: take it out again.
+    Unarchive(usize),
 }
 
 /// A dialog, plus what answering it needs that the drawing does not. Rows are named by key,
@@ -75,7 +81,13 @@ pub struct Menu {
     pub height: u16,
     header: Header,
     workspace: String,
+    /// Every row, in the order the owner has been looking at, archived ones included.
+    all: Vec<Row>,
+    /// What is drawn and what the cursor moves over: `all`, with the archived rows behind the
+    /// Archived heading's row, and shown only while it is open.
     rows: Vec<Row>,
+    /// The Archived group is open. Shut whenever the menu starts (owner, 2026-10-03).
+    archive_open: bool,
     cursor: usize,
     scroll: usize,
     screen: Screen,
@@ -90,7 +102,9 @@ impl Menu {
             height,
             header,
             workspace,
+            all: Vec::new(),
             rows: Vec::new(),
+            archive_open: false,
             cursor: 0,
             scroll: 0,
             screen: Screen::List,
@@ -134,13 +148,13 @@ impl Menu {
             let mut next = Vec::with_capacity(fresh.len());
             for g in Group::ALL {
                 let stayed = |f: &Row| {
-                    self.rows
+                    self.all
                         .iter()
                         .any(|old| old.key == f.key && old.group() == g)
                 };
                 let arrived = fresh.iter().filter(|f| f.group() == g && !stayed(f));
                 next.extend(arrived.cloned());
-                for old in self.rows.iter().filter(|old| old.group() == g) {
+                for old in self.all.iter().filter(|old| old.group() == g) {
                     if let Some(f) = fresh.iter().find(|f| f.key == old.key && f.group() == g) {
                         next.push(f.clone());
                     }
@@ -148,7 +162,8 @@ impl Menu {
             }
             next
         };
-        self.rows = next;
+        self.all = next;
+        self.rows = self.visible();
         self.cursor = under_cursor
             .and_then(|k| self.index_of(&k))
             .unwrap_or(self.cursor)
@@ -168,6 +183,45 @@ impl Menu {
             self.ask = None;
         }
         self.keep_cursor_visible();
+    }
+
+    /// The rows as drawn: every row not archived, then — when anything is archived — the
+    /// Archived heading's row, counting them, then the archived rows if the group is open.
+    fn visible(&self) -> Vec<Row> {
+        let (archived, mut out): (Vec<Row>, Vec<Row>) =
+            self.all.iter().cloned().partition(|r| r.archived);
+        if archived.is_empty() {
+            return out;
+        }
+        out.push(Row {
+            key: RowKey::ArchiveFold,
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            // Not open, so the header does not count it.
+            closed: true,
+            archived: false,
+            title: Group::Archived.name().to_string(),
+            age: archived.len().to_string(),
+        });
+        if self.archive_open {
+            out.extend(archived);
+        }
+        out
+    }
+
+    /// `Enter` on the Archived heading: open the group or shut it, the cursor staying put.
+    fn toggle_archive(&mut self) -> Action {
+        self.archive_open = !self.archive_open;
+        self.rows = self.visible();
+        self.cursor = self
+            .index_of(&RowKey::ArchiveFold)
+            .unwrap_or(self.cursor)
+            .min(self.rows.len().saturating_sub(1));
+        self.keep_cursor_visible();
+        Action::Redraw
     }
 
     fn index_of(&self, key: &RowKey) -> Option<usize> {
@@ -319,10 +373,18 @@ impl Menu {
                 Some(i) => self.move_to(i),
                 None => Action::None,
             },
+            Key::Enter if self.on(|r| r.key == RowKey::ArchiveFold) => self.toggle_archive(),
             Key::Enter if !self.rows.is_empty() => Action::Open(self.cursor),
             Key::Char('n') => Action::New,
             Key::Char('s') => Action::Shell,
-            Key::Char('c') if self.rows.get(self.cursor).is_some_and(|r| r.closed) => {
+            Key::Char('c') if self.on(|r| r.key == RowKey::ArchiveFold) => Action::None,
+            Key::Char('c') if self.on(|r| r.archived) => Action::Unarchive(self.cursor),
+            Key::Char('c')
+                if self.on(|r| r.closed && matches!(r.key, RowKey::Conversation { .. })) =>
+            {
+                Action::Archive(self.cursor)
+            }
+            Key::Char('c') if self.on(|r| r.closed) => {
                 self.status = Some("that session is already closed".to_string());
                 Action::Redraw
             }
@@ -337,16 +399,18 @@ impl Menu {
         }
     }
 
+    /// Whether the row under the cursor is one `pred` picks.
+    fn on(&self, pred: impl Fn(&Row) -> bool) -> bool {
+        self.rows.get(self.cursor).is_some_and(pred)
+    }
+
     /// Which session a click on screen line `line` landed on: the list starts on the third
     /// line, after the header and its rule. A heading, a blank line or the fold is none.
     fn row_at(&self, line: u16) -> Option<usize> {
         let offset = usize::from(line).checked_sub(2)?;
         let items = render::layout(&self.rows);
         let (shown, _) = render::window(&items, self.scroll, self.capacity());
-        match items[shown].get(offset) {
-            Some(Item::Row(i)) => Some(*i),
-            _ => None,
-        }
+        items[shown].get(offset).and_then(|i| i.selects())
     }
 
     fn answer(&mut self, ask: Ask, key: Key) -> Action {
@@ -426,10 +490,12 @@ pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
             .filter(|r| r.state != State::Closed)
             .filter_map(|r| r.session_id.clone()),
     );
+    let marks = archive::marks();
     for c in store::in_workspace(&live::config_dir(), workspace) {
         if taken.contains(&c.id) {
             continue;
         }
+        let archived = archive::is_archived(marks.get(&c.id).copied(), c.last_ms, now);
         let row = Row {
             key: RowKey::Conversation {
                 id: c.id,
@@ -441,6 +507,7 @@ pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
             attached: false,
             offloaded: false,
             closed: true,
+            archived,
             title: c.title,
             age: fmt::age(clock.saturating_sub(c.last_ms)),
         };
@@ -468,6 +535,7 @@ pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
             attached: sock.attached_bit,
             offloaded: false,
             closed: false,
+            archived: false,
             title: sock.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
         });
@@ -490,6 +558,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sockets: &[abduco::Socket]) -> Row {
         offloaded: matches!(r.state, State::Offloaded | State::Offloading)
             || (r.state == State::Live && r.pid.is_some() && !alive),
         closed: r.state == State::Closed,
+        archived: false,
         // What Claude Code's own session selector shows (`transcript.rs`), not the live
         // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1).
         title: r.display_title(),
@@ -534,6 +603,7 @@ mod tests {
             attached: false,
             offloaded: false,
             closed: false,
+            archived: false,
             title: name.into(),
             age: "1m".into(),
         }
@@ -594,6 +664,99 @@ mod tests {
         b.unread = false;
         d.wants_you = false;
         assert_eq!(names(&menu(vec![a, b, row("c"), d])), ["a", "b", "c", "d"]);
+    }
+
+    fn stored(name: &str, archived: bool) -> Row {
+        Row {
+            key: RowKey::Conversation {
+                id: name.into(),
+                cwd: "/workspace".into(),
+            },
+            closed: true,
+            archived,
+            ..row(name)
+        }
+    }
+
+    #[test]
+    fn the_archive_starts_shut_behind_one_heading_and_enter_opens_and_shuts_it() {
+        let mut m = menu(vec![
+            row("live"),
+            stored("closed", false),
+            stored("old-1", true),
+            stored("old-2", true),
+        ]);
+        assert_eq!(names(&m), ["live", "closed", "Archived"], "shut at start");
+        assert_eq!(m.rows()[2].key, RowKey::ArchiveFold);
+        assert_eq!(m.rows()[2].age, "2", "it counts what it holds");
+        // The cursor reaches it like a row, and Enter opens it rather than opening anything.
+        m.key(Key::End);
+        assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
+        assert_eq!(m.key(Key::Enter), Action::Redraw);
+        assert_eq!(names(&m), ["live", "closed", "Archived", "old-1", "old-2"]);
+        assert_eq!(
+            m.rows()[m.view().cursor].key,
+            RowKey::ArchiveFold,
+            "the cursor stays on the heading"
+        );
+        // An archived row opens like any closed one.
+        m.key(Key::Down);
+        assert_eq!(m.key(Key::Enter), Action::Open(3));
+        // And Enter on the heading again shuts it.
+        m.key(Key::Up);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["live", "closed", "Archived"]);
+        // Calibration: with nothing archived there is no heading at all.
+        let m = menu(vec![row("live"), stored("closed", false)]);
+        assert_eq!(names(&m), ["live", "closed"]);
+    }
+
+    #[test]
+    fn c_archives_a_closed_conversation_without_asking_and_unarchives_an_archived_one() {
+        let mut m = menu(vec![
+            row("live"),
+            stored("closed", false),
+            stored("old", true),
+        ]);
+        m.key(Key::Down);
+        assert_eq!(
+            m.key(Key::Char('c')),
+            Action::Archive(1),
+            "no question asked"
+        );
+        assert_eq!(m.view().dialog, None);
+        // On the heading, c does nothing.
+        m.key(Key::Down);
+        assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
+        assert_eq!(m.key(Key::Char('c')), Action::None);
+        m.key(Key::Enter);
+        m.key(Key::Down);
+        assert_eq!(m.key(Key::Char('c')), Action::Unarchive(3));
+        // Calibration: on a live row, c still asks before closing.
+        m.key(Key::Home);
+        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
+        assert!(matches!(m.view().dialog, Some(Dialog::Close { .. })));
+    }
+
+    #[test]
+    fn a_click_on_the_archived_heading_selects_it() {
+        let mut m = menu(vec![row("a"), stored("old", true)]);
+        // Header, rule, then: Idle heading, a, blank, the Archived heading on line 5.
+        assert_eq!(m.key(Key::Click { row: 5, col: 4 }), Action::Redraw);
+        assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
+        // Calibration: the Idle heading on line 2 is not selectable.
+        assert_eq!(m.key(Key::Click { row: 2, col: 4 }), Action::None);
+    }
+
+    #[test]
+    fn a_row_archived_in_a_reading_leaves_closed_and_joins_the_archive() {
+        let mut m = menu(vec![row("live"), stored("closed", false)]);
+        assert_eq!(names(&m), ["live", "closed"]);
+        m.replace_rows(vec![row("live"), stored("closed", true)], false);
+        assert_eq!(names(&m), ["live", "Archived"]);
+        m.key(Key::End);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["live", "Archived", "closed"]);
     }
 
     #[test]
@@ -767,7 +930,7 @@ mod tests {
                 let v = m.view();
                 let items = render::layout(&v.rows);
                 let (shown, _) = render::window(&items, v.scroll, m.capacity());
-                let on = items[shown].contains(&Item::Row(v.cursor));
+                let on = items[shown].iter().any(|i| i.selects() == Some(v.cursor));
                 assert!(
                     on,
                     "after {k:?} the cursor {} is not a session on screen",

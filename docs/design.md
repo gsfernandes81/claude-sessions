@@ -222,14 +222,29 @@ is the choice and why:
 ## The menu
 
 - **Lists every live and offloaded slot, every unregistered `abduco` session, and every
-  conversation on disk started in the workspace that is not running**, **grouped by state** (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`,
-  `Closed`, each under its heading, an empty group not drawn, one blank line between groups.
+  conversation on disk started in the workspace that is not running**, **grouped by state**
+  (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`, `Closed`, `Archived`, an
+  empty group not drawn, one blank line between groups. **A heading is a labelled rule with a
+  count**, `── Closed · 7 ────` (owner, 2026-10-03, chosen from three drawn options): the rule
+  dim and the name bold, the whole Needs-you line amber. A rule is a glyph, so it divides the
+  list on a monochrome terminal too, and the count says how many sit behind `… N more`. **From
+  60 columns up the rows are indented two columns** under their headings; at 40 the two
+  columns stay with the titles.
   A row's group is the first that fits: closed, offloaded, a prompt waiting, mid-turn, else
   idle; an unregistered session, which nothing describes, is idle. Within a group, most recent
   activity first, except Idle, where unread rows come first. A row is its title and its age —
   **no marks and no numbers**: an unread title is bold, a session attached somewhere else is
   drawn dim, and amber is the Needs-you heading. Closed rows are not counted as open in the
   header.
+- **The archive** (owner, 2026-10-03) hides a closed conversation in the menu and changes
+  nothing of Claude Code's: `claude --resume` and `/resume` still find it. It is one small file
+  per conversation id in `archive/` beside the registry (`src/archive.rs`). A conversation is
+  archived when `c` put it there — `c` on a Closed row, **with no question asked**, since
+  nothing is lost — or when its last entry is more than 30 days old, worked out as the list is
+  read. `c` on an archived row takes it out and marks it kept, so an old one does not fold
+  away again; `Enter` on one resumes it and does the same. **The Archived group is shut
+  whenever the menu starts**: one heading, `── Archived · 12 ──`, and `Enter` on it opens or
+  shuts it.
 - **The Closed group is read from Claude Code's own store**, `$CLAUDE_CONFIG_DIR/projects`
   (owner, 2026-10-03; `src/store.rs`), not from the registry: every conversation on disk,
   whoever started it — a slot of ours, a `claude` run by hand, the old `ssh` path, a
@@ -311,15 +326,18 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   order they open it. `Enter` on an offloaded row resumes immediately with no confirmation
   (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
   for a *different* slot, which is accepted rather than designed around.
-- **Keys:** `Enter` open · `n` new, in the workspace · `c` close · `s` a shell · `Esc` quit ·
+- **Keys:** `Enter` open (on the Archived heading, open or shut it) · `n` new, in the
+  workspace · `c` close (on a closed row, archive; on an archived one, unarchive) · `s` a
+  shell · `Esc` quit ·
   `?` the keys. **`q` also quits and is listed nowhere** (owner, 2026-10-01): it is the first
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
 - **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys or the
   mouse; `Enter` opens the highlighted row, and `c` closes it. **It only ever selects a
-  session** (owner, 2026-10-03): it is an index into the rows, never a screen line, so the
-  arrows step over headings and blank lines, and a click on a heading, a blank line or the
-  fold does nothing. The mockups draw no
+  session, or the Archived heading** (owner, 2026-10-03): it is an index into the rows, never a
+  screen line, and the Archived heading is a row of its own so that `Enter` can open it, so
+  the arrows step over every other heading and the blank lines, and a click on one of those or
+  on the fold does nothing. The mockups draw no
   highlight because they are plain text — the highlight is reverse video, which a monochrome
   terminal shows too. Mouse input is **click reporting only** (`?1000` with SGR `?1006`),
   never motion (`?1003`): motion reports would put bytes on the metered link every time a
@@ -331,7 +349,7 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   evidence for staying put — back from a session, it is no longer unread and is the most
   recent, and is still where it was.
 - **What does not fit folds into `… N more`**, on the list's last line, counting the sessions
-  below it. Closed is last, so it is what folds first. The list scrolls to keep the cursor's
+  below it — not the Archived heading. Closed and Archived are last, so they fold first. The list scrolls to keep the cursor's
   session above the fold, and scrolling up to a group's first session brings its heading.
 - **Ages tick together, once a minute.** They are measured from a clock floored to the
   minute, so rows that went idle at different seconds roll over in the same redraw rather

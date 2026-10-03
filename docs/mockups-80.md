@@ -1,36 +1,37 @@
 # The screens at 80 columns
 
 The 40-column set in [`mockups.md`](mockups.md) is the one that counts; this is the same
-eight screens drawn at 80 so the desktop case is on the record. Both are generated to
-width, not typed. What 80 columns changes is nothing structural: the title field grows from
-35 to 75 characters, the hint line fits on one line instead of two — so the list has a line
-more, and the fold one session less — and the dialogs, which are their content's width,
-centred, sit inset rather than filling the terminal.
+nine screens drawn at 80 so the desktop case is on the record. Both are generated to
+width, not typed. What 80 columns changes: the rows are indented two columns under their
+headings (from 60 columns up), the title field grows from 35 to 73 characters, the hint line
+fits on one line instead of two — so the list has a line more, and the fold one session
+less — and the dialogs, which are their content's width, centred, sit inset rather than
+filling the terminal.
 
 ### Mockup 1 — The list, in its groups
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-Needs you
-permission: write hosts/one                                                   2m
+── Needs you · 1 ───────────────────────────────────────────────────────────────
+  permission: write hosts/one                                                 2m
 
-Working
-loop: watch the base build                                                   now
+── Working · 1 ─────────────────────────────────────────────────────────────────
+  loop: watch the base build                                                 now
 
-Idle
-retire the old tunnel                                                        14m
-immich upgrade                                                                3m
-claude                                                                        5h
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      14m
+  immich upgrade                                                              3m
+  claude                                                                      5h
 
-Offloaded
-mount guards on one                                                           2d
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
 
-Closed
-fix the dns records                                                           3d
-tunnel cutover notes                                                          4d
-bcache register script                                                        5d
-syncthing share rename                                                        6d
-… 3 more
+── Closed · 7 ──────────────────────────────────────────────────────────────────
+  fix the dns records                                                         3d
+  tunnel cutover notes                                                        4d
+  bcache register script                                                      5d
+  syncthing share rename                                                      6d
+  … 3 more
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
@@ -53,8 +54,8 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-Idle
-retire the old tunnel                                                        14m
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      14m
                     ╭──────────────────────────────────────╮
                     │ Close this session?                  │
                     │   retire the old tunnel              │
@@ -70,8 +71,8 @@ retire the old tunnel                                                        14m
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-Idle
-retire the old tunnel                                                        14m
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      14m
                     ╭──────────────────────────────────────╮
                     │ No room for another claude           │
                     │                                      │
@@ -90,8 +91,8 @@ retire the old tunnel                                                        14m
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-Offloaded
-mount guards on one                                                           2d
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
                     ╭──────────────────────────────────────╮
                     │ This session did not resume          │
                     │   mount guards on one                │
@@ -111,25 +112,25 @@ mount guards on one                                                           2d
 ```
 infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-Needs you
-permission: write hosts/one                                                   2m
+── Needs you · 1 ───────────────────────────────────────────────────────────────
+  permission: write hosts/one                                                 2m
 
-Working
-loop: watch the base build                                                   now
+── Working · 1 ─────────────────────────────────────────────────────────────────
+  loop: watch the base build                                                 now
 
-Idle
-retire the old tunnel                                                        now
-immich upgrade                                                               12m
-claude                                                                        5h
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      now
+  immich upgrade                                                             12m
+  claude                                                                      5h
 
-Offloaded
-mount guards on one                                                           2d
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
 
-Closed
-fix the dns records                                                           3d
-tunnel cutover notes                                                          4d
-bcache register script                                                        5d
-… 4 more
+── Closed · 7 ──────────────────────────────────────────────────────────────────
+  fix the dns records                                                         3d
+  tunnel cutover notes                                                        4d
+  bcache register script                                                      5d
+  … 4 more
 ────────────────────────────────────────────────────────────────────────────────
 detached · it is still running
 Enter open   n new   c close   ? keys   s shell
@@ -142,7 +143,8 @@ infra-dev · keys
 Enter  open the session; resumes it
        if offloaded or closed
 n      new session in /workspace
-c      close the session
+c      close the session, or
+       archive a closed one
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
@@ -152,6 +154,9 @@ Working    claude is mid-turn
 Idle       at its prompt, waiting
 Offloaded  stopped to save memory
 Closed     ended; still resumable
+Archived   put away with c, or after
+           30 days unused; Enter on it
+           opens or shuts it
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
@@ -199,4 +204,24 @@ at 6 columns, the right edge marked:
   (the menu refuses to draw; the
    door execs a login shell and
    says why)
+```
+
+### Mockup 9 — The archive, opened
+```
+infra-dev · 2 open · 812M of 1.0G
+────────────────────────────────────────────────────────────────────────────────
+── Idle · 2 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      14m
+  claude                                                                      5h
+
+── Closed · 2 ──────────────────────────────────────────────────────────────────
+  fix the dns records                                                         3d
+  tunnel cutover notes                                                        4d
+
+── Archived · 3 ────────────────────────────────────────────────────────────────
+  bcache register script                                                     41d
+  syncthing share rename                                                     52d
+  smartd on one                                                              63d
+────────────────────────────────────────────────────────────────────────────────
+Enter open   n new   c close   ? keys   s shell
 ```

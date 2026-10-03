@@ -157,6 +157,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         RowKey::Conversation { .. } => {
             return Outcome::Back(Some(format!("{n} was already closed")));
         }
+        RowKey::ArchiveFold => return no_row(index),
     };
     let _lock = match lock_slot(slot, &n) {
         Ok(l) => l,
@@ -226,6 +227,8 @@ pub(crate) fn open_with(
         RowKey::Conversation { id, cwd } => {
             return resume_conversation(rows, (id, cwd, &row.title), &n, term, deps, check_room);
         }
+        // A heading, not a session; the menu folds it rather than asking for it to be opened.
+        RowKey::ArchiveFold => return no_row(index),
         RowKey::Slot(slot) => slot,
     };
     let rec = match registry::load(slot) {
@@ -1368,6 +1371,7 @@ exit 1"#,
             attached: false,
             offloaded: false,
             closed: false,
+            archived: false,
             title: title.into(),
             age: "now".into(),
         }

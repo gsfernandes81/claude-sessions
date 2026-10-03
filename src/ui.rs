@@ -23,6 +23,9 @@ pub enum RowKey {
     /// A conversation in Claude Code's own store that is not running (`store.rs`), listed
     /// under Closed: `Enter` resumes it in a slot, from the directory it started in.
     Conversation { id: String, cwd: String },
+    /// The Archived group's heading (owner, 2026-10-03): the one line the cursor can rest on
+    /// that is not a session. `Enter` on it folds the archive open or shut.
+    ArchiveFold,
 }
 
 /// The groups the list is drawn in, top to bottom (owner, 2026-10-03). Every row is in
@@ -37,17 +40,21 @@ pub enum Group {
     Idle,
     /// Stopped to save memory; `Enter` resumes it.
     Offloaded,
-    /// Ended, and still resumable; listed last, and not counted as open (owner, 2026-10-03).
+    /// Ended, and still resumable; not counted as open (owner, 2026-10-03).
     Closed,
+    /// Closed and put away — with `c`, or after 30 days unused — under one heading, folded
+    /// shut until the owner opens it (owner, 2026-10-03).
+    Archived,
 }
 
 impl Group {
-    pub const ALL: [Group; 5] = [
+    pub const ALL: [Group; 6] = [
         Group::NeedsYou,
         Group::Working,
         Group::Idle,
         Group::Offloaded,
         Group::Closed,
+        Group::Archived,
     ];
 
     /// The heading, as drawn.
@@ -58,6 +65,7 @@ impl Group {
             Group::Idle => "Idle",
             Group::Offloaded => "Offloaded",
             Group::Closed => "Closed",
+            Group::Archived => "Archived",
         }
     }
 }
@@ -78,8 +86,11 @@ pub struct Row {
     pub offloaded: bool,
     /// Closed; `Enter` resumes it.
     pub closed: bool,
+    /// Archived (`archive.rs`); listed under Archived when that group is open.
+    pub archived: bool,
     pub title: String,
-    /// Already formatted: `now`, `14m`, `5h`, `2d`.
+    /// Already formatted: `now`, `14m`, `5h`, `2d`. On the Archived heading's row, how many
+    /// conversations are archived.
     pub age: String,
 }
 
@@ -87,7 +98,9 @@ impl Row {
     /// Which group the row is drawn in. Being stopped outranks anything the record last said
     /// about the process, and a prompt waiting outranks being mid-turn.
     pub fn group(&self) -> Group {
-        if self.closed {
+        if self.archived || self.key == RowKey::ArchiveFold {
+            Group::Archived
+        } else if self.closed {
             Group::Closed
         } else if self.offloaded {
             Group::Offloaded

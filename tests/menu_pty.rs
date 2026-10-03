@@ -81,13 +81,19 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
             "a conversation from somewhere else",
         ),
         ("/workspace", "stored-3", "a conversation still running"),
+        ("/workspace", "stored-4", "a conversation from august"),
     ] {
+        let ts = if id == "stored-4" {
+            "2026-08-01T00:00:00.000Z"
+        } else {
+            "2026-10-01T00:00:00.000Z"
+        };
         let dir = root.join("cc/projects").join(cwd.replace('/', "-"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{id}.jsonl")),
             format!(
-                r#"{{"type":"user","cwd":"{cwd}","sessionId":"{id}","timestamp":"2026-10-01T00:00:00.000Z","message":{{"role":"user","content":"{prompt}"}}}}"#
+                r#"{{"type":"user","cwd":"{cwd}","sessionId":"{id}","timestamp":"{ts}","message":{{"role":"user","content":"{prompt}"}}}}"#
             ) + "\n",
         )
         .unwrap();
@@ -137,6 +143,16 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     assert!(
         !frame.contains("still running"),
         "a running conversation is not: {frame:?}"
+    );
+    // Unused for more than 30 days, it is archived on its own (owner, 2026-10-03): behind
+    // the Archived heading, which is shut when the menu starts.
+    assert!(
+        frame.contains("Archived · 1"),
+        "the archive's heading: {frame:?}"
+    );
+    assert!(
+        !frame.contains("from august"),
+        "an archived conversation is behind the shut heading: {frame:?}"
     );
 
     // The property: two registry polls' worth of nothing happening, and nothing written.

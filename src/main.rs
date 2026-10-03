@@ -9,6 +9,7 @@
 //! more thing to cross-compile for musl and one more thing to read before trusting.
 
 mod abduco;
+mod archive;
 mod bind;
 mod clock;
 mod events;
