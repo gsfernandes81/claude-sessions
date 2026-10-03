@@ -21,14 +21,17 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn record(slot: &str, title: &str, needs_you: bool) -> String {
+fn record(slot: &str, title: &str, needs_you: bool, transcript: &std::path::Path) -> String {
     // Two days and an hour old, so its age reads `2d` whichever minute the floored age clock
     // is in — exactly two days would read `1d` until the next minute turned, and redraw then,
-    // legitimately. Offloaded, so no process is needed to make it read as anything.
+    // legitimately. Offloaded, so no process is needed to make it read as anything — with a
+    // transcript on disk, because an offloaded slot without one is not listed (issue #5).
     let at = now_ms() - 2 * 86_400_000 - 3_600_000;
+    let t = transcript.display();
     format!(
         r#"{{"slot":"{slot}","state":"offloaded","title":"{title}","session_id":"s-{slot}",
-            "cwd":"/workspace","needs_you":{needs_you},"last_activity_ms":{at},"timers":[]}}"#
+            "cwd":"/workspace","transcript_path":"{t}","needs_you":{needs_you},
+            "last_activity_ms":{at},"timers":[]}}"#
     )
 }
 
@@ -54,9 +57,11 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     let (reg, abd) = (root.join("registry"), root.join("abduco"));
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
+    let transcript = root.join("s-claude-1.jsonl");
+    std::fs::write(&transcript, "{}\n").unwrap();
     std::fs::write(
         reg.join("claude-1.json"),
-        record("claude-1", "retire the old tunnel", false),
+        record("claude-1", "retire the old tunnel", false, &transcript),
     )
     .unwrap();
 
@@ -92,7 +97,7 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     // that read nothing above was really looking.
     std::fs::write(
         reg.join("claude-1.json"),
-        record("claude-1", "retire the old tunnel", true),
+        record("claude-1", "retire the old tunnel", true, &transcript),
     )
     .unwrap();
     let redraw = term.read_until(b"!", Duration::from_secs(6));

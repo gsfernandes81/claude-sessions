@@ -128,6 +128,12 @@ pub fn apply(
         return Outcome::Changed;
     }
 
+    // Every event from the slot's own claude names its current transcript; recorded so
+    // "is there a conversation to resume" can be answered by the file existing (issue #5).
+    if let Some(p) = ev.transcript_path() {
+        rec.transcript_path = Some(p.to_string());
+    }
+
     let out = match ev.name() {
         "SessionStart" => {
             if let Some(id) = ev.session_id() {
@@ -139,6 +145,10 @@ pub fn apply(
                     rec.title = None;
                     rec.ai_title = None;
                     rec.first_prompt = None;
+                    // The new conversation's own path, if this event carried one, was set above.
+                    if ev.transcript_path().is_none() {
+                        rec.transcript_path = None;
+                    }
                 }
                 rec.session_id = Some(id.to_string());
             }

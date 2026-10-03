@@ -90,6 +90,9 @@ pub struct SlotRecord {
     /// Claude Code's generated title for the current conversation — what its session
     /// selector shows when there is no custom title.
     pub ai_title: Option<String>,
+    /// Where Claude Code keeps the current conversation's transcript, as its hooks report it.
+    /// The file exists only once the conversation has had its first prompt (issue #5).
+    pub transcript_path: Option<String>,
     /// The current conversation's first prompt, on one line and cut short — the title of last
     /// resort, for a conversation Claude Code has not named. Written once per conversation by
     /// `UserPromptSubmit`.
@@ -130,6 +133,7 @@ impl SlotRecord {
             cwd: None,
             title: None,
             ai_title: None,
+            transcript_path: None,
             first_prompt: None,
             state: State::Live,
             busy: false,
@@ -147,6 +151,41 @@ impl SlotRecord {
 
     /// The title a row shows: what Claude Code's own session selector would — the custom
     /// title, else the generated one — then the first prompt, then nothing yet.
+    /// Where the current conversation's transcript is: the path the hooks reported, else —
+    /// for a record written before 0.3.3 recorded it — where Claude Code puts one, under
+    /// `projects/` named for the directory with every character that is not a letter, a
+    /// digit or `-` turned into `-` (`/home/user/x` → `-home-user-x`).
+    pub fn conversation_path(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.transcript_path {
+            return Some(PathBuf::from(p));
+        }
+        let (id, cwd) = (self.session_id.as_deref()?, self.cwd.as_deref()?);
+        let slug: String = cwd
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        Some(
+            crate::live::config_dir()
+                .join("projects")
+                .join(slug)
+                .join(format!("{id}.jsonl")),
+        )
+    }
+
+    /// Whether there is a conversation on disk to resume. **A recorded `session_id` is not
+    /// enough** (issue #5): Claude Code writes a new conversation's transcript at its first
+    /// prompt, not at `SessionStart`, so a slot closed or offloaded before anyone spoke to it
+    /// has an id and nothing behind it, and `claude --resume` on it exits at once.
+    pub fn has_conversation(&self) -> bool {
+        self.conversation_path().is_some_and(|p| p.is_file())
+    }
+
     pub fn display_title(&self) -> String {
         self.title
             .clone()
@@ -189,6 +228,7 @@ impl SlotRecord {
         set_opt_str(&mut o, "cwd", self.cwd.as_deref());
         set_opt_str(&mut o, "title", self.title.as_deref());
         set_opt_str(&mut o, "ai_title", self.ai_title.as_deref());
+        set_opt_str(&mut o, "transcript_path", self.transcript_path.as_deref());
         set_opt_str(&mut o, "first_prompt", self.first_prompt.as_deref());
         o.set("busy", Value::Bool(self.busy));
         o.set("needs_you", Value::Bool(self.needs_you));
@@ -265,6 +305,7 @@ impl SlotRecord {
             cwd: str_of(v, "cwd"),
             title: str_of(v, "title"),
             ai_title: str_of(v, "ai_title"),
+            transcript_path: str_of(v, "transcript_path"),
             first_prompt: str_of(v, "first_prompt"),
             state: State::parse(v.get("state").and_then(Value::as_str).unwrap_or("live")),
             busy: v.get("busy").and_then(Value::as_bool).unwrap_or(false),
@@ -434,6 +475,39 @@ mod tests {
         );
         rec.title = Some("tunnel".into());
         assert_eq!(rec.display_title(), "tunnel", "the owner's own name wins");
+    }
+
+    #[test]
+    fn a_conversation_exists_only_once_its_transcript_does() {
+        let dir = std::env::temp_dir().join(format!("cs-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("abc.jsonl");
+        let mut rec = SlotRecord::new("claude-1", 0);
+        rec.session_id = Some("abc".into());
+        rec.cwd = Some("/workspace".into());
+        rec.transcript_path = Some(path.display().to_string());
+        assert!(!rec.has_conversation(), "never prompted: no transcript yet");
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(
+            rec.has_conversation(),
+            "calibration: once written, it is there"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_record_finds_its_transcript_where_claude_code_keeps_it() {
+        let mut rec = SlotRecord::new("claude-1", 0);
+        rec.session_id = Some("abc".into());
+        rec.cwd = Some("/home/user/claude-sessions".into());
+        let p = rec.conversation_path().unwrap();
+        assert!(
+            p.ends_with("projects/-home-user-claude-sessions/abc.jsonl"),
+            "got {}",
+            p.display()
+        );
+        rec.session_id = None;
+        assert_eq!(rec.conversation_path(), None, "no id, no conversation");
     }
 
     #[test]

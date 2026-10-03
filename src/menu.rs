@@ -379,6 +379,10 @@ pub fn gather(now: Millis) -> Vec<Row> {
     let mut slots: Vec<(&SlotRecord, Row)> = recs
         .iter()
         .map(|r| (r, slot_row(r, now, clock, &sockets)))
+        // A slot that is not running and has no conversation on disk is nothing to open:
+        // closed or offloaded before its first prompt, it has a session id and no
+        // transcript, and `Enter` on it would fail at once (issue #5). Not listed.
+        .filter(|(r, row)| !(row.offloaded || row.closed) || r.has_conversation())
         .collect();
     slots.sort_by_key(|(r, _)| std::cmp::Reverse(r.last_activity_ms));
     let mut rows: Vec<Row> = slots.into_iter().map(|(_, row)| row).collect();

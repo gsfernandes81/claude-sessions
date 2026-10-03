@@ -68,10 +68,15 @@ fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn sessions_dir() -> PathBuf {
+/// Claude Code's configuration directory: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var("CLAUDE_CONFIG_DIR")
         .unwrap_or_else(|_| format!("{}/.claude", std::env::var("HOME").unwrap_or_default()));
-    PathBuf::from(base).join("sessions")
+    PathBuf::from(base)
+}
+
+fn sessions_dir() -> PathBuf {
+    config_dir().join("sessions")
 }
 
 /// Every live session Claude Code currently claims, stale files skipped.
