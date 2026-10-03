@@ -39,9 +39,11 @@ reads the registry and `abduco`, never guesses, and opens what the owner picks.
   It fell back to a face with a different advance and silently dragged every line it sat on
   out of alignment. The key is spelled `Enter`. Anything outside ASCII and the box-drawing
   set used in the mockups gets the same treatment: check coverage, do not assume it.
-- **Nothing is colour-only.** Every mark is a glyph first, so a pipe, a monochrome terminal
-  and a screen reader all lose nothing. Amber means *this one is waiting for you* and is used
-  for nothing else.
+- **Nothing is colour-only.** A session's state is said in words — the group heading it is
+  under — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for
+  unread and dim for attached are emphasis on top, the owner's choice over glyph marks
+  (2026-10-03). Amber means *this one is waiting for you* — the Needs-you heading — and is
+  used for nothing else.
 - **Never resume a conversation that is already running.** Two processes on one conversation
   fork it. Checked under the slot's lock, not before taking it.
 - **Never start, stop or offload anything on the fleet on your own initiative.** Bring-up is

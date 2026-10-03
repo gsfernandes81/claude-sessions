@@ -5,11 +5,17 @@
 //!
 //! Two behaviours that are decisions, not accidents:
 //!
-//! **Rows keep their places while the menu is open.** The order is wants-you, then unread,
-//! then most recent — once, when the menu starts. After that a row stays where it was and a
-//! new row joins at the bottom. Mockup 6 is the evidence: back from slot 2, row 2 now reads
-//! `now` and is no longer unread, yet it is still second, above unread row 3. Re-sorting under
-//! the cursor would move the row the owner is reaching for.
+//! **Rows are grouped by state, and keep their places within a group while the menu is open**
+//! (owner, 2026-10-03). Needs you, Working, Idle, Offloaded, Closed, top to bottom; each in
+//! recency order when the menu starts, except Idle, where unread rows come first. After that
+//! a row that stays in its group stays where it was, and a row that is new, or has moved
+//! group, joins the top of its group. Mockup 6 is the evidence for staying put: back from a
+//! session, it reads `now` and is no longer unread, yet it is still where it was. Re-sorting
+//! under the cursor would move the row the owner is reaching for; a row that changes group
+//! has moved anyway, and the top is where the eye goes to see what changed.
+//!
+//! The cursor is an index into the rows, never a screen line, so it can only ever be on a
+//! session: headings, the blank lines between groups and the `… N more` fold are not rows.
 //!
 //! **Ages are measured from a clock floored to the minute.** Each row's age would otherwise
 //! roll over at its own second of the minute, and six rows could redraw six times a minute.
@@ -21,7 +27,8 @@ use crate::clock::Millis;
 use crate::fmt;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
-use crate::ui::{Dialog, Header, Key, Row, RowKey, Screen, View};
+use crate::render::{self, Item};
+use crate::ui::{Dialog, Group, Header, Key, Row, RowKey, Screen, View};
 
 /// What the loop should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,18 +51,19 @@ pub enum Action {
     },
 }
 
-/// A dialog, plus what answering it needs that the drawing does not.
+/// A dialog, plus what answering it needs that the drawing does not. Rows are named by key,
+/// not index: a reading taken while the question is up can regroup them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
     Close {
-        index: usize,
+        key: RowKey,
     },
     NoRoom {
-        then: Option<usize>,
-        victim: Option<usize>,
+        then: Option<RowKey>,
+        victim: Option<RowKey>,
     },
     ResumeFailed {
-        index: usize,
+        key: RowKey,
     },
 }
 
@@ -109,45 +117,59 @@ impl Menu {
 
     /// Take a fresh reading of the rows, keeping the order the owner has been looking at.
     ///
-    /// `first` sorts — wants-you, unread, then whatever order `gather` produced, which is
-    /// most recent first. Afterwards, rows that are still there keep their places, rows that
-    /// are gone go, and new ones join at the bottom. The cursor stays on the row it was on.
+    /// `first` sorts into groups — each in `gather`'s order, which is most recent first,
+    /// except Idle, where unread rows come first. Afterwards, rows that are still in the same
+    /// group keep their places, rows that are gone go, and rows that are new or have changed
+    /// group join the top of theirs. The cursor stays on the row it was on.
     pub fn replace_rows(&mut self, fresh: Vec<Row>, first: bool) {
         let under_cursor = self.rows.get(self.cursor).map(|r| r.key.clone());
-        let mut next: Vec<Row> = Vec::with_capacity(fresh.len());
-        if first {
-            next = fresh;
-            // Stable, so `gather`'s recency order survives within each group. Closed rows go
-            // last: they are history, reachable but never in the way.
-            next.sort_by_key(|r| (r.closed, !r.wants_you, !r.unread));
+        let next: Vec<Row> = if first {
+            let mut next = fresh;
+            // Stable, so `gather`'s recency order survives within each group.
+            next.sort_by_key(|r| (r.group(), r.group() == Group::Idle && !r.unread));
+            next
         } else {
-            for old in &self.rows {
-                if let Some(f) = fresh.iter().find(|f| f.key == old.key) {
-                    next.push(f.clone());
+            let mut next = Vec::with_capacity(fresh.len());
+            for g in Group::ALL {
+                let stayed = |f: &Row| {
+                    self.rows
+                        .iter()
+                        .any(|old| old.key == f.key && old.group() == g)
+                };
+                let arrived = fresh.iter().filter(|f| f.group() == g && !stayed(f));
+                next.extend(arrived.cloned());
+                for old in self.rows.iter().filter(|old| old.group() == g) {
+                    if let Some(f) = fresh.iter().find(|f| f.key == old.key && f.group() == g) {
+                        next.push(f.clone());
+                    }
                 }
             }
-            for f in fresh {
-                if !next.iter().any(|n| n.key == f.key) {
-                    next.push(f);
-                }
-            }
-        }
+            next
+        };
         self.rows = next;
         self.cursor = under_cursor
-            .and_then(|k| self.rows.iter().position(|r| r.key == k))
+            .and_then(|k| self.index_of(&k))
             .unwrap_or(self.cursor)
             .min(self.rows.len().saturating_sub(1));
         // A dialog about a row that has gone is a question about nothing.
-        if let Some((ask, _)) = &self.ask {
-            let index = match ask {
-                Ask::Close { index } | Ask::ResumeFailed { index } => Some(*index),
-                Ask::NoRoom { .. } => None,
-            };
-            if index.is_some_and(|i| i >= self.rows.len()) {
-                self.ask = None;
+        let gone = match &self.ask {
+            Some((Ask::Close { key } | Ask::ResumeFailed { key }, _)) => {
+                self.index_of(key).is_none()
             }
+            Some((Ask::NoRoom { victim, then }, _)) => [victim, then]
+                .into_iter()
+                .flatten()
+                .any(|k| self.index_of(k).is_none()),
+            None => false,
+        };
+        if gone {
+            self.ask = None;
         }
         self.keep_cursor_visible();
+    }
+
+    fn index_of(&self, key: &RowKey) -> Option<usize> {
+        self.rows.iter().position(|r| r.key == *key)
     }
 
     /// How many lines the hint takes at this width, counted by the renderer that draws it.
@@ -155,42 +177,32 @@ impl Menu {
         crate::render::hint_line_count(self.width, self.rows.is_empty())
     }
 
-    /// Rows that fit between the header's rule and the closing rule.
+    /// Lines of the list that fit between the header's rule and the closing rule.
     fn capacity(&self) -> usize {
         let status = self
             .status
             .as_deref()
-            .map_or(0, |s| crate::render::status_line_count(self.width, s));
+            .map_or(0, |s| render::status_line_count(self.width, s));
         let fixed = 3 + status + self.hint_lines();
         usize::from(self.height).saturating_sub(fixed).max(1)
     }
 
     fn keep_cursor_visible(&mut self) {
-        let cap = self.capacity();
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + cap {
-            self.scroll = self.cursor + 1 - cap;
-        }
-        self.scroll = self.scroll.min(self.rows.len().saturating_sub(cap));
+        let items = render::layout(&self.rows);
+        self.scroll = render::scroll_to(&items, self.cursor, self.scroll, self.capacity());
     }
 
     pub fn view(&self) -> View {
-        let (dialog, scroll) = match &self.ask {
-            // A dialog draws two rows above itself, from `scroll`. Show the row the question
-            // is about first, and the one after it, as mockups 4 and 5 do — clamped so there
-            // are two to show when it is the last row.
+        let (dialog, about) = match &self.ask {
             Some((ask, dialog)) => {
-                let about = match ask {
-                    Ask::Close { index } | Ask::ResumeFailed { index } => *index,
-                    Ask::NoRoom { victim, then } => victim.or(*then).unwrap_or(self.cursor),
+                let key = match ask {
+                    Ask::Close { key } | Ask::ResumeFailed { key } => Some(key),
+                    Ask::NoRoom { victim, then } => victim.as_ref().or(then.as_ref()),
                 };
-                (
-                    Some(dialog.clone()),
-                    about.min(self.rows.len().saturating_sub(2)),
-                )
+                let about = key.and_then(|k| self.index_of(k));
+                (Some(dialog.clone()), about)
             }
-            None => (None, self.scroll),
+            None => (None, None),
         };
         View {
             width: self.width,
@@ -199,7 +211,8 @@ impl Menu {
             workspace: self.workspace.clone(),
             rows: self.rows.clone(),
             cursor: self.cursor,
-            scroll,
+            scroll: self.scroll,
+            about,
             screen: self.screen,
             dialog,
             status: self.status.clone(),
@@ -212,20 +225,25 @@ impl Menu {
         self.keep_cursor_visible();
     }
 
-    /// Ask the owner something a launch came back with (mockups 4 and 5).
+    /// Ask the owner something a launch came back with (mockups 4 and 5). Indices are into
+    /// the rows as they were when the launch was asked for, which they still are.
     pub fn ask_no_room(&mut self, dialog: Dialog, then: Option<usize>) {
         let victim = match &dialog {
             Dialog::NoRoom {
-                offer: Some((row, _, _)),
+                offer: Some((index, _, _)),
                 ..
-            } => Some(row.saturating_sub(1)),
+            } => self.rows.get(*index).map(|r| r.key.clone()),
             _ => None,
         };
+        let then = then.and_then(|i| self.rows.get(i)).map(|r| r.key.clone());
         self.ask = Some((Ask::NoRoom { then, victim }, dialog));
     }
 
     pub fn ask_resume_failed(&mut self, dialog: Dialog, index: usize) {
-        self.ask = Some((Ask::ResumeFailed { index }, dialog));
+        if let Some(r) = self.rows.get(index) {
+            let key = r.key.clone();
+            self.ask = Some((Ask::ResumeFailed { key }, dialog));
+        }
     }
 
     fn move_to(&mut self, index: usize) -> Action {
@@ -246,11 +264,11 @@ impl Menu {
             return Action::None;
         };
         let dialog = Dialog::Close {
-            row: index + 1,
             title: row.title.clone(),
             running: !row.offloaded,
         };
-        self.ask = Some((Ask::Close { index }, dialog));
+        let key = row.key.clone();
+        self.ask = Some((Ask::Close { key }, dialog));
         Action::Redraw
     }
 
@@ -303,7 +321,7 @@ impl Menu {
             Key::Char('n') => Action::New,
             Key::Char('s') => Action::Shell,
             Key::Char('c') if self.rows.get(self.cursor).is_some_and(|r| r.closed) => {
-                self.status = Some(format!("{} is already closed", self.cursor + 1));
+                self.status = Some("that session is already closed".to_string());
                 Action::Redraw
             }
             Key::Char('c') if !self.rows.is_empty() => self.ask_close(self.cursor),
@@ -317,15 +335,16 @@ impl Menu {
         }
     }
 
-    /// Which row a click on screen line `line` landed on: rows start on the third line, after
-    /// the header and its rule.
+    /// Which session a click on screen line `line` landed on: the list starts on the third
+    /// line, after the header and its rule. A heading, a blank line or the fold is none.
     fn row_at(&self, line: u16) -> Option<usize> {
         let offset = usize::from(line).checked_sub(2)?;
-        if offset >= self.capacity() {
-            return None;
+        let items = render::layout(&self.rows);
+        let (shown, _) = render::window(&items, self.scroll, self.capacity());
+        match items[shown].get(offset) {
+            Some(Item::Row(i)) => Some(*i),
+            _ => None,
         }
-        let index = self.scroll + offset;
-        (index < self.rows.len()).then_some(index)
     }
 
     fn answer(&mut self, ask: Ask, key: Key) -> Action {
@@ -333,11 +352,13 @@ impl Menu {
             m.ask = None;
             Action::Redraw
         };
+        // `replace_rows` drops a dialog whose row has gone, so these find their rows.
+        let at = |m: &Menu, k: &RowKey| m.index_of(k).unwrap_or(m.cursor);
         match (ask, key) {
             (_, Key::Resize) => Action::Redraw,
-            (Ask::Close { index }, Key::Char('y')) => {
+            (Ask::Close { key }, Key::Char('y')) => {
                 self.ask = None;
-                Action::Close(index)
+                Action::Close(at(self, &key))
             }
             (Ask::Close { .. }, Key::Char('n') | Key::Esc) => dismiss(self),
             (
@@ -348,14 +369,17 @@ impl Menu {
                 Key::Char('y'),
             ) => {
                 self.ask = None;
-                Action::OffloadThenOpen { victim, then }
+                Action::OffloadThenOpen {
+                    victim: at(self, &victim),
+                    then: then.map(|k| at(self, &k)),
+                }
             }
             (Ask::NoRoom { .. }, Key::Char('n') | Key::Esc) => dismiss(self),
-            (Ask::ResumeFailed { index }, Key::Char('r')) => {
+            (Ask::ResumeFailed { key }, Key::Char('r')) => {
                 self.ask = None;
-                Action::Open(index)
+                Action::Open(at(self, &key))
             }
-            (Ask::ResumeFailed { index }, Key::Char('c')) => self.ask_close(index),
+            (Ask::ResumeFailed { key }, Key::Char('c')) => self.ask_close(at(self, &key)),
             (Ask::ResumeFailed { .. }, Key::Esc) => dismiss(self),
             _ => Action::None,
         }
@@ -378,7 +402,7 @@ pub fn gather(now: Millis) -> Vec<Row> {
     // ran in a slot can be resumed from the menu after it was closed.
     let mut slots: Vec<(&SlotRecord, Row)> = recs
         .iter()
-        .map(|r| (r, slot_row(r, now, clock, &sockets)))
+        .map(|r| (r, slot_row(r, clock, &sockets)))
         // A slot that is not running and has no conversation on disk is nothing to open:
         // closed or offloaded before its first prompt, it has a session id and no
         // transcript, and `Enter` on it would fail at once (issue #5). Not listed.
@@ -400,11 +424,11 @@ pub fn gather(now: Millis) -> Vec<Row> {
         rows.push(Row {
             key: RowKey::Socket(sock.name.clone()),
             wants_you: false,
+            // Nothing says what a session with no hooks is doing; it is listed as Idle.
+            busy: false,
             unread: false,
-            timer: false,
             attached: sock.attached_bit,
             offloaded: false,
-            unregistered: true,
             closed: false,
             title: sock.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
@@ -413,21 +437,20 @@ pub fn gather(now: Millis) -> Vec<Row> {
     rows
 }
 
-fn slot_row(r: &SlotRecord, now: Millis, clock: Millis, sockets: &[abduco::Socket]) -> Row {
+fn slot_row(r: &SlotRecord, clock: Millis, sockets: &[abduco::Socket]) -> Row {
     let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
     let attached = alive && sockets.iter().any(|s| s.name == r.slot && s.attached_bit);
     Row {
         key: RowKey::Slot(r.slot.clone()),
         wants_you: r.needs_you,
+        busy: r.busy,
         unread: r.unread(),
-        timer: r.has_pending_timer(now),
         attached,
         // A record whose process has gone is resumable whatever its state says — reconcile
         // has not caught up yet. One with no pid at all is a slot just started, waiting for
         // its SessionStart, and is not.
         offloaded: matches!(r.state, State::Offloaded | State::Offloading)
             || (r.state == State::Live && r.pid.is_some() && !alive),
-        unregistered: !r.registered,
         closed: r.state == State::Closed,
         // What Claude Code's own session selector shows (`transcript.rs`), not the live
         // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1).
@@ -469,10 +492,9 @@ mod tests {
             key: RowKey::Slot(name.into()),
             wants_you: false,
             unread: false,
-            timer: false,
+            busy: false,
             attached: false,
             offloaded: false,
-            unregistered: false,
             closed: false,
             title: name.into(),
             age: "1m".into(),
@@ -495,16 +517,40 @@ mod tests {
     }
 
     #[test]
-    fn the_first_reading_sorts_wants_you_then_unread_then_recency() {
+    fn the_first_reading_groups_and_puts_unread_first_in_idle() {
         let mut a = row("a");
         let mut b = row("b");
         b.unread = true;
         let c = row("c");
         let mut d = row("d");
         d.wants_you = true;
-        // Gathered most-recent first: a, b, c, d.
-        let m = menu(vec![a.clone(), b.clone(), c, d.clone()]);
-        assert_eq!(names(&m), ["d", "b", "a", "c"]);
+        let mut e = row("e");
+        e.busy = true;
+        e.unread = true;
+        let mut f = row("f");
+        f.offloaded = true;
+        // Gathered most-recent first.
+        let m = menu(vec![
+            f.clone(),
+            a.clone(),
+            e.clone(),
+            b.clone(),
+            c,
+            d.clone(),
+        ]);
+        assert_eq!(names(&m), ["d", "e", "b", "a", "c", "f"]);
+        let groups: Vec<Group> = m.rows().iter().map(Row::group).collect();
+        assert_eq!(
+            groups,
+            [
+                Group::NeedsYou,
+                Group::Working,
+                Group::Idle,
+                Group::Idle,
+                Group::Idle,
+                Group::Offloaded
+            ]
+        );
         // Calibration: with nothing flagged the recency order is untouched.
         a.unread = false;
         b.unread = false;
@@ -532,12 +578,15 @@ mod tests {
             None,
             "nothing to ask: it is already closed"
         );
-        assert_eq!(m.view().status.as_deref(), Some("3 is already closed"));
+        assert_eq!(
+            m.view().status.as_deref(),
+            Some("that session is already closed")
+        );
         assert_eq!(m.key(Key::Enter), Action::Open(2), "Enter resumes it");
     }
 
     #[test]
-    fn later_readings_keep_places_and_add_new_rows_at_the_bottom() {
+    fn later_readings_keep_places_and_add_new_rows_at_the_top_of_their_group() {
         let mut two = row("two");
         two.unread = true;
         let mut m = menu(vec![row("one"), two.clone(), row("three")]);
@@ -545,12 +594,55 @@ mod tests {
         // Mockup 6: back from "two", it is no longer unread and is the most recent — and it
         // stays where it was.
         two.unread = false;
-        m.replace_rows(vec![two, row("four"), row("one")], false);
+        m.replace_rows(vec![two, row("one"), row("four")], false);
         assert_eq!(
             names(&m),
-            ["two", "one", "four"],
-            "three went, four joined at the bottom, nothing moved"
+            ["four", "two", "one"],
+            "three went, four joined at the top of Idle, nothing else moved"
         );
+    }
+
+    #[test]
+    fn a_row_that_changes_group_joins_the_top_of_its_new_group_and_the_cursor_follows() {
+        let mut busy = row("busy");
+        busy.busy = true;
+        let mut m = menu(vec![busy.clone(), row("a"), row("b"), row("c")]);
+        assert_eq!(names(&m), ["busy", "a", "b", "c"]);
+        m.key(Key::End);
+        assert_eq!(m.rows()[m.view().cursor].title, "c");
+        // "c" starts a turn and "busy" finishes one.
+        let mut c = row("c");
+        c.busy = true;
+        m.replace_rows(vec![row("busy"), row("a"), row("b"), c], false);
+        assert_eq!(names(&m), ["c", "busy", "a", "b"]);
+        assert_eq!(
+            m.rows()[m.view().cursor].title,
+            "c",
+            "the cursor went with it"
+        );
+        // Calibration: the same reading with nothing changing group moves nothing.
+        let before = names(&m);
+        let same = m.rows().to_vec();
+        m.replace_rows(same, false);
+        assert_eq!(names(&m), before);
+    }
+
+    #[test]
+    fn a_dialog_follows_its_row_through_a_regroup() {
+        let mut m = menu(vec![row("a"), row("b")]);
+        m.key(Key::Down);
+        m.key(Key::Char('c'));
+        // "a" starts a turn and moves above "b" into Working: the question is still about b.
+        let mut a = row("a");
+        a.busy = true;
+        m.replace_rows(vec![a, row("b")], false);
+        assert_eq!(names(&m), ["a", "b"]);
+        assert_eq!(m.view().about, Some(1));
+        assert_eq!(m.key(Key::Char('y')), Action::Close(1));
+        // And a dialog about a row that has gone goes with it.
+        m.key(Key::Char('c'));
+        m.replace_rows(vec![row("a")], false);
+        assert_eq!(m.view().dialog, None);
     }
 
     #[test]
@@ -576,22 +668,75 @@ mod tests {
     }
 
     #[test]
-    fn a_click_on_a_row_moves_the_cursor_there() {
-        let mut m = menu(vec![row("a"), row("b"), row("c")]);
-        // Line 0 is the header, line 1 its rule, rows from line 2.
-        assert_eq!(m.key(Key::Click { row: 4, col: 10 }), Action::Redraw);
-        assert_eq!(m.view().cursor, 2);
-        assert_eq!(
-            m.key(Key::Click { row: 0, col: 3 }),
-            Action::None,
-            "the header"
-        );
-        assert_eq!(
-            m.key(Key::Click { row: 9, col: 3 }),
-            Action::None,
-            "below the last row"
-        );
-        assert_eq!(m.view().cursor, 2);
+    fn a_click_on_a_row_moves_the_cursor_there_and_anywhere_else_does_nothing() {
+        let mut w = row("w");
+        w.wants_you = true;
+        let mut m = menu(vec![w, row("a"), row("b")]);
+        // Header, rule, then: Needs you, w, blank, Idle, a, b.
+        assert_eq!(m.key(Key::Click { row: 7, col: 10 }), Action::Redraw);
+        assert_eq!(m.rows()[m.view().cursor].title, "b");
+        for (line, what) in [
+            (0, "the header"),
+            (2, "a heading"),
+            (4, "a blank"),
+            (5, "a heading"),
+            (9, "below the list"),
+        ] {
+            assert_eq!(
+                m.key(Key::Click { row: line, col: 3 }),
+                Action::None,
+                "{what}"
+            );
+        }
+        assert_eq!(m.rows()[m.view().cursor].title, "b");
+        // Calibration: a click on the first session does move it.
+        assert_eq!(m.key(Key::Click { row: 3, col: 0 }), Action::Redraw);
+        assert_eq!(m.view().cursor, 0);
+    }
+
+    #[test]
+    fn the_cursor_only_ever_lands_on_a_session() {
+        // Every group, a short terminal so the list scrolls and folds, and every key that
+        // moves the cursor, many times over: the cursor's line is always a session's.
+        let mut rows = Vec::new();
+        for (i, flag) in ["!", "b", "", "*", "z", "x", "x", "x", "x", "x"]
+            .iter()
+            .enumerate()
+        {
+            let mut r = row(&format!("r{i}"));
+            r.wants_you = *flag == "!";
+            r.busy = *flag == "b";
+            r.unread = *flag == "*";
+            r.offloaded = *flag == "z";
+            r.closed = *flag == "x";
+            rows.push(r);
+        }
+        let mut m = Menu::new(40, 12, header(), "/w".into(), rows);
+        let keys = [
+            Key::Down,
+            Key::Down,
+            Key::PageDown,
+            Key::End,
+            Key::Up,
+            Key::PageUp,
+            Key::Home,
+            Key::WheelDown,
+            Key::Down,
+        ];
+        for _ in 0..5 {
+            for k in keys {
+                m.key(k);
+                let v = m.view();
+                let items = render::layout(&v.rows);
+                let (shown, _) = render::window(&items, v.scroll, m.capacity());
+                let on = items[shown].contains(&Item::Row(v.cursor));
+                assert!(
+                    on,
+                    "after {k:?} the cursor {} is not a session on screen",
+                    v.cursor
+                );
+            }
+        }
     }
 
     #[test]
@@ -645,14 +790,13 @@ mod tests {
         let mut m = menu(vec![row("a"), row("b")]);
         m.key(Key::Down);
         assert_eq!(m.key(Key::Char('c')), Action::Redraw);
-        assert!(matches!(
+        assert_eq!(
             m.view().dialog,
             Some(Dialog::Close {
-                row: 2,
+                title: "b".into(),
                 running: true,
-                ..
             })
-        ));
+        );
         assert_eq!(m.key(Key::Enter), Action::None, "only y or n answer it");
         assert_eq!(m.key(Key::Char('n')), Action::Redraw);
         assert_eq!(m.view().dialog, None, "n keeps it");
@@ -680,13 +824,13 @@ mod tests {
             used: 1,
             limit: 2,
             want: 1,
-            offer: Some((2, "2d".into(), "b".into())),
+            offer: Some((1, "2d".into(), "b".into())),
         };
         m.ask_no_room(dialog.clone(), Some(2));
         assert_eq!(
-            m.view().scroll,
-            1,
-            "the two rows above the dialog start at the one it offers"
+            m.view().about,
+            Some(1),
+            "the dialog shows the session it offers"
         );
         assert_eq!(
             m.key(Key::Char('y')),
@@ -714,19 +858,17 @@ mod tests {
     fn a_failed_resume_offers_retry_close_and_back() {
         let mut m = menu(vec![row("a"), row("b")]);
         let failed = Dialog::ResumeFailed {
-            row: 2,
+            title: "b".into(),
             session: "0f9c4a1e".into(),
             status: 1,
             output: vec![],
+            closed: false,
         };
         m.ask_resume_failed(failed.clone(), 1);
         assert_eq!(m.key(Key::Char('r')), Action::Open(1));
         m.ask_resume_failed(failed.clone(), 1);
         assert_eq!(m.key(Key::Char('c')), Action::Redraw);
-        assert!(matches!(
-            m.view().dialog,
-            Some(Dialog::Close { row: 2, .. })
-        ));
+        assert!(matches!(m.view().dialog, Some(Dialog::Close { ref title, .. }) if title == "b"));
         m.key(Key::Esc);
         m.ask_resume_failed(failed, 1);
         assert_eq!(m.key(Key::Esc), Action::Redraw);
@@ -736,7 +878,7 @@ mod tests {
     #[test]
     fn a_status_line_goes_with_the_next_key() {
         let mut m = menu(vec![row("a")]);
-        m.set_status(Some("detached from 1 · it is still running".into()));
+        m.set_status(Some("detached · it is still running".into()));
         assert!(m.view().status.is_some());
         assert_eq!(
             m.key(Key::Up),
@@ -757,11 +899,10 @@ mod tests {
         }
         let v = m.view();
         assert_eq!(v.cursor, 7);
-        assert!(
-            v.scroll <= 7 && 7 < v.scroll + 5,
-            "cursor 7 not within scroll {}",
-            v.scroll
-        );
+        // Line 0 of the list is the Idle heading, so session 7 is on line 8.
+        let items = render::layout(&v.rows);
+        let (shown, _) = render::window(&items, v.scroll, 5);
+        assert!(shown.contains(&8), "cursor 7 not within {shown:?}");
         m.key(Key::Home);
         assert_eq!(m.view().scroll, 0);
     }

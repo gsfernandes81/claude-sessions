@@ -3,19 +3,34 @@
 The 40-column set in [`mockups.md`](mockups.md) is the one that counts; this is the same
 eight screens drawn at 80 so the desktop case is on the record. Both are generated to
 width, not typed. What 80 columns changes is nothing structural: the title field grows from
-29 to 69 characters, the hint line fits on one line instead of two, and the dialogs — which
-are their content's width, centred — sit inset rather than filling the terminal.
+35 to 75 characters, the hint line fits on one line instead of two — so the list has a line
+more, and the fold one session less — and the dialogs, which are their content's width,
+centred, sit inset rather than filling the terminal.
 
-### Mockup 1 — The list, every mark mixed
+### Mockup 1 — The list, in its groups
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-1 !   permission: write hosts/one                                             2m
-2 *   retire the old tunnel                                                  14m
-3 *t  loop: watch the base build                                             31m
-4 @   immich upgrade                                                         now
-5 z   mount guards on one                                                     2d
-6 u   claude                                                                  5h
+Needs you
+permission: write hosts/one                                                   2m
+
+Working
+loop: watch the base build                                                   now
+
+Idle
+retire the old tunnel                                                        14m
+immich upgrade                                                                3m
+claude                                                                        5h
+
+Offloaded
+mount guards on one                                                           2d
+
+Closed
+fix the dns records                                                           3d
+tunnel cutover notes                                                          4d
+bcache register script                                                        5d
+syncthing share rename                                                        6d
+… 3 more
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
@@ -34,14 +49,14 @@ infra-dev · nothing open · 812M of 1.0G
 n new   ? keys   s shell
 ```
 
-### Mockup 3 — Closing a live slot
+### Mockup 3 — Closing a live session
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-1 !   permission: write hosts/one                                             2m
-2 *   retire the old tunnel                                                  14m
+Idle
+retire the old tunnel                                                        14m
                     ╭──────────────────────────────────────╮
-                    │ Close slot 2?                        │
+                    │ Close this session?                  │
                     │   retire the old tunnel              │
                     │                                      │
                     │ Running. Stops the process, not the  │
@@ -55,16 +70,16 @@ infra-dev · 6 open · 812M of 1.0G
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-5 z   mount guards on one                                                     2d
-6 u   claude                                                                  5h
+Idle
+retire the old tunnel                                                        14m
                     ╭──────────────────────────────────────╮
                     │ No room for another claude           │
                     │                                      │
                     │ 892M of 1.0G used. A new one wants   │
                     │ about 250M.                          │
                     │                                      │
-                    │ Offload slot 5, idle 2d?             │
-                    │   mount guards on one                │
+                    │ Offload this session, idle 14m?      │
+                    │   retire the old tunnel              │
                     │   resumable from disk                │
                     │                                      │
                     │ y offload, then open    n cancel     │
@@ -75,10 +90,11 @@ infra-dev · 6 open · 892M of 1.0G
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-5 z   mount guards on one                                                     2d
-6 u   claude                                                                  5h
+Offloaded
+mount guards on one                                                           2d
                     ╭──────────────────────────────────────╮
-                    │ Slot 5 did not resume                │
+                    │ This session did not resume          │
+                    │   mount guards on one                │
                     │                                      │
                     │ claude --resume 0f9c4a1e exited 1    │
                     │   No conversation found with that    │
@@ -91,40 +107,51 @@ infra-dev · 6 open · 812M of 1.0G
                     ╰──────────────────────────────────────╯
 ```
 
-### Mockup 6 — Back from a slot, after detaching
+### Mockup 6 — Back from a session, after detaching
 ```
 infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-1 !   permission: write hosts/one                                             2m
-2     retire the old tunnel                                                  now
-3 *t  loop: watch the base build                                             31m
-4 @   immich upgrade                                                         12m
-5 z   mount guards on one                                                     2d
-6 u   claude                                                                  5h
+Needs you
+permission: write hosts/one                                                   2m
+
+Working
+loop: watch the base build                                                   now
+
+Idle
+retire the old tunnel                                                        now
+immich upgrade                                                               12m
+claude                                                                        5h
+
+Offloaded
+mount guards on one                                                           2d
+
+Closed
+fix the dns records                                                           3d
+tunnel cutover notes                                                          4d
+bcache register script                                                        5d
+… 4 more
 ────────────────────────────────────────────────────────────────────────────────
-detached from 2 · it is still running
+detached · it is still running
 Enter open   n new   c close   ? keys   s shell
 ```
 
 ### Mockup 7 — The keys, on ?
 ```
-infra-dev · keys and marks
+infra-dev · keys
 ────────────────────────────────────────────────────────────────────────────────
-Enter  open the row (resume if z)
+Enter  open the session; resumes it
+       if offloaded or closed
 n      new session in /workspace
-c      close the row
+c      close the session
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
 
-!  wants you: a prompt is waiting
-*  unread: it finished while away
-t  a timer is pending; not
-   offloaded until it fires
-@  attached somewhere else too
-z  offloaded: Enter resumes it
-u  not started by claude-sessions
-x  closed: Enter resumes it
+Needs you  a prompt is waiting
+Working    claude is mid-turn
+Idle       at its prompt, waiting
+Offloaded  stopped to save memory
+Closed     ended; still resumable
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```

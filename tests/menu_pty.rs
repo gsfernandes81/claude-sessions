@@ -21,7 +21,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn record(slot: &str, title: &str, needs_you: bool, transcript: &std::path::Path) -> String {
+fn record(slot: &str, title: &str, transcript: &std::path::Path) -> String {
     // Two days and an hour old, so its age reads `2d` whichever minute the floored age clock
     // is in — exactly two days would read `1d` until the next minute turned, and redraw then,
     // legitimately. Offloaded, so no process is needed to make it read as anything — with a
@@ -30,7 +30,7 @@ fn record(slot: &str, title: &str, needs_you: bool, transcript: &std::path::Path
     let t = transcript.display();
     format!(
         r#"{{"slot":"{slot}","state":"offloaded","title":"{title}","session_id":"s-{slot}",
-            "cwd":"/workspace","transcript_path":"{t}","needs_you":{needs_you},
+            "cwd":"/workspace","transcript_path":"{t}","needs_you":false,
             "last_activity_ms":{at},"timers":[]}}"#
     )
 }
@@ -61,7 +61,7 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     std::fs::write(&transcript, "{}\n").unwrap();
     std::fs::write(
         reg.join("claude-1.json"),
-        record("claude-1", "retire the old tunnel", false, &transcript),
+        record("claude-1", "retire the old tunnel", &transcript),
     )
     .unwrap();
 
@@ -94,16 +94,16 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     );
 
     // Calibration 2: a registry change IS seen — the instrument is not deaf, and the poll
-    // that read nothing above was really looking.
+    // that read nothing above was really looking. Claude Code renames the conversation.
     std::fs::write(
         reg.join("claude-1.json"),
-        record("claude-1", "retire the old tunnel", true, &transcript),
+        record("claude-1", "retire the new tunnel", &transcript),
     )
     .unwrap();
-    let redraw = term.read_until(b"!", Duration::from_secs(6));
+    let redraw = term.read_until(b"new tunnel", Duration::from_secs(6));
     assert!(
-        String::from_utf8_lossy(&redraw).contains('!'),
-        "a slot that started wanting you was never redrawn: {:?}",
+        String::from_utf8_lossy(&redraw).contains("new tunnel"),
+        "a session that was renamed was never redrawn: {:?}",
         String::from_utf8_lossy(&redraw)
     );
 

@@ -159,7 +159,8 @@ is the choice and why:
   auto-compaction can come in the middle of a turn, and the docs do not say it cannot.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules, so
-  a `u` slot whose hooks did record those is offloadable and comes back as a registered one.
+  an unregistered slot whose hooks did record those is offloadable and comes back as a
+  registered one.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
   stopped; `judge` then makes it a close when the record's transcript — `transcript_path`, or
   for an older record the path derived under `CLAUDE_CONFIG_DIR` — is not a file. Every
@@ -171,9 +172,9 @@ is the choice and why:
   a close, and a stop that fails leaves the slot `live` for the next pass, where an offload
   leaves it `offloading`. Afterwards the record is `closed`, the line in `offload.log` says
   `closed … no conversation on disk to resume`, and the pass's summary counts it apart.
-- **The menu's make-room path still offloads** (`offload_quiet`, from `src/launch.rs`): it
-  asks `decide`, not `judge`, so a victim with no conversation is marked `offloaded`, a row
-  the menu does not list either way. `stop_quiet` takes the verdict for when it asks `judge`.
+- **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
+  offload, because the dialog promises it is resumable from disk; accepted, the stop is
+  `judge`'s again under the lock, so a transcript that went in between makes it a close.
 - **Not being able to look keeps it.** No abduco socket (attached cannot be ruled out), a
   `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
   is a reason to keep, because the offloader needs evidence to act, never to hold off.
@@ -214,11 +215,23 @@ is the choice and why:
 
 ## The menu
 
-- **Lists every slot** — live, offloaded and, at the bottom, closed — plus unregistered
-  `abduco` sessions. Order: wants you, then unread, then most recent activity; closed rows
-  last. Closed rows are marked `x`, are not counted as open in the header, and `Enter` resumes
-  one exactly as it resumes an offloaded one (owner, 2026-10-03: past conversations must be
-  reachable from the menu, and these are the ones that ran in a slot).
+- **Lists every slot** — live, offloaded and closed — plus unregistered `abduco` sessions,
+  **grouped by state** (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`,
+  `Closed`, each under its heading, an empty group not drawn, one blank line between groups.
+  A row's group is the first that fits: closed, offloaded, a prompt waiting, mid-turn, else
+  idle; an unregistered session, which nothing describes, is idle. Within a group, most recent
+  activity first, except Idle, where unread rows come first. A row is its title and its age —
+  **no marks and no numbers**: an unread title is bold, a session attached somewhere else is
+  drawn dim, and amber is the Needs-you heading. Closed rows are not counted as open in the
+  header, and `Enter` resumes one exactly as it resumes an offloaded one (owner, 2026-10-03:
+  past conversations must be reachable from the menu, and these are the ones that ran in a
+  slot).
+- **A stopped slot is listed only with a conversation on disk** — its `transcript_path`, or
+  for a record older than 0.3.3 the path Claude Code keeps it at under `CLAUDE_CONFIG_DIR`.
+  Claude Code writes a transcript at a conversation's first prompt, so a slot stopped before
+  one has a session id and nothing to resume, and `Enter` on it would fail at once (issue #5).
+  The resume path refuses such a slot too, for one whose transcript went after the list was
+  read.
 - **Opening a row:** live → `abduco -a`; offloaded → start a new slot running
   `claude --resume <session_id>` in its `cwd`. `abduco` runs as a **child**, so on detach the
   menu comes back rather than the login ending — a fresh login costs a Cloudflare Access
@@ -229,8 +242,8 @@ is the choice and why:
 
 Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco` and `claude`.
 
-- **A resume keeps the slot's name and row.** The record is reused — same title, same place in
-  the list — and marked registered, so a `u` slot comes back as one of ours.
+- **A resume keeps the slot's name.** The record is reused — same title — and marked
+  registered, so an unregistered slot comes back as one of ours.
 - **Deciding happens under the slot's lock; running happens after it.** Under the lock the
   record is re-read, the conversation is checked not to be running anywhere — Claude Code's
   own live-session files and every other record — and the record is marked live with its pid
@@ -241,13 +254,14 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   refused for 30 s otherwise, and after that treated as a start that died and is resumable —
   so a menu killed mid-start cannot strand a slot.
 - **A failed resume** is a start that ends within 10 s without a `SessionStart` binding it: the
-  record goes back to offloaded and mockup 5 shows the last lines of the captured stderr,
-  control characters removed. A start into a `cwd` that no longer exists is refused before it
+  record goes back to offloaded or closed, whichever it was, and mockup 5 shows the last lines
+  of the captured stderr, control characters removed — or says it wrote nothing to stderr,
+  rather than leaving a gap that reads as a lost reason. A start into a `cwd` that no longer exists is refused before it
   runs, and a leftover socket of the same name is refused with a pointer to `reconcile`.
 - **New slots take the lowest free `claude-<n>`** under a registry-wide lock with a timeout,
   writing the record before the lock goes. A closed slot's name is never reused: its record
   is what its row is drawn from, and a new slot under the name would overwrite it. A new slot
-  that dies before binding is marked closed and reported by name, since it has no row yet.
+  that dies before binding is marked closed and reported, since it has no row yet.
 - **Room is checked once.** After offloading to make room, the open goes ahead without asking
   the cgroup again: its figure includes page cache that is not freed at once, and a second
   check could refuse the room just made.
@@ -265,7 +279,11 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 - **Wording the mockups did not draw**, written in their voice and the owner's to change:
   closing an offloaded slot says "Offloaded. Hides the row, not the conversation — claude
   --resume still finds it."; no room with nothing offloadable says "Nothing can be offloaded
-  right now. Close a slot to make room." with only `Esc back`.
+  right now. Close a session to make room." with only `Esc back`; a failed resume of a closed
+  row says "Left closed." where mockup 5 says "Left offloaded.".
+- **Nothing on the screen is numbered, so messages name a session by its title**, quoted and
+  cut to 24 characters: `"retire the old tunnel" ran in /gone, which is gone …`. Mockup 6's
+  `detached · it is still running` names none, because the cursor is still on it.
 - **Nothing is ever resumed automatically.** Memory is spent on what the owner opens, in the
   order they open it. `Enter` on an offloaded row resumes immediately with no confirmation
   (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
@@ -275,22 +293,30 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
 - **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys or the
-  mouse; `Enter` opens the highlighted row, and `c` closes it. The mockups draw no
+  mouse; `Enter` opens the highlighted row, and `c` closes it. **It only ever selects a
+  session** (owner, 2026-10-03): it is an index into the rows, never a screen line, so the
+  arrows step over headings and blank lines, and a click on a heading, a blank line or the
+  fold does nothing. The mockups draw no
   highlight because they are plain text — the highlight is reverse video, which a monochrome
   terminal shows too. Mouse input is **click reporting only** (`?1000` with SGR `?1006`),
   never motion (`?1003`): motion reports would put bytes on the metered link every time a
   pointer crossed the window, which is the idle traffic the menu exists not to make.
-- **Rows keep their places while the menu is open.** The order above is taken once, at
-  start; afterwards a row stays where it is and a new one joins at the bottom, so nothing
-  moves under the cursor. Mockup 6 is the evidence — back from slot 2, row 2 is no longer
-  unread and is the most recent, and is still second.
+- **Rows keep their places within their group while the menu is open.** The order above is
+  taken once, at start; afterwards a row that stays in its group stays where it is, and a row
+  that is new or has changed group joins the top of its group — it has moved anyway, and the
+  top is where the eye looks for what changed. The cursor goes with its row. Mockup 6 is the
+  evidence for staying put — back from a session, it is no longer unread and is the most
+  recent, and is still where it was.
+- **What does not fit folds into `… N more`**, on the list's last line, counting the sessions
+  below it. Closed is last, so it is what folds first. The list scrolls to keep the cursor's
+  session above the fold, and scrolling up to a group's first session brings its heading.
 - **Ages tick together, once a minute.** They are measured from a clock floored to the
   minute, so rows that went idle at different seconds roll over in the same redraw rather
   than one redraw each.
-- **A dialog draws two rows above itself**, as all three dialog mockups do: the row the
-  question is about and the one after it (mockups 4 and 5), or the last two when it is the
-  last row. Mockup 3 shows the row before instead; two of three agree, and the rule has to be
-  one rule.
+- **A dialog draws the session it is about above itself, under its group's heading**, and
+  names it by title in the box (mockups 3 to 5). A reading taken while the question is up
+  cannot redirect it: the dialog remembers its session, not a position, and goes if the
+  session does.
 - **The footer sits at the bottom of the terminal** (owner, 2026-10-03): the closing rule,
   status and hints take its last lines, blank between them and the list; the mockups show
   them straight after the content only because they are drawn shorter than a terminal.
@@ -304,12 +330,12 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 closed. **`/clear` does not**: it starts a new conversation in the same process, which is
 right for *same session, new task* and wrong for *done*. `c` in the menu closes without
 opening, for something offloaded last week. Stale slots are never closed automatically; they
-sort to the bottom. The one close the offloader makes is of an idle slot with no
+sit in their group. The one close the offloader makes is of an idle slot with no
 conversation on disk, which has nothing to offload (*The offloader*).
 
 **Closing is not destructive and the dialog says so.** What a close stops is the process; the
 conversation stays on disk, and the closed row stays in the list, at the bottom, to resume it
-from. The difference between close and offload is where the row sorts and that the offloader
+from. The difference between close and offload is the group the row is in and that the offloader
 never stops a slot on its own initiative to close it — except one with no conversation to
 offload, whose row would not be listed either way.
 
@@ -355,7 +381,7 @@ source of truth.
 
 Until every client is reconfigured, `ssh <container>` still runs `abduco -A claude claude`,
 and so does `make claude` in several repos. The menu lists **`abduco`'s sessions ∪ the
-registry**, marking the ones it did not start with `u`. They cannot be named — there is no
+registry**, under Idle, since nothing reports what they are doing. They cannot be named — there is no
 session id to map to a transcript, so all there is to show is the `abduco` session name.
 Matching `cwd` and start time against transcripts would work and is guesswork; it is worth
 building only if those rows turn out to persist.

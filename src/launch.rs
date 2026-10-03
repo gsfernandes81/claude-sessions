@@ -141,7 +141,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
     let Some(row) = rows.get(index) else {
         return no_row(index);
     };
-    let n = index + 1;
+    let n = label(row);
     let slot = match &row.key {
         RowKey::Slot(slot) => slot,
         // An abduco session with no record has no pid and start time on file, and a process
@@ -154,7 +154,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
             ));
         }
     };
-    let _lock = match lock_slot(slot, &n.to_string()) {
+    let _lock = match lock_slot(slot, &n) {
         Ok(l) => l,
         Err(why) => return Outcome::Refused(why),
     };
@@ -174,8 +174,8 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
                 let server = offload::abduco_server(table.as_deref(), pid);
                 if let Err(e) = offload::stop(pid, start, offload::TERM_GRACE, offload::KILL_GRACE)
                 {
-                    // Not marked closed: a closed slot is never listed, and a claude still
-                    // running behind a row nobody can see is the one outcome worse than this.
+                    // Not marked closed: a claude still running behind a row that says it
+                    // has ended is the one outcome worse than this.
                     return Outcome::Refused(format!("could not stop {n}: {e}"));
                 }
                 offload::teardown_abduco(slot, server);
@@ -197,10 +197,10 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
     if let Err(e) = registry::store(&rec) {
         return Outcome::Refused(format!("{n}: {e}"));
     }
-    Outcome::Back(Some(if rec.session_id.is_some() {
-        format!("closed {n} · resumable from disk")
+    Outcome::Back(Some(if rec.has_conversation() {
+        "closed · resumable from disk".to_string()
     } else {
-        format!("closed {n}")
+        "closed".to_string()
     }))
 }
 
@@ -216,7 +216,7 @@ pub(crate) fn open_with(
     let Some(row) = rows.get(index) else {
         return no_row(index);
     };
-    let n = (index + 1).to_string();
+    let n = label(row);
     let slot = match &row.key {
         RowKey::Socket(name) => return attach_socket(name, &n, term, deps),
         RowKey::Slot(slot) => slot,
@@ -280,16 +280,28 @@ fn starting(n: &str) -> String {
     format!("{n} is being started somewhere else — try again in a moment")
 }
 
-fn no_row(index: usize) -> Outcome {
-    Outcome::Refused(format!("there is no row {}", index + 1))
+fn no_row(_index: usize) -> Outcome {
+    Outcome::Refused("that session is no longer listed".to_string())
 }
 
-/// A row's number as drawn, or the slot's name when it is not on the list — a new slot, or
-/// the one a resume found its conversation already running in.
+/// How a message names a session: its title as the list draws it, quoted, and cut short
+/// enough to leave the message room on a phone. Nothing on the screen is numbered (owner,
+/// 2026-10-03).
+fn label(row: &Row) -> String {
+    const MOST: usize = 24;
+    let mut t: String = row.title.chars().take(MOST).collect();
+    if row.title.chars().count() > MOST {
+        t.push_str("...");
+    }
+    format!("\"{t}\"")
+}
+
+/// A row's label, or the slot's name when it is not on the list — a new slot, or the one a
+/// resume found its conversation already running in.
 fn label_of(rows: &[Row], slot: &str) -> String {
     rows.iter()
-        .position(|r| matches!(&r.key, RowKey::Slot(s) if s == slot))
-        .map(|i| (i + 1).to_string())
+        .find(|r| matches!(&r.key, RowKey::Slot(s) if s == slot))
+        .map(label)
         .unwrap_or_else(|| slot.to_string())
 }
 
@@ -303,7 +315,7 @@ fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -
         return Outcome::Refused(why);
     }
     match settle(slot, None, false) {
-        After::Running => detached(&n),
+        After::Running => detached(),
         After::Ended | After::DiedUnbound => ended(&n),
     }
 }
@@ -317,14 +329,15 @@ fn attach_socket(name: &str, n: &str, term: &mut dyn Terminal, deps: &Deps) -> O
         return Outcome::Refused(why);
     }
     if abduco::socket_for(name).is_some() {
-        detached(n)
+        detached()
     } else {
         ended(n)
     }
 }
 
-fn detached(n: &str) -> Outcome {
-    Outcome::Back(Some(format!("detached from {n} · it is still running")))
+/// Mockup 6. The cursor is still on the session, so the line need not say which.
+fn detached() -> Outcome {
+    Outcome::Back(Some("detached · it is still running".to_string()))
 }
 
 fn ended(n: &str) -> Outcome {
@@ -358,6 +371,10 @@ fn resume(
             return no_room;
         }
     }
+    let title = rows
+        .iter()
+        .find(|r| matches!(&r.key, RowKey::Slot(s) if s == slot))
+        .map_or(slot, |r| r.title.as_str());
     let (session, cwd, back_to) = match plan_resume(slot, n) {
         Plan::Start {
             session,
@@ -376,16 +393,17 @@ fn resume(
         }
     };
     match settle(slot, Some(back_to), took < deps.quick) {
-        After::Running => detached(n),
+        After::Running => detached(),
         After::Ended => ended(n),
         // Gone with no SessionStart: claude never got as far as running the conversation.
         // A slow death still means it ran unbound — hooks missing — and ended; only a quick
         // one is the failure mockup 5 describes. Either way the record is offloaded again.
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
-            row: n.parse().unwrap_or(0),
+            title: title.to_string(),
             session: session.chars().take(8).collect(),
             status: exit_code(status),
             output: stderr_tail(&stderr_path(slot), STDERR_LINES),
+            closed: back_to == State::Closed,
         }),
         After::DiedUnbound => ended(n),
     }
@@ -429,6 +447,16 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
             "{n} has no conversation recorded to resume — close it instead"
         ));
     };
+    // A session id is written at SessionStart, the transcript only at the first prompt: a slot
+    // stopped before it was ever prompted has the one and not the other, and `--resume` on it
+    // fails at once (issue #5). The menu does not list such a slot; this is for one that lost
+    // its transcript, or a reading older than the list.
+    if !rec.has_conversation() {
+        return Plan::Refuse(format!(
+            "{n} has no conversation on disk to resume — it was never prompted, or its \
+             transcript is gone; close it instead"
+        ));
+    }
     if !Path::new(&cwd).is_dir() {
         return Plan::Refuse(format!(
             "{n} ran in {cwd}, which is gone — claude finds a conversation by the directory it \
@@ -565,8 +593,8 @@ pub(crate) fn new_session_with(
     // A new slot that dies unbound is closed rather than offloaded: it never had a
     // conversation, so there is nothing for a row to bring back.
     match settle(&slot, Some(State::Closed), took < deps.quick) {
-        After::Running => detached(&slot),
-        After::Ended => ended(&slot),
+        After::Running => detached(),
+        After::Ended => ended("the new session"),
         After::DiedUnbound if took < deps.quick => {
             let said = stderr_tail(&stderr_path(&slot), 1);
             Outcome::Refused(format!(
@@ -637,7 +665,7 @@ pub(crate) fn offload_then_open_with(
     let Some(row) = rows.get(victim) else {
         return no_row(victim);
     };
-    let n = (victim + 1).to_string();
+    let n = label(row);
     let RowKey::Slot(slot) = &row.key else {
         return Outcome::Refused(format!("{n} was not started here and cannot be offloaded"));
     };
@@ -655,14 +683,16 @@ pub(crate) fn offload_then_open_with(
         // may have taken a while to answer. The offloader's own rule, asked again under the
         // lock, is the only thing that may stop a slot.
         let table = procinfo::table();
-        let idle = match offload::decide(&rec, clock::now(), &offload::look(&rec, table.as_deref()))
-        {
-            Ok(idle) => idle,
+        let seen = offload::look(&rec, table.as_deref());
+        let verdict = match offload::judge(&rec, clock::now(), &seen) {
+            Ok(verdict) => verdict,
             Err(hold) => {
                 return Outcome::Refused(format!("{n} can no longer be offloaded: {hold}"));
             }
         };
-        match offload::offload_quiet(&mut rec, idle, table.as_deref()) {
+        // Offered only with a conversation on disk (`offer`); if that went in the meantime, a
+        // stop is a close, as the offloader's would be.
+        match offload::stop_quiet(&mut rec, verdict, table.as_deref()) {
             Ok(Ok(_)) => {}
             Ok(Err(why)) => return Outcome::Refused(why),
             Err(e) => return Outcome::Refused(format!("{n}: {e}")),
@@ -694,8 +724,10 @@ fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
     }))
 }
 
-/// The slot the offloader would stop that has been idle longest, as its row number, idle age
-/// and title as drawn. A suggestion only: accepting it decides again under the lock.
+/// The slot the offloader would offload that has been idle longest, as its index in the rows,
+/// idle age and title as drawn. A suggestion only: accepting it decides again under the lock.
+/// One the offloader would close instead — never prompted, nothing on disk — is not offered:
+/// the dialog promises the offered session is resumable from disk.
 fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
     let now = clock::now();
     let table = procinfo::table();
@@ -704,14 +736,17 @@ fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
         .iter()
         .filter(|r| matches!(r.state, State::Live | State::Offloading))
         .filter_map(|r| {
-            let idle = offload::decide(r, now, &offload::look(r, table.as_deref())).ok()?;
+            let verdict = offload::judge(r, now, &offload::look(r, table.as_deref())).ok()?;
+            let offload::Verdict::Offload { idle } = verdict else {
+                return None;
+            };
             let index = rows
                 .iter()
                 .position(|row| matches!(&row.key, RowKey::Slot(s) if *s == r.slot))?;
             Some((idle, index))
         })
         .max_by_key(|(idle, _)| *idle)
-        .map(|(idle, index)| (index + 1, fmt::age(idle), rows[index].title.clone()))
+        .map(|(idle, index)| (index, fmt::age(idle), rows[index].title.clone()))
 }
 
 // ── shell ───────────────────────────────────────────────────────────────────
@@ -1213,10 +1248,9 @@ exit 1"#,
             key: RowKey::Slot(slot.into()),
             wants_you: false,
             unread: false,
-            timer: false,
+            busy: false,
             attached: false,
             offloaded: false,
-            unregistered: false,
             closed: false,
             title: title.into(),
             age: "now".into(),
@@ -1232,18 +1266,28 @@ exit 1"#,
         r
     }
 
+    /// An offloaded slot with its conversation on disk: a transcript beside it in `cwd`.
     fn offloaded(slot: &str, session: &str, cwd: &str) -> SlotRecord {
         let mut r = SlotRecord::new(slot, clock::now() - 3_600_000);
         r.state = State::Offloaded;
         r.session_id = Some(session.into());
         r.cwd = Some(cwd.into());
+        let transcript = Path::new(cwd).join(format!("{session}.jsonl"));
+        if Path::new(cwd).is_dir() {
+            std::fs::write(&transcript, "{}\n").unwrap();
+        }
+        r.transcript_path = Some(transcript.display().to_string());
         r
     }
 
     /// An idle, detached slot the offloader would stop: stopped eleven minutes ago.
+    /// A live slot idle past the threshold, detached, with its conversation on disk.
     fn idle(f: &mut Fixture, slot: &str) -> (u32, u64) {
         let (pid, start) = f.process();
         let mut r = live(slot, pid, start);
+        let transcript = Path::new(&f.work()).join(format!("conv-of-{slot}.jsonl"));
+        std::fs::write(&transcript, "{}\n").unwrap();
+        r.transcript_path = Some(transcript.display().to_string());
         let stop = clock::now() - 11 * 60 * 1000;
         r.last_stop_ms = Some(stop);
         r.last_activity_ms = stop;
@@ -1287,7 +1331,7 @@ exit 1"#,
 
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         assert_eq!(f.calls(), ["abduco -a claude-1"]);
         term.assert_handed_over(1);
@@ -1311,7 +1355,7 @@ exit 1"#,
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
-        assert_eq!(out, Outcome::Back(Some("1 ended".into())));
+        assert_eq!(out, Outcome::Back(Some("\"a\" ended".into())));
         term.assert_handed_over(1);
     }
 
@@ -1326,7 +1370,7 @@ exit 1"#,
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         assert_eq!(f.calls(), ["abduco -a claude"]);
         term.assert_handed_over(1);
@@ -1345,7 +1389,7 @@ exit 1"#,
 
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         term.assert_handed_over(1);
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
@@ -1404,7 +1448,7 @@ exit 1"#,
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         assert_eq!(f.calls().len(), 1);
     }
@@ -1425,7 +1469,7 @@ exit 1"#,
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 2 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         assert_eq!(f.calls(), ["abduco -a claude-2"], "attached, not resumed");
         assert_eq!(load("claude-1").state, State::Offloaded);
@@ -1461,10 +1505,11 @@ exit 1"#,
         assert_eq!(
             out,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
-                row: 5,
+                title: "t".into(),
                 session: "0f9c4a1e".into(),
                 status: 1,
                 output: vec!["No conversation found with that session id".into()],
+                closed: false,
             })
         );
         term.assert_handed_over(1);
@@ -1498,7 +1543,7 @@ exit 1"#,
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from 1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         assert!(started.ends_with("--resume conv-1"), "got {started}");
@@ -1523,6 +1568,30 @@ exit 1"#,
     }
 
     #[test]
+    fn a_resume_with_no_conversation_on_disk_is_refused_before_anything_runs() {
+        // Issue #5: a session id with no transcript — never prompted, or the transcript is
+        // gone. `--resume` on it exits at once, so it is not tried.
+        let f = Fixture::new("resume-no-conversation");
+        let rec = offloaded("claude-1", "conv-1", &f.work());
+        std::fs::remove_file(rec.transcript_path.as_ref().unwrap()).unwrap();
+        registry::store(&rec).unwrap();
+        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert!(
+            matches!(&out, Outcome::Refused(why) if why.contains("no conversation on disk")),
+            "{out:?}"
+        );
+        term.assert_handed_over(0);
+        assert_eq!(load("claude-1").state, State::Offloaded, "left as it was");
+        // Calibration: with the transcript back, the same slot resumes.
+        std::fs::write(rec.transcript_path.as_ref().unwrap(), "{}\n").unwrap();
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert!(!matches!(out, Outcome::Refused(_)), "{out:?}");
+    }
+
+    #[test]
     fn a_resume_with_no_room_offers_the_idlest_offloadable_slot() {
         let mut f = Fixture::new("no-room");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
@@ -1538,7 +1607,7 @@ exit 1"#,
                 used: (1 << 30) - (100 << 20),
                 limit: 1 << 30,
                 want: mem::SESSION_COST,
-                offer: Some((2, "11m".into(), "mount guards on one".into())),
+                offer: Some((1, "11m".into(), "mount guards on one".into())),
             })
         );
         assert!(f.calls().is_empty() && term.events.is_empty());
@@ -1584,13 +1653,37 @@ exit 1"#,
         let out = offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from claude-2 · it is still running".into())),
+            Outcome::Back(Some("detached · it is still running".into())),
             "no second room check after making room"
         );
         assert!(!procinfo::is_alive(pid, start), "the victim was stopped");
         assert_eq!(load("claude-1").state, State::Offloaded);
         assert_eq!(load("claude-2").state, State::Live);
         term.assert_handed_over(1);
+    }
+
+    #[test]
+    fn a_never_prompted_slot_is_not_offered_and_one_whose_transcript_went_is_closed() {
+        // Issue #5: the dialog promises the offered session is resumable from disk.
+        let mut f = Fixture::new("make-room-unprompted");
+        let (pid, start) = idle(&mut f, "claude-1");
+        let rows = [row("claude-1", "a")];
+        assert!(
+            offer(&rows).is_some(),
+            "calibration: with a transcript it is offered"
+        );
+        let transcript = load("claude-1").transcript_path.unwrap();
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(offer(&rows), None, "with none it is not");
+
+        // Accepted all the same — the transcript went after the offer was drawn — the stop is
+        // a close, as the offloader's would be.
+        let mut deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        deps.memory = full;
+        let mut term = Term::new(&f);
+        offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
+        assert!(!procinfo::is_alive(pid, start), "the victim was stopped");
+        assert_eq!(load("claude-1").state, State::Closed);
     }
 
     // ── new ─────────────────────────────────────────────────────────────────
@@ -1663,7 +1756,7 @@ exit 1"#,
         let out = new_session_with(&[], &f.work(), &mut term, &deps, true);
         assert_eq!(
             out,
-            Outcome::Back(Some("detached from claude-1 · it is still running".into()))
+            Outcome::Back(Some("detached · it is still running".into()))
         );
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         let fields: Vec<&str> = started.split_whitespace().collect();
@@ -1705,6 +1798,9 @@ exit 1"#,
         rec.pid = Some(pid);
         rec.proc_start = Some(start);
         rec.session_id = Some("conv-1".into());
+        let transcript = Path::new(&f.work()).join("conv-1.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        rec.transcript_path = Some(transcript.display().to_string());
         registry::store(&rec).unwrap();
         assert!(procinfo::is_alive(pid, start), "calibration: it is running");
         assert!(abduco::socket_for("claude-1").is_some());
@@ -1713,7 +1809,7 @@ exit 1"#,
         let out = close(&rows, 0);
         assert_eq!(
             out,
-            Outcome::Back(Some("closed 1 · resumable from disk".into()))
+            Outcome::Back(Some("closed · resumable from disk".into()))
         );
         assert!(!procinfo::is_alive(pid, start), "the process is stopped");
         assert_eq!(load("claude-1").state, State::Closed);
@@ -1730,7 +1826,7 @@ exit 1"#,
         let mut rows = vec![row("claude-1", "a"), row("x", "claude")];
         assert_eq!(
             close(&rows, 0),
-            Outcome::Back(Some("closed 1 · resumable from disk".into()))
+            Outcome::Back(Some("closed · resumable from disk".into()))
         );
         assert_eq!(load("claude-1").state, State::Closed);
 

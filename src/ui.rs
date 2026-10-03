@@ -17,33 +17,85 @@
 pub enum RowKey {
     /// A slot with a registry record, ours or not (`registered` on the record says which).
     Slot(String),
-    /// An abduco session with no record at all — the `u` row of a session started before the
-    /// hooks were installed. All there is to show is its name.
+    /// An abduco session with no record at all — a session started before the hooks were
+    /// installed, listed under Idle. All there is to show is its name.
     Socket(String),
+}
+
+/// The groups the list is drawn in, top to bottom (owner, 2026-10-03). Every row is in
+/// exactly one, decided by [`Row::group`]; an empty group is not drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    /// A prompt is waiting. The only heading drawn in amber.
+    NeedsYou,
+    /// Claude is mid-turn.
+    Working,
+    /// At its prompt, waiting.
+    Idle,
+    /// Stopped to save memory; `Enter` resumes it.
+    Offloaded,
+    /// Ended, and still resumable; listed last, and not counted as open (owner, 2026-10-03).
+    Closed,
+}
+
+impl Group {
+    pub const ALL: [Group; 5] = [
+        Group::NeedsYou,
+        Group::Working,
+        Group::Idle,
+        Group::Offloaded,
+        Group::Closed,
+    ];
+
+    /// The heading, as drawn.
+    pub fn name(self) -> &'static str {
+        match self {
+            Group::NeedsYou => "Needs you",
+            Group::Working => "Working",
+            Group::Idle => "Idle",
+            Group::Offloaded => "Offloaded",
+            Group::Closed => "Closed",
+        }
+    }
 }
 
 /// One row of the list, already decided: the renderer formats it and judges nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub key: RowKey,
-    /// `!` — a prompt is waiting. The only amber on the screen.
+    /// A prompt is waiting: the row is in Needs you.
     pub wants_you: bool,
-    /// `*` — it finished something since the owner last looked.
+    /// Mid-turn: the row is in Working.
+    pub busy: bool,
+    /// It finished something since the owner last looked: the title is bold.
     pub unread: bool,
-    /// `t` — a timer is pending.
-    pub timer: bool,
-    /// `@` — attached somewhere else right now.
+    /// Attached somewhere else right now: the row is drawn dim.
     pub attached: bool,
-    /// `z` — offloaded; `Enter` resumes it.
+    /// Offloaded; `Enter` resumes it.
     pub offloaded: bool,
-    /// `u` — not started by claude-sessions.
-    pub unregistered: bool,
-    /// `x` — closed; listed at the bottom so its conversation can be reached again, and
-    /// `Enter` resumes it (owner, 2026-10-03). Not counted as open.
+    /// Closed; `Enter` resumes it.
     pub closed: bool,
     pub title: String,
     /// Already formatted: `now`, `14m`, `5h`, `2d`.
     pub age: String,
+}
+
+impl Row {
+    /// Which group the row is drawn in. Being stopped outranks anything the record last said
+    /// about the process, and a prompt waiting outranks being mid-turn.
+    pub fn group(&self) -> Group {
+        if self.closed {
+            Group::Closed
+        } else if self.offloaded {
+            Group::Offloaded
+        } else if self.wants_you {
+            Group::NeedsYou
+        } else if self.busy {
+            Group::Working
+        } else {
+            Group::Idle
+        }
+    }
 }
 
 /// The header line: `infra-dev · 6 open · 812M of 1.0G`.
@@ -55,19 +107,15 @@ pub struct Header {
     pub memory: Option<(u64, u64)>,
 }
 
-/// A question in a frame over the list. Row numbers are the 1-based numbers the rows are
-/// drawn with — what the owner sees — never slot names.
+/// A question in a frame over the list. It names the session by its title: nothing on the
+/// screen is numbered (owner, 2026-10-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
     /// Mockup 3. `running` picks the explanation: a live slot's process is stopped, an
     /// offloaded one is only hidden; either way the conversation stays on disk.
-    Close {
-        row: usize,
-        title: String,
-        running: bool,
-    },
-    /// Mockup 4. `offer` is the slot that could make room — its row, idle age and title —
-    /// or `None` when nothing is offloadable, and then the dialog can only say so.
+    Close { title: String, running: bool },
+    /// Mockup 4. `offer` is the slot that could make room — its index in the rows, idle age
+    /// and title — or `None` when nothing is offloadable, and then the dialog can only say so.
     NoRoom {
         used: u64,
         limit: u64,
@@ -75,12 +123,14 @@ pub enum Dialog {
         offer: Option<(usize, String, String)>,
     },
     /// Mockup 5. `session` is the conversation id as shown (its first 8 characters), `status`
-    /// the exit status, `output` the last lines claude wrote to stderr.
+    /// the exit status, `output` the last lines claude wrote to stderr, and `closed` whether
+    /// the row went back to Closed rather than Offloaded.
     ResumeFailed {
-        row: usize,
+        title: String,
         session: String,
         status: i32,
         output: Vec<String>,
+        closed: bool,
     },
 }
 
@@ -103,18 +153,21 @@ pub struct View {
     pub rows: Vec<Row>,
     /// Index into `rows` of the highlighted row. Ignored when `rows` is empty.
     pub cursor: usize,
-    /// Index into `rows` of the first row drawn, so the cursor can stay on screen in a short
-    /// terminal and a dialog can show the rows around the one it is about.
+    /// The first line of the list drawn — a line of the grouped layout, headings and blanks
+    /// included (`render::layout`) — so the cursor can stay on screen in a short terminal.
     pub scroll: usize,
+    /// Index into `rows` of the session a dialog is about, drawn above the box under its
+    /// group's heading.
+    pub about: Option<usize>,
     pub screen: Screen,
     pub dialog: Option<Dialog>,
     /// One line between the list's closing rule and the hint line, as in mockup 6:
-    /// `detached from 2 · it is still running`.
+    /// `detached · it is still running`.
     pub status: Option<String>,
 }
 
 /// A colour from the approved table in `docs/mockups.md`. Two, and only two: amber is spent
-/// on `!` and nothing else; blue is the keys and `t`.
+/// on the Needs-you heading and nothing else; blue is the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colour {
     Amber,
@@ -184,8 +237,8 @@ pub trait Terminal {
 /// What came of asking `launch.rs` to do something, for the menu to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Back at the menu, with a line for the status slot: `detached from 2 · it is still
-    /// running`, or `2 ended`, or nothing.
+    /// Back at the menu, with a line for the status slot: `detached · it is still running`,
+    /// or `the session ended`, or nothing.
     Back(Option<String>),
     /// There is not room for another claude; ask (mockup 4).
     NoRoom(Dialog),

@@ -417,18 +417,6 @@ pub fn run(dry_run: bool) -> io::Result<()> {
 /// Why a stop is a close, as the pass and its log say it.
 const NO_CONVERSATION: &str = "no conversation on disk to resume";
 
-/// Offload a slot whose [`decide`] was asked under its lock, which the caller still holds:
-/// [`stop_quiet`] with an offload, whatever is on disk. The menu's make-room path, which
-/// still marks a victim with no conversation `offloaded` — a row the menu does not list —
-/// until it asks [`judge`] and calls [`stop_quiet`] instead.
-pub fn offload_quiet(
-    rec: &mut SlotRecord,
-    idle: Millis,
-    table: Option<&[Proc]>,
-) -> io::Result<Result<String, String>> {
-    stop_quiet(rec, Verdict::Offload { idle }, table)
-}
-
 /// The stop itself, an offload or a close as `verdict` says, with the slot's lock held by the
 /// caller. Logged to `offload.log` and never printed: `Ok` is the line saying what was done,
 /// `Err` the line saying why it was not finished.

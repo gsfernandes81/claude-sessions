@@ -18,7 +18,8 @@
 //! terminal as one.
 
 use crate::fmt::human;
-use crate::ui::{Colour, Dialog, Frame, Row, Screen, Span, Style, TooNarrow, View};
+use crate::ui::{Colour, Dialog, Frame, Group, Row, Screen, Span, Style, TooNarrow, View};
+use std::ops::Range;
 
 const FG: Style = Style {
     fg: None,
@@ -32,9 +33,10 @@ const BLUE: Style = Style {
     fg: Some(Colour::Blue),
     ..FG
 };
-/// Spent on `!` and nothing else: the colour table in `docs/mockups.md`.
-const AMBER: Style = Style {
+/// Spent on the Needs-you heading and nothing else: the colour table in `docs/mockups.md`.
+const AMBER_BOLD: Style = Style {
     fg: Some(Colour::Amber),
+    bold: true,
     ..FG
 };
 
@@ -55,9 +57,6 @@ const HINTS_EMPTY: [Hint; 3] = [("n", "new"), ("?", "keys"), WAY_OUT];
 /// Between hint items, and between most dialog buttons: three spaces, as every mockup draws.
 const GAP: &str = "   ";
 
-/// The marks field: three columns, ASCII only, so the age right-aligned after it never moves
-/// (`docs/mockups.md`, on why the marks column stays single-byte).
-const MARKS_WIDTH: usize = 3;
 /// The age field, right-aligned: wide enough for `now`, `14m`, `999d`.
 const AGE_WIDTH: usize = 5;
 /// Mockups 3 to 5: the box is 40 columns at either width, centred at 80 — "their content's
@@ -113,18 +112,24 @@ impl Frame {
             .join("\n")
     }
 
-    /// A full redraw: home the cursor, then each line with its styling and a clear to the end
-    /// of the line, so whatever the last frame left there goes. No newline after the last
-    /// line — on the bottom row it would scroll the screen.
+    /// A full redraw: home the cursor, then each line cleared and drawn. No newline after the
+    /// last line — on the bottom row it would scroll the screen.
     ///
-    /// Trailing blanks are not sent unless they are reverse video: `ESC[K` clears them anyway,
-    /// and on a metered link they are bytes that draw nothing.
+    /// **The clear comes before the line, never after it.** A line that fills the last column
+    /// leaves the terminal's cursor on that column with a wrap pending, and an erase sent then
+    /// erases from where the cursor is — the last character. That is how the owner came to see
+    /// `no` for `now` and `14` for `14m` on a real terminal (0.3.2), while pyte, which does not
+    /// model the pending wrap, drew it whole. Cleared first, a line can fill the width safely.
+    ///
+    /// Trailing blanks are not sent unless they are reverse video: the clear has already
+    /// blanked them, and on a metered link they are bytes that draw nothing.
     pub fn ansi(&self) -> String {
         let mut out = String::from("\x1b[H");
         for (i, line) in self.lines.iter().enumerate() {
             if i > 0 {
                 out.push_str("\r\n");
             }
+            out.push_str(CLEAR_LINE);
             let ink = line
                 .iter()
                 .rposition(|s| s.style.reverse || s.text.chars().any(|c| c != ' '));
@@ -146,11 +151,13 @@ impl Frame {
                     }
                 }
             }
-            out.push_str("\x1b[K");
         }
         out
     }
 }
+
+/// Erase the whole line the cursor is on, whatever column it is in.
+const CLEAR_LINE: &str = "\x1b[2K";
 
 /// The SGR sequence for a style, or `None` for the plain foreground.
 fn sgr(style: Style) -> Option<String> {
@@ -399,50 +406,119 @@ fn header(view: &View) -> Line {
     line
 }
 
-/// `count` rows of the list from `from`, numbered as the owner sees them.
-fn rows(view: &View, w: usize, from: usize, count: usize) -> Vec<Line> {
-    let digits = view.rows.len().to_string().len();
-    // Number, space, marks, space, title, age: the title takes whatever the rest leaves —
-    // 29 at 40 columns and 69 at 80 with single-digit numbering, as mockups 1 and 6 draw.
-    let title_w = w.saturating_sub(digits + 1 + MARKS_WIDTH + 1 + AGE_WIDTH);
-    view.rows
-        .iter()
-        .enumerate()
-        .skip(from)
-        .take(count)
-        .map(|(i, r)| row(i + 1, r, digits, title_w, i == view.cursor))
-        .collect()
+/// One line of the list as laid out: a group's heading, a session, or the blank line between
+/// two groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item {
+    Heading(Group),
+    Row(usize),
+    Blank,
 }
 
-fn row(n: usize, r: &Row, digits: usize, title_w: usize, cursor: bool) -> Line {
+/// The list's lines: each group's heading, then its rows, with a blank line between groups
+/// (owner, 2026-10-03). `rows` is in group order — `menu.rs` keeps it so — and a heading is
+/// drawn wherever the group changes, so an empty group has none.
+pub fn layout(rows: &[Row]) -> Vec<Item> {
+    let mut out = Vec::new();
+    let mut last: Option<Group> = None;
+    for (i, r) in rows.iter().enumerate() {
+        let g = r.group();
+        if last != Some(g) {
+            if last.is_some() {
+                out.push(Item::Blank);
+            }
+            out.push(Item::Heading(g));
+            last = Some(g);
+        }
+        out.push(Item::Row(i));
+    }
+    out
+}
+
+/// Which lines of the layout `room` lines from `scroll` show, and how many sessions are
+/// folded into the `… N more` line drawn at the foot when the rest does not fit (0 when it
+/// does, and then there is no such line). The fold takes a line of its own, so it costs one
+/// session's line and never hides that sessions are there.
+pub fn window(items: &[Item], scroll: usize, room: usize) -> (Range<usize>, usize) {
+    let scroll = scroll.min(items.len());
+    if items.len() - scroll <= room {
+        return (scroll..items.len(), 0);
+    }
+    let end = scroll + room.saturating_sub(1);
+    let more = items[end..]
+        .iter()
+        .filter(|i| matches!(i, Item::Row(_)))
+        .count();
+    (scroll..end, if room == 0 { 0 } else { more })
+}
+
+/// The scroll that shows the session at index `cursor`, moving as little as possible from
+/// `scroll`. Scrolling up to a group's first session brings its heading with it.
+pub fn scroll_to(items: &[Item], cursor: usize, scroll: usize, room: usize) -> usize {
+    let mut s = scroll.min(items.len().saturating_sub(room));
+    let Some(at) = items.iter().position(|i| *i == Item::Row(cursor)) else {
+        return s;
+    };
+    if at < s {
+        s = match at.checked_sub(1).map(|h| items[h]) {
+            Some(Item::Heading(_)) => at - 1,
+            _ => at,
+        };
+    }
+    while s < at && !window(items, s, room).0.contains(&at) {
+        s += 1;
+    }
+    s
+}
+
+/// The list's lines from `scroll`, as many as `room` holds.
+fn list_lines(view: &View, w: usize, room: usize) -> Vec<Line> {
+    let items = layout(&view.rows);
+    let (shown, more) = window(&items, view.scroll, room);
+    let mut out: Vec<Line> = items[shown]
+        .iter()
+        .map(|item| match *item {
+            Item::Heading(g) => heading(g),
+            Item::Row(i) => row(&view.rows[i], w, i == view.cursor),
+            Item::Blank => blank(),
+        })
+        .collect();
+    if more > 0 {
+        // `…` is in every face `↵` was missing from — see `docs/mockups.md`.
+        out.push(text(&format!("… {more} more"), DIM));
+    }
+    out
+}
+
+/// A group's heading: bold, and amber for the one group that is waiting for the owner.
+fn heading(g: Group) -> Line {
+    text(g.name(), heading_style(g))
+}
+
+fn heading_style(g: Group) -> Style {
+    match g {
+        Group::NeedsYou => AMBER_BOLD,
+        _ => BOLD,
+    }
+}
+
+/// A session: its title, cut to fit, and its age right-aligned in the last five columns. No
+/// marks and no number (owner, 2026-10-03): the group says what state it is in, an unread
+/// title is bold, and a session attached somewhere else is drawn dim.
+fn row(r: &Row, w: usize, cursor: bool) -> Line {
     // The cursor is reverse video across the whole row (owner, 2026-10-02): a monochrome
-    // terminal shows it too, and the glyphs and colours inside it still read.
+    // terminal shows it too, and the styles inside it still read.
     let st = |s: Style| Style {
         reverse: cursor,
+        dim: s.dim || r.attached,
         ..s
     };
-    let marks = [
-        (r.wants_you, "!", AMBER),
-        (r.unread, "*", BOLD),
-        (r.timer, "t", BLUE),
-        (r.attached, "@", DIM),
-        (r.offloaded, "z", DIM),
-        (r.unregistered, "u", DIM),
-        (r.closed, "x", DIM),
-    ];
+    let title_style = if r.unread { BOLD } else { FG };
+    let title_w = w.saturating_sub(AGE_WIDTH);
     let mut line = Line::default();
-    line.push(&format!("{n:>digits$}"), st(DIM))
-        .push(" ", st(FG));
-    // Four marks can be true at once (`!*t@`) and the field is three wide; the field is the
-    // one width the mockups make load-bearing, so the last in the approved order gives way.
-    for (_, mark, style) in marks.iter().filter(|m| m.0).take(MARKS_WIDTH) {
-        line.push(mark, st(*style));
-    }
-    line.pad(digits + 1 + MARKS_WIDTH + 1, st(FG));
-    // Cut, with no ellipsis: `…` is outside the glyph set the fonts were measured for.
+    // Cut, with no ellipsis: the fold line is the one place `…` is drawn, as a word.
     let title: String = r.title.chars().take(title_w).collect();
-    line.push(&title, st(FG))
-        .pad(digits + 1 + MARKS_WIDTH + 1 + title_w, st(FG));
+    line.push(&title, st(title_style)).pad(title_w, st(FG));
     let age: String = r.age.chars().take(AGE_WIDTH).collect();
     line.push(&format!("{age:>AGE_WIDTH$}"), st(DIM));
     line
@@ -450,8 +526,8 @@ fn row(n: usize, r: &Row, digits: usize, title_w: usize, cursor: bool) -> Line {
 
 // ── Screens ─────────────────────────────────────────────────────────────────────────────
 
-/// Mockups 1, 2 and 6: header, rule and the rows that fit on top; the closing rule, the
-/// status line if there is one and the hint line as the footer.
+/// Mockups 1, 2 and 6: header, rule and the list's lines that fit on top; the closing rule,
+/// the status line if there is one and the hint line as the footer.
 fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     let mut out = vec![header(view), rule(w)];
     let hints = if view.rows.is_empty() {
@@ -460,7 +536,7 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     } else {
         let tail = 1 + status_lines(view, w).len() + hints_len(w);
         let room = h.saturating_sub(out.len() + tail);
-        out.extend(rows(view, w, view.scroll, room));
+        out.extend(list_lines(view, w, room));
         hint_lines(&HINTS, GAP, w)
     };
     let mut footer = vec![rule(w)];
@@ -501,45 +577,42 @@ fn empty_body(view: &View, w: usize) -> Vec<Line> {
     out
 }
 
-/// Mockup 7, on `?`. Keys are blue, as everywhere a key can be pressed; each mark is drawn in
-/// the colour it has in the list, so the screen is also the colour key. The closing rule and
+/// Mockup 7, on `?`. Keys are blue, as everywhere a key can be pressed; each group's name is
+/// drawn as its heading is, so the screen is also the key to the list. The closing rule and
 /// the hint line are the footer.
 fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     let mut head = text(&view.header.host, FG);
-    head.push(" · keys and marks", DIM);
+    head.push(" · keys", DIM);
     let mut out = vec![head, rule(w)];
     let ws = &view.workspace;
     let new = format!("new session in {ws}");
     let shell = format!("a shell in {ws}");
-    let keys: [(&str, &str); 6] = [
-        ("Enter", "open the row (resume if z)"),
-        ("n", &new),
-        ("c", "close the row"),
-        ("s", &shell),
-        ("Esc", "quit the launcher"),
-        ("?", "this"),
+    // `Enter`'s line breaks after "it" at 80 columns as well as at 40: the approved screens
+    // break it there, so it is two segments rather than one wrapped sentence.
+    let keys: [(&str, &[&str]); 6] = [
+        (
+            "Enter",
+            &["open the session; resumes it", "if offloaded or closed"],
+        ),
+        ("n", &[&new]),
+        ("c", &["close the session"]),
+        ("s", &[&shell]),
+        ("Esc", &["quit the launcher"]),
+        ("?", &["this"]),
     ];
     for (key, what) in keys {
-        keyed(&mut out, 0, (key, BLUE), 7, &[what], w);
+        keyed(&mut out, 0, (key, BLUE), 7, what, w);
     }
     out.push(blank());
-    // The `t` line breaks after "not" at 80 columns as well as at 40: the approved screens
-    // break it there, so it is two segments rather than one wrapped sentence.
-    let marks: [(&str, Style, &[&str]); 7] = [
-        ("!", AMBER, &["wants you: a prompt is waiting"]),
-        ("*", BOLD, &["unread: it finished while away"]),
-        (
-            "t",
-            BLUE,
-            &["a timer is pending; not", "offloaded until it fires"],
-        ),
-        ("@", DIM, &["attached somewhere else too"]),
-        ("z", DIM, &["offloaded: Enter resumes it"]),
-        ("u", DIM, &["not started by claude-sessions"]),
-        ("x", DIM, &["closed: Enter resumes it"]),
-    ];
-    for (mark, style, what) in marks {
-        keyed(&mut out, 0, (mark, style), 3, what, w);
+    for g in Group::ALL {
+        let what = match g {
+            Group::NeedsYou => "a prompt is waiting",
+            Group::Working => "claude is mid-turn",
+            Group::Idle => "at its prompt, waiting",
+            Group::Offloaded => "stopped to save memory",
+            Group::Closed => "ended; still resumable",
+        };
+        keyed(&mut out, 0, (g.name(), heading_style(g)), 11, &[what], w);
     }
     let hints: &[Hint] = if view.rows.is_empty() {
         &HINTS_EMPTY
@@ -551,19 +624,22 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     (out, footer)
 }
 
-/// Mockups 3 to 5: header, rule, two rows from `scroll` for context, the box, and nothing
-/// after it — no closing rule and no hint line, because the box carries its own keys.
+/// Mockups 3 to 5: header, rule, the session the dialog is about under its group's heading,
+/// the box, and nothing after it — no closing rule and no hint line, because the box carries
+/// its own keys.
 fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> {
     let box_w = w.min(DIALOG_WIDTH);
     // Header and rule above, the box's own two borders around the body.
     let room = h.saturating_sub(4);
     let body = dialog_body(dialog, box_w.saturating_sub(4), room);
-    // In a short terminal the context rows go first; the question never does.
-    let context = 2
-        .min(view.rows.len().saturating_sub(view.scroll))
-        .min(room.saturating_sub(body.len()));
     let mut out = vec![header(view), rule(w)];
-    out.extend(rows(view, w, view.scroll, context));
+    // In a short terminal the context goes first; the question never does.
+    if let Some(r) = view.about.and_then(|i| view.rows.get(i).map(|r| (i, r))) {
+        if room.saturating_sub(body.len()) >= 2 {
+            out.push(heading(r.1.group()));
+            out.push(row(r.1, w, r.0 == view.cursor));
+        }
+    }
     out.extend(boxed(body, w, box_w));
     out
 }
@@ -574,12 +650,8 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
 fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
     let mut out = Vec::new();
     match dialog {
-        Dialog::Close {
-            row,
-            title,
-            running,
-        } => {
-            paragraph(&mut out, &format!("Close slot {row}?"), 0, tw, BOLD);
+        Dialog::Close { title, running } => {
+            paragraph(&mut out, "Close this session?", 0, tw, BOLD);
             paragraph(&mut out, title, 2, tw, FG);
             out.push(blank());
             // Closing is never destructive, and the dialog says so either way: a live slot's
@@ -611,8 +683,8 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             paragraph(&mut out, &why, 0, tw, FG);
             out.push(blank());
             match offer {
-                Some((row, age, title)) => {
-                    let ask = format!("Offload slot {row}, idle {age}?");
+                Some((_, age, title)) => {
+                    let ask = format!("Offload this session, idle {age}?");
                     paragraph(&mut out, &ask, 0, tw, FG);
                     paragraph(&mut out, title, 2, tw, FG);
                     paragraph(&mut out, "resumable from disk", 2, tw, FG);
@@ -623,7 +695,7 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
                 // Nothing to offer, so nothing to accept: the dialog can only say so and go
                 // back. Closing a live slot is what frees memory, so that is the advice.
                 None => {
-                    let none = "Nothing can be offloaded right now. Close a slot to make room.";
+                    let none = "Nothing can be offloaded right now. Close a session to make room.";
                     paragraph(&mut out, none, 0, tw, FG);
                     out.push(blank());
                     out.extend(hint_lines(&[("Esc", "back")], GAP, tw));
@@ -631,12 +703,14 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             }
         }
         Dialog::ResumeFailed {
-            row,
+            title,
             session,
             status,
             output,
+            closed,
         } => {
-            paragraph(&mut out, &format!("Slot {row} did not resume"), 0, tw, BOLD);
+            paragraph(&mut out, "This session did not resume", 0, tw, BOLD);
+            paragraph(&mut out, title, 2, tw, FG);
             out.push(blank());
             let cmd = format!("claude --resume {session} exited {status}");
             paragraph(&mut out, &cmd, 0, tw, FG);
@@ -644,8 +718,17 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             for l in output {
                 paragraph(&mut said, l, 2, tw, FG);
             }
+            // A claude that dies before writing anything still gets a line: an empty space
+            // under the command reads as the dialog having lost the reason (issue #5).
+            if said.is_empty() {
+                paragraph(&mut said, "and wrote nothing to stderr", 2, tw, FG);
+            }
             let mut tail = vec![blank()];
-            let left = "Left offloaded. Nothing was deleted; the transcript may be gone.";
+            let left = if *closed {
+                "Left closed. Nothing was deleted; the transcript may be gone."
+            } else {
+                "Left offloaded. Nothing was deleted; the transcript may be gone."
+            };
             paragraph(&mut tail, left, 0, tw, FG);
             tail.push(blank());
             let buttons = [("r", "retry"), ("c", "close it"), ("Esc", "back")];
@@ -708,32 +791,46 @@ mod tests {
         lines.take_while(|l| *l != "```").collect()
     }
 
-    fn row(marks: &str, title: &str, age: &str) -> Row {
+    /// A row from its flags: `!` wants you, `b` busy, `*` unread, `@` attached, `z`
+    /// offloaded, `x` closed.
+    fn row(flags: &str, title: &str, age: &str) -> Row {
         Row {
             key: RowKey::Slot(title.to_string()),
-            wants_you: marks.contains('!'),
-            unread: marks.contains('*'),
-            timer: marks.contains('t'),
-            attached: marks.contains('@'),
-            offloaded: marks.contains('z'),
-            unregistered: marks.contains('u'),
-            closed: marks.contains('x'),
+            wants_you: flags.contains('!'),
+            busy: flags.contains('b'),
+            unread: flags.contains('*'),
+            attached: flags.contains('@'),
+            offloaded: flags.contains('z'),
+            closed: flags.contains('x'),
             title: title.to_string(),
             age: age.to_string(),
         }
     }
 
-    /// The six slots of mockup 1.
-    fn six() -> Vec<Row> {
+    /// The sessions of mockup 1, in group order: six open, seven closed.
+    fn listed() -> Vec<Row> {
+        let mut claude = row("", "claude", "5h");
+        claude.key = RowKey::Socket("claude".to_string());
         vec![
             row("!", "permission: write hosts/one", "2m"),
+            row("b", "loop: watch the base build", "now"),
             row("*", "retire the old tunnel", "14m"),
-            row("*t", "loop: watch the base build", "31m"),
-            row("@", "immich upgrade", "now"),
+            row("@", "immich upgrade", "3m"),
+            claude,
             row("z", "mount guards on one", "2d"),
-            row("u", "claude", "5h"),
+            row("x", "fix the dns records", "3d"),
+            row("x", "tunnel cutover notes", "4d"),
+            row("x", "bcache register script", "5d"),
+            row("x", "syncthing share rename", "6d"),
+            row("x", "pihole blocklist sync", "8d"),
+            row("x", "two podman iptables", "9d"),
+            row("x", "smartd on one", "12d"),
         ]
     }
+
+    /// Indices into `listed()`.
+    const RETIRE: usize = 2;
+    const MOUNT: usize = 5;
 
     fn view(width: u16, rows: Vec<Row>, used_mib: u64) -> View {
         View {
@@ -747,6 +844,7 @@ mod tests {
             rows,
             cursor: 0,
             scroll: 0,
+            about: None,
             screen: Screen::List,
             dialog: None,
             status: None,
@@ -756,61 +854,85 @@ mod tests {
     // The View each mockup depicts, at a given width.
 
     fn mockup_1(w: u16) -> View {
-        view(w, six(), 812)
+        view(w, listed(), 812)
     }
     fn mockup_2(w: u16) -> View {
         view(w, vec![], 812)
     }
     fn mockup_3(w: u16) -> View {
         View {
-            cursor: 1,
+            cursor: RETIRE,
+            about: Some(RETIRE),
             dialog: Some(Dialog::Close {
-                row: 2,
                 title: "retire the old tunnel".to_string(),
                 running: true,
             }),
-            ..view(w, six(), 812)
+            ..view(w, listed(), 812)
         }
     }
     fn mockup_4(w: u16) -> View {
         View {
-            scroll: 4,
+            about: Some(RETIRE),
             dialog: Some(Dialog::NoRoom {
                 used: 892 * MIB,
                 limit: 1024 * MIB,
                 want: 250 * MIB,
-                offer: Some((5, "2d".to_string(), "mount guards on one".to_string())),
+                offer: Some((
+                    RETIRE,
+                    "14m".to_string(),
+                    "retire the old tunnel".to_string(),
+                )),
             }),
-            ..view(w, six(), 892)
+            ..view(w, listed(), 892)
         }
     }
     fn mockup_5(w: u16) -> View {
         View {
-            cursor: 4,
-            scroll: 4,
+            cursor: MOUNT,
+            about: Some(MOUNT),
             dialog: Some(Dialog::ResumeFailed {
-                row: 5,
+                title: "mount guards on one".to_string(),
                 session: "0f9c4a1e".to_string(),
                 status: 1,
                 output: vec!["No conversation found with that session id".to_string()],
+                closed: false,
             }),
-            ..view(w, six(), 812)
+            ..view(w, listed(), 812)
         }
     }
     fn mockup_6(w: u16) -> View {
-        let mut rows = six();
-        rows[1] = row("", "retire the old tunnel", "now");
+        let mut rows = listed();
+        rows[RETIRE] = row("", "retire the old tunnel", "now");
         rows[3].age = "12m".to_string();
         View {
-            cursor: 1,
-            status: Some("detached from 2 · it is still running".to_string()),
+            cursor: RETIRE,
+            status: Some("detached · it is still running".to_string()),
             ..view(w, rows, 1024)
         }
     }
     fn mockup_7(w: u16) -> View {
         View {
             screen: Screen::Keys,
-            ..view(w, six(), 812)
+            ..view(w, listed(), 812)
+        }
+    }
+
+    /// Prints the screens the mockup files draw, for redrawing those files to width:
+    /// `cargo test print_the_mockups -- --ignored --nocapture`. The files list and keys
+    /// screens without the blank gap above the footer (see `compare`).
+    #[test]
+    #[ignore]
+    fn print_the_mockups() {
+        let builds: [fn(u16) -> View; 7] = [
+            mockup_1, mockup_2, mockup_3, mockup_4, mockup_5, mockup_6, mockup_7,
+        ];
+        for w in [40u16, 80] {
+            for (n, b) in builds.iter().enumerate() {
+                let p = render(&b(w)).unwrap().plain();
+                let p = p.trim_end_matches('\n');
+                println!("=== {} {w}", n + 1);
+                println!("{p}");
+            }
         }
     }
 
@@ -916,7 +1038,7 @@ mod tests {
     // ── The approved screens, at 40×24 and 80×24 ─────────────────────────────────────
 
     #[test]
-    fn mockup_1_the_list_every_mark_mixed() {
+    fn mockup_1_the_list_in_its_groups() {
         assert_mockup(1, mockup_1);
     }
 
@@ -926,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn mockup_3_closing_a_live_slot() {
+    fn mockup_3_closing_a_live_session() {
         assert_mockup(3, mockup_3);
     }
 
@@ -941,10 +1063,20 @@ mod tests {
     }
 
     #[test]
+    fn mockup_6_back_from_a_session_with_a_status_line() {
+        assert_mockup(6, mockup_6);
+    }
+
+    #[test]
+    fn mockup_7_the_keys() {
+        assert_mockup(7, mockup_7);
+    }
+
+    #[test]
     fn a_long_status_wraps_and_loses_nothing() {
         // A refusal's reason, at 40 columns: every word must reach the screen.
-        let reason = "5 ran in /home/owner/projects/old-thing, which is gone - claude --resume \
-                      would start somewhere else";
+        let reason = "\"retire the old tunnel\" ran in /home/owner/projects/old-thing, which is \
+                      gone - claude --resume would start somewhere else";
         let mut v = View {
             status: Some(reason.to_string()),
             ..mockup_1(40)
@@ -962,23 +1094,13 @@ mod tests {
             status_line_count(40, reason) > 1,
             "calibration: it does need wrapping"
         );
-        // And the rows give way to it rather than the hint line falling off the bottom.
+        // And the list gives way to it rather than the hint line falling off the bottom.
         v.height = 9;
         let frame = render(&v).unwrap();
         assert!(
             frame.plain().contains("s shell"),
             "the hint must survive a long status"
         );
-    }
-
-    #[test]
-    fn mockup_6_back_from_a_slot_with_a_status_line() {
-        assert_mockup(6, mockup_6);
-    }
-
-    #[test]
-    fn mockup_7_the_keys() {
-        assert_mockup(7, mockup_7);
     }
 
     #[test]
@@ -992,9 +1114,13 @@ mod tests {
                 assert_eq!(v.height, 24);
                 let f = render(&v).unwrap();
                 assert_eq!(last_hint_line(&f), Some(23), "mockup {n} at {w}x24");
+                // Mockups 1 and 6 fill the screen, so the footer is at the bottom either way.
+                let expected = mockup(doc, n);
+                if expected.len() == 24 {
+                    continue;
+                }
                 // Calibration: the same frame laid out as before the move — footer straight
                 // after the content — must fail both this check and the mockup comparison.
-                let expected = mockup(doc, n);
                 let split = closing_rule(&expected).unwrap();
                 let old = footer_raised(&f, split, expected.len() - split);
                 assert_eq!(
@@ -1002,7 +1128,6 @@ mod tests {
                     Some(expected.len() - 1),
                     "calibration: the raised footer's last hint is where the mockup draws it"
                 );
-                assert!(expected.len() - 1 < 23);
                 assert!(
                     compare(&old, &v, &expected).is_err(),
                     "mockup {n} at {w}: the old layout passed the new comparison"
@@ -1015,33 +1140,139 @@ mod tests {
         }
     }
 
+    // ── The groups ────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn when_the_rows_fill_the_space_the_footer_follows_them_directly() {
-        let mut rows = six();
-        rows.extend(six());
-        rows.extend(six());
-        rows.extend(six());
+    fn the_layout_heads_each_group_and_puts_one_blank_line_between_groups() {
+        use Item::{Blank, Heading, Row as R};
+        let items = layout(&listed());
+        assert_eq!(
+            items[..16],
+            [
+                Heading(Group::NeedsYou),
+                R(0),
+                Blank,
+                Heading(Group::Working),
+                R(1),
+                Blank,
+                Heading(Group::Idle),
+                R(2),
+                R(3),
+                R(4),
+                Blank,
+                Heading(Group::Offloaded),
+                R(5),
+                Blank,
+                Heading(Group::Closed),
+                R(6),
+            ]
+        );
+        assert_eq!(
+            items.len(),
+            22,
+            "and the other six closed rows, no blank after"
+        );
+        // An empty group draws nothing at all: with no one waiting, the list opens on Working.
+        let rest = listed()[1..].to_vec();
+        assert_eq!(layout(&rest)[0], Heading(Group::Working));
+        assert!(!layout(&rest).contains(&Heading(Group::NeedsYou)));
+        assert_eq!(layout(&[]), []);
+    }
+
+    #[test]
+    fn a_row_is_grouped_by_what_it_is_doing_stopped_first() {
+        assert_eq!(row("", "a", "1m").group(), Group::Idle);
+        assert_eq!(row("*@", "a", "1m").group(), Group::Idle);
+        assert_eq!(row("b", "a", "1m").group(), Group::Working);
+        assert_eq!(row("!b", "a", "1m").group(), Group::NeedsYou);
+        assert_eq!(row("!bz", "a", "1m").group(), Group::Offloaded);
+        assert_eq!(row("!bzx", "a", "1m").group(), Group::Closed);
+    }
+
+    #[test]
+    fn what_does_not_fit_folds_into_a_count_of_the_sessions_left() {
+        let items = layout(&listed());
+        // Mockup 1 at 40: nineteen lines between the rules; three closed shown, four folded.
+        assert_eq!(window(&items, 0, 19), (0..18, 4));
+        assert_eq!(window(&items, 0, 20), (0..19, 3), "at 80, one hint line");
+        // Everything fits: no fold line at all.
+        assert_eq!(window(&items, 0, 22), (0..22, 0));
+        assert_eq!(window(&items, 0, 99), (0..22, 0));
+        // Scrolled to the end, nothing is below.
+        assert_eq!(window(&items, 3, 19), (3..22, 0));
+        // No room is no lines and no fold.
+        assert_eq!(window(&items, 0, 0), (0..0, 0));
+        // One line is the fold alone, counting every session.
+        assert_eq!(window(&items, 0, 1), (0..0, 13));
+    }
+
+    #[test]
+    fn scrolling_shows_the_cursor_and_brings_its_heading() {
+        let items = layout(&listed());
+        // The last closed session, at 40×24: scrolled until it is above the fold.
+        let s = scroll_to(&items, 12, 0, 19);
+        assert!(window(&items, s, 19).0.contains(&21));
+        assert_eq!(s, 3, "the least scroll that shows it");
+        // In six lines, scrolled down to the closed rows and back up to the first Idle
+        // session: its heading comes with it. And to the top, the Needs-you heading.
+        let deep = scroll_to(&items, 9, 0, 6);
+        assert!(deep > 7, "{deep}");
+        assert_eq!(scroll_to(&items, 2, deep, 6), 6);
+        assert_eq!(scroll_to(&items, 0, deep, 6), 0);
+        // Already on screen: nothing moves.
+        assert_eq!(scroll_to(&items, 6, 0, 19), 0);
+        // Calibration: the fold line is not on screen for a session. The fifth closed row is
+        // on line 19, which is the fold at scroll 0, so scrolling must move.
+        assert_eq!(window(&items, 0, 19).0.end, 18);
+        assert!(scroll_to(&items, 10, 0, 19) > 0);
+    }
+
+    #[test]
+    fn when_the_list_fills_the_space_the_fold_sits_on_the_closing_rule() {
+        let rows: Vec<Row> = (0..30).map(|i| row("", &format!("r{i}"), "1m")).collect();
         for (w, hints) in [(40u16, 2), (80, 1)] {
             let v = view(w, rows.clone(), 812);
             let p = lines(&render(&v).unwrap());
-            // Every line between the rules is a row: 24 less header, two rules and hints.
-            let shown = 24 - 3 - hints;
-            for (i, l) in p[2..2 + shown].iter().enumerate() {
-                assert!(
-                    l.starts_with(&format!("{:>2} ", i + 1)),
-                    "line {}: {l:?}",
-                    i + 2
-                );
-            }
-            assert!(
-                p[2 + shown].starts_with('─'),
-                "the closing rule follows the rows"
-            );
+            // 24 less header, rule, closing rule and hints; the heading and the fold take two.
+            let room = 24 - 3 - hints;
+            assert_eq!(p[2], "Idle");
+            assert!(p[3].starts_with("r0 "), "{:?}", p[3]);
+            assert_eq!(p[1 + room], format!("… {} more", 30 - (room - 2)));
+            assert!(p[2 + room].starts_with('─'), "the closing rule follows");
             assert!(p[23].ends_with("s shell"));
         }
     }
 
-    /// Mockup 8's blocks: `(width, hint lines)` for each `at N columns` it shows.
+    #[test]
+    fn nothing_is_numbered_and_nothing_is_marked() {
+        for w in [40u16, 80] {
+            let p = lines(&render(&mockup_1(w)).unwrap());
+            let title_w = w as usize - AGE_WIDTH;
+            for (r, line) in [(0, 3), (1, 6), (2, 9), (5, 14), (6, 17)] {
+                let r = &listed()[r];
+                assert_eq!(
+                    p[line],
+                    format!("{:<title_w$}{:>5}", r.title, r.age),
+                    "line {line} at {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dialog_shows_its_session_under_that_sessions_heading() {
+        let p = lines(&render(&mockup_5(40)).unwrap());
+        assert_eq!(p[2], "Offloaded");
+        assert!(p[3].starts_with("mount guards on one"));
+        assert!(p[4].starts_with('╭'));
+        // With nothing to say it is about, the box follows the rule.
+        let v = View {
+            about: None,
+            ..mockup_5(40)
+        };
+        assert!(lines(&render(&v).unwrap())[2].starts_with('╭'));
+    }
+
     fn narrowing(doc: &'static str) -> Vec<(u16, Vec<&'static str>)> {
         let mut out: Vec<(u16, Vec<&str>)> = Vec::new();
         for l in mockup(doc, 8) {
@@ -1100,22 +1331,17 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_row_is_marked_x_and_not_counted_as_open() {
+    fn closed_rows_are_listed_under_closed_and_not_counted_as_open() {
+        let plain = render(&mockup_1(40)).unwrap().plain();
+        assert!(plain.starts_with("infra-dev · 6 open"), "got {plain}");
+        // Calibration: reopen one and it counts.
         let mut v = mockup_1(40);
-        v.rows[4].offloaded = false;
-        v.rows[4].closed = true;
-        let plain = render(&v).unwrap().plain();
-        assert!(plain.starts_with("infra-dev · 5 open"), "got {plain}");
+        v.rows[6].closed = false;
         assert!(
-            plain.contains("5 x   mount guards on one"),
-            "the closed row's mark: {plain}"
-        );
-        // Calibration: with it not closed, it counts.
-        assert!(
-            render(&mockup_1(40))
+            render(&v)
                 .unwrap()
                 .plain()
-                .starts_with("infra-dev · 6 open")
+                .starts_with("infra-dev · 7 open")
         );
     }
 
@@ -1124,13 +1350,13 @@ mod tests {
     #[test]
     fn the_mockup_comparison_fails_on_a_wrong_view() {
         // The parse finds real screens, not empty ones that would match anything.
-        assert_eq!(mockup(MOCKUPS_40, 1).len(), 11);
-        assert_eq!(mockup(MOCKUPS_80, 7).len(), 19);
+        assert_eq!(mockup(MOCKUPS_40, 1).len(), 24);
+        assert_eq!(mockup(MOCKUPS_80, 7).len(), 17);
         assert!(mockup(MOCKUPS_40, 5)[0].starts_with("infra-dev · 6 open"));
 
         let wrong_title = {
             let mut v = mockup_1(40);
-            v.rows[1].title = "retire the new tunnel".to_string();
+            v.rows[RETIRE].title = "retire the new tunnel".to_string();
             v
         };
         let wrong_age = {
@@ -1138,23 +1364,22 @@ mod tests {
             v.rows[0].age = "3m".to_string();
             v
         };
-        let wrong_mark = {
+        let wrong_group = {
             let mut v = mockup_1(40);
-            v.rows[2].timer = false;
+            v.rows[1].busy = false;
             v
         };
-        let wrong_memory = view(40, six(), 813);
+        let wrong_memory = view(40, listed(), 813);
         let wrong_status = View {
             status: None,
             ..mockup_6(40)
         };
-        let wrong_scroll = View {
-            scroll: 3,
+        let wrong_about = View {
+            about: Some(MOUNT),
             ..mockup_4(40)
         };
         let wrong_dialog = View {
             dialog: Some(Dialog::Close {
-                row: 2,
                 title: "retire the old tunnel".to_string(),
                 running: false,
             }),
@@ -1172,10 +1397,10 @@ mod tests {
         for (n, v) in [
             (1, wrong_title),
             (1, wrong_age),
-            (1, wrong_mark),
+            (1, wrong_group),
             (1, wrong_memory),
             (6, wrong_status),
-            (4, wrong_scroll),
+            (4, wrong_about),
             (3, wrong_dialog),
             (7, wrong_workspace),
             (1, short),
@@ -1188,9 +1413,9 @@ mod tests {
             );
         }
         // And a trailing line of junk after the screen is caught.
-        let mut expected = mockup(doc, 1);
+        let mut expected = mockup(doc, 7);
         expected.pop();
-        assert!(matches(&mockup_1(40), &expected).is_err());
+        assert!(matches(&mockup_7(40), &expected).is_err());
     }
 
     // ── Colour, against the table in docs/mockups.md ──────────────────────────────────
@@ -1219,35 +1444,52 @@ mod tests {
             .collect()
     }
 
+    /// The style of the character at `col` on `line`.
+    fn style_at(f: &Frame, line: usize, col: usize) -> Style {
+        let mut at = 0;
+        for s in &f.lines[line] {
+            let n = s.text.chars().count();
+            if col < at + n {
+                return s.style;
+            }
+            at += n;
+        }
+        panic!("no column {col} on line {line}");
+    }
+
     #[test]
-    fn amber_is_spent_on_the_wants_you_mark_and_nothing_else() {
+    fn amber_is_spent_on_the_needs_you_heading_and_nothing_else() {
         for (v, f) in all_mockup_frames() {
             let amber = chars_styled(&f, |s| s.fg == Some(Colour::Amber));
             assert!(
-                amber.chars().all(|c| c == '!'),
+                amber.is_empty() || amber == "Needs you",
                 "amber on {amber:?} at {}",
                 v.width
             );
         }
-        // Mockup 1 at 40: one slot wants you, so one amber character on the whole screen.
-        // (The colour table's prose says "two amber characters" in a full list of six; the
-        // approved screen has one `!`, and the screen is what is binding.)
         let f = render(&mockup_1(40)).unwrap();
-        assert_eq!(chars_styled(&f, |s| s.fg == Some(Colour::Amber)), "!");
-        let a = f.ansi();
-        assert_eq!(a.matches("38;5;214").count(), 1);
+        assert_eq!(f.lines[2][0].style, AMBER_BOLD);
+        assert_eq!(f.ansi().matches("38;5;214").count(), 1);
+        // And on the keys screen, where it is the key to the heading.
+        let k = render(&mockup_7(40)).unwrap();
+        assert_eq!(
+            chars_styled(&k, |s| s.fg == Some(Colour::Amber)),
+            "Needs you"
+        );
+        // Calibration: with nobody waiting there is no amber anywhere.
+        let mut v = mockup_1(40);
+        v.rows[0].wants_you = false;
+        let f = render(&v).unwrap();
+        assert_eq!(chars_styled(&f, |s| s.fg == Some(Colour::Amber)), "");
     }
 
     #[test]
-    fn keys_and_the_timer_mark_are_blue() {
+    fn keys_are_blue_and_the_keys_screen_draws_each_group_as_its_heading() {
         let f = render(&mockup_1(40)).unwrap();
-        // Row 3's `t`, then the hint line's keys in order.
         assert_eq!(
             chars_styled(&f, |s| s.fg == Some(Colour::Blue)),
-            "tEnternc?s"
+            "Enternc?s"
         );
-        // The hint line's first line, second from the bottom at 40 columns: keys blue,
-        // descriptions in the foreground.
         let hint = &f.lines[22];
         let blue: Vec<&str> = hint
             .iter()
@@ -1255,52 +1497,46 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(blue, ["Enter", "n", "c", "?"]);
-        assert!(
-            hint.iter()
-                .filter(|s| s.text.contains("open"))
-                .all(|s| s.style == FG)
-        );
-        // The keys screen: every key blue and each mark in its list colour.
         let k = render(&mockup_7(40)).unwrap();
         let first = |i: usize| k.lines[i][0].clone();
-        for i in 2..8 {
+        for i in [2, 4, 5, 6, 7, 8] {
             assert_eq!(first(i).style, BLUE, "key on line {i}");
         }
-        assert_eq!(first(9).style, AMBER);
-        assert_eq!(first(10).style, BOLD);
-        assert_eq!(first(11).style, BLUE);
-        for i in [13, 14, 15] {
-            assert_eq!(first(i).style, DIM, "mark on line {i}");
+        assert_eq!(first(10).style, AMBER_BOLD, "Needs you");
+        for i in 11..15 {
+            assert_eq!(first(i).style, BOLD, "group on line {i}");
         }
     }
 
     #[test]
-    fn marks_numbers_and_ages_take_their_table_styles() {
+    fn headings_are_bold_unread_titles_bold_attached_rows_dim_ages_dim() {
+        let f = render(&mockup_1(40)).unwrap();
+        for line in [5, 8, 13, 16] {
+            assert_eq!(style_at(&f, line, 0), BOLD, "heading on line {line}");
+        }
+        // Line 3 is the Needs-you row: title in the foreground, age dim. But it is the cursor.
         let f = render(&View {
             cursor: 99,
             ..mockup_1(40)
         })
         .unwrap();
-        let style_of = |line: usize, col: usize| {
-            let mut at = 0;
-            for s in &f.lines[line] {
-                let n = s.text.chars().count();
-                if col < at + n {
-                    return s.style;
-                }
-                at += n;
-            }
-            panic!("no column {col} on line {line}");
+        assert_eq!(style_at(&f, 3, 0), FG, "title");
+        assert_eq!(style_at(&f, 3, 39), DIM, "age");
+        assert_eq!(style_at(&f, 9, 0), BOLD, "unread title");
+        assert_eq!(style_at(&f, 9, 39), DIM, "unread age");
+        assert_eq!(style_at(&f, 10, 0), DIM, "attached title");
+        assert_eq!(style_at(&f, 10, 39), DIM, "attached age");
+        assert_eq!(style_at(&f, 11, 0), FG, "plain title");
+        // Calibration: the same rows with nothing unread or attached draw plainly.
+        let mut v = View {
+            cursor: 99,
+            ..mockup_1(40)
         };
-        assert_eq!(style_of(2, 0), DIM, "row number");
-        assert_eq!(style_of(2, 2), AMBER, "!");
-        assert_eq!(style_of(3, 2), BOLD, "*");
-        assert_eq!(style_of(4, 3), BLUE, "t");
-        assert_eq!(style_of(5, 2), DIM, "@");
-        assert_eq!(style_of(6, 2), DIM, "z");
-        assert_eq!(style_of(7, 2), DIM, "u");
-        assert_eq!(style_of(2, 6), FG, "title");
-        assert_eq!(style_of(2, 39), DIM, "age");
+        v.rows[RETIRE].unread = false;
+        v.rows[3].attached = false;
+        let f = render(&v).unwrap();
+        assert_eq!(style_at(&f, 9, 0), FG);
+        assert_eq!(style_at(&f, 10, 0), FG);
         // The header: the container's name, then everything after it dim.
         assert_eq!(f.lines[0][0].text, "infra-dev");
         assert_eq!(f.lines[0][0].style, FG);
@@ -1309,40 +1545,34 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_row_is_reverse_across_the_full_width_and_nowhere_else() {
+    fn the_cursor_is_reverse_across_its_session_and_nowhere_else() {
         for w in [40u16, 80] {
-            for cursor in 0..6 {
-                let f = render(&View {
+            let rows = listed();
+            let items = layout(&rows);
+            for (cursor, r) in rows.iter().enumerate() {
+                let mut v = View {
                     cursor,
                     ..mockup_1(w)
-                })
-                .unwrap();
-                for (i, line) in f.lines.iter().enumerate() {
-                    let rev = line.iter().filter(|s| s.style.reverse).count();
-                    if i == 2 + cursor {
-                        assert_eq!(rev, line.len(), "the whole cursor row is reverse");
-                        let n: usize = line.iter().map(|s| s.text.chars().count()).sum();
+                };
+                let room = 24 - 3 - hints_len(w as usize);
+                v.scroll = scroll_to(&items, cursor, 0, room);
+                let f = render(&v).unwrap();
+                let at = items.iter().position(|i| *i == Item::Row(cursor)).unwrap();
+                let line = 2 + at - v.scroll;
+                for (i, l) in f.lines.iter().enumerate() {
+                    let rev = l.iter().filter(|s| s.style.reverse).count();
+                    if i == line {
+                        assert_eq!(rev, l.len(), "the whole cursor row is reverse");
+                        let n: usize = l.iter().map(|s| s.text.chars().count()).sum();
                         assert_eq!(n, w as usize, "the cursor row spans the width");
+                        let text: String = l.iter().map(|s| s.text.as_str()).collect();
+                        assert!(text.starts_with(&r.title), "{text:?}");
                     } else {
-                        assert_eq!(rev, 0, "line {i} is not the cursor");
+                        assert_eq!(rev, 0, "line {i} is not the cursor ({cursor} at {w})");
                     }
                 }
             }
         }
-        // Scrolled, the cursor is still the row it names.
-        let mut rows = six();
-        rows.extend(six());
-        let f = render(&View {
-            height: 8,
-            scroll: 3,
-            cursor: 4,
-            ..view(40, rows, 812)
-        })
-        .unwrap();
-        let p = lines(&f);
-        assert!(p[2].starts_with(" 4 @"), "{:?}", p[2]);
-        assert!(f.lines[3].iter().all(|s| s.style.reverse));
-        assert!(p[3].starts_with(" 5 z"));
     }
 
     #[test]
@@ -1357,13 +1587,14 @@ mod tests {
         for build in [mockup_3, mockup_4, mockup_5] {
             for w in [40u16, 80] {
                 let f = render(&build(w)).unwrap();
-                // The box's first body line is header, rule, two rows, top border on.
+                // The box's first body line: header, rule, heading, row, top border, then it.
                 let question: Vec<&Span> = f.lines[5]
                     .iter()
                     .filter(|s| s.text.trim() != "" && s.text != "│")
                     .collect();
                 assert_eq!(question.len(), 1);
                 assert_eq!(question[0].style, BOLD);
+                assert!(!question[0].text.chars().any(|c| c.is_ascii_digit()));
                 // Dialog keys are keys you can press, so they are blue too.
                 let keys = chars_styled(&f, |s| s.fg == Some(Colour::Blue));
                 assert!(!keys.is_empty() && keys.chars().all(|c| "ynrcEsc".contains(c)));
@@ -1390,16 +1621,103 @@ mod tests {
         out
     }
 
+    /// A terminal as xterm and Termux behave, as far as a frame needs: printing in the last
+    /// column leaves the cursor there with a wrap pending, the next printable character wraps
+    /// first, and an erase in line erases from the cursor — so from the last column, after a
+    /// full-width line. pyte draws such a line whole, which is how 0.3.2 shipped with the
+    /// last character of every full line erased.
+    fn terminal(ansi: &str, w: usize, h: usize) -> Vec<String> {
+        let mut screen = vec![vec![' '; w]; h];
+        let (mut row, mut col, mut pending) = (0usize, 0usize, false);
+        let mut chars = ansi.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => {
+                    assert_eq!(chars.next(), Some('['));
+                    let mut params = String::new();
+                    let fin = loop {
+                        let c = chars.next().unwrap();
+                        if c.is_ascii_alphabetic() {
+                            break c;
+                        }
+                        params.push(c);
+                    };
+                    match (fin, params.as_str()) {
+                        ('H', "") => (row, col, pending) = (0, 0, false),
+                        ('K', "" | "0") => screen[row][col..].fill(' '),
+                        ('K', "2") => screen[row].fill(' '),
+                        ('m', _) => {}
+                        other => panic!("the model does not know {other:?}"),
+                    }
+                }
+                '\r' => (col, pending) = (0, false),
+                '\n' => (row, pending) = (row + 1, false),
+                c => {
+                    if pending {
+                        (row, col, pending) = (row + 1, 0, false);
+                    }
+                    screen[row][col] = c;
+                    if col + 1 == w {
+                        pending = true;
+                    } else {
+                        col += 1;
+                    }
+                }
+            }
+        }
+        screen
+            .into_iter()
+            .map(|l| l.into_iter().collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    /// How 0.3.2 wrote a frame: each line, then the erase. For calibration only.
+    fn ansi_erase_after(f: &Frame) -> String {
+        f.ansi()
+            .replace(CLEAR_LINE, "")
+            .replace("\r\n", "\x1b[K\r\n")
+            + "\x1b[K"
+    }
+
     #[test]
-    fn ansi_is_a_full_redraw_that_reads_back_as_the_plain_text() {
+    fn a_full_width_line_keeps_its_last_column_on_a_real_terminal() {
+        for (v, f) in all_mockup_frames() {
+            let (w, h) = (v.width as usize, v.height as usize);
+            let got = terminal(&f.ansi(), w, h);
+            assert_eq!(got.join("\n"), f.plain(), "at {w}");
+        }
+        // Calibration: the old order loses `now` to `no` and `14m` to `14`, exactly as the
+        // owner saw — so the model reproduces the bug, and the check above can fail.
+        let f = render(&View {
+            cursor: 99,
+            ..mockup_1(40)
+        })
+        .unwrap();
+        let old = terminal(&ansi_erase_after(&f), 40, 24);
+        assert!(old[6].ends_with(" no"), "{:?}", old[6]);
+        assert!(old[9].ends_with(" 14"), "{:?}", old[9]);
+        assert_ne!(old.join("\n"), f.plain());
+    }
+
+    #[test]
+    fn each_line_is_cleared_before_it_is_drawn_and_never_after() {
         for (v, f) in all_mockup_frames() {
             let a = f.ansi();
             assert!(a.starts_with("\x1b[H"));
             assert_eq!(a.matches("\r\n").count(), v.height as usize - 1);
             assert!(!a.ends_with('\n'), "no newline after the bottom line");
-            for line in a.split("\r\n") {
-                assert!(line.ends_with("\x1b[K"), "{line:?}");
+            for (i, line) in a["\x1b[H".len()..].split("\r\n").enumerate() {
+                assert!(line.starts_with(CLEAR_LINE), "line {i}: {line:?}");
+                let rest = &line[CLEAR_LINE.len()..];
+                assert!(!rest.contains("K"), "an erase after content on line {i}");
             }
+        }
+    }
+
+    #[test]
+    fn ansi_is_a_full_redraw_that_reads_back_as_the_plain_text() {
+        for (v, f) in all_mockup_frames() {
+            let a = f.ansi();
             let back: Vec<String> = strip(&a)
                 .split("\r\n")
                 .map(|l| l.trim_end_matches(' ').to_string())
@@ -1417,25 +1735,21 @@ mod tests {
         })
         .unwrap()
         .ansi();
-        assert!(f.contains("\x1b[38;5;214m!\x1b[0m"));
+        assert!(f.contains("\x1b[1;38;5;214mNeeds you\x1b[0m"));
         assert!(f.contains("\x1b[38;5;75mEnter\x1b[0m open"));
-        assert!(f.contains("\x1b[1m*\x1b[0m"));
-        assert!(f.contains("\x1b[2m1\x1b[0m"));
+        assert!(f.contains("\x1b[1mretire the old tunnel\x1b[0m"));
+        assert!(f.contains("\x1b[2mimmich upgrade"));
         let cursor = render(&View {
-            cursor: 1,
+            cursor: RETIRE,
             ..mockup_1(40)
         })
         .unwrap()
         .ansi();
-        assert!(cursor.contains("\x1b[2;7m2\x1b[0m"));
-        assert!(cursor.contains("\x1b[1;7m*\x1b[0m"));
-        // The blank lines between the list and the footer cost three bytes and a separator
-        // each.
-        assert!(f.contains("\x1b[K\r\n\x1b[K\r\n\x1b[K"));
-        assert!(
-            f.ends_with(" shell\x1b[K"),
-            "the hint line is the bottom line"
-        );
+        assert!(cursor.contains("\x1b[1;7mretire the old tunnel\x1b[0m"));
+        // The blank lines between the list and the footer cost a clear and a separator each.
+        let keys = render(&mockup_7(40)).unwrap().ansi();
+        assert!(keys.contains("\x1b[2K\r\n\x1b[2K\r\n\x1b[2K"));
+        assert!(keys.ends_with(" shell"), "the hint line is the bottom line");
     }
 
     // ── The parts the mockups do not draw ─────────────────────────────────────────────
@@ -1449,21 +1763,22 @@ mod tests {
     }
 
     #[test]
-    fn closing_an_offloaded_slot_says_it_is_only_hidden() {
+    fn closing_an_offloaded_session_says_it_is_only_hidden() {
         let v = View {
+            cursor: MOUNT,
+            about: Some(MOUNT),
             dialog: Some(Dialog::Close {
-                row: 5,
                 title: "mount guards on one".to_string(),
                 running: false,
             }),
-            ..mockup_4(40)
+            ..mockup_1(40)
         };
         let f = render(&v).unwrap();
         check_shape(&f, &v).unwrap();
         assert_eq!(
             box_text(&f),
             [
-                " Close slot 5?",
+                " Close this session?",
                 "   mount guards on one",
                 "",
                 " Offloaded. Hides the row, not the",
@@ -1496,9 +1811,41 @@ mod tests {
                 " about 250M.",
                 "",
                 " Nothing can be offloaded right now.",
-                " Close a slot to make room.",
+                " Close a session to make room.",
                 "",
                 " Esc back",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resume_that_says_nothing_says_so_and_a_closed_one_is_left_closed() {
+        let v = View {
+            dialog: Some(Dialog::ResumeFailed {
+                title: "fix the dns records".to_string(),
+                session: "5b2d0c77".to_string(),
+                status: 1,
+                output: vec![],
+                closed: true,
+            }),
+            about: Some(6),
+            ..mockup_1(40)
+        };
+        let f = render(&v).unwrap();
+        assert_eq!(lines(&f)[2], "Closed");
+        assert_eq!(
+            box_text(&f),
+            [
+                " This session did not resume",
+                "   fix the dns records",
+                "",
+                " claude --resume 5b2d0c77 exited 1",
+                "   and wrote nothing to stderr",
+                "",
+                " Left closed. Nothing was deleted;",
+                " the transcript may be gone.",
+                "",
+                " r retry   c close it   Esc back",
             ]
         );
     }
@@ -1509,10 +1856,11 @@ mod tests {
         let v = View {
             height: 16,
             dialog: Some(Dialog::ResumeFailed {
-                row: 5,
+                title: "mount guards on one".to_string(),
                 session: "0f9c4a1e".to_string(),
                 status: 1,
                 output,
+                closed: false,
             }),
             ..mockup_5(40)
         };
@@ -1523,59 +1871,18 @@ mod tests {
         assert!(p[14].contains("r retry   c close it   Esc back"));
         assert!(p.iter().any(|l| l.contains("  line 40")));
         assert!(!p.iter().any(|l| l.contains("line 1 ")));
-        assert!(
-            !p.iter().any(|l| l.contains("mount guards")),
-            "rows go first"
-        );
-    }
-
-    #[test]
-    fn ten_rows_or_more_widen_the_number_and_narrow_the_title() {
-        let mut rows = six();
-        rows.extend(six());
-        let f = render(&view(40, rows, 812)).unwrap();
-        let p = lines(&f);
-        assert_eq!(p[2], " 1 !   permission: write hosts/one    2m");
-        assert_eq!(p[13], "12 u   claude                         5h");
-        assert_eq!(p[0], "infra-dev · 12 open · 812M of 1.0G");
+        assert_eq!(p[2].chars().next(), Some('╭'), "the context goes first");
     }
 
     #[test]
     fn a_long_title_is_cut_to_its_field_with_no_ellipsis() {
         // No spaces, so a field one column off cannot pass by trimming luck.
         let long = "0123456789".repeat(10);
-        for (w, field) in [(40u16, 29), (80, 69)] {
+        for (w, field) in [(40u16, 35), (80, 75)] {
             let f = render(&view(w, vec![row("", &long, "3m")], 812)).unwrap();
-            let want = format!("1     {}{:>5}", &long[..field], "3m");
-            assert_eq!(lines(&f)[2], want, "at {w} columns");
+            let want = format!("{}{:>5}", &long[..field], "3m");
+            assert_eq!(lines(&f)[3], want, "at {w} columns");
         }
-    }
-
-    #[test]
-    fn the_list_scrolls_to_what_fits_above_the_rule_status_and_hints() {
-        let mut rows = six();
-        rows.extend(six());
-        rows.extend(six());
-        let v = View {
-            height: 12,
-            scroll: 2,
-            status: Some("2 ended".to_string()),
-            ..view(40, rows, 812)
-        };
-        let f = render(&v).unwrap();
-        let p = lines(&f);
-        // header, rule, six rows, rule, status, two hint lines: twelve exactly.
-        assert!(p[2].starts_with(" 3 *t"));
-        assert!(p[7].starts_with(" 8 *"));
-        assert!(p[8].starts_with('─'));
-        assert_eq!(p[9], "2 ended");
-        assert_eq!(p[11], "s shell");
-    }
-
-    #[test]
-    fn four_marks_keep_the_first_three_and_the_age_does_not_move() {
-        let f = render(&view(40, vec![row("!*t@", "busy", "1m")], 812)).unwrap();
-        assert_eq!(lines(&f)[2], format!("1 !*t {:<29}{:>5}", "busy", "1m"));
     }
 
     #[test]
@@ -1584,12 +1891,13 @@ mod tests {
         v.header.host = "host\x07".to_string();
         v.status = Some("bad\rstatus".to_string());
         let f = render(&v).unwrap();
+        // The frame's own clears are `ESC[2K`; a title's `ESC[2J` must not survive.
         assert!(!f.ansi().contains("\x1b[2J"));
         for span in f.lines.iter().flatten() {
             assert!(!span.text.chars().any(char::is_control), "{:?}", span.text);
         }
-        let cleaned = format!("1     {:<29}{:>5}", "evil [2Jtitle next", "1m");
-        assert_eq!(lines(&f)[2], cleaned);
+        let cleaned = format!("{:<35}{:>5}", "evil [2Jtitle next", "1m");
+        assert_eq!(lines(&f)[3], cleaned);
     }
 
     #[test]
@@ -1604,9 +1912,9 @@ mod tests {
 
     #[test]
     fn every_frame_is_height_lines_none_wider_than_width() {
-        let mut many = six();
+        let mut many = listed();
         for _ in 0..4 {
-            many.extend(six());
+            many.extend(listed());
         }
         let long_ws = View {
             workspace: "/a/workspace/path/long/enough/to/wrap/at/forty".to_string(),
