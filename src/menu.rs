@@ -163,6 +163,10 @@ impl Menu {
             next
         };
         self.all = next;
+        // An archive emptied is shut again, so the group shows shut whenever it reappears.
+        if !self.all.iter().any(|r| r.archived) {
+            self.archive_open = false;
+        }
         self.rows = self.visible();
         self.cursor = under_cursor
             .and_then(|k| self.index_of(&k))
@@ -495,7 +499,9 @@ pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
         if taken.contains(&c.id) {
             continue;
         }
-        let archived = archive::is_archived(marks.get(&c.id).copied(), c.last_ms, now);
+        // Against the floored clock, like the ages: a row crosses into the archive on the
+        // minute's redraw, never between them.
+        let archived = archive::is_archived(marks.get(&c.id).copied(), c.last_ms, clock);
         let row = Row {
             key: RowKey::Conversation {
                 id: c.id,
@@ -757,6 +763,18 @@ mod tests {
         m.key(Key::End);
         m.key(Key::Enter);
         assert_eq!(names(&m), ["live", "Archived", "closed"]);
+    }
+
+    #[test]
+    fn an_archive_emptied_while_open_comes_back_shut() {
+        let mut m = menu(vec![row("live"), stored("old", true)]);
+        m.key(Key::End);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["live", "Archived", "old"], "opened");
+        m.replace_rows(vec![row("live"), stored("old", false)], false);
+        assert_eq!(names(&m), ["live", "old"], "unarchived: no heading");
+        m.replace_rows(vec![row("live"), stored("old", true)], false);
+        assert_eq!(names(&m), ["live", "Archived"], "archived again: shut");
     }
 
     #[test]

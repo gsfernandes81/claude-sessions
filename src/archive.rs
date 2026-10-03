@@ -3,13 +3,15 @@
 //! **Archiving hides a conversation in the menu and nothing else** (owner, 2026-10-03). Its
 //! transcript is Claude Code's and is never moved or changed, so `claude --resume` and Claude
 //! Code's own `/resume` still find it. The archive is one small file per conversation id in
-//! `archive/` beside the registry, saying `archived` or `kept`; creating or removing one is a
-//! single file operation, so two menus need no lock between them.
+//! `archive/` beside the registry, saying `archived` or `kept` and when; writing one is a
+//! single rename, so two menus need no lock between them.
 //!
-//! **A conversation is archived when its file says so, or when it has none and its last
-//! entry is more than 30 days old** (owner, 2026-10-03). Age is worked out as the list is
-//! read, so nothing is written for it. `kept` is what unarchiving an old conversation writes,
-//! so it does not fold away again on the next reading.
+//! **A conversation is archived when it has gone 30 days unused, or when `c` archived it and
+//! it has not been used since** (owner, 2026-10-03). Age is worked out as the list is read, so
+//! nothing is written for it. Each mark carries its time, because the conversation can go on
+//! without the menu: one archived and then resumed by hand with `claude --resume` is in use
+//! again and leaves the archive, and `kept` — what taking one out writes — gives it a fresh
+//! 30 days rather than holding it out of the archive for good.
 
 use crate::clock::Millis;
 use std::collections::HashMap;
@@ -21,10 +23,11 @@ pub const AUTO_AFTER: Millis = 30 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
-    /// Put away with `c`.
-    Archived,
-    /// Taken out of the archive, and kept out whatever its age.
-    Kept,
+    /// Put away with `c`, at this time.
+    Archived(Millis),
+    /// Taken out of the archive at this time: 30 days from then, or from its last use if
+    /// later, before age archives it again.
+    Kept(Millis),
 }
 
 pub fn dir() -> PathBuf {
@@ -47,9 +50,17 @@ fn marks_in(dir: &Path) -> HashMap<String, Mark> {
         if !valid(&name) {
             continue;
         }
-        let mark = match std::fs::read_to_string(e.path()).as_deref().map(str::trim) {
-            Ok("archived") => Mark::Archived,
-            Ok("kept") => Mark::Kept,
+        let Ok(body) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let mut words = body.split_whitespace();
+        let (Some(word), Some(Ok(at))) = (words.next(), words.next().map(str::parse::<Millis>))
+        else {
+            continue;
+        };
+        let mark = match word {
+            "archived" => Mark::Archived(at),
+            "kept" => Mark::Kept(at),
             _ => continue,
         };
         out.insert(name, mark);
@@ -59,10 +70,12 @@ fn marks_in(dir: &Path) -> HashMap<String, Mark> {
 
 /// Whether a conversation last used at `last_ms` is archived, given its mark.
 pub fn is_archived(mark: Option<Mark>, last_ms: Millis, now: Millis) -> bool {
+    let unused_since = |from: Millis| now.saturating_sub(from) > AUTO_AFTER;
     match mark {
-        Some(Mark::Archived) => true,
-        Some(Mark::Kept) => false,
-        None => now.saturating_sub(last_ms) > AUTO_AFTER,
+        // Used after it was archived — resumed by hand — it is in use again.
+        Some(Mark::Archived(at)) => last_ms <= at || unused_since(last_ms),
+        Some(Mark::Kept(at)) => unused_since(last_ms.max(at)),
+        None => unused_since(last_ms),
     }
 }
 
@@ -81,11 +94,11 @@ fn set_in(d: &Path, id: &str, mark: Mark) -> io::Result<()> {
     }
     std::fs::create_dir_all(d)?;
     let tmp = d.join(format!(".{id}.{}", std::process::id()));
-    let word = match mark {
-        Mark::Archived => "archived",
-        Mark::Kept => "kept",
+    let (word, at) = match mark {
+        Mark::Archived(at) => ("archived", at),
+        Mark::Kept(at) => ("kept", at),
     };
-    std::fs::write(&tmp, format!("{word}\n"))?;
+    std::fs::write(&tmp, format!("{word} {at}\n"))?;
     std::fs::rename(&tmp, d.join(id))
 }
 
@@ -112,14 +125,39 @@ mod tests {
             "exactly 30 days: not yet"
         );
         assert!(is_archived(None, now - 30 * DAY - 1, now), "past 30 days");
+        let used = now - DAY;
         assert!(
-            is_archived(Some(Mark::Archived), now, now),
-            "put away with c"
+            is_archived(Some(Mark::Archived(now)), used, now),
+            "put away with c a day after its last use"
         );
         assert!(
-            !is_archived(Some(Mark::Kept), now - 90 * DAY, now),
-            "unarchived stays out, whatever its age"
+            !is_archived(Some(Mark::Archived(now - 2 * DAY)), used, now),
+            "resumed by hand after it was archived: in use again"
         );
+    }
+
+    #[test]
+    fn taking_one_out_gives_it_thirty_days_not_forever() {
+        let now = 100 * DAY;
+        let old = now - 90 * DAY;
+        assert!(
+            !is_archived(Some(Mark::Kept(now)), old, now),
+            "out, though old"
+        );
+        assert!(
+            !is_archived(Some(Mark::Kept(now - 30 * DAY)), old, now),
+            "for 30 days"
+        );
+        assert!(
+            is_archived(Some(Mark::Kept(now - 31 * DAY)), old, now),
+            "then age archives it again"
+        );
+        // A young one taken out ages from its last use, as it would have anyway.
+        assert!(!is_archived(
+            Some(Mark::Kept(now - 40 * DAY)),
+            now - DAY,
+            now
+        ));
     }
 
     #[test]
@@ -127,14 +165,14 @@ mod tests {
         let d = std::env::temp_dir().join(format!("cs-archive-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         assert!(marks_in(&d).is_empty(), "no archive yet");
-        set_in(&d, "conv-1", Mark::Archived).unwrap();
-        set_in(&d, "conv-2", Mark::Archived).unwrap();
-        set_in(&d, "conv-2", Mark::Kept).unwrap();
+        set_in(&d, "conv-1", Mark::Archived(7)).unwrap();
+        set_in(&d, "conv-2", Mark::Archived(8)).unwrap();
+        set_in(&d, "conv-2", Mark::Kept(9)).unwrap();
         let m = marks_in(&d);
-        assert_eq!(m.get("conv-1"), Some(&Mark::Archived));
-        assert_eq!(m.get("conv-2"), Some(&Mark::Kept));
+        assert_eq!(m.get("conv-1"), Some(&Mark::Archived(7)));
+        assert_eq!(m.get("conv-2"), Some(&Mark::Kept(9)));
         assert_eq!(m.len(), 2, "no temporary files left behind");
-        assert!(set_in(&d, "../escape", Mark::Archived).is_err());
+        assert!(set_in(&d, "../escape", Mark::Archived(1)).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

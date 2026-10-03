@@ -989,9 +989,6 @@ mod tests {
         }
     }
 
-    /// Prints the screens the mockup files draw, for redrawing those files to width:
-    /// `cargo test print_the_mockups -- --ignored --nocapture`. The files list and keys
-    /// screens without the blank gap above the footer (see `compare`).
     /// Mockup 9: the Archived group open, the cursor on its heading, as `menu.rs` lays the
     /// rows out — everything not archived, the heading's row, then the archived rows.
     fn mockup_9(w: u16) -> View {
@@ -1019,17 +1016,29 @@ mod tests {
         }
     }
 
+    /// Prints the screens the mockup files draw, for redrawing those files to width:
+    /// `cargo test print_the_mockups -- --ignored --nocapture`. The files list and keys
+    /// screens without the blank gap above the footer (see `compare`).
     #[test]
     #[ignore]
     fn print_the_mockups() {
-        let builds: [fn(u16) -> View; 8] = [
-            mockup_1, mockup_2, mockup_3, mockup_4, mockup_5, mockup_6, mockup_7, mockup_9,
+        // Numbered as the files number them; mockup 8 is the refusal, not a View.
+        type Build = fn(u16) -> View;
+        let builds: [(u8, Build); 8] = [
+            (1, mockup_1),
+            (2, mockup_2),
+            (3, mockup_3),
+            (4, mockup_4),
+            (5, mockup_5),
+            (6, mockup_6),
+            (7, mockup_7),
+            (9, mockup_9),
         ];
         for w in [40u16, 80] {
-            for (n, b) in builds.iter().enumerate() {
+            for (n, b) in builds {
                 let p = render(&b(w)).unwrap().plain();
                 let p = p.trim_end_matches('\n');
-                println!("=== {} {w}", if n == 7 { 9 } else { n + 1 });
+                println!("=== {n} {w}");
                 println!("{p}");
             }
         }

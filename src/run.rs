@@ -151,10 +151,11 @@ fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> Done {
             let Some(id) = id(i) else {
                 return Done::Nothing;
             };
+            let now = clock::now();
             let mark = if archiving {
-                Mark::Archived
+                Mark::Archived(now)
             } else {
-                Mark::Kept
+                Mark::Kept(now)
             };
             menu.set_status(Some(match archive::set(&id, mark) {
                 Ok(()) if archiving => "archived · c under Archived undoes it".into(),
@@ -164,11 +165,12 @@ fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> Done {
             return Done::Changed;
         }
         Action::Open(i) => {
-            // Resumed, it leaves the archive; marked kept first, so a resume that fails does
-            // not leave it folded away again by its age.
+            // Resumed, it leaves the archive. Marked kept first, so a resume that fails does
+            // not leave it folded straight back by its age; a kept mark lasts 30 days, so a
+            // launch that was refused costs no more than that.
             if rows.get(i).is_some_and(|r| r.archived) {
                 if let Some(id) = id(i) {
-                    let _ = archive::set(&id, Mark::Kept);
+                    let _ = archive::set(&id, Mark::Kept(clock::now()));
                 }
             }
             (launch::open(&rows, i, &ws, term), Some(i))

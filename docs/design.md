@@ -238,13 +238,15 @@ is the choice and why:
   header.
 - **The archive** (owner, 2026-10-03) hides a closed conversation in the menu and changes
   nothing of Claude Code's: `claude --resume` and `/resume` still find it. It is one small file
-  per conversation id in `archive/` beside the registry (`src/archive.rs`). A conversation is
-  archived when `c` put it there — `c` on a Closed row, **with no question asked**, since
-  nothing is lost — or when its last entry is more than 30 days old, worked out as the list is
-  read. `c` on an archived row takes it out and marks it kept, so an old one does not fold
-  away again; `Enter` on one resumes it and does the same. **The Archived group is shut
-  whenever the menu starts**: one heading, `── Archived · 12 ──`, and `Enter` on it opens or
-  shuts it.
+  per conversation id in `archive/` beside the registry (`src/archive.rs`), saying `archived`
+  or `kept` and when. A conversation is archived when it has gone 30 days unused, worked out
+  as the list is read, or when `c` on its Closed row put it there — **with no question
+  asked**, since nothing is lost — and it has not been used since: one resumed by hand after
+  it was archived is in use again. `c` on an archived row takes it out, and `Enter` on one
+  resumes it and does the same; either way it is marked kept, which gives it 30 days from
+  then before age archives it again, so an old one does not fold straight back. **The
+  Archived group is shut whenever the menu starts**, and again whenever it empties: one
+  heading, `── Archived · 12 ──`, and `Enter` on it opens or shuts it.
 - **The Closed group is read from Claude Code's own store**, `$CLAUDE_CONFIG_DIR/projects`
   (owner, 2026-10-03; `src/store.rs`), not from the registry: every conversation on disk,
   whoever started it — a slot of ours, a `claude` run by hand, the old `ssh` path, a

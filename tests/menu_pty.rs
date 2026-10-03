@@ -24,6 +24,38 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// `ms` as Claude Code writes a transcript's `timestamp`: `2026-10-01T00:00:00.000Z`. The
+/// stored conversations are dated from now, not from a fixed day, because 30 days unused
+/// archives one: a fixed date would move a listed row into the archive a month later and
+/// fail this test for no change at all. Days to civil date as in Howard Hinnant's
+/// `civil_from_days`.
+fn iso(ms: u64) -> String {
+    let (days, rem) = ((ms / 86_400_000) as i64, ms % 86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (h, mi, s, milli) = (
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1_000 % 60,
+        rem % 1_000,
+    );
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
+}
+
+#[test]
+fn iso_dates_as_claude_code_writes_them() {
+    assert_eq!(iso(0), "1970-01-01T00:00:00.000Z");
+    assert_eq!(iso(1_790_812_800_000), "2026-10-01T00:00:00.000Z");
+    assert_eq!(iso(1_709_208_000_123), "2024-02-29T12:00:00.123Z");
+}
+
 fn record(slot: &str, title: &str, transcript: &std::path::Path) -> String {
     // Two days and an hour old, so its age reads `2d` whichever minute the floored age clock
     // is in — exactly two days would read `1d` until the next minute turned, and redraw then,
@@ -81,13 +113,16 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
             "a conversation from somewhere else",
         ),
         ("/workspace", "stored-3", "a conversation still running"),
-        ("/workspace", "stored-4", "a conversation from august"),
+        (
+            "/workspace",
+            "stored-4",
+            "a conversation from two months ago",
+        ),
     ] {
-        let ts = if id == "stored-4" {
-            "2026-08-01T00:00:00.000Z"
-        } else {
-            "2026-10-01T00:00:00.000Z"
-        };
+        // Two days and an hour old, or sixty: either side of the 30 days that archive one,
+        // and well clear of any minute boundary in its age.
+        let days = if id == "stored-4" { 60 } else { 2 };
+        let ts = iso(now_ms() - days * 86_400_000 - 3_600_000);
         let dir = root.join("cc/projects").join(cwd.replace('/', "-"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -151,7 +186,7 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
         "the archive's heading: {frame:?}"
     );
     assert!(
-        !frame.contains("from august"),
+        !frame.contains("two months ago"),
         "an archived conversation is behind the shut heading: {frame:?}"
     );
 
