@@ -258,6 +258,9 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   question is about and the one after it (mockups 4 and 5), or the last two when it is the
   last row. Mockup 3 shows the row before instead; two of three agree, and the rule has to be
   one rule.
+- **The footer sits at the bottom of the terminal** (owner, 2026-10-03): the closing rule,
+  status and hints take its last lines, blank between them and the list; the mockups show
+  them straight after the content only because they are drawn shorter than a terminal.
 - **Width:** usable from 40 columns up. Below the width of the shortest drawn way out the menu
   refuses to draw at all and the door falls through to a shell, saying why.
 - **Startup** is on the ssh path: target under 100 ms.

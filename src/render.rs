@@ -5,7 +5,10 @@
 //! character, at 40 and at 80 columns; the tests at the bottom of this file read the fenced
 //! blocks out of both mockup files rather than keeping copies, so a change to the approved
 //! screens breaks the build until the renderer follows it. Every layout number below is
-//! measured off those screens, and each says which one.
+//! measured off those screens, and each says which one. The one thing they do not fix is
+//! the vertical gap: a full screen's footer sits on the terminal's last lines (owner,
+//! 2026-10-03), and the screens draw it straight after the content only because they are
+//! shorter than a terminal.
 //!
 //! Every glyph drawn here is ASCII, box drawing, `·` or `—` — the set the mockups use, which
 //! was checked against the common monospace fonts on 2026-10-01 — so one `char` is one
@@ -82,12 +85,11 @@ pub fn render(view: &View) -> Result<Frame, TooNarrow> {
     // A dialog wins over either screen: it is a question the next key answers, so it must be
     // what is on the screen when that key is pressed.
     let mut lines = match (&view.dialog, view.screen) {
+        // A dialog has no footer: it flows from the top and the rest of the screen is blank.
         (Some(dialog), _) => dialog_screen(view, dialog, w, h),
-        (None, Screen::Keys) => keys_screen(view, w),
-        (None, Screen::List) => list_screen(view, w, h),
+        (None, Screen::Keys) => pinned(keys_screen(view, w), h),
+        (None, Screen::List) => pinned(list_screen(view, w, h), h),
     };
-    // Content flows from the top and the rest of the screen is blank — the mockups are
-    // shorter than 24 lines and none of them pads between the list and the hint line.
     lines.truncate(h);
     lines.resize_with(h, Line::default);
     Ok(Frame {
@@ -168,6 +170,20 @@ fn sgr(style: Style) -> Option<String> {
         None => {}
     }
     (!codes.is_empty()).then(|| format!("\x1b[{}m", codes.join(";")))
+}
+
+/// A full screen's two parts laid on the terminal: the top from line 0 down, the footer —
+/// closing rule, status, hints — on the last lines, and blank between (owner, 2026-10-03;
+/// the mockups show the footer straight after the content only because they are drawn
+/// shorter than a terminal). With no room for a gap the footer follows the top directly, so
+/// nothing overlaps, and the cut to `h` takes the same lines it did before the footer moved.
+/// The top always starts on line 0, which keeps rows on line 2 for `menu.rs`'s click mapping.
+fn pinned((top, footer): (Vec<Line>, Vec<Line>), h: usize) -> Vec<Line> {
+    let gap = h.saturating_sub(top.len() + footer.len());
+    let mut out = top;
+    out.extend(std::iter::repeat_with(Line::default).take(gap));
+    out.extend(footer);
+    out
 }
 
 // ── Lines ───────────────────────────────────────────────────────────────────────────────
@@ -432,9 +448,9 @@ fn row(n: usize, r: &Row, digits: usize, title_w: usize, cursor: bool) -> Line {
 
 // ── Screens ─────────────────────────────────────────────────────────────────────────────
 
-/// Mockups 1, 2 and 6: header, rule, the rows that fit, rule, the status line if there is
-/// one, the hint line.
-fn list_screen(view: &View, w: usize, h: usize) -> Vec<Line> {
+/// Mockups 1, 2 and 6: header, rule and the rows that fit on top; the closing rule, the
+/// status line if there is one and the hint line as the footer.
+fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     let mut out = vec![header(view), rule(w)];
     let hints = if view.rows.is_empty() {
         out.extend(empty_body(view, w));
@@ -445,10 +461,10 @@ fn list_screen(view: &View, w: usize, h: usize) -> Vec<Line> {
         out.extend(rows(view, w, view.scroll, room));
         hint_lines(&HINTS, GAP, w)
     };
-    out.push(rule(w));
-    out.extend(status_lines(view, w).iter().map(|l| text(l, FG)));
-    out.extend(hints);
-    out
+    let mut footer = vec![rule(w)];
+    footer.extend(status_lines(view, w).iter().map(|l| text(l, FG)));
+    footer.extend(hints);
+    (out, footer)
 }
 
 /// The status line, wrapped rather than cut: it is usually a reason something was refused,
@@ -484,8 +500,9 @@ fn empty_body(view: &View, w: usize) -> Vec<Line> {
 }
 
 /// Mockup 7, on `?`. Keys are blue, as everywhere a key can be pressed; each mark is drawn in
-/// the colour it has in the list, so the screen is also the colour key.
-fn keys_screen(view: &View, w: usize) -> Vec<Line> {
+/// the colour it has in the list, so the screen is also the colour key. The closing rule and
+/// the hint line are the footer.
+fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     let mut head = text(&view.header.host, FG);
     head.push(" · keys and marks", DIM);
     let mut out = vec![head, rule(w)];
@@ -521,14 +538,14 @@ fn keys_screen(view: &View, w: usize) -> Vec<Line> {
     for (mark, style, what) in marks {
         keyed(&mut out, 0, (mark, style), 3, what, w);
     }
-    out.push(rule(w));
     let hints: &[Hint] = if view.rows.is_empty() {
         &HINTS_EMPTY
     } else {
         &HINTS
     };
-    out.extend(hint_lines(hints, GAP, w));
-    out
+    let mut footer = vec![rule(w)];
+    footer.extend(hint_lines(hints, GAP, w));
+    (out, footer)
 }
 
 /// Mockups 3 to 5: header, rule, two rows from `scroll` for context, the box, and nothing
@@ -815,24 +832,72 @@ mod tests {
         Ok(())
     }
 
-    /// The comparison every mockup test makes: the screen's lines first, then blank to the
-    /// bottom. Returns rather than asserts so the calibration test can watch it fail.
+    /// The comparison every mockup test makes. Returns rather than asserts so the calibration
+    /// test can watch it fail.
     fn matches(v: &View, expected: &[&str]) -> Result<(), String> {
         let frame = render(v).map_err(|e| format!("{e:?}"))?;
-        check_shape(&frame, v)?;
-        let got = lines(&frame);
+        compare(&frame, v, expected)
+    }
+
+    /// A dialog's screen is its lines from the top and then blank. Any other screen has a
+    /// footer, which sits on the terminal's last lines (owner, 2026-10-03): the mockup down to
+    /// its closing rule is the frame's first lines, the closing rule onward is its last
+    /// lines, and everything between is blank.
+    fn compare(frame: &Frame, v: &View, expected: &[&str]) -> Result<(), String> {
+        check_shape(frame, v)?;
+        let got = lines(frame);
         if got.len() < expected.len() {
             return Err("the frame is shorter than the mockup".to_string());
         }
-        for (i, (g, e)) in got.iter().zip(expected).enumerate() {
-            if g != e {
-                return Err(format!("line {i}:\n  got  {g:?}\n  want {e:?}"));
+        let split = if v.dialog.is_some() {
+            expected.len()
+        } else {
+            closing_rule(expected)?
+        };
+        let (top, footer) = expected.split_at(split);
+        let bottom = got.len() - footer.len();
+        let want = top
+            .iter()
+            .enumerate()
+            .chain(footer.iter().enumerate().map(|(i, e)| (bottom + i, e)));
+        for (i, e) in want {
+            if got[i] != *e {
+                return Err(format!("line {i}:\n  got  {:?}\n  want {e:?}", got[i]));
             }
         }
-        if let Some(i) = got[expected.len()..].iter().position(|l| !l.is_empty()) {
-            return Err(format!("line {} should be blank", expected.len() + i));
+        if let Some(i) = got[top.len()..bottom].iter().position(|l| !l.is_empty()) {
+            return Err(format!("line {} should be blank", top.len() + i));
         }
         Ok(())
+    }
+
+    /// Where a full screen's footer starts: its closing rule, the last line drawn in `─`
+    /// after the header's own rule.
+    fn closing_rule(expected: &[&str]) -> Result<usize, String> {
+        match expected.iter().rposition(|l| l.starts_with('─')) {
+            Some(i) if i > 1 => Ok(i),
+            _ => Err("the mockup has no closing rule".to_string()),
+        }
+    }
+
+    /// The line the last hint is drawn on: the last line with ink on it. `None` when the
+    /// last ink is not a hint line (it must start with a key from the hint line).
+    fn last_hint_line(frame: &Frame) -> Option<usize> {
+        let got = lines(frame);
+        let i = got.iter().rposition(|l| !l.is_empty())?;
+        let keys = ["Enter ", "n ", "c ", "? ", "s "];
+        keys.iter().any(|k| got[i].starts_with(k)).then_some(i)
+    }
+
+    /// The frame as the renderer drew it before the footer moved: the first `top` lines, the
+    /// last `footer` lines straight after them, then blank. For calibration only — the layout
+    /// the checks for the new one must reject.
+    fn footer_raised(frame: &Frame, top: usize, footer: usize) -> Frame {
+        let n = frame.lines.len();
+        let mut lines = frame.lines[..top].to_vec();
+        lines.extend_from_slice(&frame.lines[n - footer..]);
+        lines.resize_with(n, Vec::new);
+        Frame { lines }
     }
 
     fn assert_mockup(n: usize, build: fn(u16) -> View) {
@@ -910,6 +975,66 @@ mod tests {
     #[test]
     fn mockup_7_the_keys() {
         assert_mockup(7, mockup_7);
+    }
+
+    #[test]
+    fn the_footer_sits_on_the_last_line_of_the_terminal() {
+        // Owner, 2026-10-03: the list, the empty list and the keys screen put their closing
+        // rule, status and hints on the terminal's last lines, however little is above them.
+        let builds: [fn(u16) -> View; 4] = [mockup_1, mockup_2, mockup_6, mockup_7];
+        for (doc, w) in SETS {
+            for (n, build) in [1, 2, 6, 7].into_iter().zip(builds) {
+                let v = build(w);
+                assert_eq!(v.height, 24);
+                let f = render(&v).unwrap();
+                assert_eq!(last_hint_line(&f), Some(23), "mockup {n} at {w}x24");
+                // Calibration: the same frame laid out as before the move — footer straight
+                // after the content — must fail both this check and the mockup comparison.
+                let expected = mockup(doc, n);
+                let split = closing_rule(&expected).unwrap();
+                let old = footer_raised(&f, split, expected.len() - split);
+                assert_eq!(
+                    last_hint_line(&old),
+                    Some(expected.len() - 1),
+                    "calibration: the raised footer's last hint is where the mockup draws it"
+                );
+                assert!(expected.len() - 1 < 23);
+                assert!(
+                    compare(&old, &v, &expected).is_err(),
+                    "mockup {n} at {w}: the old layout passed the new comparison"
+                );
+            }
+        }
+        // A dialog draws no footer: its last line is the box's bottom, not a hint.
+        for build in [mockup_3, mockup_4, mockup_5] {
+            assert_eq!(last_hint_line(&render(&build(40)).unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn when_the_rows_fill_the_space_the_footer_follows_them_directly() {
+        let mut rows = six();
+        rows.extend(six());
+        rows.extend(six());
+        rows.extend(six());
+        for (w, hints) in [(40u16, 2), (80, 1)] {
+            let v = view(w, rows.clone(), 812);
+            let p = lines(&render(&v).unwrap());
+            // Every line between the rules is a row: 24 less header, two rules and hints.
+            let shown = 24 - 3 - hints;
+            for (i, l) in p[2..2 + shown].iter().enumerate() {
+                assert!(
+                    l.starts_with(&format!("{:>2} ", i + 1)),
+                    "line {}: {l:?}",
+                    i + 2
+                );
+            }
+            assert!(
+                p[2 + shown].starts_with('─'),
+                "the closing rule follows the rows"
+            );
+            assert!(p[23].ends_with("s shell"));
+        }
     }
 
     /// Mockup 8's blocks: `(width, hint lines)` for each `at N columns` it shows.
@@ -1097,8 +1222,9 @@ mod tests {
             chars_styled(&f, |s| s.fg == Some(Colour::Blue)),
             "tEnternc?s"
         );
-        // The hint line: keys blue, descriptions in the foreground.
-        let hint = &f.lines[9];
+        // The hint line's first line, second from the bottom at 40 columns: keys blue,
+        // descriptions in the foreground.
+        let hint = &f.lines[22];
         let blue: Vec<&str> = hint
             .iter()
             .filter(|s| s.style == BLUE)
@@ -1279,8 +1405,13 @@ mod tests {
         .ansi();
         assert!(cursor.contains("\x1b[2;7m2\x1b[0m"));
         assert!(cursor.contains("\x1b[1;7m*\x1b[0m"));
-        // An idle screen's blank lines cost three bytes and a separator each.
-        assert!(f.ends_with("\x1b[K\r\n\x1b[K"));
+        // The blank lines between the list and the footer cost three bytes and a separator
+        // each.
+        assert!(f.contains("\x1b[K\r\n\x1b[K\r\n\x1b[K"));
+        assert!(
+            f.ends_with(" shell\x1b[K"),
+            "the hint line is the bottom line"
+        );
     }
 
     // ── The parts the mockups do not draw ─────────────────────────────────────────────

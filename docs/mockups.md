@@ -4,9 +4,11 @@
 > reviewed in.
 
 **These are binding.** Phase 4 renders to them; a change needs the owner, not a judgement
-call. One correction since approval, by the owner on 2026-10-02: mockup 2's way out read
+call. Two corrections since approval. By the owner on 2026-10-02: mockup 2's way out read
 `q   a shell instead`, which was a mistake — `q` quits and `s` is the shell everywhere else —
-and now reads `s   a shell instead`, in both widths.
+and now reads `s   a shell instead`, in both widths. And on 2026-10-03 the owner asked for
+the footer — closing rule, status, hints — to sit at the bottom of the terminal; the screens
+show content flowing from the top only because they are drawn shorter than a terminal.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
