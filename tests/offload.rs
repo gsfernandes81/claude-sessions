@@ -72,9 +72,16 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// An idle slot `claude-1`: stopped eleven minutes ago, nothing pending, socket `mode`.
+/// An idle slot `claude-1`: stopped eleven minutes ago, nothing pending, socket `mode`, and a
+/// transcript on disk for its conversation.
 /// With `child`, the stand-in claude has a `sleep` running under it — work a stop would kill.
 fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
+    idle_slot_with(tag, socket_mode, child, true)
+}
+
+/// As [`idle_slot`], with the transcript there or not. A slot opened and never prompted has
+/// none: Claude Code writes it at the first prompt (issue #5).
+fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["bin", "registry", "abduco"] {
@@ -120,11 +127,19 @@ fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
     std::fs::write(&sock, "").unwrap();
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(socket_mode)).unwrap();
 
+    // The path is recorded either way, as the hooks record it from SessionStart on; only
+    // whether the file is there differs.
+    let transcript_path = root.join("conv-1.jsonl");
+    if transcript {
+        std::fs::write(&transcript_path, "{}\n").unwrap();
+    }
     let stop = now_ms() - 11 * 60 * 1000;
     let record = format!(
         r#"{{"slot":"claude-1","state":"live","pid":{claude},"proc_start":{claude_start},
-            "session_id":"conv-1","cwd":"/workspace","busy":false,"needs_you":false,
-            "last_activity_ms":{stop},"last_stop_ms":{stop},"timers":[]}}"#
+            "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}",
+            "busy":false,"needs_you":false,
+            "last_activity_ms":{stop},"last_stop_ms":{stop},"timers":[]}}"#,
+        transcript_path.display()
     );
     std::fs::write(root.join("registry/claude-1.json"), record).unwrap();
     Slot {
@@ -141,6 +156,8 @@ fn offload(root: &Path, extra: &[&str]) -> (bool, String) {
         .args(extra)
         .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
         .env("ABDUCO_SOCKET_DIR", root.join("abduco"))
+        // Never the real config directory, should a record ever fall back to the derived path.
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
         .output()
         .expect("offload runs");
     (
@@ -165,6 +182,7 @@ fn an_idle_detached_slot_is_stopped_and_marked_offloaded() {
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
     assert!(out.contains("claude-1: offloaded"), "got: {out}");
+    assert!(out.contains("1 slot(s) offloaded, 0 closed"), "got: {out}");
     assert!(!alive(s.claude, s.claude_start), "the claude is gone");
     assert_eq!(state_of(&s.root), "offloaded");
     assert!(
@@ -173,6 +191,38 @@ fn an_idle_detached_slot_is_stopped_and_marked_offloaded() {
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
     assert!(log.contains("claude-1: offloaded"), "logged: {log}");
+}
+
+#[test]
+fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
+    // Issue #5. Calibrated by the test above: the same fixture with its transcript present is
+    // offloaded, so a pass here that closed would be reading the transcript, not closing all.
+    let s = idle_slot_with("notranscript", 0o600, false, false);
+    assert!(
+        alive(s.claude, s.claude_start),
+        "calibration: it starts alive"
+    );
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "offload failed: {out}");
+    assert!(
+        out.contains("claude-1: would close, idle 11m"),
+        "got: {out}"
+    );
+    assert!(alive(s.claude, s.claude_start), "a dry run stops nothing");
+    assert_eq!(state_of(&s.root), "live");
+
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "offload failed: {out}");
+    assert!(out.contains("claude-1: closed"), "got: {out}");
+    assert!(out.contains("0 slot(s) offloaded, 1 closed"), "got: {out}");
+    assert!(!alive(s.claude, s.claude_start), "the claude is gone");
+    assert_eq!(state_of(&s.root), "closed");
+    assert!(
+        !s.root.join("abduco/claude-1@test").exists(),
+        "torn down exactly as an offload is"
+    );
+    let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
+    assert!(log.contains("claude-1: closed"), "logged: {log}");
 }
 
 #[test]

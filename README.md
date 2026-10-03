@@ -32,7 +32,7 @@ registry implementation and one set of tests:
 |---|---|
 | `claude-sessions` | the menu — the default, and what an ssh login lands on |
 | `claude-sessions hook` | fed by Claude Code's hooks; the only writer of session state |
-| `claude-sessions offload` | stops a session nobody is using, keeping its conversation |
+| `claude-sessions offload` | stops a session nobody is using, keeping its conversation — closing it if it never had one |
 | `claude-sessions reconcile` | makes the registry agree with reality after a restart |
 | `claude-sessions close` | ends a session without opening it |
 | `claude-sessions doctor` | says what it can and cannot see, per slot |

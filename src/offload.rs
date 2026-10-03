@@ -14,6 +14,11 @@
 //! That hook cannot take the lock we are holding, gives up after its 400 ms, and logs that it
 //! did; the offloader writes `offloaded` itself, so nothing is lost but a `hook.log` line.
 //!
+//! **A slot with no conversation on disk is closed, not offloaded** (issue #5). Claude Code
+//! writes a conversation's transcript at its first prompt, so a slot opened and never spoken
+//! to has a `session_id` and nothing behind it to resume. It is stopped by the same path, but
+//! the record says `closed`: an `offloaded` row promises a resume that would exit at once.
+//!
 //! Run as a pass: `claude-sessions offload`, from whatever timer the box uses. `--dry-run`
 //! decides and reports without signalling anything.
 
@@ -58,6 +63,9 @@ pub struct Seen {
     /// The first descendant that is not a `claude`: a background build, a dev server, a
     /// shell. Its existence means work is running that a stop would kill.
     pub foreign_descendant: Option<String>,
+    /// The record's current conversation has a transcript on disk
+    /// ([`SlotRecord::has_conversation`]). Without one, a stop is a close.
+    pub conversation: bool,
 }
 
 /// Why a slot was kept. Every variant is a reason to do nothing.
@@ -101,9 +109,40 @@ impl fmt::Display for Hold {
     }
 }
 
-/// The rule, pure: may this slot be stopped now? `Ok` carries how long it has been idle.
+/// What to do with a slot that may be stopped. Both carry how long it has been idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Stop it and mark it `offloaded`, to be resumed from its row.
+    Offload { idle: Millis },
+    /// Stop it and mark it `closed`: there is no conversation on disk to resume.
+    Close { idle: Millis },
+}
+
+impl Verdict {
+    pub fn idle(self) -> Millis {
+        match self {
+            Verdict::Offload { idle } | Verdict::Close { idle } => idle,
+        }
+    }
+}
+
+/// The rule, pure, and what follows from it: keep the slot, offload it, or close it.
 ///
-/// Offloadable when: live · its process alive · resumable · nothing waiting for you · no
+/// A slot that may be stopped ([`decide`]) is closed rather than offloaded when its record's
+/// conversation has no transcript on disk — a slot opened and never prompted.
+pub fn judge(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Verdict, Hold> {
+    let idle = decide(rec, now, seen)?;
+    Ok(if seen.conversation {
+        Verdict::Offload { idle }
+    } else {
+        Verdict::Close { idle }
+    })
+}
+
+/// The rule, pure: may this slot be stopped now? `Ok` carries how long it has been idle.
+/// Whether that stop is an offload or a close is [`judge`]'s answer, not this one's.
+///
+/// Stoppable when: live · its process alive · resumable · nothing waiting for you · no
 /// pending timer, whoever set it · a `Stop`, or a start at the prompt, is the latest thing that
 /// happened · idle past the threshold · detached · nothing but Claude Code under it.
 pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold> {
@@ -158,7 +197,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     Ok(idle)
 }
 
-/// Gather what `decide` needs for one slot.
+/// Gather what `decide` and `judge` need for one slot.
 pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
     let (Some(pid), Some(start)) = (rec.pid, rec.proc_start) else {
         return Seen::default();
@@ -173,6 +212,7 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
         },
         table_readable: table.is_some(),
         foreign_descendant: table.and_then(|t| foreign_descendant(t, pid)),
+        conversation: rec.has_conversation(),
     }
 }
 
@@ -291,7 +331,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     if let Some(free) = m.headroom() {
         println!("memory: {} MB free in this container", free / (1024 * 1024));
     }
-    let mut offloaded = 0usize;
+    let (mut offloaded, mut closed) = (0usize, 0usize);
     // One snapshot of /proc for the whole pass, taken holding no lock. Reading every
     // process's stat and cmdline is the slow part of a pass, and a hook that arrives while a
     // slot's lock is held has to wait for it — issue #1: a prompt dropped that way leaves a
@@ -303,8 +343,8 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         }
         // First decision from the snapshot and the record as listed, holding nothing. Every
         // slot that is kept — nearly all of them, nearly always — ends here.
-        let idle = match decide(&listed, clock::now(), &look(&listed, table.as_deref())) {
-            Ok(idle) => idle,
+        let verdict = match judge(&listed, clock::now(), &look(&listed, table.as_deref())) {
+            Ok(verdict) => verdict,
             Err(hold) => {
                 println!("{}: kept — {hold}", listed.slot);
                 continue;
@@ -312,7 +352,16 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         };
         // A dry run writes nothing, so it has nothing to protect and takes no lock at all.
         if dry_run {
-            println!("{}: would offload, idle {}m", listed.slot, idle / 60_000);
+            match verdict {
+                Verdict::Offload { idle } => {
+                    println!("{}: would offload, idle {}m", listed.slot, idle / 60_000)
+                }
+                Verdict::Close { idle } => println!(
+                    "{}: would close, idle {}m — {NO_CONVERSATION}",
+                    listed.slot,
+                    idle / 60_000
+                ),
+            }
             continue;
         }
         // A candidate. Now the lock, held from here through the kill as the design requires,
@@ -338,49 +387,58 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             continue;
         };
         let fresh = procinfo::table();
-        let idle = match decide(&rec, clock::now(), &look(&rec, fresh.as_deref())) {
-            Ok(idle) => idle,
+        let verdict = match judge(&rec, clock::now(), &look(&rec, fresh.as_deref())) {
+            Ok(verdict) => verdict,
             Err(hold) => {
                 println!("{slot}: kept — {hold}");
                 continue;
             }
         };
-        if offload_one(&mut rec, idle, fresh.as_deref())? {
-            offloaded += 1;
+        match stop_quiet(&mut rec, verdict, fresh.as_deref())? {
+            Ok(line) => {
+                println!("{line}");
+                match verdict {
+                    Verdict::Offload { .. } => offloaded += 1,
+                    Verdict::Close { .. } => closed += 1,
+                }
+            }
+            Err(why) => println!("{why}"),
         }
     }
 
     sweep_orphans(dry_run);
     println!(
-        "offload: {offloaded} slot(s) offloaded{}",
+        "offload: {offloaded} slot(s) offloaded, {closed} closed{}",
         if dry_run { " (dry run)" } else { "" }
     );
     Ok(())
 }
 
-/// Stop one slot whose decision has already been made, with its lock held by the caller.
-fn offload_one(rec: &mut SlotRecord, idle: Millis, table: Option<&[Proc]>) -> io::Result<bool> {
-    match offload_quiet(rec, idle, table)? {
-        Ok(line) => {
-            println!("{line}");
-            Ok(true)
-        }
-        Err(why) => {
-            println!("{why}");
-            Ok(false)
-        }
-    }
-}
+/// Why a stop is a close, as the pass and its log say it.
+const NO_CONVERSATION: &str = "no conversation on disk to resume";
 
-/// The stop itself, logged to `offload.log` and never printed: `Ok` is the line saying what
-/// was done, `Err` the line saying why the slot was left `offloading`.
-///
-/// Split from `offload_one` for the menu, which offloads a slot to make room when the owner
-/// accepts mockup 4's offer. It runs with the terminal in raw mode on the menu's own screen,
-/// where a stray `println!` would land in the middle of the drawing.
+/// Offload a slot whose [`decide`] was asked under its lock, which the caller still holds:
+/// [`stop_quiet`] with an offload, whatever is on disk. The menu's make-room path, which
+/// still marks a victim with no conversation `offloaded` — a row the menu does not list —
+/// until it asks [`judge`] and calls [`stop_quiet`] instead.
 pub fn offload_quiet(
     rec: &mut SlotRecord,
     idle: Millis,
+    table: Option<&[Proc]>,
+) -> io::Result<Result<String, String>> {
+    stop_quiet(rec, Verdict::Offload { idle }, table)
+}
+
+/// The stop itself, an offload or a close as `verdict` says, with the slot's lock held by the
+/// caller. Logged to `offload.log` and never printed: `Ok` is the line saying what was done,
+/// `Err` the line saying why it was not finished.
+///
+/// Never printed for the menu, which stops a slot to make room when the owner accepts mockup
+/// 4's offer, with the terminal in raw mode on its own screen, where a stray `println!` would
+/// land in the middle of the drawing.
+pub fn stop_quiet(
+    rec: &mut SlotRecord,
+    verdict: Verdict,
     table: Option<&[Proc]>,
 ) -> io::Result<Result<String, String>> {
     let (Some(pid), Some(start)) = (rec.pid, rec.proc_start) else {
@@ -390,17 +448,22 @@ pub fn offload_quiet(
         )));
     };
     let server = abduco_server(table, pid);
+    let offload = matches!(verdict, Verdict::Offload { .. });
 
-    // Written BEFORE the signal: the SessionEnd it provokes must read as an offload.
-    rec.state = State::Offloading;
-    rec.updated_ms = clock::now();
-    registry::store(rec)?;
+    // An offload is written BEFORE the signal: the SessionEnd it provokes must read as an
+    // offload. A close writes nothing first — that SessionEnd already reads as a close — so a
+    // stop that fails leaves the slot `live` for the next pass to decide again.
+    if offload {
+        rec.state = State::Offloading;
+        rec.updated_ms = clock::now();
+        registry::store(rec)?;
+    }
 
     let how = match stop(pid, start, TERM_GRACE, KILL_GRACE) {
         Ok(how) => how,
         Err(e) => {
-            // Left `offloading`: the next pass decides again, and reconcile finishes it if
-            // the process does die.
+            // Left as it was: the next pass decides again, and reconcile finishes it if the
+            // process does die.
             let line = format!("{}: stop failed: {e}", rec.slot);
             log(&line);
             return Ok(Err(line));
@@ -408,19 +471,29 @@ pub fn offload_quiet(
     };
     let notes = teardown_abduco(&rec.slot, server);
 
-    rec.state = State::Offloaded;
+    rec.state = if offload {
+        State::Offloaded
+    } else {
+        State::Closed
+    };
     rec.busy = false;
     rec.updated_ms = clock::now();
     registry::store(rec)?;
 
     let line = format!(
-        "{}: offloaded pid {pid} after {}m idle ({}){}{}",
+        "{}: {} pid {pid} after {}m idle ({}){}{}{}",
         rec.slot,
-        idle / 60_000,
+        if offload { "offloaded" } else { "closed" },
+        verdict.idle() / 60_000,
         match how {
             Stopped::ByTerm => "TERM",
             Stopped::ByKill => "needed KILL",
             Stopped::AlreadyGone => "already gone",
+        },
+        if offload {
+            String::new()
+        } else {
+            format!(" — {NO_CONVERSATION}")
         },
         if notes.is_empty() { "" } else { "; " },
         notes.join("; ")
@@ -614,6 +687,7 @@ mod tests {
             attached: Some(false),
             table_readable: true,
             foreign_descendant: None,
+            conversation: true,
         };
         (r, seen)
     }
@@ -622,6 +696,62 @@ mod tests {
     fn calibration_an_idle_detached_slot_is_offloadable() {
         let (rec, seen) = idle();
         assert_eq!(decide(&rec, NOW, &seen), Ok(IDLE_AFTER_STOP_MS + 1));
+        assert_eq!(
+            judge(&rec, NOW, &seen),
+            Ok(Verdict::Offload {
+                idle: IDLE_AFTER_STOP_MS + 1
+            })
+        );
+    }
+
+    #[test]
+    fn an_idle_slot_with_no_conversation_on_disk_is_closed_not_offloaded() {
+        // Issue #5: opened at its prompt and never spoken to — a session id, no transcript.
+        // Stopping it is right; promising a resume is not.
+        let (mut rec, mut seen) = idle();
+        let at = rec.last_stop_ms.take().unwrap();
+        rec.ready_ms = Some(at);
+        seen.conversation = false;
+        assert_eq!(
+            judge(&rec, NOW, &seen),
+            Ok(Verdict::Close {
+                idle: IDLE_AFTER_STOP_MS + 1
+            })
+        );
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Ok(IDLE_AFTER_STOP_MS + 1),
+            "still a slot that may be stopped, which is all the menu's room offer asks"
+        );
+        // Calibration: the same slot with its transcript there is offloaded.
+        seen.conversation = true;
+        assert_eq!(
+            judge(&rec, NOW, &seen),
+            Ok(Verdict::Offload {
+                idle: IDLE_AFTER_STOP_MS + 1
+            })
+        );
+    }
+
+    #[test]
+    fn no_conversation_never_overrides_a_reason_to_keep() {
+        // A close is still a stop: every hold applies to it exactly as to an offload.
+        let (rec, mut seen) = idle();
+        seen.conversation = false;
+        seen.attached = Some(true);
+        assert_eq!(judge(&rec, NOW, &seen), Err(Hold::Attached));
+        let (mut rec, mut seen) = idle();
+        seen.conversation = false;
+        rec.last_stop_ms = Some(NOW - 1_000);
+        rec.last_activity_ms = NOW - 1_000;
+        assert!(matches!(
+            judge(&rec, NOW, &seen),
+            Err(Hold::TooRecent { .. })
+        ));
+        let (mut rec, mut seen) = idle();
+        seen.conversation = false;
+        rec.session_id = None;
+        assert_eq!(judge(&rec, NOW, &seen), Err(Hold::NotResumable));
     }
 
     #[test]

@@ -123,6 +123,13 @@ It holds the slot lock from decision through kill, marks the slot `offloading` b
 signalling and `offloaded` after, and keeps `TERM` → grace → `KILL` → `abduco` teardown with
 the pid-plus-start-time check at each step.
 
+**A slot with no conversation on disk is closed, not offloaded** (issue #5). Claude Code
+writes a conversation's transcript at its first prompt, not at `SessionStart`, so a slot
+opened and never spoken to — or `/clear`ed and left — has a `session_id` with nothing behind
+it, and `claude --resume` on it exits at once. Such a slot is stopped by the same rules and
+the same path, but marked `closed`: an `offloaded` row would promise a resume that cannot
+happen.
+
 **Low memory is the container's, not the host's.** `/proc/meminfo` inside a container reports
 the whole machine; the ceiling is the cgroup. Read `/sys/fs/cgroup/memory.max` and
 `memory.current` — both readable unprivileged on cgroup v2, verified 2026-10-01 — and fall
@@ -153,6 +160,20 @@ is the choice and why:
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules, so
   a `u` slot whose hooks did record those is offloadable and comes back as a registered one.
+- **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
+  stopped; `judge` then makes it a close when the record's transcript — `transcript_path`, or
+  for an older record the path derived under `CLAUDE_CONFIG_DIR` — is not a file. Every
+  reason to keep holds a close exactly as it holds an offload. A slot with no `session_id`
+  is still kept rather than closed: there the hooks never bound and nothing is known, while
+  a recorded id with no transcript is evidence there is nothing to lose. `--dry-run` prints
+  `would close` for it, in the shape of `would offload`.
+- **A close writes nothing before the signal.** The `SessionEnd` it provokes already reads as
+  a close, and a stop that fails leaves the slot `live` for the next pass, where an offload
+  leaves it `offloading`. Afterwards the record is `closed`, the line in `offload.log` says
+  `closed … no conversation on disk to resume`, and the pass's summary counts it apart.
+- **The menu's make-room path still offloads** (`offload_quiet`, from `src/launch.rs`): it
+  asks `decide`, not `judge`, so a victim with no conversation is marked `offloaded`, a row
+  the menu does not list either way. `stop_quiet` takes the verdict for when it asks `judge`.
 - **Not being able to look keeps it.** No abduco socket (attached cannot be ruled out), a
   `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
   is a reason to keep, because the offloader needs evidence to act, never to hold off.
@@ -180,7 +201,7 @@ is the choice and why:
   dropped `UserPromptSubmit` leaves a working claude reading as idle.
 - **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
-  offloader writes `offloaded` itself. A `hook.log` line per offload is expected.
+  offloader writes `offloaded` (or `closed`) itself. A `hook.log` line per offload is expected.
 - **The sweep infers "spawner gone" from the parent**: a transient daemon whose parent is no
   longer a `claude` has been reparented away from the session that started it — sound only
   with agent view disabled, as above. **A daemon under 10 minutes old is left alone**, as is
@@ -283,12 +304,14 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 closed. **`/clear` does not**: it starts a new conversation in the same process, which is
 right for *same session, new task* and wrong for *done*. `c` in the menu closes without
 opening, for something offloaded last week. Stale slots are never closed automatically; they
-sort to the bottom.
+sort to the bottom. The one close the offloader makes is of an idle slot with no
+conversation on disk, which has nothing to offload (*The offloader*).
 
 **Closing is not destructive and the dialog says so.** What a close stops is the process; the
 conversation stays on disk, and the closed row stays in the list, at the bottom, to resume it
 from. The difference between close and offload is where the row sorts and that the offloader
-never stops a slot on its own initiative to close it.
+never stops a slot on its own initiative to close it — except one with no conversation to
+offload, whose row would not be listed either way.
 
 ## The door
 
