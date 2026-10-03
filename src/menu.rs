@@ -118,8 +118,9 @@ impl Menu {
         let mut next: Vec<Row> = Vec::with_capacity(fresh.len());
         if first {
             next = fresh;
-            // Stable, so `gather`'s recency order survives within each group.
-            next.sort_by_key(|r| (!r.wants_you, !r.unread));
+            // Stable, so `gather`'s recency order survives within each group. Closed rows go
+            // last: they are history, reachable but never in the way.
+            next.sort_by_key(|r| (r.closed, !r.wants_you, !r.unread));
         } else {
             for old in &self.rows {
                 if let Some(f) = fresh.iter().find(|f| f.key == old.key) {
@@ -302,6 +303,10 @@ impl Menu {
             Key::Enter if !self.rows.is_empty() => Action::Open(self.cursor),
             Key::Char('n') => Action::New,
             Key::Char('s') => Action::Shell,
+            Key::Char('c') if self.rows.get(self.cursor).is_some_and(|r| r.closed) => {
+                self.status = Some(format!("{} is already closed", self.cursor + 1));
+                Action::Redraw
+            }
             Key::Char('c') if !self.rows.is_empty() => self.ask_close(self.cursor),
             Key::Char('?') => {
                 self.screen = Screen::Keys;
@@ -371,9 +376,10 @@ pub fn gather(now: Millis) -> Vec<Row> {
     let recs = registry::all().unwrap_or_default();
     let sockets = abduco::sockets();
     let lives = live::all();
+    // Closed slots too (owner, 2026-10-03): listed at the bottom, so a conversation that
+    // ran in a slot can be resumed from the menu after it was closed.
     let mut slots: Vec<(&SlotRecord, Row)> = recs
         .iter()
-        .filter(|r| r.state != State::Closed)
         .map(|r| (r, slot_row(r, now, clock, &sockets, &lives)))
         .collect();
     slots.sort_by_key(|(r, _)| std::cmp::Reverse(r.last_activity_ms));
@@ -397,6 +403,7 @@ pub fn gather(now: Millis) -> Vec<Row> {
             attached: sock.attached_bit,
             offloaded: false,
             unregistered: true,
+            closed: false,
             title: sock.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
         });
@@ -428,8 +435,9 @@ fn slot_row(
         // has not caught up yet. One with no pid at all is a slot just started, waiting for
         // its SessionStart, and is not.
         offloaded: matches!(r.state, State::Offloaded | State::Offloading)
-            || (r.pid.is_some() && !alive),
+            || (r.state == State::Live && r.pid.is_some() && !alive),
         unregistered: !r.registered,
+        closed: r.state == State::Closed,
         title: live_title
             .or_else(|| r.title.clone())
             .or_else(|| r.first_prompt.clone())
@@ -475,6 +483,7 @@ mod tests {
             attached: false,
             offloaded: false,
             unregistered: false,
+            closed: false,
             title: name.into(),
             age: "1m".into(),
         }
@@ -511,6 +520,30 @@ mod tests {
         b.unread = false;
         d.wants_you = false;
         assert_eq!(names(&menu(vec![a, b, row("c"), d])), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn closed_rows_go_last_and_c_on_one_only_says_so() {
+        let mut old = row("old");
+        old.closed = true;
+        let mut waiting = row("waiting");
+        waiting.wants_you = true;
+        // Gathered most recent first, the closed one most recent of all.
+        let mut m = menu(vec![old, row("a"), waiting]);
+        assert_eq!(
+            names(&m),
+            ["waiting", "a", "old"],
+            "closed is history: last"
+        );
+        m.key(Key::End);
+        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
+        assert_eq!(
+            m.view().dialog,
+            None,
+            "nothing to ask: it is already closed"
+        );
+        assert_eq!(m.view().status.as_deref(), Some("3 is already closed"));
+        assert_eq!(m.key(Key::Enter), Action::Open(2), "Enter resumes it");
     }
 
     #[test]

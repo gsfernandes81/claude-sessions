@@ -38,6 +38,9 @@ pub struct Row {
     pub offloaded: bool,
     /// `u` — not started by claude-sessions.
     pub unregistered: bool,
+    /// `x` — closed; listed at the bottom so its conversation can be reached again, and
+    /// `Enter` resumes it (owner, 2026-10-03). Not counted as open.
+    pub closed: bool,
     pub title: String,
     /// Already formatted: `now`, `14m`, `5h`, `2d`.
     pub age: String,

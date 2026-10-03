@@ -4,11 +4,13 @@
 > reviewed in.
 
 **These are binding.** Phase 4 renders to them; a change needs the owner, not a judgement
-call. Two corrections since approval. By the owner on 2026-10-02: mockup 2's way out read
+call. Three changes since approval, each the owner's. On 2026-10-02: mockup 2's way out read
 `q   a shell instead`, which was a mistake — `q` quits and `s` is the shell everywhere else —
-and now reads `s   a shell instead`, in both widths. And on 2026-10-03 the owner asked for
-the footer — closing rule, status, hints — to sit at the bottom of the terminal; the screens
-show content flowing from the top only because they are drawn shorter than a terminal.
+and now reads `s   a shell instead`, in both widths. On 2026-10-03 the owner asked for the
+footer — closing rule, status, hints — to sit at the bottom of the terminal; the screens show
+content flowing from the top only because they are drawn shorter than a terminal. And on
+2026-10-03, closed slots are listed too, at the bottom, with a new mark `x` (dim, like the
+other state marks) and a line for it on the keys screen, mockup 7, in both widths.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -192,6 +194,7 @@ t  a timer is pending; not
 @  attached somewhere else too
 z  offloaded: Enter resumes it
 u  not started by claude-sessions
+x  closed: Enter resumes it
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell

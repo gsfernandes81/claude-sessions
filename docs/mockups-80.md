@@ -124,6 +124,7 @@ t  a timer is pending; not
 @  attached somewhere else too
 z  offloaded: Enter resumes it
 u  not started by claude-sessions
+x  closed: Enter resumes it
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```

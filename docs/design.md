@@ -185,8 +185,11 @@ is the choice and why:
 
 ## The menu
 
-- **Lists open slots** — live and offloaded, never closed — plus unregistered `abduco`
-  sessions. Order: wants you, then unread, then most recent activity.
+- **Lists every slot** — live, offloaded and, at the bottom, closed — plus unregistered
+  `abduco` sessions. Order: wants you, then unread, then most recent activity; closed rows
+  last. Closed rows are marked `x`, are not counted as open in the header, and `Enter` resumes
+  one exactly as it resumes an offloaded one (owner, 2026-10-03: past conversations must be
+  reachable from the menu, and these are the ones that ran in a slot).
 - **Opening a row:** live → `abduco -a`; offloaded → start a new slot running
   `claude --resume <session_id>` in its `cwd`. `abduco` runs as a **child**, so on detach the
   menu comes back rather than the login ending — a fresh login costs a Cloudflare Access
@@ -213,7 +216,8 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   control characters removed. A start into a `cwd` that no longer exists is refused before it
   runs, and a leftover socket of the same name is refused with a pointer to `reconcile`.
 - **New slots take the lowest free `claude-<n>`** under a registry-wide lock with a timeout,
-  writing the record before the lock goes; a closed record's name may be reused. A new slot
+  writing the record before the lock goes. A closed slot's name is never reused: its record
+  is what its row is drawn from, and a new slot under the name would overwrite it. A new slot
   that dies before binding is marked closed and reported by name, since it has no row yet.
 - **Room is checked once.** After offloading to make room, the open goes ahead without asking
   the cgroup again: its figure includes page cache that is not freed at once, and a second
@@ -274,8 +278,9 @@ opening, for something offloaded last week. Stale slots are never closed automat
 sort to the bottom.
 
 **Closing is not destructive and the dialog says so.** What a close stops is the process; the
-conversation stays on disk and `claude --resume` brings it back. The only difference between
-close and offload is whether the row stays in the list.
+conversation stays on disk, and the closed row stays in the list, at the bottom, to resume it
+from. The difference between close and offload is where the row sorts and that the offloader
+never stops a slot on its own initiative to close it.
 
 ## The door
 

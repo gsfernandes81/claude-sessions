@@ -234,9 +234,10 @@ pub(crate) fn open_with(
     // again under the lock.
     match classify(&rec, clock::now()) {
         Kind::Running => attach_slot(rows, slot, term, deps),
-        Kind::Resumable => resume(rows, slot, &n, term, deps, check_room),
+        // A closed slot is listed (owner, 2026-10-03) so that its conversation can be reached
+        // again; opening it resumes it exactly as an offloaded one is resumed.
+        Kind::Resumable | Kind::Closed => resume(rows, slot, &n, term, deps, check_room),
         Kind::Starting => Outcome::Refused(starting(&n)),
-        Kind::Closed => Outcome::Refused(format!("{n} is closed")),
     }
 }
 
@@ -335,6 +336,9 @@ enum Plan {
     Start {
         session: String,
         cwd: String,
+        /// Where the record goes back to if the start does not take: offloaded or closed,
+        /// whichever it was.
+        back_to: State,
     },
     /// The conversation is already running in this slot; attach rather than fork it.
     Attach(String),
@@ -354,8 +358,12 @@ fn resume(
             return no_room;
         }
     }
-    let (session, cwd) = match plan_resume(slot, n) {
-        Plan::Start { session, cwd } => (session, cwd),
+    let (session, cwd, back_to) = match plan_resume(slot, n) {
+        Plan::Start {
+            session,
+            cwd,
+            back_to,
+        } => (session, cwd, back_to),
         Plan::Attach(other) => return attach_slot(rows, &other, term, deps),
         Plan::Refuse(why) => return Outcome::Refused(why),
     };
@@ -363,11 +371,11 @@ fn resume(
     let (status, took) = match start_slot(slot, &cwd, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
-            put_back(slot, State::Offloaded);
+            put_back(slot, back_to);
             return Outcome::Refused(why);
         }
     };
-    match settle(slot, Some(State::Offloaded), took < deps.quick) {
+    match settle(slot, Some(back_to), took < deps.quick) {
         After::Running => detached(n),
         After::Ended => ended(n),
         // Gone with no SessionStart: claude never got as far as running the conversation.
@@ -396,12 +404,16 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
         Err(e) => return Plan::Refuse(format!("{n}: {e}")),
     };
     match classify(&rec, now) {
-        Kind::Resumable => {}
+        Kind::Resumable | Kind::Closed => {}
         // Somebody resumed it between the list being drawn and the lock being taken.
         Kind::Running => return Plan::Attach(slot.to_string()),
         Kind::Starting => return Plan::Refuse(starting(n)),
-        Kind::Closed => return Plan::Refuse(format!("{n} is closed")),
     }
+    let back_to = if rec.state == State::Closed {
+        State::Closed
+    } else {
+        State::Offloaded
+    };
     // A socket with nothing recorded running behind it: a server the offloader could not
     // stop, or one killed without cleanup. `abduco -c` on a taken name fails at once, and the
     // socket still being there would then read as a slot that started — so refuse, and let
@@ -452,7 +464,11 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
     if let Err(e) = registry::store(&rec) {
         return Plan::Refuse(format!("{n}: {e}"));
     }
-    Plan::Start { session, cwd }
+    Plan::Start {
+        session,
+        cwd,
+        back_to,
+    }
 }
 
 /// Where a conversation is already running, if it is.
@@ -592,7 +608,9 @@ pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
         let _lock = lock_slot(&slot, &slot)?;
         match registry::load(&slot) {
             Ok(None) => {}
-            Ok(Some(rec)) if rec.state == State::Closed => {}
+            // A closed slot's name is NOT reused: closed slots are listed so their
+            // conversations can be resumed (owner, 2026-10-03), and a new slot under the same
+            // name would overwrite the record its row is drawn from.
             Ok(Some(_)) => continue,
             // A record that cannot be read is not ours to overwrite; doctor reports it.
             Err(_) => continue,
@@ -1199,6 +1217,7 @@ exit 1"#,
             attached: false,
             offloaded: false,
             unregistered: false,
+            closed: false,
             title: title.into(),
             age: "now".into(),
         }
@@ -1466,6 +1485,44 @@ exit 1"#,
     }
 
     #[test]
+    fn a_closed_slot_is_resumed_like_an_offloaded_one() {
+        // Closed slots are listed so their conversations can be reached again (owner,
+        // 2026-10-03). Calibration first: a closed slot resumes.
+        let f = Fixture::new("resume-closed");
+        let mut closed = offloaded("claude-1", "conv-1", &f.work());
+        closed.state = State::Closed;
+        registry::store(&closed).unwrap();
+        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::Back(Some("detached from 1 · it is still running".into()))
+        );
+        let started = wait_for("the stand-in claude", || f.claude_log().pop());
+        assert!(started.ends_with("--resume conv-1"), "got {started}");
+        assert_eq!(load("claude-1").state, State::Live);
+    }
+
+    #[test]
+    fn a_closed_slot_that_fails_to_resume_goes_back_to_closed() {
+        // Back to where it came from — closed — not to offloaded. (A separate test: fixtures
+        // hold the lock that serialises the launcher's environment-reading tests, so two in
+        // one test would wait on each other forever.)
+        let f = Fixture::new("resume-closed-fails");
+        let mut closed = offloaded("claude-2", "0f9c4a1e-7d", &f.work());
+        closed.state = State::Closed;
+        registry::store(&closed).unwrap();
+        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let rows = [row("claude-1", "a"), row("claude-2", "b")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 1, &mut term, &deps, true);
+        assert!(matches!(out, Outcome::ResumeFailed(_)), "got {out:?}");
+        assert_eq!(load("claude-2").state, State::Closed);
+    }
+
+    #[test]
     fn a_resume_with_no_room_offers_the_idlest_offloadable_slot() {
         let mut f = Fixture::new("no-room");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
@@ -1539,7 +1596,7 @@ exit 1"#,
     // ── new ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn allocation_takes_the_lowest_free_name_and_reuses_a_closed_one() {
+    fn allocation_takes_the_lowest_free_name_and_leaves_a_closed_one_alone() {
         let mut f = Fixture::new("allocate");
         assert_eq!(allocate("/w").unwrap(), "claude-1", "calibration: empty");
         let (pid, start) = f.process();
@@ -1550,15 +1607,21 @@ exit 1"#,
         registry::store(&offloaded("claude-3", "c", "/")).unwrap();
         f.socket("claude-4", 0o600); // started by hand under one of our names
 
-        assert_eq!(allocate("/w").unwrap(), "claude-2", "closed is free");
-        let rec = load("claude-2");
+        // Closed slots are listed so their conversations can be resumed (owner, 2026-10-03):
+        // reusing the name would overwrite the record the row is drawn from.
+        assert_eq!(
+            allocate("/w").unwrap(),
+            "claude-5",
+            "live, closed, offloaded and socket-only names are all taken"
+        );
+        let rec = load("claude-5");
         assert_eq!(rec.state, State::Live);
         assert_eq!((rec.pid, rec.session_id), (None, None), "a fresh record");
         assert_eq!(rec.cwd.as_deref(), Some("/w"));
         assert_eq!(
-            allocate("/w").unwrap(),
-            "claude-5",
-            "offloaded and socket-only names are taken"
+            load("claude-2").state,
+            State::Closed,
+            "the closed record is untouched"
         );
     }
 

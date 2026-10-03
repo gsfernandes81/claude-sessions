@@ -386,7 +386,8 @@ fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
 /// `infra-dev · 6 open · 812M of 1.0G`: the container's name in the foreground, the rest
 /// dim, as structure.
 fn header(view: &View) -> Line {
-    let mut rest = match view.rows.len() {
+    // Closed rows are listed but are not open (owner, 2026-10-03).
+    let mut rest = match view.rows.iter().filter(|r| !r.closed).count() {
         0 => " · nothing open".to_string(),
         n => format!(" · {n} open"),
     };
@@ -427,6 +428,7 @@ fn row(n: usize, r: &Row, digits: usize, title_w: usize, cursor: bool) -> Line {
         (r.attached, "@", DIM),
         (r.offloaded, "z", DIM),
         (r.unregistered, "u", DIM),
+        (r.closed, "x", DIM),
     ];
     let mut line = Line::default();
     line.push(&format!("{n:>digits$}"), st(DIM))
@@ -523,7 +525,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     out.push(blank());
     // The `t` line breaks after "not" at 80 columns as well as at 40: the approved screens
     // break it there, so it is two segments rather than one wrapped sentence.
-    let marks: [(&str, Style, &[&str]); 6] = [
+    let marks: [(&str, Style, &[&str]); 7] = [
         ("!", AMBER, &["wants you: a prompt is waiting"]),
         ("*", BOLD, &["unread: it finished while away"]),
         (
@@ -534,6 +536,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
         ("@", DIM, &["attached somewhere else too"]),
         ("z", DIM, &["offloaded: Enter resumes it"]),
         ("u", DIM, &["not started by claude-sessions"]),
+        ("x", DIM, &["closed: Enter resumes it"]),
     ];
     for (mark, style, what) in marks {
         keyed(&mut out, 0, (mark, style), 3, what, w);
@@ -714,6 +717,7 @@ mod tests {
             attached: marks.contains('@'),
             offloaded: marks.contains('z'),
             unregistered: marks.contains('u'),
+            closed: marks.contains('x'),
             title: title.to_string(),
             age: age.to_string(),
         }
@@ -1095,13 +1099,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_closed_row_is_marked_x_and_not_counted_as_open() {
+        let mut v = mockup_1(40);
+        v.rows[4].offloaded = false;
+        v.rows[4].closed = true;
+        let plain = render(&v).unwrap().plain();
+        assert!(plain.starts_with("infra-dev · 5 open"), "got {plain}");
+        assert!(
+            plain.contains("5 x   mount guards on one"),
+            "the closed row's mark: {plain}"
+        );
+        // Calibration: with it not closed, it counts.
+        assert!(
+            render(&mockup_1(40))
+                .unwrap()
+                .plain()
+                .starts_with("infra-dev · 6 open")
+        );
+    }
+
     // ── Calibration: the comparison must be able to fail ──────────────────────────────
 
     #[test]
     fn the_mockup_comparison_fails_on_a_wrong_view() {
         // The parse finds real screens, not empty ones that would match anything.
         assert_eq!(mockup(MOCKUPS_40, 1).len(), 11);
-        assert_eq!(mockup(MOCKUPS_80, 7).len(), 18);
+        assert_eq!(mockup(MOCKUPS_80, 7).len(), 19);
         assert!(mockup(MOCKUPS_40, 5)[0].starts_with("infra-dev · 6 open"));
 
         let wrong_title = {
