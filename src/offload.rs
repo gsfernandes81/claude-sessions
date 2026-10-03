@@ -350,7 +350,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         }
     }
 
-    sweep_orphans();
+    sweep_orphans(dry_run);
     println!(
         "offload: {offloaded} slot(s) offloaded{}",
         if dry_run { " (dry run)" } else { "" }
@@ -429,7 +429,7 @@ pub fn offload_quiet(
     Ok(Ok(line))
 }
 
-// ── the orphan sweep: logging only ──────────────────────────────────────────
+// ── the orphan sweep ────────────────────────────────────────────────────────
 
 /// A transient daemon whose spawner has gone, with everything under it.
 #[derive(Debug)]
@@ -450,13 +450,14 @@ fn is_transient_daemon(p: &Proc) -> bool {
 
 /// The transient daemons whose spawner is gone, pure over a snapshot.
 ///
-/// **Gone is inferred from the parent, and that inference has not met a real daemon.** A
-/// process whose parent dies is reparented to init or a subreaper, so a transient daemon
-/// whose parent is no longer a `claude` has lost the session that started it. If the daemon
-/// turns out to detach on purpose — parent 1 from birth — every one of them will show up
-/// here, live or not. That is exactly what a week of log-only running is for: the log line
-/// carries the daemon's whole command line so a spawner pid in it, if there is one, can be
-/// used instead.
+/// **Gone is inferred from the parent.** A process whose parent dies is reparented to init or a
+/// subreaper, so a transient daemon whose parent is no longer a `claude` has lost the session
+/// that started it. That inference is only sound because **this tool runs with agent view
+/// disabled** (owner, 2026-10-03): agent view's supervisor is *meant* to outlive the session
+/// that started it — it keeps background sessions running after the terminal closes, per the
+/// vendor docs — and on a box with agent view on, this rule would pick out working
+/// supervisors. With it off there is no legitimate one, and a transient daemon left behind is
+/// a leak.
 pub fn orphans(table: &[Proc]) -> Vec<Orphan<'_>> {
     table
         .iter()
@@ -474,10 +475,58 @@ pub fn orphans(table: &[Proc]) -> Vec<Orphan<'_>> {
         .collect()
 }
 
-/// Log what the sweep WOULD kill, and kill nothing. It is armed only after the owner has
-/// read a week of this — and arming it is a code change, not a flag, so it cannot happen by
-/// accident from a timer's command line.
-fn sweep_orphans() {
+/// A daemon younger than this is left alone, whatever its parent: a tree caught in the moment
+/// between its spawner exiting and its own exit is not a leak yet. The offloader's own
+/// threshold, for the same reason.
+const SWEEP_MIN_AGE: Duration = Duration::from_millis(IDLE_AFTER_STOP_MS);
+
+/// Old enough to sweep? An age that cannot be read keeps the tree: evidence to act, never to
+/// hold off.
+fn old_enough(age: Option<Duration>) -> bool {
+    age.is_some_and(|a| a >= SWEEP_MIN_AGE)
+}
+
+/// Stop an orphan's whole tree: `TERM` to every process in it, deepest first so nothing is
+/// respawned by its parent, then the grace, then `KILL` to whatever is left. Every signal is
+/// sent only to the recorded process (pid and start time, through a pidfd — `signal.rs`).
+/// Returns how many processes are still alive afterwards.
+fn kill_tree(o: &Orphan<'_>, grace: Duration) -> usize {
+    let mut targets: Vec<(u32, u64)> = o.tree.iter().rev().map(|p| (p.pid, p.start)).collect();
+    targets.push((o.daemon.pid, o.daemon.start));
+    for &(pid, start) in &targets {
+        let _ = signal::send(pid, start, SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline
+        && targets
+            .iter()
+            .any(|&(pid, start)| procinfo::is_alive(pid, start))
+    {
+        sleep(Duration::from_millis(20));
+    }
+    for &(pid, start) in &targets {
+        if procinfo::is_alive(pid, start) {
+            let _ = signal::send(pid, start, SIGKILL);
+        }
+    }
+    let settle = Instant::now() + KILL_GRACE;
+    while Instant::now() < settle
+        && targets
+            .iter()
+            .any(|&(pid, start)| procinfo::is_alive(pid, start))
+    {
+        sleep(Duration::from_millis(20));
+    }
+    targets
+        .iter()
+        .filter(|&&(pid, start)| procinfo::is_alive(pid, start))
+        .count()
+}
+
+/// Find the leaked transient daemons and stop them — armed 2026-10-03, on the owner's word and
+/// on agent view being disabled wherever this runs (see [`orphans`]). A dry run logs what it
+/// would stop and stops nothing.
+fn sweep_orphans(dry_run: bool) {
     let Some(table) = procinfo::table() else {
         println!("sweep: could not list /proc; nothing to report");
         return;
@@ -502,13 +551,27 @@ fn sweep_orphans() {
                 )
             })
             .collect();
-        let line = format!(
-            "sweep: WOULD KILL pid {} start {}, {parent}; under it: [{}]; argv: {}",
+        let what = format!(
+            "pid {} start {}, {parent}; under it: [{}]; argv: {}",
             o.daemon.pid,
             o.daemon.start,
             tree.join(", "),
             o.daemon.args.join(" ")
         );
+        let age = procinfo::age(o.daemon.start);
+        let line = if dry_run {
+            format!("sweep: WOULD KILL {what}")
+        } else if !old_enough(age) {
+            format!(
+                "sweep: kept, too young ({}) — {what}",
+                age.map_or("age unknown".into(), |a| format!("{}s", a.as_secs()))
+            )
+        } else {
+            match kill_tree(&o, TERM_GRACE) {
+                0 => format!("sweep: killed {what}"),
+                n => format!("sweep: killed, but {n} process(es) survived KILL — {what}"),
+            }
+        };
         log(&line);
         println!("{line}");
     }
@@ -764,6 +827,59 @@ mod tests {
             found[0].tree.iter().map(|p| p.pid).collect::<Vec<_>>(),
             [301]
         );
+    }
+
+    #[test]
+    fn a_tree_too_young_or_of_unknown_age_is_never_swept() {
+        assert!(!old_enough(None), "unknown age keeps it");
+        assert!(!old_enough(Some(SWEEP_MIN_AGE - Duration::from_secs(1))));
+        assert!(
+            old_enough(Some(SWEEP_MIN_AGE)),
+            "calibration: old enough is swept"
+        );
+    }
+
+    #[test]
+    fn kill_tree_stops_the_daemon_and_everything_under_it() {
+        // A stand-in leaked daemon: a shell whose argv reads `daemon run --origin transient`,
+        // with two children. Its parent is this test, not a claude, so `orphans` picks it.
+        let mut daemon = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 600 & sleep 600 & wait",
+                "daemon",
+                "run",
+                "--origin",
+                "transient",
+            ])
+            .spawn()
+            .expect("spawn");
+        let pid = daemon.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let table = loop {
+            let t = procinfo::table().unwrap();
+            if procinfo::descendants(&t, pid).len() == 2 {
+                break t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in's children never started"
+            );
+            sleep(Duration::from_millis(20));
+        };
+        let found = orphans(&table);
+        let o = found
+            .iter()
+            .find(|o| o.daemon.pid == pid)
+            .expect("calibration: the stand-in reads as an orphaned transient daemon");
+        let all: Vec<(u32, u64)> = std::iter::once(o.daemon)
+            .chain(o.tree.iter().copied())
+            .map(|p| (p.pid, p.start))
+            .collect();
+        assert!(all.iter().all(|&(p, s)| procinfo::is_alive(p, s)));
+        assert_eq!(kill_tree(o, Duration::from_secs(2)), 0, "nothing survives");
+        assert!(all.iter().all(|&(p, s)| !procinfo::is_alive(p, s)));
+        daemon.wait().ok();
     }
 
     #[test]

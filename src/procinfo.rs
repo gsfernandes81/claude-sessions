@@ -99,6 +99,24 @@ pub fn ancestor_named(pid: u32, name: &str, limit: usize) -> Option<u32> {
     None
 }
 
+/// How long ago a process started, from its start time in clock ticks.
+///
+/// `/proc/<pid>/stat` counts start time in `USER_HZ` ticks since boot, and `USER_HZ` is 100 on
+/// every Linux the binary ships for — it is part of the kernel's user ABI, fixed regardless of
+/// the kernel's internal `HZ`. `None` when the uptime cannot be read.
+pub fn age(start_ticks: u64) -> Option<std::time::Duration> {
+    let uptime: f64 = fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let started = start_ticks as f64 / 100.0;
+    Some(std::time::Duration::from_secs_f64(
+        (uptime - started).max(0.0),
+    ))
+}
+
 /// One row of a `/proc` snapshot.
 #[derive(Debug, Clone)]
 pub struct Proc {
@@ -212,6 +230,14 @@ mod tests {
         );
         tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn our_own_age_is_small_and_known() {
+        let start = start_time(std::process::id()).unwrap();
+        let age = age(start).expect("uptime is readable");
+        // The test binary started moments ago; a wrong tick rate would put this hours out.
+        assert!(age < std::time::Duration::from_secs(600), "age {age:?}");
     }
 
     #[test]

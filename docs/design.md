@@ -126,9 +126,13 @@ the whole machine; the ceiling is the cgroup. Read `/sys/fs/cgroup/memory.max` a
 back to `MemAvailable` only when the limit reads `max`.
 
 **The orphan sweep** collects `daemon run --origin transient` trees whose spawning pid and
-start time are gone, with their `bg-pty-host` / `bg-spare` children. **It ships logging what
-it would kill and nothing else**, the owner reads a week of that log, and only then is it
-armed. Arming it is a code change, not a flag, so a timer's command line cannot do it.
+start time are gone, with their `bg-pty-host` / `bg-spare` children. It shipped logging
+only, and was **armed on 2026-10-03** on the owner's word — and on a fact that makes it safe:
+**this tool runs with agent view disabled**. Agent view's supervisor is meant to outlive the
+session that started it (it keeps background sessions running after the terminal closes), so
+on a box with agent view on the sweep's rule would pick out working supervisors; with it off
+there is no legitimate one, and a transient daemon left behind is a leak. `--dry-run` still
+only logs what it would kill.
 
 ### How `claude-sessions offload` reads those rules
 
@@ -175,12 +179,13 @@ is the choice and why:
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
   offloader writes `offloaded` itself. A `hook.log` line per offload is expected.
 - **The sweep infers "spawner gone" from the parent**: a transient daemon whose parent is no
-  longer a `claude` has been reparented away from the session that started it. That inference
-  has not met a real daemon — none was running where this was written. If the daemon detaches
-  on purpose, every one will be listed, live or not; each log line carries the full command
-  line so a spawner pid in it, if there is one, can replace the inference before arming.
+  longer a `claude` has been reparented away from the session that started it — sound only
+  with agent view disabled, as above. **A daemon under 10 minutes old is left alone**, as is
+  one whose age cannot be read: a tree caught between its spawner exiting and its own exit is
+  not a leak yet. The kill is `TERM` to the whole tree, deepest first, the offloader's grace,
+  then `KILL` to what is left, every signal checked against pid and start time.
 - **Logged to `offload.log`** beside the registry: every stop, every failed stop, and every
-  would-be sweep kill. Slots kept are printed to stdout only, since a pass every few minutes
+  sweep kill, kept-too-young tree and would-be kill. Slots kept are printed to stdout only, since a pass every few minutes
   would otherwise bury the lines that matter.
 
 ## The menu
