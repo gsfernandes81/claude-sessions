@@ -1266,16 +1266,17 @@ exit 1"#,
         r
     }
 
-    /// An offloaded slot with its conversation on disk: a transcript beside it in `cwd`.
+    /// An offloaded slot with its conversation on disk.
     fn offloaded(slot: &str, session: &str, cwd: &str) -> SlotRecord {
         let mut r = SlotRecord::new(slot, clock::now() - 3_600_000);
         r.state = State::Offloaded;
         r.session_id = Some(session.into());
         r.cwd = Some(cwd.into());
-        let transcript = Path::new(cwd).join(format!("{session}.jsonl"));
-        if Path::new(cwd).is_dir() {
-            std::fs::write(&transcript, "{}\n").unwrap();
-        }
+        // Beside the test's other files, never in `cwd`, which may be `/`.
+        let dir = std::env::temp_dir().join(format!("cs-launch-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{slot}-{session}.jsonl"));
+        std::fs::write(&transcript, "{}\n").unwrap();
         r.transcript_path = Some(transcript.display().to_string());
         r
     }
