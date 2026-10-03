@@ -221,27 +221,40 @@ is the choice and why:
 
 ## The menu
 
-- **Lists every slot** — live, offloaded and closed — plus unregistered `abduco` sessions,
-  **grouped by state** (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`,
+- **Lists every live and offloaded slot, every unregistered `abduco` session, and every
+  conversation on disk started in the workspace that is not running**, **grouped by state** (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`,
   `Closed`, each under its heading, an empty group not drawn, one blank line between groups.
   A row's group is the first that fits: closed, offloaded, a prompt waiting, mid-turn, else
   idle; an unregistered session, which nothing describes, is idle. Within a group, most recent
   activity first, except Idle, where unread rows come first. A row is its title and its age —
   **no marks and no numbers**: an unread title is bold, a session attached somewhere else is
   drawn dim, and amber is the Needs-you heading. Closed rows are not counted as open in the
-  header, and `Enter` resumes one exactly as it resumes an offloaded one (owner, 2026-10-03:
-  past conversations must be reachable from the menu, and these are the ones that ran in a
-  slot).
-- **A stopped slot is listed only with a conversation on disk** — its `transcript_path`, or
-  for a record older than 0.3.3 the path Claude Code keeps it at under `CLAUDE_CONFIG_DIR` —
-  with an exchange in it (*The offloader*). A slot stopped before its first prompt, or
-  `/clear`ed and left, has nothing to resume, and `Enter` on it would fail at once or reopen
-  an empty conversation (issue #5).
-- **A row stands for its slot's current conversation.** When that one is empty, the slot's
-  earlier conversations are not listed through it, even though they are on disk; they stay
-  reachable with `claude --resume`. Raised by infra on 2026-10-03, and the owner's to change.
-  The resume path refuses such a slot too, for one whose transcript went after the list was
-  read.
+  header.
+- **The Closed group is read from Claude Code's own store**, `$CLAUDE_CONFIG_DIR/projects`
+  (owner, 2026-10-03; `src/store.rs`), not from the registry: every conversation on disk,
+  whoever started it — a slot of ours, a `claude` run by hand, the old `ssh` path, a
+  conversation a slot held before a `/clear`. Until then Closed listed only slots of ours, and
+  only the conversation each held last, so a conversation from before a `/clear`, or from
+  anywhere but the door, could be reached only with `claude --resume`. **Only conversations
+  started in the workspace** are listed (owner, 2026-10-03), as Claude Code's `/resume` lists
+  one directory's; a conversation's start directory is the first `cwd` in its transcript whose
+  name is the directory the file sits in. Not listed: one that is running — Claude Code's
+  live-session files say which, and a slot's current conversation is that slot's row — and
+  one with no exchange in it (*The offloader*). One conversation can be in two project
+  directories after its `cwd` changed; the newest copy wins. A row's age is its last entry's
+  own `timestamp`, never the file's modification time, which `/clear` was seen to touch on
+  other conversations' files. Files are re-read only when their size or modification time
+  changes, so the two-second poll stays cheap.
+- **`Enter` on a closed row resumes it in a slot**, `claude --resume <id>` under `abduco` in
+  its start directory. If a slot's record already names the conversation, that slot resumes
+  it — both ways in then take one slot lock; otherwise a new slot is allocated, the never-
+  resume-running check made under the allocation lock, and the record, naming the
+  conversation, written before the lock goes, so a second menu finds it starting.
+- **An offloaded slot is listed only with a conversation on disk** — its `transcript_path`,
+  or for a record older than 0.3.3 the path Claude Code keeps it at under `CLAUDE_CONFIG_DIR`
+  — with an exchange in it. A slot offloaded before its first prompt, or `/clear`ed and left,
+  has nothing to resume (issue #5), and the resume path refuses such a slot too, for one whose
+  transcript went after the list was read.
 - **Opening a row:** live → `abduco -a`; offloaded → start a new slot running
   `claude --resume <session_id>` in its `cwd`. `abduco` runs as a **child**, so on detach the
   menu comes back rather than the login ending — a fresh login costs a Cloudflare Access
@@ -269,9 +282,9 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   rather than leaving a gap that reads as a lost reason. A start into a `cwd` that no longer exists is refused before it
   runs, and a leftover socket of the same name is refused with a pointer to `reconcile`.
 - **New slots take the lowest free `claude-<n>`** under a registry-wide lock with a timeout,
-  writing the record before the lock goes. A closed slot's name is never reused: its record
-  is what its row is drawn from, and a new slot under the name would overwrite it. A new slot
-  that dies before binding is marked closed and reported, since it has no row yet.
+  writing the record before the lock goes. A closed slot's name is reused: closed slots are
+  not listed, their conversations are, from the store, under their own ids. A new slot that
+  dies before binding is marked closed and reported, since it has no row yet.
 - **Room is checked once.** After offloading to make room, the open goes ahead without asking
   the cgroup again: its figure includes page cache that is not freed at once, and a second
   check could refuse the room just made.
@@ -344,8 +357,7 @@ sit in their group. The one close the offloader makes is of an idle slot with no
 conversation on disk, which has nothing to offload (*The offloader*).
 
 **Closing is not destructive and the dialog says so.** What a close stops is the process; the
-conversation stays on disk, and the closed row stays in the list, at the bottom, to resume it
-from. The difference between close and offload is the group the row is in and that the offloader
+conversation stays on disk, and is listed under Closed to resume it from. The difference between close and offload is the group the row is in and that the offloader
 never stops a slot on its own initiative to close it — except one with no conversation to
 offload, whose row would not be listed either way.
 
@@ -391,10 +403,11 @@ source of truth.
 
 Until every client is reconfigured, `ssh <container>` still runs `abduco -A claude claude`,
 and so does `make claude` in several repos. The menu lists **`abduco`'s sessions ∪ the
-registry**, under Idle, since nothing reports what they are doing. They cannot be named — there is no
-session id to map to a transcript, so all there is to show is the `abduco` session name.
-Matching `cwd` and start time against transcripts would work and is guesswork; it is worth
-building only if those rows turn out to persist.
+registry**, under Idle, since nothing reports what they are doing. They cannot be named while
+they run — there is no session id to map to a transcript, so all there is to show is the
+`abduco` session name. Matching `cwd` and start time against transcripts would work and is
+guesswork. Once one ends, its conversation is in Claude Code's store like any other, and is
+listed under Closed, by its own title, to resume in a slot of ours.
 
 ## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 

@@ -47,13 +47,9 @@ fn too_narrow(t: &TooNarrow) -> String {
 /// it and falls through to a login shell.
 pub fn run() -> Result<(), String> {
     let (width, height) = term::size().ok_or("not a terminal")?;
-    let mut menu = Menu::new(
-        width,
-        height,
-        header(),
-        menu::workspace(),
-        menu::gather(clock::now()),
-    );
+    let workspace = menu::workspace();
+    let rows = menu::gather(clock::now(), &workspace);
+    let mut menu = Menu::new(width, height, header(), workspace, rows);
     // Refuse before touching the terminal: a door that falls through to a shell should find
     // the terminal exactly as the login left it.
     if let Err(t) = render::render(&menu.view()) {
@@ -91,7 +87,8 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
                 polled = Instant::now();
                 let now = clock::now();
                 let before = menu.rows().to_vec();
-                menu.replace_rows(menu::gather(now), false);
+                let rows = menu::gather(now, menu.workspace());
+                menu.replace_rows(rows, false);
                 let turned = menu::age_clock(now) != minute;
                 if turned || menu.rows() != before.as_slice() {
                     minute = menu::age_clock(now);
@@ -114,7 +111,8 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
                     if act(term, menu, action) {
                         // A child had the terminal: the alternate screen came back blank.
                         last = None;
-                        menu.replace_rows(menu::gather(clock::now()), false);
+                        let rows = menu::gather(clock::now(), menu.workspace());
+                        menu.replace_rows(rows, false);
                         menu.set_header(header());
                     }
                 }

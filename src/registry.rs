@@ -158,16 +158,7 @@ impl SlotRecord {
             return Some(PathBuf::from(p));
         }
         let (id, cwd) = (self.session_id.as_deref()?, self.cwd.as_deref()?);
-        let slug: String = cwd
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
+        let slug = crate::store::slug(cwd);
         Some(
             crate::live::config_dir()
                 .join("projects")

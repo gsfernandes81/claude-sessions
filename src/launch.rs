@@ -153,6 +153,10 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
                  safely — open it and /exit"
             ));
         }
+        // A conversation from the store is listed because nothing is running it.
+        RowKey::Conversation { .. } => {
+            return Outcome::Back(Some(format!("{n} was already closed")));
+        }
     };
     let _lock = match lock_slot(slot, &n) {
         Ok(l) => l,
@@ -219,6 +223,9 @@ pub(crate) fn open_with(
     let n = label(row);
     let slot = match &row.key {
         RowKey::Socket(name) => return attach_socket(name, &n, term, deps),
+        RowKey::Conversation { id, cwd } => {
+            return resume_conversation(rows, (id, cwd, &row.title), &n, term, deps, check_room);
+        }
         RowKey::Slot(slot) => slot,
     };
     let rec = match registry::load(slot) {
@@ -562,6 +569,82 @@ fn running_elsewhere(slot: &str, session: &str, now: Millis) -> io::Result<Optio
     Ok(None)
 }
 
+// ── resume a conversation from the store ────────────────────────────────────
+
+/// `Enter` on a conversation from Claude Code's own store (`store.rs`): resumed in a slot,
+/// from the directory it started in, whoever started it.
+///
+/// A slot whose record already names the conversation is that slot's to resume, through
+/// `resume`, so both ways in to one conversation take the same slot lock and two menus
+/// cannot start it twice. Otherwise a new slot is allocated for it, and the never-resume-
+/// running check is made under the allocation lock with the record — naming the
+/// conversation — written before that lock is let go: a second menu then finds it starting.
+fn resume_conversation(
+    rows: &[Row],
+    (id, cwd, title): (&str, &str, &str),
+    n: &str,
+    term: &mut dyn Terminal,
+    deps: &Deps,
+    check_room: bool,
+) -> Outcome {
+    let now = clock::now();
+    let holders: Vec<SlotRecord> = match registry::all() {
+        Ok(recs) => recs
+            .into_iter()
+            .filter(|r| r.session_id.as_deref() == Some(id))
+            .collect(),
+        Err(e) => return Outcome::Refused(format!("{n}: {e}")),
+    };
+    if let Some(r) = holders.iter().find(|r| classify(r, now) == Kind::Running) {
+        return attach_slot(rows, &r.slot, term, deps);
+    }
+    if holders.iter().any(|r| classify(r, now) == Kind::Starting) {
+        return Outcome::Refused(starting(n));
+    }
+    if let Some(r) = holders.first() {
+        return resume(rows, &r.slot, n, term, deps, check_room);
+    }
+    if check_room {
+        if let Some(no_room) = room_check(rows, deps) {
+            return no_room;
+        }
+    }
+    if !Path::new(cwd).is_dir() {
+        return Outcome::Refused(format!(
+            "{n} ran in {cwd}, which is gone — claude finds a conversation by the directory it \
+             ran in"
+        ));
+    }
+    let slot = match allocate_for(cwd, Some((id, title))) {
+        Ok(Ok(slot)) => slot,
+        Ok(Err(Elsewhere::Slot(other))) => return attach_slot(rows, &other, term, deps),
+        Ok(Err(Elsewhere::Unattachable(why))) => {
+            return Outcome::Refused(format!("{n} is not resumed: {why}"));
+        }
+        Err(why) => return Outcome::Refused(why),
+    };
+    let args = ["--resume".to_string(), id.to_string()];
+    let (status, took) = match start_slot(&slot, cwd, &args, term, deps) {
+        Ok(ran) => ran,
+        Err(why) => {
+            put_back(&slot, State::Closed);
+            return Outcome::Refused(why);
+        }
+    };
+    match settle(&slot, Some(State::Closed), took < deps.quick) {
+        After::Running => detached(),
+        After::Ended => ended(n),
+        After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
+            title: title.to_string(),
+            session: id.chars().take(8).collect(),
+            status: exit_code(status),
+            output: stderr_tail(&stderr_path(&slot), STDERR_LINES),
+            closed: true,
+        }),
+        After::DiedUnbound => ended(n),
+    }
+}
+
 // ── new ─────────────────────────────────────────────────────────────────────
 
 pub(crate) fn new_session_with(
@@ -608,17 +691,31 @@ pub(crate) fn new_session_with(
 }
 
 /// The lowest free `claude-<n>`, with its record written before anyone else can choose it.
+pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
+    match allocate_for(workspace, None)? {
+        Ok(slot) => Ok(slot),
+        Err(_) => unreachable!("only a resume checks for a running conversation"),
+    }
+}
+
+/// The lowest free `claude-<n>` for a slot starting in `cwd`, resuming `(id, title)` if
+/// given; `Ok(Err(..))` when that conversation is running somewhere already.
 ///
 /// Free means no record that is live, offloading or offloaded, and no abduco socket of that
 /// name — a session started by hand as `claude-3` is still `claude-3`. A closed record's name
-/// is reused: closed is never listed, and its conversation is on disk under its own id, not
-/// under the slot's name.
+/// is reused: closed slots are not listed, their conversations are, from Claude Code's own
+/// store, under their own ids (owner, 2026-10-03).
 ///
 /// **Under a registry-wide lock**, because two menus pressing `n` at once would otherwise
 /// both see `claude-4` free and both start it. The lock is held from the first look to the
-/// record being on disk, and the record is written as `live` with the workspace and no pid —
-/// the same shape a resume leaves — so the name is taken the moment the lock is let go.
-pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
+/// record being on disk, and the record is written as `live` with no pid — the same shape a
+/// resume leaves — so the name is taken the moment the lock is let go. A resume's check that
+/// its conversation is not running is made under the same lock, and its record names the
+/// conversation, so a second menu resuming it finds it starting.
+fn allocate_for(
+    cwd: &str,
+    resuming: Option<(&str, &str)>,
+) -> Result<Result<String, Elsewhere>, String> {
     let _all = SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT)
         .map_err(|e| match e.kind() {
             io::ErrorKind::TimedOut => {
@@ -626,6 +723,18 @@ pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
             }
             _ => format!("could not take the allocation lock: {e}"),
         })?;
+    if let Some((id, _)) = resuming {
+        match running_elsewhere("", id, clock::now()) {
+            Ok(None) => {}
+            Ok(Some(e)) => return Ok(Err(e)),
+            // Not being able to look is not the same as nothing being there.
+            Err(e) => {
+                return Err(format!(
+                    "could not check whether that conversation is running ({e})"
+                ));
+            }
+        }
+    }
     let sockets = abduco::sockets();
     for n in 1..=MAX_SLOTS {
         let slot = format!("claude-{n}");
@@ -636,18 +745,21 @@ pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
         let _lock = lock_slot(&slot, &slot)?;
         match registry::load(&slot) {
             Ok(None) => {}
-            // A closed slot's name is NOT reused: closed slots are listed so their
-            // conversations can be resumed (owner, 2026-10-03), and a new slot under the same
-            // name would overwrite the record its row is drawn from.
+            Ok(Some(r)) if r.state == State::Closed => {}
             Ok(Some(_)) => continue,
             // A record that cannot be read is not ours to overwrite; doctor reports it.
             Err(_) => continue,
         }
         let now = clock::now();
         let mut rec = SlotRecord::new(&slot, now);
-        rec.cwd = Some(workspace.to_string());
+        rec.cwd = Some(cwd.to_string());
+        if let Some((id, title)) = resuming {
+            rec.session_id = Some(id.to_string());
+            // Shown on the row until the resumed conversation's own hooks read its titles.
+            rec.ai_title = Some(title.to_string());
+        }
         registry::store(&rec).map_err(|e| format!("{slot}: {e}"))?;
-        return Ok(slot);
+        return Ok(Ok(slot));
     }
     Err(format!("no free slot name up to claude-{MAX_SLOTS}"))
 }
@@ -1481,6 +1593,117 @@ exit 1"#,
         assert!(load("claude-2").last_attach_ms > 0);
     }
 
+    fn stored(id: &str, cwd: &str, title: &str) -> Row {
+        Row {
+            key: RowKey::Conversation {
+                id: id.into(),
+                cwd: cwd.into(),
+            },
+            closed: true,
+            ..row("unused", title)
+        }
+    }
+
+    #[test]
+    fn a_stored_conversation_is_resumed_in_a_new_slot_from_where_it_started() {
+        // Owner, 2026-10-03: any conversation on disk, whoever started it, is one Enter away.
+        let f = Fixture::new("stored");
+        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let rows = [stored("conv-9", &f.work(), "fix the dns")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::Back(Some("detached · it is still running".into()))
+        );
+        let started = wait_for("the stand-in claude", || f.claude_log().pop());
+        let fields: Vec<&str> = started.split_whitespace().collect();
+        assert_eq!(
+            &fields[1..],
+            [&f.work(), "claude-1", "--resume", "conv-9"],
+            "a new slot, in the directory the conversation started in"
+        );
+        let rec = load("claude-1");
+        assert_eq!(
+            rec.session_id.as_deref(),
+            Some("conv-9"),
+            "the record names it"
+        );
+        assert_eq!(rec.cwd.as_deref(), Some(f.work().as_str()));
+        assert_eq!(
+            rec.display_title(),
+            "fix the dns",
+            "titled before its hooks run"
+        );
+    }
+
+    #[test]
+    fn a_stored_conversation_already_running_is_never_resumed() {
+        let mut f = Fixture::new("stored-running");
+        // A `claude --resume` somebody typed in a shell, in no slot.
+        let (pid, start) = f.process();
+        let file = f.path(&format!("config/sessions/{pid}.json"));
+        std::fs::write(
+            &file,
+            format!(r#"{{"pid":{pid},"sessionId":"conv-9","procStart":{start}}}"#),
+        )
+        .unwrap();
+        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let rows = [stored("conv-9", &f.work(), "t")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert!(
+            matches!(&out, Outcome::Refused(why) if why.contains(&format!("pid {pid}"))),
+            "{out:?}"
+        );
+        assert!(f.calls().is_empty(), "nothing was started");
+        assert!(
+            registry::load("claude-1").unwrap().is_none(),
+            "no slot taken"
+        );
+        // Calibration: with that session gone, it resumes.
+        std::fs::remove_file(&file).unwrap();
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::Back(Some("detached · it is still running".into()))
+        );
+    }
+
+    #[test]
+    fn a_stored_conversation_a_slot_already_holds_goes_through_that_slot() {
+        // Both ways in to one conversation take the same slot lock.
+        let f = Fixture::new("stored-held");
+        registry::store(&offloaded("claude-4", "conv-9", &f.work())).unwrap();
+        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let rows = [stored("conv-9", &f.work(), "t")];
+        let mut term = Term::new(&f);
+        open_with(&rows, 0, &mut term, &deps, true);
+        let started = wait_for("the stand-in claude", || f.claude_log().pop());
+        assert!(started.contains(" claude-4 --resume conv-9"), "{started}");
+        assert!(registry::load("claude-1").unwrap().is_none(), "no new slot");
+    }
+
+    #[test]
+    fn a_stored_conversation_that_fails_to_resume_leaves_its_slot_closed() {
+        let f = Fixture::new("stored-fails");
+        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let rows = [stored("0f9c4a1e-7d", &f.work(), "fix the dns")];
+        let mut term = Term::new(&f);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::ResumeFailed(Dialog::ResumeFailed {
+                title: "fix the dns".into(),
+                session: "0f9c4a1e".into(),
+                status: 1,
+                output: vec!["No conversation found with that session id".into()],
+                closed: true,
+            })
+        );
+        assert_eq!(load("claude-1").state, State::Closed);
+    }
+
     #[test]
     fn a_leftover_socket_blocks_a_resume_rather_than_reading_as_one() {
         // The calibrating case is the resume test above: the same record, no socket, resumes.
@@ -1694,32 +1917,35 @@ exit 1"#,
     // ── new ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn allocation_takes_the_lowest_free_name_and_leaves_a_closed_one_alone() {
+    fn allocation_takes_the_lowest_free_name_and_reuses_a_closed_one() {
         let mut f = Fixture::new("allocate");
         assert_eq!(allocate("/w").unwrap(), "claude-1", "calibration: empty");
         let (pid, start) = f.process();
         registry::store(&live("claude-1", pid, start)).unwrap();
-        let mut closed = live("claude-2", pid, start);
-        closed.state = State::Closed;
-        registry::store(&closed).unwrap();
         registry::store(&offloaded("claude-3", "c", "/")).unwrap();
         f.socket("claude-4", 0o600); // started by hand under one of our names
-
-        // Closed slots are listed so their conversations can be resumed (owner, 2026-10-03):
-        // reusing the name would overwrite the record the row is drawn from.
         assert_eq!(
             allocate("/w").unwrap(),
-            "claude-5",
-            "live, closed, offloaded and socket-only names are all taken"
+            "claude-2",
+            "live, offloaded and socket-only names are taken"
         );
-        let rec = load("claude-5");
+        let rec = load("claude-2");
         assert_eq!(rec.state, State::Live);
         assert_eq!((rec.pid, rec.session_id), (None, None), "a fresh record");
         assert_eq!(rec.cwd.as_deref(), Some("/w"));
+
+        // A closed slot's name is free: its conversation is listed from Claude Code's own
+        // store, under its own id, not from the record (owner, 2026-10-03).
+        let mut closed = load("claude-2");
+        closed.state = State::Closed;
+        closed.session_id = Some("old".into());
+        registry::store(&closed).unwrap();
+        assert_eq!(allocate("/w").unwrap(), "claude-2");
+        assert_eq!(load("claude-2").session_id, None, "a fresh record over it");
         assert_eq!(
-            load("claude-2").state,
-            State::Closed,
-            "the closed record is untouched"
+            allocate("/w").unwrap(),
+            "claude-5",
+            "calibration: once live again, it is taken"
         );
     }
 

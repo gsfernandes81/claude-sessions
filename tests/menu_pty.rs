@@ -68,6 +68,46 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     )
     .unwrap();
 
+    // Claude Code's own store: one conversation started in the workspace, listed under
+    // Closed whoever started it (owner, 2026-10-03), and one started in `/workspace-old`,
+    // which is not — its directory name begins like the workspace's, so only its own `cwd`
+    // can rule it out (calibrated 2026-10-03: from `/elsewhere` it was skipped by name and
+    // the test passed with the `cwd` check removed).
+    for (cwd, id, prompt) in [
+        ("/workspace", "stored-1", "a conversation run by hand"),
+        (
+            "/workspace-old",
+            "stored-2",
+            "a conversation from somewhere else",
+        ),
+        ("/workspace", "stored-3", "a conversation still running"),
+    ] {
+        let dir = root.join("cc/projects").join(cwd.replace('/', "-"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.jsonl")),
+            format!(
+                r#"{{"type":"user","cwd":"{cwd}","sessionId":"{id}","timestamp":"2026-10-01T00:00:00.000Z","message":{{"role":"user","content":"{prompt}"}}}}"#
+            ) + "\n",
+        )
+        .unwrap();
+    }
+
+    // `stored-3` is running: Claude Code's live-session file says so, naming this test's own
+    // process, which is alive with exactly that start time. Never listed, never resumable.
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 2..];
+    let start: u64 = after_comm.split(' ').nth(19).unwrap().parse().unwrap();
+    std::fs::create_dir_all(root.join("cc/sessions")).unwrap();
+    std::fs::write(
+        root.join(format!("cc/sessions/{}.json", std::process::id())),
+        format!(
+            r#"{{"pid":{},"sessionId":"stored-3","procStart":{start},"kind":"interactive"}}"#,
+            std::process::id()
+        ),
+    )
+    .unwrap();
+
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("ABDUCO_SOCKET_DIR", &abd)
@@ -83,7 +123,21 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
         String::from_utf8_lossy(&first)
     );
     // Let the first frame finish arriving.
-    term.read_for(Duration::from_millis(500));
+    let rest = term.read_for(Duration::from_millis(500));
+    let frame = String::from_utf8_lossy(&[first.clone(), rest].concat()).into_owned();
+    assert!(frame.contains("Closed"), "no Closed group: {frame:?}");
+    assert!(
+        frame.contains("a conversation run by hand"),
+        "the workspace's stored conversation is listed: {frame:?}"
+    );
+    assert!(
+        !frame.contains("somewhere else"),
+        "one started outside the workspace is not: {frame:?}"
+    );
+    assert!(
+        !frame.contains("still running"),
+        "a running conversation is not: {frame:?}"
+    );
 
     // The property: two registry polls' worth of nothing happening, and nothing written.
     let window = Duration::from_secs(5);

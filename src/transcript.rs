@@ -101,7 +101,7 @@ pub fn exchange_in(text: &str) -> bool {
 /// local command's markup, which opens with `<` (`<command-name>/clear</command-name>`,
 /// `<local-command-stdout>`). A tool result is a `user` entry too, but only ever after a
 /// reply, so it never has to decide anything.
-fn exchange_line(line: &str) -> bool {
+pub fn exchange_line(line: &str) -> bool {
     // Cheap filter first: most lines of a long transcript are neither.
     if !line.contains("\"assistant\"") && !line.contains("\"user\"") {
         return false;

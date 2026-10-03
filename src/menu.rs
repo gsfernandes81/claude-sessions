@@ -25,9 +25,11 @@
 use crate::abduco;
 use crate::clock::Millis;
 use crate::fmt;
+use crate::live;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
 use crate::render::{self, Item};
+use crate::store;
 use crate::ui::{Dialog, Group, Header, Key, Row, RowKey, Screen, View};
 
 /// What the loop should do after a key.
@@ -392,24 +394,60 @@ pub fn age_clock(now: Millis) -> Millis {
     now - now % 60_000
 }
 
-/// Read the rows: every open slot in the registry, plus every abduco session the registry
-/// has never heard of. In recency order; `Menu::replace_rows` does the grouping.
-pub fn gather(now: Millis) -> Vec<Row> {
+/// Read the rows: every slot in the registry that is not closed, every abduco session the
+/// registry has never heard of, and every conversation started in `workspace` that is not
+/// running. In recency order; `Menu::replace_rows` does the grouping.
+pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
     let clock = age_clock(now);
     let recs = registry::all().unwrap_or_default();
     let sockets = abduco::sockets();
-    // Closed slots too (owner, 2026-10-03): listed at the bottom, so a conversation that
-    // ran in a slot can be resumed from the menu after it was closed.
-    let mut slots: Vec<(&SlotRecord, Row)> = recs
+    let mut dated: Vec<(Millis, Row)> = recs
         .iter()
+        // Closed slots are not listed as slots: their conversations are in Claude Code's own
+        // store, with every other conversation, and are listed from there (below).
+        .filter(|r| r.state != State::Closed)
         .map(|r| (r, slot_row(r, clock, &sockets)))
-        // A slot that is not running and has no conversation on disk is nothing to open:
-        // closed or offloaded before its first prompt, it has a session id and no
-        // transcript, and `Enter` on it would fail at once (issue #5). Not listed.
-        .filter(|(r, row)| !(row.offloaded || row.closed) || r.has_conversation())
+        // An offloaded slot with no conversation on disk is nothing to open: offloaded
+        // before its first prompt, or `/clear`ed and left, `Enter` on it would fail at once
+        // (issue #5). Not listed.
+        .filter(|(r, row)| !row.offloaded || r.has_conversation())
+        .map(|(r, row)| (r.last_activity_ms, row))
         .collect();
-    slots.sort_by_key(|(r, _)| std::cmp::Reverse(r.last_activity_ms));
-    let mut rows: Vec<Row> = slots.into_iter().map(|(_, row)| row).collect();
+    // The Closed group: conversations on disk (owner, 2026-10-03), whoever started them, so
+    // a conversation from before a `/clear`, or from a `claude` run by hand, is one `Enter`
+    // away. Not one that is running — Claude Code's live sessions say which — and not the
+    // current conversation of a slot listed above, which is that slot's row.
+    let mut taken: std::collections::HashSet<String> = live::all()
+        .into_iter()
+        .filter_map(|s| s.session_id)
+        .collect();
+    taken.extend(
+        recs.iter()
+            .filter(|r| r.state != State::Closed)
+            .filter_map(|r| r.session_id.clone()),
+    );
+    for c in store::in_workspace(&live::config_dir(), workspace) {
+        if taken.contains(&c.id) {
+            continue;
+        }
+        let row = Row {
+            key: RowKey::Conversation {
+                id: c.id,
+                cwd: c.cwd,
+            },
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: true,
+            title: c.title,
+            age: fmt::age(clock.saturating_sub(c.last_ms)),
+        };
+        dated.push((c.last_ms, row));
+    }
+    dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    let mut rows: Vec<Row> = dated.into_iter().map(|(_, row)| row).collect();
     for sock in sockets {
         if recs.iter().any(|r| r.slot == sock.name) {
             continue;

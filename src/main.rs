@@ -26,6 +26,7 @@ mod registry;
 mod render;
 mod run;
 mod signal;
+mod store;
 mod term;
 mod transcript;
 mod ui;

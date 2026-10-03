@@ -20,6 +20,9 @@ pub enum RowKey {
     /// An abduco session with no record at all — a session started before the hooks were
     /// installed, listed under Idle. All there is to show is its name.
     Socket(String),
+    /// A conversation in Claude Code's own store that is not running (`store.rs`), listed
+    /// under Closed: `Enter` resumes it in a slot, from the directory it started in.
+    Conversation { id: String, cwd: String },
 }
 
 /// The groups the list is drawn in, top to bottom (owner, 2026-10-03). Every row is in
