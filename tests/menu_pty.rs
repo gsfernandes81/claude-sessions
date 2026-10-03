@@ -14,6 +14,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
+/// A transcript with an exchange in it: a conversation on disk to resume.
+const PROMPTED: &str = r#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -58,7 +61,7 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
     let transcript = root.join("s-claude-1.jsonl");
-    std::fs::write(&transcript, "{}\n").unwrap();
+    std::fs::write(&transcript, PROMPTED).unwrap();
     std::fs::write(
         reg.join("claude-1.json"),
         record("claude-1", "retire the old tunnel", &transcript),

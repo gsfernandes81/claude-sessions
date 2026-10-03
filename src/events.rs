@@ -145,6 +145,11 @@ pub fn apply(
                     rec.title = None;
                     rec.ai_title = None;
                     rec.first_prompt = None;
+                    // The per-event times too: a `UserPromptSubmit` left over from the last
+                    // conversation reads as this one having been prompted, which misled
+                    // infra's own check on 2026-10-03. This event is the first of the new one.
+                    rec.last_event_ms.clear();
+                    rec.last_event_ms.insert(ev.name().to_string(), now);
                     // The new conversation's own path, if this event carried one, was set above.
                     if ev.transcript_path().is_none() {
                         rec.transcript_path = None;
@@ -401,6 +406,38 @@ mod tests {
             Some("second"),
             "same slot, new conversation"
         );
+    }
+
+    #[test]
+    fn a_new_conversation_starts_its_event_times_afresh() {
+        // Infra, 2026-10-03: a `UserPromptSubmit` from the conversation before read as this
+        // one having been prompted.
+        let mut rec = slot();
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"x"}"#),
+            1_500,
+        );
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
+            2_000,
+        );
+        assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), None);
+        assert_eq!(rec.last_event_ms.get("SessionStart"), Some(&2_000));
+        assert_eq!(rec.last_event_ms.len(), 1);
+        // Calibration: a start of the same conversation (compaction) keeps them.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"y"}"#),
+            2_500,
+        );
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"compact","session_id":"second"}"#),
+            3_000,
+        );
+        assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), Some(&2_500));
     }
 
     #[test]

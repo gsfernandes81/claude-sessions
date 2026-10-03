@@ -91,7 +91,7 @@ pub struct SlotRecord {
     /// selector shows when there is no custom title.
     pub ai_title: Option<String>,
     /// Where Claude Code keeps the current conversation's transcript, as its hooks report it.
-    /// The file exists only once the conversation has had its first prompt (issue #5).
+    /// Whether it holds a conversation is `has_conversation`'s question (issue #5).
     pub transcript_path: Option<String>,
     /// The current conversation's first prompt, on one line and cut short — the title of last
     /// resort, for a conversation Claude Code has not named. Written once per conversation by
@@ -177,11 +177,12 @@ impl SlotRecord {
     }
 
     /// Whether there is a conversation on disk to resume. **A recorded `session_id` is not
-    /// enough** (issue #5): Claude Code writes a new conversation's transcript at its first
-    /// prompt, not at `SessionStart`, so a slot closed or offloaded before anyone spoke to it
-    /// has an id and nothing behind it, and `claude --resume` on it exits at once.
+    /// enough, and nor is a file** (issue #5): a new session's transcript appears only at its
+    /// first prompt, and a `/clear`ed one's appears at once with nothing in it to come back
+    /// to. So the transcript must hold an exchange (`transcript::has_exchange`).
     pub fn has_conversation(&self) -> bool {
-        self.conversation_path().is_some_and(|p| p.is_file())
+        self.conversation_path()
+            .is_some_and(|p| crate::transcript::has_exchange(&p))
     }
 
     /// The title a row shows: what Claude Code's own session selector would — the custom
@@ -477,6 +478,10 @@ mod tests {
         assert_eq!(rec.display_title(), "tunnel", "the owner's own name wins");
     }
 
+    /// A transcript with an exchange in it.
+    const PROMPTED: &str =
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n";
+
     #[test]
     fn a_conversation_exists_only_once_its_transcript_does() {
         let dir = std::env::temp_dir().join(format!("cs-conv-{}", std::process::id()));
@@ -487,10 +492,12 @@ mod tests {
         rec.cwd = Some("/workspace".into());
         rec.transcript_path = Some(path.display().to_string());
         assert!(!rec.has_conversation(), "never prompted: no transcript yet");
-        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::write(&path, "{\"type\":\"mode\"}\n").unwrap();
+        assert!(!rec.has_conversation(), "a file with no exchange: /clear's");
+        std::fs::write(&path, PROMPTED).unwrap();
         assert!(
             rec.has_conversation(),
-            "calibration: once written, it is there"
+            "calibration: once prompted, it is there"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

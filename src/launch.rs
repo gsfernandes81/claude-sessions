@@ -1243,6 +1243,10 @@ exit 1"#,
         }
     }
 
+    /// A transcript with an exchange in it: a conversation on disk to resume.
+    const PROMPTED: &str = r#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
+
     fn row(slot: &str, title: &str) -> Row {
         Row {
             key: RowKey::Slot(slot.into()),
@@ -1276,7 +1280,7 @@ exit 1"#,
         let dir = std::env::temp_dir().join(format!("cs-launch-conv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let transcript = dir.join(format!("{slot}-{session}.jsonl"));
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(&transcript, PROMPTED).unwrap();
         r.transcript_path = Some(transcript.display().to_string());
         r
     }
@@ -1287,7 +1291,7 @@ exit 1"#,
         let (pid, start) = f.process();
         let mut r = live(slot, pid, start);
         let transcript = Path::new(&f.work()).join(format!("conv-of-{slot}.jsonl"));
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(&transcript, PROMPTED).unwrap();
         r.transcript_path = Some(transcript.display().to_string());
         let stop = clock::now() - 11 * 60 * 1000;
         r.last_stop_ms = Some(stop);
@@ -1587,7 +1591,7 @@ exit 1"#,
         term.assert_handed_over(0);
         assert_eq!(load("claude-1").state, State::Offloaded, "left as it was");
         // Calibration: with the transcript back, the same slot resumes.
-        std::fs::write(rec.transcript_path.as_ref().unwrap(), "{}\n").unwrap();
+        std::fs::write(rec.transcript_path.as_ref().unwrap(), PROMPTED).unwrap();
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert!(!matches!(out, Outcome::Refused(_)), "{out:?}");
     }
@@ -1800,7 +1804,7 @@ exit 1"#,
         rec.proc_start = Some(start);
         rec.session_id = Some("conv-1".into());
         let transcript = Path::new(&f.work()).join("conv-1.jsonl");
-        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(&transcript, PROMPTED).unwrap();
         rec.transcript_path = Some(transcript.display().to_string());
         registry::store(&rec).unwrap();
         assert!(procinfo::is_alive(pid, start), "calibration: it is running");

@@ -91,7 +91,7 @@ from the hook upwards to the first `claude` whose parent is an `abduco` server.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title` and `first_prompt`, so a new conversation never wears the old one's name; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
@@ -123,10 +123,13 @@ It holds the slot lock from decision through kill, marks the slot `offloading` b
 signalling and `offloaded` after, and keeps `TERM` → grace → `KILL` → `abduco` teardown with
 the pid-plus-start-time check at each step.
 
-**A slot with no conversation on disk is closed, not offloaded** (issue #5). Claude Code
-writes a conversation's transcript at its first prompt, not at `SessionStart`, so a slot
-opened and never spoken to — or `/clear`ed and left — has a `session_id` with nothing behind
-it, and `claude --resume` on it exits at once. Such a slot is stopped by the same rules and
+**A slot with no conversation on disk is closed, not offloaded** (issue #5). A slot opened
+and never spoken to has a `session_id` and no transcript: Claude Code writes a new session's
+file at its first prompt, and `claude --resume` on it exits at once. A slot `/clear`ed and
+left has a file — `/clear` writes the new conversation's at once (infra, 2026-10-03), holding
+only its bookkeeping and the command's own local entries — but nothing in it to come back
+to. So "a conversation on disk" means a transcript with an exchange in it: a reply from
+Claude, or a prompt the owner typed (`transcript::has_exchange`). Such a slot is stopped by the same rules and
 the same path, but marked `closed`: an `offloaded` row would promise a resume that cannot
 happen.
 
@@ -163,7 +166,8 @@ is the choice and why:
   registered one.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
   stopped; `judge` then makes it a close when the record's transcript — `transcript_path`, or
-  for an older record the path derived under `CLAUDE_CONFIG_DIR` — is not a file. Every
+  for an older record the path derived under `CLAUDE_CONFIG_DIR` — holds no exchange, or is
+  not there at all. Every
   reason to keep holds a close exactly as it holds an offload. A slot with no `session_id`
   is still kept rather than closed: there the hooks never bound and nothing is known, while
   a recorded id with no transcript is evidence there is nothing to lose. `--dry-run` prints
@@ -208,7 +212,9 @@ is the choice and why:
   with agent view disabled, as above. **A daemon under 10 minutes old is left alone**, as is
   one whose age cannot be read: a tree caught between its spawner exiting and its own exit is
   not a leak yet. The kill is `TERM` to the whole tree, deepest first, the offloader's grace,
-  then `KILL` to what is left, every signal checked against pid and start time.
+  then `KILL` to what is left, every signal checked against pid and start time. **A dry run
+  applies the same age check**, printing `would keep, too young` where the live sweep keeps
+  and `WOULD KILL` only where it would kill, so the dry run reads as the live sweep would act.
 - **Logged to `offload.log`** beside the registry: every stop, every failed stop, and every
   sweep kill, kept-too-young tree and would-be kill. Slots kept are printed to stdout only, since a pass every few minutes
   would otherwise bury the lines that matter.
@@ -227,9 +233,13 @@ is the choice and why:
   past conversations must be reachable from the menu, and these are the ones that ran in a
   slot).
 - **A stopped slot is listed only with a conversation on disk** — its `transcript_path`, or
-  for a record older than 0.3.3 the path Claude Code keeps it at under `CLAUDE_CONFIG_DIR`.
-  Claude Code writes a transcript at a conversation's first prompt, so a slot stopped before
-  one has a session id and nothing to resume, and `Enter` on it would fail at once (issue #5).
+  for a record older than 0.3.3 the path Claude Code keeps it at under `CLAUDE_CONFIG_DIR` —
+  with an exchange in it (*The offloader*). A slot stopped before its first prompt, or
+  `/clear`ed and left, has nothing to resume, and `Enter` on it would fail at once or reopen
+  an empty conversation (issue #5).
+- **A row stands for its slot's current conversation.** When that one is empty, the slot's
+  earlier conversations are not listed through it, even though they are on disk; they stay
+  reachable with `claude --resume`. Raised by infra on 2026-10-03, and the owner's to change.
   The resume path refuses such a slot too, for one whose transcript went after the list was
   read.
 - **Opening a row:** live → `abduco -a`; offloaded → start a new slot running

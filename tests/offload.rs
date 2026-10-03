@@ -42,6 +42,9 @@ impl Drop for Slot {
     }
 }
 
+/// A transcript with an exchange in it: a conversation on disk to resume.
+const PROMPTED: &str = r#"{"type":"user","message":{"role":"user","content":"hello"}}
+"#;
 fn stat_fields(pid: u32) -> Option<Vec<String>> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     Some(
@@ -131,7 +134,7 @@ fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) ->
     // whether the file is there differs.
     let transcript_path = root.join("conv-1.jsonl");
     if transcript {
-        std::fs::write(&transcript_path, "{}\n").unwrap();
+        std::fs::write(&transcript_path, PROMPTED).unwrap();
     }
     let stop = now_ms() - 11 * 60 * 1000;
     let record = format!(

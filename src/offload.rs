@@ -14,9 +14,9 @@
 //! That hook cannot take the lock we are holding, gives up after its 400 ms, and logs that it
 //! did; the offloader writes `offloaded` itself, so nothing is lost but a `hook.log` line.
 //!
-//! **A slot with no conversation on disk is closed, not offloaded** (issue #5). Claude Code
-//! writes a conversation's transcript at its first prompt, so a slot opened and never spoken
-//! to has a `session_id` and nothing behind it to resume. It is stopped by the same path, but
+//! **A slot with no conversation on disk is closed, not offloaded** (issue #5). A slot opened
+//! and never spoken to, or `/clear`ed and left, has a `session_id` and nothing behind it to
+//! resume (`transcript::has_exchange`). It is stopped by the same path, but
 //! the record says `closed`: an `offloaded` row promises a resume that would exit at once.
 //!
 //! Run as a pass: `claude-sessions offload`, from whatever timer the box uses. `--dry-run`
@@ -541,6 +541,27 @@ pub fn orphans(table: &[Proc]) -> Vec<Orphan<'_>> {
 /// threshold, for the same reason.
 const SWEEP_MIN_AGE: Duration = Duration::from_millis(IDLE_AFTER_STOP_MS);
 
+/// What the sweep does with one orphan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepAct {
+    /// Too young, or of unknown age: left alone.
+    Keep,
+    /// A dry run's `WOULD KILL`.
+    Report,
+    Kill,
+}
+
+/// The age check comes first in a dry run too, so a dry run reads exactly as the live sweep
+/// would act: infra's gate had to count consecutive passes to make up for a `WOULD KILL`
+/// printed for a daemon the live sweep would have left alone (2026-10-03).
+fn sweep_act(dry_run: bool, age: Option<Duration>) -> SweepAct {
+    match (old_enough(age), dry_run) {
+        (false, _) => SweepAct::Keep,
+        (true, true) => SweepAct::Report,
+        (true, false) => SweepAct::Kill,
+    }
+}
+
 /// Old enough to sweep? An age that cannot be read keeps the tree: evidence to act, never to
 /// hold off.
 fn old_enough(age: Option<Duration>) -> bool {
@@ -620,18 +641,17 @@ fn sweep_orphans(dry_run: bool) {
             o.daemon.args.join(" ")
         );
         let age = procinfo::age(o.daemon.start);
-        let line = if dry_run {
-            format!("sweep: WOULD KILL {what}")
-        } else if !old_enough(age) {
-            format!(
-                "sweep: kept, too young ({}) — {what}",
+        let line = match sweep_act(dry_run, age) {
+            SweepAct::Keep => format!(
+                "sweep: {}, too young ({}) — {what}",
+                if dry_run { "would keep" } else { "kept" },
                 age.map_or("age unknown".into(), |a| format!("{}s", a.as_secs()))
-            )
-        } else {
-            match kill_tree(&o, TERM_GRACE) {
+            ),
+            SweepAct::Report => format!("sweep: WOULD KILL {what}"),
+            SweepAct::Kill => match kill_tree(&o, TERM_GRACE) {
                 0 => format!("sweep: killed {what}"),
                 n => format!("sweep: killed, but {n} process(es) survived KILL — {what}"),
-            }
+            },
         };
         log(&line);
         println!("{line}");
@@ -955,6 +975,19 @@ mod tests {
             old_enough(Some(SWEEP_MIN_AGE)),
             "calibration: old enough is swept"
         );
+    }
+
+    #[test]
+    fn a_dry_run_sweep_reports_only_what_the_live_one_would_kill() {
+        let young = Some(SWEEP_MIN_AGE - Duration::from_secs(1));
+        let old = Some(SWEEP_MIN_AGE);
+        for dry in [true, false] {
+            assert_eq!(sweep_act(dry, young), SweepAct::Keep, "dry run {dry}");
+            assert_eq!(sweep_act(dry, None), SweepAct::Keep, "dry run {dry}");
+        }
+        // Calibration: old enough, the dry run reports exactly what the live sweep kills.
+        assert_eq!(sweep_act(true, old), SweepAct::Report);
+        assert_eq!(sweep_act(false, old), SweepAct::Kill);
     }
 
     #[test]
