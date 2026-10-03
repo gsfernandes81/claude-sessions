@@ -88,7 +88,7 @@ from the hook upwards to the first `claude` whose parent is an `abduco` server.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title` and `first_prompt`, so a new conversation never wears the old one's name |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title` and `first_prompt`, so a new conversation never wears the old one's name. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
@@ -108,9 +108,9 @@ Three details that cost something if missed, read from the vendor hook documenta
 
 ## The offloader
 
-Offloadable when: detached · `Stop` is the latest event · no `needs_you` · **no pending
-timer** (owner, 2026-10-01: never, whoever set it) · no non-`claude` descendants · idle past
-the threshold.
+Offloadable when: detached · `Stop`, or a start at the prompt, is the latest event · no
+`needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · no
+non-`claude` descendants · idle past the threshold.
 
 **The threshold is 10 minutes** after `Stop` (owner, 2026-10-01). The hour floor the old
 shell script used existed only because self-scheduled wake-ups were invisible; the timer
@@ -136,12 +136,13 @@ Built 2026-10-01 in `src/offload.rs`. One pass per invocation, run from the box'
 `--dry-run` decides and reports without signalling. Where the rules above left a choice, this
 is the choice and why:
 
-- **"`Stop` is the latest event"** is `last_stop_ms >= last_activity_ms` and not `busy`.
-  `Stop` sets both to its own time, and everything after it — a prompt, a nested claude's
-  events, a `needs_you` notification, a `SessionStart` — moves `last_activity_ms` past it.
-  **Consequence worth knowing:** a slot that was resumed or started and then left without a
-  prompt has no `Stop` after its `SessionStart`, so it is never offloaded until it is used
-  once. Owner, 2026-10-01: leave it so for now.
+- **"`Stop` is the latest event"** is the later of `last_stop_ms` and `ready_ms` being at or
+  after `last_activity_ms`, and not `busy`. `ready_ms` is the last `SessionStart` that opened a
+  conversation at its prompt — `startup`, `resume`, `clear` or `fork`, which the vendor docs
+  describe as "you can type right away" — so a slot resumed or started and then left is
+  offloadable ten minutes later like any other (owner, 2026-10-03, after asking for this to be
+  checked). A `compact` start is never readiness, and leaves `busy` and `needs_you` alone:
+  auto-compaction can come in the middle of a turn, and the docs do not say it cannot.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules, so
   a `u` slot whose hooks did record those is offloadable and comes back as a registered one.

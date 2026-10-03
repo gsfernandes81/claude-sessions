@@ -100,6 +100,11 @@ pub struct SlotRecord {
     /// The most recent `Stop`. `unread` is this being later than `last_attach_ms`, which is
     /// why neither is derived from the other.
     pub last_stop_ms: Option<Millis>,
+    /// The most recent `SessionStart` that opened a conversation at its prompt — `startup`,
+    /// `resume`, `clear` or `fork`. A claude in that state is idle as surely as one after a
+    /// `Stop`, so the offloader counts idleness from whichever is later. Not `compact`: that
+    /// can fire mid-turn, and nothing in the vendor docs says otherwise.
+    pub ready_ms: Option<Millis>,
     pub timers: Vec<Timer>,
     /// False for a session this tool did not start — one of today's `abduco -A claude claude`
     /// logins. Listed, marked, and never assumed to behave like one of ours.
@@ -127,6 +132,7 @@ impl SlotRecord {
             last_activity_ms: now,
             last_attach_ms: 0,
             last_stop_ms: None,
+            ready_ms: None,
             timers: Vec::new(),
             registered: true,
             updated_ms: now,
@@ -174,6 +180,7 @@ impl SlotRecord {
         o.set("last_activity_ms", Value::num(self.last_activity_ms as f64));
         o.set("last_attach_ms", Value::num(self.last_attach_ms as f64));
         set_opt_u64(&mut o, "last_stop_ms", self.last_stop_ms);
+        set_opt_u64(&mut o, "ready_ms", self.ready_ms);
         o.set("updated_ms", Value::num(self.updated_ms as f64));
         o.set(
             "timers",
@@ -251,6 +258,7 @@ impl SlotRecord {
                 .unwrap_or(0),
             last_attach_ms: v.get("last_attach_ms").and_then(Value::as_u64).unwrap_or(0),
             last_stop_ms: v.get("last_stop_ms").and_then(Value::as_u64),
+            ready_ms: v.get("ready_ms").and_then(Value::as_u64),
             timers,
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),

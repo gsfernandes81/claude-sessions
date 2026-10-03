@@ -89,7 +89,7 @@ impl fmt::Display for Hold {
             ),
             Hold::NeedsYou => write!(f, "waiting for you"),
             Hold::PendingTimer => write!(f, "a timer is pending"),
-            Hold::NotStopped => write!(f, "something happened since its last Stop"),
+            Hold::NotStopped => write!(f, "something happened since it last went idle"),
             Hold::TooRecent { left_ms } => {
                 write!(f, "idle, offloadable in {}s", left_ms.div_ceil(1000))
             }
@@ -104,8 +104,8 @@ impl fmt::Display for Hold {
 /// The rule, pure: may this slot be stopped now? `Ok` carries how long it has been idle.
 ///
 /// Offloadable when: live · its process alive · resumable · nothing waiting for you · no
-/// pending timer, whoever set it · `Stop` is the latest thing that happened · idle past the
-/// threshold · detached · nothing but `claude` running under it.
+/// pending timer, whoever set it · a `Stop`, or a start at the prompt, is the latest thing that
+/// happened · idle past the threshold · detached · nothing but Claude Code under it.
 pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold> {
     // `Offloading` is a pass that died between deciding and finishing. Deciding again is
     // right: if the slot is still idle the job is finished, and if a SessionStart has since
@@ -129,10 +129,12 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     if rec.has_pending_timer(now) {
         return Err(Hold::PendingTimer);
     }
-    // `Stop` sets `last_activity_ms` to its own time, and everything that happens afterwards
-    // — a prompt, a nested claude's events, a SessionStart — moves `last_activity_ms` past it.
-    // So "`Stop` is the latest event" is exactly this, with `busy` as belt and braces.
-    let stop = match rec.last_stop_ms {
+    // `Stop` and a start at the prompt each set `last_activity_ms` to their own time, and
+    // everything that happens afterwards — a prompt, a nested claude's events, a compaction —
+    // moves `last_activity_ms` past them. So "the latest thing that happened left it idle" is
+    // exactly this, with `busy` as belt and braces. A resumed slot the owner looked at and
+    // left is as idle as one that finished a turn.
+    let stop = match rec.last_stop_ms.max(rec.ready_ms) {
         Some(stop) if stop >= rec.last_activity_ms && !rec.busy => stop,
         _ => return Err(Hold::NotStopped),
     };
@@ -627,6 +629,24 @@ mod tests {
             Err(Hold::NotStopped),
             "never stopped"
         );
+    }
+
+    #[test]
+    fn a_slot_started_at_its_prompt_and_left_is_idle_like_one_that_stopped() {
+        let (mut rec, seen) = idle();
+        let at = rec.last_stop_ms.take().unwrap();
+        rec.ready_ms = Some(at);
+        assert!(
+            decide(&rec, NOW, &seen).is_ok(),
+            "opened and never prompted, ten minutes ago: offloadable"
+        );
+        // Calibration: a prompt after it means it is working, not idle.
+        rec.last_activity_ms = at + 1;
+        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
+        // And neither readiness nor a Stop at all is still no evidence.
+        rec.ready_ms = None;
+        rec.last_activity_ms = at;
+        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
     }
 
     #[test]

@@ -50,6 +50,10 @@ impl Event {
     pub fn cwd(&self) -> Option<&str> {
         self.s("cwd")
     }
+    /// `SessionStart`: startup | resume | clear | compact | fork.
+    pub fn source(&self) -> Option<&str> {
+        self.s("source")
+    }
     pub fn session_title(&self) -> Option<&str> {
         self.s("session_title")
     }
@@ -147,9 +151,22 @@ pub fn apply(
             // it faster than the offloader could stop it, and the process in front of them is
             // the truth.
             rec.state = State::Live;
-            rec.busy = false;
-            rec.needs_you = false;
             rec.last_activity_ms = now;
+            // A start that opens a conversation leaves claude at its prompt, waiting: "you can
+            // type right away" (vendor hook docs, read 2026-10-03). That is idle, as after a
+            // Stop, so a slot opened and then left is offloadable like any other. `compact` is
+            // NOT one of these: auto-compaction can happen in the middle of a turn, the docs
+            // do not say otherwise, and a compaction must not make a working claude read as
+            // done — so it leaves `busy`, `needs_you` and readiness exactly as they were. A
+            // start with no source at all is treated the same way: no evidence of idleness.
+            if matches!(
+                ev.source(),
+                Some("startup") | Some("resume") | Some("clear") | Some("fork")
+            ) {
+                rec.busy = false;
+                rec.needs_you = false;
+                rec.ready_ms = Some(now);
+            }
             Outcome::Changed
         }
         "UserPromptSubmit" => {
@@ -371,6 +388,40 @@ mod tests {
             2_000,
         );
         assert_eq!(rec.state, State::Live);
+    }
+
+    #[test]
+    fn a_start_at_the_prompt_is_ready_and_a_compaction_changes_nothing_about_it() {
+        for source in ["startup", "resume", "clear", "fork"] {
+            let mut rec = slot();
+            rec.busy = true;
+            let body = format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#);
+            own(&mut rec, &ev(&body), 2_000);
+            assert_eq!(rec.ready_ms, Some(2_000), "{source} opens at the prompt");
+            assert!(!rec.busy, "{source}: nothing is running yet");
+        }
+        // A compaction mid-turn: the claude is still working, and must keep reading so.
+        let mut rec = slot();
+        rec.busy = true;
+        rec.needs_you = false;
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"compact"}"#),
+            3_000,
+        );
+        assert!(rec.busy, "a compaction does not end a turn");
+        assert_eq!(rec.ready_ms, None, "nor does it leave claude at its prompt");
+        assert_eq!(rec.last_activity_ms, 3_000, "it is activity all the same");
+        // No source at all: no evidence of idleness either.
+        let mut rec = slot();
+        rec.busy = true;
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart"}"#),
+            4_000,
+        );
+        assert!(rec.busy);
+        assert_eq!(rec.ready_ms, None);
     }
 
     #[test]
