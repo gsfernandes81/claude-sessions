@@ -437,7 +437,13 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
         r#"{{"slot":"claude-1","state":"offloaded","title":"behind the pipe","session_id":"s-1",
             "cwd":"/workspace","needs_you":false,"last_activity_ms":{at},"timers":[]}}"#
     );
-    std::fs::write(&pipe, body).unwrap();
+    std::fs::write(&pipe, &body).unwrap();
+    // A regular file in the pipe's place at once, before the next reading two seconds on:
+    // that reading would open the pipe again and wait for ever, and the menu with it (it
+    // passed locally and failed in CI, where the next reading came before the q).
+    let swap = reg.join(".swap");
+    std::fs::write(&swap, &body).unwrap();
+    std::fs::rename(&swap, &pipe).unwrap();
     // An offloaded slot is listed only with a conversation on disk; this one has none, so
     // the list it settles on is the empty one — the point is that the reading arrived.
     let after = term.read_until(b"nothing open", Duration::from_secs(3));
@@ -446,7 +452,8 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
         after.contains("nothing open"),
         "the list replaced the spinner: {after:?}"
     );
-    let idle = term.read_for(Duration::from_secs(2));
+    // Past the next reading (every two seconds), which must find the file and carry on.
+    let idle = term.read_for(Duration::from_secs(3));
     assert!(idle.is_empty(), "the spinner stopped: {} bytes", idle.len());
 
     term.write(b"q");
