@@ -74,6 +74,26 @@ const MAX_SLOTS: u32 = 999;
 /// line under the real hook.
 pub const START_WRAP: &str = r#"e=$1; shift; exec "$@" 2>>"$e""#;
 
+/// Set to `1` for every claude a slot starts, each only if the login has not set it already:
+/// **the terminal's own scrollback instead of Claude Code's** (owner, 2026-10-04, issue #8).
+/// Every slot is reached over ssh, mostly from a phone. Claude Code's default renderer keeps
+/// the transcript on the alternate screen in a scrollback of its own, so each swipe is a round
+/// trip asking the server to repaint; its mouse tracking makes Termux send swipes to claude
+/// rather than scroll its own buffer, in every renderer; and the inline renderer still holds
+/// older output in its viewport unless virtual scroll is off too. With all three set, output
+/// lands in the terminal's buffer and scrolling is local. Only the first has a settings key,
+/// so the launcher, which makes the process, is where the mode is chosen.
+///
+/// **Only if unset**, so a value the login brings (ssh `SendEnv`, or a later relaunch with the
+/// opposite) wins over this default. The names are read from the Claude Code binary, and a
+/// rename would fail silently — passed and never read — so `docs/design.md` gives the check to
+/// repeat at each Claude Code pin.
+pub const SCROLLBACK: [&str; 3] = [
+    "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN",
+    "CLAUDE_CODE_DISABLE_MOUSE",
+    "CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL",
+];
+
 /// What the launcher runs and reads, gathered so tests can substitute each of them.
 pub struct Deps {
     pub abduco: String,
@@ -83,6 +103,9 @@ pub struct Deps {
     /// The memory reading behind the no-room check.
     pub memory: fn() -> mem::Memory,
     pub quick: Duration,
+    /// Whether the login has set this environment variable, which the slot's claude then
+    /// inherits as it is (`SCROLLBACK`).
+    pub preset: fn(&str) -> bool,
 }
 
 impl Deps {
@@ -93,6 +116,7 @@ impl Deps {
             shell: env_or("SHELL", "/bin/sh"),
             memory: mem::read,
             quick: QUICK_FAIL,
+            preset: |key| std::env::var_os(key).is_some(),
         }
     }
 }
@@ -884,17 +908,23 @@ fn stderr_path(slot: &str) -> PathBuf {
 
 /// The command line a slot is started with:
 ///
-/// `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> sh -c START_WRAP sh <stderr> <claude> <args…>`
+/// `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> [SCROLLBACK=1…] sh -c START_WRAP sh <stderr> <claude> <args…>`
 ///
-/// `env` sets the name every hook inherits and execs the shell, the shell points stderr at
-/// the capture file and execs claude: one pid from the abduco server's fork to claude, so
-/// claude is that server's direct child.
+/// `env` sets the name every hook inherits, and each of `SCROLLBACK` the login has not set,
+/// and execs the shell; the shell points stderr at the capture file and execs claude: one pid
+/// from the abduco server's fork to claude, so claude is that server's direct child.
 fn start_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Command {
     let mut cmd = Command::new(&deps.abduco);
     cmd.arg("-c")
         .arg(slot)
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
+        .args(
+            SCROLLBACK
+                .iter()
+                .filter(|key| !(deps.preset)(key))
+                .map(|key| format!("{key}=1")),
+        )
         .arg("sh")
         .arg("-c")
         .arg(START_WRAP)
@@ -1199,18 +1229,29 @@ exit 2"#,
             )
         }
 
-        /// A claude that stays up: it records its pid, directory and arguments, writes a line
-        /// to stderr, and becomes a long sleep under the same pid.
+        /// A claude that stays up: it records its pid, directory and arguments, and the
+        /// scrollback variables it was given, writes a line to stderr, and becomes a long sleep
+        /// under the same pid.
         fn claude_ok(&self) -> String {
             self.script(
                 "claude",
                 &format!(
                     r#"echo "$$ $PWD $CLAUDE_SESSIONS_SLOT $*" >> "{}"
+echo "${{CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN-unset}} ${{CLAUDE_CODE_DISABLE_MOUSE-unset}} ${{CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL-unset}}" >> "{}"
 echo "a warning on stderr" >&2
 exec sleep 600"#,
-                    self.path("claude.log").display()
+                    self.path("claude.log").display(),
+                    self.path("claude.env").display()
                 ),
             )
+        }
+
+        fn claude_env(&self) -> Vec<String> {
+            std::fs::read_to_string(self.path("claude.env"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
         }
 
         /// A claude that fails as `--resume` of a missing transcript does.
@@ -1233,6 +1274,7 @@ exit 1"#,
                 shell: "/bin/false".into(),
                 memory: room,
                 quick: QUICK_FAIL,
+                preset: |_| false,
             }
         }
 
@@ -1533,6 +1575,11 @@ exit 1"#,
         assert!(rec.last_attach_ms > 0);
         let captured = std::fs::read_to_string(stderr_path("claude-1")).unwrap();
         assert_eq!(captured, "a warning on stderr\n");
+        let env = wait_for("its environment", || f.claude_env().pop());
+        assert_eq!(
+            env, "1 1 1",
+            "a resume gets the terminal's scrollback as a new one does"
+        );
     }
 
     #[test]
@@ -1998,6 +2045,15 @@ exit 1"#,
         assert_eq!(&fields[1..], [&f.work(), "claude-1"], "no arguments");
         term.assert_handed_over(1);
         assert_eq!(load("claude-1").state, State::Live);
+        // Said on the command line rather than inherited, so this cannot pass merely because
+        // the tests themselves run under a slot that already has them.
+        assert!(
+            f.calls()[0].contains(" env CLAUDE_SESSIONS_SLOT=claude-1 CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_DISABLE_MOUSE=1 CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 sh -c "),
+            "{:?}",
+            f.calls()
+        );
+        let env = wait_for("its environment", || f.claude_env().pop());
+        assert_eq!(env, "1 1 1", "the terminal's own scrollback, issue #8");
     }
 
     #[test]
@@ -2085,6 +2141,36 @@ exit 1"#,
         term.assert_handed_over(1);
     }
 
+    #[test]
+    fn a_scrollback_variable_the_login_set_is_left_to_it() {
+        let deps = Deps {
+            abduco: "abduco".into(),
+            claude: "claude".into(),
+            shell: String::new(),
+            memory: room,
+            quick: QUICK_FAIL,
+            preset: |key| key == "CLAUDE_CODE_DISABLE_MOUSE",
+        };
+        let cmd = start_command("claude-3", Path::new("/r/e"), &[], &deps);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let assigned: Vec<&str> = args
+            .iter()
+            .map(String::as_str)
+            .filter(|a| a.starts_with("CLAUDE_CODE_"))
+            .collect();
+        assert_eq!(
+            assigned,
+            [
+                "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1",
+                "CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1"
+            ],
+            "no assignment for the one the login set, so claude inherits the login's value"
+        );
+    }
+
     // ── small pieces ────────────────────────────────────────────────────────
 
     #[test]
@@ -2107,6 +2193,7 @@ exit 1"#,
             shell: String::new(),
             memory: room,
             quick: QUICK_FAIL,
+            preset: |_| false,
         };
         let cmd = start_command(
             "claude-3",
@@ -2126,6 +2213,9 @@ exit 1"#,
                 "claude-3",
                 "env",
                 "CLAUDE_SESSIONS_SLOT=claude-3",
+                "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1",
+                "CLAUDE_CODE_DISABLE_MOUSE=1",
+                "CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1",
                 "sh",
                 "-c",
                 r#"e=$1; shift; exec "$@" 2>>"$e""#,

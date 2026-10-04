@@ -66,6 +66,8 @@ The menu starts each slot as:
 
 ```
 abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> \
+  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_DISABLE_MOUSE=1 \
+  CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 \
   sh -c 'e=$1; shift; exec "$@" 2>>"$e"' sh <registry>/claude-<n>.stderr claude …
 ```
 
@@ -80,6 +82,38 @@ direct child of that slot's `abduco` server**, checked in `/proc`. A nested clau
 as *work running under* the slot, never rebind its `session_id`. Hook payloads carry
 `agent_id`/`agent_type` **on subagents only**, which is a cheaper test than the `/proc` walk
 for that case; a `claude -p` spawned from a shell still needs the walk.
+
+**The three `CLAUDE_CODE_DISABLE_*` give claude the terminal's own scrollback** (owner,
+2026-10-04, issue #8), for a new slot and a resume alike. Every slot is reached over ssh,
+mostly from a phone, and Claude Code's default renderer owns scrolling itself: the alternate
+screen with a virtualised scrollback makes each swipe a round trip asking the server to
+repaint; mouse tracking, on in every renderer, makes Termux send swipes to claude instead of
+scrolling its own buffer; and the inline renderer keeps older output in its viewport unless
+virtual scroll is off too. With all three, output lands in the terminal's buffer, scrolling
+is local and instant, and long-press selection works. Only the first has a settings key
+(`tui`), so the launcher — which makes the process — is where the mode is chosen. **Each is
+set only if the login has not set it**, so a value it brings (ssh `SendEnv`, or a later
+relaunch with the opposite) wins; the launcher leaves such a variable off the line and claude
+inherits it. These are the one deliberate exception to nothing of ours in claude's
+environment: they are meant for claude.
+
+The costs, accepted: the classic renderer flickers more and leaves debris after a resize
+(Termux resizes on every keyboard show and hide); abduco redraws only the current screen on
+attach, so output from before a dropped link lives only in a terminal that stayed open —
+Ctrl+E redraws the whole transcript; what needs the fullscreen renderer (focus view, the diff
+panel) refuses and says so; and menus, links and collapsible blocks are keyboard-only. It
+applies to every login, a laptop's too, because it is about claude over ssh rather than about
+a device; if that proves wrong, the follow-up is a toggle key, not a revert.
+
+**Re-check the names at each Claude Code pin bump.** They were read from the 2.1.289 binary,
+and a rename fails silently — passed, never read, and scrolling is back to round trips with
+no message:
+
+```sh
+strings "$(command -v claude)" | grep -oE 'CLAUDE_CODE_DISABLE_(ALTERNATE_SCREEN|MOUSE|VIRTUAL_SCROLL)' | sort -u
+```
+
+Expect all three names.
 
 Sessions started without the menu (see *Unregistered sessions*) are found by walking `/proc`
 from the hook upwards to the first `claude` whose parent is an `abduco` server.

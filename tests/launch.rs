@@ -1,7 +1,7 @@
 //! A slot started the way the menu starts one is bound by the real hook.
 //!
 //! The menu starts a slot as
-//! `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> sh -c '<wrap>' sh <stderr> claude …`,
+//! `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> CLAUDE_CODE_DISABLE_…=1 sh -c '<wrap>' sh <stderr> claude …`,
 //! and a hook binds to a slot only when its claude is the direct child of the abduco server
 //! (`src/bind.rs`). The shell in the middle is there to capture stderr and must `exec` itself
 //! away, or no `SessionStart` would ever bind the slot's own claude and every slot would read
@@ -104,6 +104,11 @@ fn start(root: &Path, slot: &str, wrap: &str) {
         .arg(slot)
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
+        .args([
+            "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1",
+            "CLAUDE_CODE_DISABLE_MOUSE=1",
+            "CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1",
+        ])
         .arg("sh")
         .arg("-c")
         .arg(wrap)
