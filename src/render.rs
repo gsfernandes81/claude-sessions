@@ -129,31 +129,41 @@ impl Frame {
     /// blanked them, and on a metered link they are bytes that draw nothing.
     pub fn ansi(&self) -> String {
         let mut out = String::from("\x1b[H");
-        for (i, line) in self.lines.iter().enumerate() {
+        for i in 0..self.lines.len() {
             if i > 0 {
                 out.push_str("\r\n");
             }
-            out.push_str(CLEAR_LINE);
-            let ink = line
-                .iter()
-                .rposition(|s| s.style.reverse || s.text.chars().any(|c| c != ' '));
-            if let Some(last) = ink {
-                for (j, span) in line[..=last].iter().enumerate() {
-                    let text = if j == last && !span.style.reverse {
-                        span.text.trim_end_matches(' ')
-                    } else {
-                        span.text.as_str()
-                    };
-                    let blank = !span.style.reverse && text.chars().all(|c| c == ' ');
-                    match sgr(span.style) {
-                        Some(code) if !blank => {
-                            out.push_str(&code);
-                            out.push_str(text);
-                            out.push_str("\x1b[0m");
-                        }
-                        _ => out.push_str(text),
-                    }
+            out.push_str(&self.ansi_line(i));
+        }
+        out
+    }
+
+    /// One line as `ansi` writes it: cleared, then drawn. The loop sends only the lines that
+    /// changed, each after a move to its row, so a spinner turning costs one line, not a
+    /// screen.
+    pub fn ansi_line(&self, i: usize) -> String {
+        let line = &self.lines[i];
+        let mut out = String::from(CLEAR_LINE);
+        let ink = line
+            .iter()
+            .rposition(|s| s.style.reverse || s.text.chars().any(|c| c != ' '));
+        let Some(last) = ink else {
+            return out;
+        };
+        for (j, span) in line[..=last].iter().enumerate() {
+            let text = if j == last && !span.style.reverse {
+                span.text.trim_end_matches(' ')
+            } else {
+                span.text.as_str()
+            };
+            let blank = !span.style.reverse && text.chars().all(|c| c == ' ');
+            match sgr(span.style) {
+                Some(code) if !blank => {
+                    out.push_str(&code);
+                    out.push_str(text);
+                    out.push_str("\x1b[0m");
                 }
+                _ => out.push_str(text),
             }
         }
         out
@@ -397,8 +407,10 @@ fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
 /// `infra-dev · 6 open · 812M of 1.0G`: the container's name in the foreground, the rest
 /// dim, as structure.
 fn header(view: &View) -> Line {
-    // Closed rows are listed but are not open (owner, 2026-10-03).
+    // Closed rows are listed but are not open (owner, 2026-10-03). While the list is first
+    // being read there is no count to give, so none is given.
     let mut rest = match view.rows.iter().filter(|r| !r.closed).count() {
+        _ if loading(view) => String::new(),
         0 => " · nothing open".to_string(),
         n => format!(" · {n} open"),
     };
@@ -503,7 +515,7 @@ fn list_lines(view: &View, w: usize, room: usize) -> Vec<Line> {
         .iter()
         .map(|item| match *item {
             Item::Heading(g) => heading(g, &count(&view.rows, g), w, false),
-            Item::Row(i) => row(&view.rows[i], w, indent, i == view.cursor),
+            Item::Row(i) => row(&view.rows[i], w, indent, i == view.cursor, spin_on(view, i)),
             Item::Fold(i) => heading(Group::Archived, &view.rows[i].age, w, i == view.cursor),
             Item::Blank => blank(),
         })
@@ -568,7 +580,7 @@ fn heading_style(g: Group) -> Style {
 /// A session: its title, cut to fit, and its age right-aligned in the last five columns. No
 /// marks and no number (owner, 2026-10-03): the group says what state it is in, an unread
 /// title is bold, and a session attached somewhere else is drawn dim.
-fn row(r: &Row, w: usize, indent: usize, cursor: bool) -> Line {
+fn row(r: &Row, w: usize, indent: usize, cursor: bool, spin: Option<&str>) -> Line {
     // The cursor is reverse video across the whole row (owner, 2026-10-02): a monochrome
     // terminal shows it too, and the styles inside it still read.
     let st = |s: Style| Style {
@@ -584,8 +596,14 @@ fn row(r: &Row, w: usize, indent: usize, cursor: bool) -> Line {
     let title: String = r.title.chars().take(title_w).collect();
     line.push(&title, st(title_style))
         .pad(indent + title_w, st(FG));
-    let age: String = r.age.chars().take(AGE_WIDTH).collect();
-    line.push(&format!("{age:>AGE_WIDTH$}"), st(DIM));
+    // While it is being worked on, the spinner stands in for its age, in the foreground.
+    match spin {
+        Some(glyph) => line.push(&format!("{glyph:>AGE_WIDTH$}"), st(FG)),
+        None => {
+            let age: String = r.age.chars().take(AGE_WIDTH).collect();
+            line.push(&format!("{age:>AGE_WIDTH$}"), st(DIM))
+        }
+    };
     line
 }
 
@@ -595,7 +613,14 @@ fn row(r: &Row, w: usize, indent: usize, cursor: bool) -> Line {
 /// the status line if there is one and the hint line as the footer.
 fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     let mut out = vec![header(view), rule(w)];
-    let hints = if view.rows.is_empty() {
+    let hints = if let Some(b) = view.busy.as_ref().filter(|b| b.loading) {
+        // Mockup 10: the frame at once, and the spinner where the list will go.
+        out.push(blank());
+        let mut line = Line::default();
+        line.push(b.glyph(), FG).push(" ", FG).push(&b.what, DIM);
+        out.push(line);
+        hint_lines(&HINTS_EMPTY, GAP, w)
+    } else if view.rows.is_empty() {
         out.extend(empty_body(view, w));
         hint_lines(&HINTS_EMPTY, GAP, w)
     } else {
@@ -613,11 +638,31 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
 /// The status line, wrapped rather than cut: it is usually a reason something was refused,
 /// and a reason cut off at the edge of a phone screen is no reason at all. Mockup 6's fits on
 /// one line, as most do.
+///
+/// While something is being worked on, the line is the spinner and what is happening, in
+/// place of any status (mockup 11).
 fn status_lines(view: &View, w: usize) -> Vec<String> {
-    view.status
-        .as_deref()
-        .map(|s| wrap(s, w))
-        .unwrap_or_default()
+    match &view.busy {
+        Some(b) if !b.loading => wrap(&format!("{} {}", b.glyph(), b.what), w),
+        _ => view
+            .status
+            .as_deref()
+            .map(|s| wrap(s, w))
+            .unwrap_or_default(),
+    }
+}
+
+/// The list is still being read for the first time.
+fn loading(view: &View) -> bool {
+    view.busy.as_ref().is_some_and(|b| b.loading)
+}
+
+/// The spinner's glyph if it stands in for row `i`'s age.
+fn spin_on(view: &View, i: usize) -> Option<&'static str> {
+    view.busy
+        .as_ref()
+        .filter(|b| !b.loading && b.row == Some(i))
+        .map(|b| b.glyph())
 }
 
 /// How many lines a status takes at `width` — for `menu.rs`, which must leave room for it.
@@ -708,7 +753,7 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
         if room.saturating_sub(body.len()) >= 2 {
             let g = r.1.group();
             out.push(heading(g, &count(&view.rows, g), w, false));
-            out.push(row(r.1, w, indent(w), r.0 == view.cursor));
+            out.push(row(r.1, w, indent(w), r.0 == view.cursor, None));
         }
     }
     out.extend(boxed(body, w, box_w));
@@ -843,7 +888,7 @@ fn boxed(body: Vec<Line>, w: usize, box_w: usize) -> Vec<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{Header, RowKey};
+    use crate::ui::{Busy, Header, RowKey};
 
     const MOCKUPS_40: &str = include_str!("../docs/mockups.md");
     const MOCKUPS_80: &str = include_str!("../docs/mockups-80.md");
@@ -920,6 +965,7 @@ mod tests {
             screen: Screen::List,
             dialog: None,
             status: None,
+            busy: None,
         }
     }
 
@@ -1016,6 +1062,33 @@ mod tests {
         }
     }
 
+    /// Mockup 10: the first frame while the list is still being read.
+    fn mockup_10(w: u16) -> View {
+        View {
+            busy: Some(Busy {
+                frame: 0,
+                row: None,
+                what: "reading sessions".to_string(),
+                loading: true,
+            }),
+            ..view(w, vec![], 812)
+        }
+    }
+
+    /// Mockup 11: closing a running session, the spinner in its age and on the status line.
+    fn mockup_11(w: u16) -> View {
+        View {
+            cursor: RETIRE,
+            busy: Some(Busy {
+                frame: 0,
+                row: Some(RETIRE),
+                what: "closing session".to_string(),
+                loading: false,
+            }),
+            ..view(w, listed(), 812)
+        }
+    }
+
     /// Prints the screens the mockup files draw, for redrawing those files to width:
     /// `cargo test print_the_mockups -- --ignored --nocapture`. The files list and keys
     /// screens without the blank gap above the footer (see `compare`).
@@ -1024,7 +1097,7 @@ mod tests {
     fn print_the_mockups() {
         // Numbered as the files number them; mockup 8 is the refusal, not a View.
         type Build = fn(u16) -> View;
-        let builds: [(u8, Build); 8] = [
+        let builds: [(u8, Build); 10] = [
             (1, mockup_1),
             (2, mockup_2),
             (3, mockup_3),
@@ -1033,6 +1106,8 @@ mod tests {
             (6, mockup_6),
             (7, mockup_7),
             (9, mockup_9),
+            (10, mockup_10),
+            (11, mockup_11),
         ];
         for w in [40u16, 80] {
             for (n, b) in builds {
@@ -1183,6 +1258,63 @@ mod tests {
     #[test]
     fn mockup_9_the_archive_opened() {
         assert_mockup(9, mockup_9);
+    }
+
+    #[test]
+    fn the_spinner_stands_in_for_the_age_and_the_status_and_steps_through_every_frame() {
+        let mut v = mockup_11(40);
+        v.status = Some("an earlier status".to_string());
+        v.cursor = 0;
+        let f = render(&v).unwrap();
+        let p = lines(&f);
+        // Its row: the title as ever, the spinner where the age was, in the foreground.
+        assert_eq!(p[9], format!("{:<35}{:>5}", "retire the old tunnel", "⠋"));
+        assert_eq!(style_at(&f, 9, 39), FG);
+        // The status line says what is happening, in place of any status.
+        assert!(p.contains(&"⠋ closing session".to_string()), "{p:?}");
+        assert!(!p.iter().any(|l| l.contains("earlier status")));
+        // Every other row keeps its age.
+        assert!(p[10].ends_with("3m"));
+        // Ten frames, in Compose's order, then round again.
+        let glyphs: String = (0..11)
+            .map(|frame| {
+                let b = Busy {
+                    frame,
+                    ..v.busy.clone().unwrap()
+                };
+                b.glyph()
+            })
+            .collect();
+        assert_eq!(glyphs, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋");
+        // Calibration: with nothing being worked on, the age and the status are back.
+        let idle = View { busy: None, ..v };
+        let p = lines(&render(&idle).unwrap());
+        assert!(p[9].ends_with("14m"));
+        assert!(p.contains(&"an earlier status".to_string()));
+    }
+
+    #[test]
+    fn the_first_frame_while_reading_has_no_count_and_offers_only_what_needs_no_list() {
+        let p = lines(&render(&mockup_10(40)).unwrap());
+        assert_eq!(p[0], "infra-dev · 812M of 1.0G", "no count yet");
+        assert_eq!(p[3], "⠋ reading sessions");
+        assert_eq!(p[23], "n new   ? keys   s shell");
+        // Calibration: the same empty list, read, says nothing is open.
+        let read = View {
+            busy: None,
+            ..mockup_10(40)
+        };
+        assert!(lines(&render(&read).unwrap())[0].contains("nothing open"));
+    }
+
+    #[test]
+    fn mockup_10_the_first_frame_while_the_list_is_read() {
+        assert_mockup(10, mockup_10);
+    }
+
+    #[test]
+    fn mockup_11_closing_a_session_the_spinner_turning() {
+        assert_mockup(11, mockup_11);
     }
 
     #[test]
@@ -1585,6 +1717,7 @@ mod tests {
         for (_, w) in SETS {
             for build in [
                 mockup_1, mockup_2, mockup_3, mockup_4, mockup_5, mockup_6, mockup_7, mockup_9,
+                mockup_10, mockup_11,
             ] {
                 let v = build(w);
                 let f = render(&v).unwrap();

@@ -38,7 +38,10 @@ reads the registry and `abduco`, never guesses, and opens what the owner picks.
   Mono, Fira Mono and Space Mono were each downloaded and their cmaps read on 2026-10-01.
   It fell back to a face with a different advance and silently dragged every line it sat on
   out of alignment. The key is spelled `Enter`. Anything outside ASCII and the box-drawing
-  set used in the mockups gets the same treatment: check coverage, do not assume it.
+  set used in the mockups gets the same treatment: check coverage, do not assume it. The one
+  exception is the spinner's braille (`⠋⠙⠹…`): in none of those faces, used on the owner's
+  word that it draws on Termux and Windows Terminal (2026-10-04), and only ever alone in a
+  cell.
 - **Nothing is colour-only.** A session's state is said in words — the group heading it is
   under — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for
   unread and dim for attached are emphasis on top, the owner's choice over glyph marks

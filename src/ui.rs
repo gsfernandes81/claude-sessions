@@ -180,6 +180,34 @@ pub struct View {
     /// One line between the list's closing rule and the hint line, as in mockup 6:
     /// `detached · it is still running`.
     pub status: Option<String>,
+    /// Something is being worked on and has taken long enough to show (mockups 10 and 11).
+    pub busy: Option<Busy>,
+}
+
+/// Docker Compose's spinner (owner, 2026-10-04): ten braille frames, one every 100 ms. Braille
+/// is in none of the monospace fonts measured on 2026-10-01; the owner has seen it drawn on
+/// the terminals this is driven from, which put a fallback glyph in one cell, and it is only
+/// ever drawn alone in a cell, so a fallback cannot drag a line out of true.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// What is being worked on, as drawn: the spinner's frame, the row it is on, if it is about
+/// one, and what is happening, in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Busy {
+    pub frame: usize,
+    /// The row whose age the spinner stands in for. `None` for work that has no row yet — a
+    /// new session — or is about the whole list.
+    pub row: Option<usize>,
+    pub what: String,
+    /// The list itself is still being read for the first time: drawn blank, with the spinner
+    /// where it will go (mockup 10).
+    pub loading: bool,
+}
+
+impl Busy {
+    pub fn glyph(&self) -> &'static str {
+        SPINNER[self.frame % SPINNER.len()]
+    }
 }
 
 /// A colour from the approved table in `docs/mockups.md`. Two, and only two: amber is spent

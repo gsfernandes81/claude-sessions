@@ -258,3 +258,199 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The spinner while a session closes (owner, 2026-10-04): it shows only after a quarter of a
+/// second, steps through Compose's frames one at a time with none skipped, at an even pace,
+/// writes a line or two per frame rather than the screen, and leaves the menu idle and silent
+/// once the close is done.
+#[test]
+fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let root = std::env::temp_dir().join(format!("cs-menu-spin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (reg, abd) = (root.join("registry"), root.join("abduco"));
+    std::fs::create_dir_all(&reg).unwrap();
+    std::fs::create_dir_all(&abd).unwrap();
+
+    // A claude that ignores TERM, so the close waits out its five-second grace and the
+    // spinner has time to turn. The ignore is inherited across the exec.
+    let mut stubborn = Command::new("sh")
+        .args(["-c", "trap '' TERM; exec sleep 60"])
+        .spawn()
+        .unwrap();
+    let pid = stubborn.id();
+    std::thread::sleep(Duration::from_millis(100));
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 2..];
+    let start: u64 = after_comm.split(' ').nth(19).unwrap().parse().unwrap();
+    let at = now_ms() - 3_600_000;
+    std::fs::write(
+        reg.join("claude-1.json"),
+        format!(
+            r#"{{"slot":"claude-1","state":"live","pid":{pid},"proc_start":{start},
+                "session_id":"s-1","cwd":"/workspace","title":"a stubborn session",
+                "needs_you":false,"last_activity_ms":{at},"timers":[]}}"#
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("CLAUDE_SESSIONS_DIR", &reg)
+        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
+        .env("CLAUDE_CONFIG_DIR", root.join("cc"));
+    let mut term = pty::Pty::spawn(cmd, 40, 24).expect("spawn the menu on a pty");
+    let first = term.read_until(b"a stubborn session", Duration::from_secs(5));
+    assert!(String::from_utf8_lossy(&first).contains("a stubborn session"));
+    term.read_for(Duration::from_millis(300));
+
+    // c asks; y closes.
+    term.write(b"c");
+    term.read_until(b"y close", Duration::from_secs(3));
+    term.write(b"y");
+    let pressed = std::time::Instant::now();
+    let chunks = term.read_timed(Duration::from_secs(7));
+
+    // The frames, in order, each with when it first arrived: the spinner is drawn on its row
+    // and on the status line, so a frame is a run of one glyph.
+    let mut frames: Vec<(usize, std::time::Instant, usize)> = Vec::new();
+    for (when, chunk) in &chunks {
+        let text = String::from_utf8_lossy(chunk);
+        for c in text.chars() {
+            if let Some(f) = FRAMES.iter().position(|g| *g == c) {
+                if frames.last().map(|l| l.0) != Some(f) {
+                    frames.push((f, *when, 0));
+                }
+            }
+        }
+        if let Some(last) = frames.last_mut() {
+            last.2 += chunk.len();
+        }
+    }
+    let all = String::from_utf8_lossy(&chunks.iter().flat_map(|c| c.1.clone()).collect::<Vec<_>>())
+        .into_owned();
+    assert!(
+        all.contains("closing session"),
+        "it says what it is doing: {all:?}"
+    );
+    assert!(
+        frames.len() >= 30,
+        "about five seconds of frames, got {}",
+        frames.len()
+    );
+
+    // Not before a quarter of a second.
+    let shown = frames[0].1.duration_since(pressed);
+    assert!(shown >= Duration::from_millis(200), "shown after {shown:?}");
+    assert_eq!(frames[0].0, 0, "it starts on the first frame");
+
+    // One step at a time: never a frame missed out.
+    for pair in frames.windows(2) {
+        assert_eq!(
+            pair[1].0,
+            (pair[0].0 + 1) % FRAMES.len(),
+            "a frame was skipped: {:?}",
+            frames.iter().map(|f| FRAMES[f.0]).collect::<String>()
+        );
+    }
+
+    // An even pace: a frame every 80 ms, give or take what a loaded test machine adds.
+    let gaps: Vec<u128> = frames
+        .windows(2)
+        .map(|p| p[1].1.duration_since(p[0].1).as_millis())
+        .collect();
+    let mean = gaps.iter().sum::<u128>() / gaps.len() as u128;
+    assert!((70..=100).contains(&mean), "mean gap {mean} ms: {gaps:?}");
+    let ragged = gaps.iter().filter(|g| !(40..=140).contains(*g)).count();
+    assert!(ragged * 10 <= gaps.len(), "uneven frames: {gaps:?}");
+
+    // A line or two per frame, not the screen.
+    let per_frame = frames[1..frames.len() - 1]
+        .iter()
+        .map(|f| f.2)
+        .max()
+        .unwrap();
+    assert!(per_frame < 400, "{per_frame} bytes in one frame");
+
+    // Done: the stubborn claude was stopped, and the menu says so and then says nothing.
+    let mut waited = 0;
+    while stubborn.try_wait().unwrap().is_none() && waited < 50 {
+        std::thread::sleep(Duration::from_millis(100));
+        waited += 1;
+    }
+    assert!(
+        stubborn.try_wait().unwrap().is_some(),
+        "the close stopped it"
+    );
+    assert!(all.contains("closed"), "{all:?}");
+    let idle = term.read_for(Duration::from_secs(3));
+    assert!(
+        idle.is_empty(),
+        "an idle menu wrote {} bytes after the close",
+        idle.len()
+    );
+
+    term.write(b"q");
+    term.wait(Duration::from_secs(3))
+        .expect("the menu exits on q");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The first frame while the list is still being read (owner, 2026-10-04): drawn at once, a
+/// spinner where the list will go, and the list in its place when the reading is done. The
+/// reading is held open by a named pipe in the registry, which blocks until it is written.
+#[test]
+fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
+    let root = std::env::temp_dir().join(format!("cs-menu-first-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (reg, abd) = (root.join("registry"), root.join("abduco"));
+    std::fs::create_dir_all(&reg).unwrap();
+    std::fs::create_dir_all(&abd).unwrap();
+    let pipe = reg.join("claude-1.json");
+    let made = Command::new("mkfifo").arg(&pipe).status().unwrap();
+    assert!(made.success(), "mkfifo");
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("CLAUDE_SESSIONS_DIR", &reg)
+        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
+        .env("CLAUDE_CONFIG_DIR", root.join("cc"));
+    let mut term = pty::Pty::spawn(cmd, 40, 24).expect("spawn the menu on a pty");
+    let first = term.read_until(b"reading sessions", Duration::from_secs(3));
+    let first = String::from_utf8_lossy(&first).into_owned();
+    assert!(first.contains("reading sessions"), "{first:?}");
+    assert!(
+        first.contains('⠋'),
+        "the spinner, from its first frame: {first:?}"
+    );
+    assert!(
+        first.contains(" shell"),
+        "the footer is drawn already: {first:?}"
+    );
+    // It turns while it waits.
+    let turning = String::from_utf8_lossy(&term.read_for(Duration::from_millis(400))).into_owned();
+    assert!(turning.contains('⠙'), "{turning:?}");
+
+    // Let the reading finish: the record arrives through the pipe.
+    let at = now_ms() - 3_600_000;
+    let body = format!(
+        r#"{{"slot":"claude-1","state":"offloaded","title":"behind the pipe","session_id":"s-1",
+            "cwd":"/workspace","needs_you":false,"last_activity_ms":{at},"timers":[]}}"#
+    );
+    std::fs::write(&pipe, body).unwrap();
+    // An offloaded slot is listed only with a conversation on disk; this one has none, so
+    // the list it settles on is the empty one — the point is that the reading arrived.
+    let after = term.read_until(b"nothing open", Duration::from_secs(3));
+    let after = String::from_utf8_lossy(&after).into_owned();
+    assert!(
+        after.contains("nothing open"),
+        "the list replaced the spinner: {after:?}"
+    );
+    let idle = term.read_for(Duration::from_secs(2));
+    assert!(idle.is_empty(), "the spinner stopped: {} bytes", idle.len());
+
+    term.write(b"q");
+    term.wait(Duration::from_secs(3))
+        .expect("the menu exits on q");
+    let _ = std::fs::remove_dir_all(&root);
+}

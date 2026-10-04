@@ -144,6 +144,27 @@ impl Pty {
         self.slave.as_raw_fd()
     }
 
+    /// Everything written over the next `window`, chunk by chunk, each with when it arrived —
+    /// for measuring how evenly something animates.
+    pub fn read_timed(&mut self, window: Duration) -> Vec<(Instant, Vec<u8>)> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return out;
+            }
+            match self.rx.recv_timeout(left) {
+                Ok(chunk) => out.push((Instant::now(), chunk)),
+                Err(RecvTimeoutError::Timeout) => return out,
+                Err(RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(left);
+                    return out;
+                }
+            }
+        }
+    }
+
     /// Everything written to the terminal over the next `window` — the whole window, even
     /// once bytes have arrived, because the question is usually whether *more* do.
     pub fn read_for(&mut self, window: Duration) -> Vec<u8> {

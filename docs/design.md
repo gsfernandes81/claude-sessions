@@ -353,6 +353,22 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 - **What does not fit folds into `… N more`**, on the list's last line, counting the sessions
   below it — not the Archived heading. Closed and Archived are last, so they fold first. The list scrolls to keep the cursor's
   session above the fold, and scrolling up to a group's first session brings its heading.
+- **Anything that takes a while shows a spinner** (owner, 2026-10-04; mockups 10 and 11):
+  Docker Compose's ten braille frames, one every 80 ms, a little faster than Compose's 100.
+  It stands in for the age of the session being worked on, and the status line says what is
+  happening without naming the session — `closing session`, `resuming session`, `offloading
+  session for room`, `archiving session` — or, for a new session or a shell, on the status
+  line alone. **It shows only after a quarter of a second**, so quick actions never flash it.
+  **It steps one frame at a time on a fixed cadence**, each deadline set from the last rather
+  than from when the frame was drawn, so it never skips a frame and never stutters (the owner
+  saw a mockup step unevenly). **Only the lines that change are written**, so a frame costs a
+  line or two, and an idle menu still writes nothing. The work runs on its own thread
+  (`src/work.rs`); an action that hands the terminal to a child asks the menu's thread to do
+  it, so the spinner covers what comes before and after the child but never draws over it.
+  While it turns, keys are ignored except `q`, Ctrl-C and a resize, so nothing can be done to
+  a session mid-close. **The first frame does not wait for the list**: given a quarter of a
+  second the list is usually read, and if not the frame is drawn with the spinner where the
+  list will go, and `n`, `s` and `?` work meanwhile.
 - **Ages tick together, once a minute.** They are measured from a clock floored to the
   minute, so rows that went idle at different seconds roll over in the same redraw rather
   than one redraw each.

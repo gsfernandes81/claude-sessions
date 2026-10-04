@@ -24,7 +24,15 @@ with a count** — `── Closed · 7 ────` — with the rows indented 
 columns up, and added **the archive**: an Archived group last, folded shut until `Enter` on its
 heading opens it — the one line the cursor rests on that is not a session — filled by `c` on a
 closed row, with no question asked, and by 30 days unused. Mockups 1 and 3 to 7 were redrawn
-again for it, and mockup 9 is new.
+again for it, and mockup 9 is new. On 2026-10-04 the owner added **a spinner for anything
+that takes a while** — Docker Compose's, `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`, a little faster than Compose's
+100 ms per frame — standing in for the age of the session being worked on, with the status
+line saying what is happening and naming no session (`⠹ closing session`), and on the first
+frame where the list will go while it is read. Mockups 10 and 11 are new. **The braille is
+the one glyph here outside the measured set**: it is in none of the six faces, and is used
+on the owner's word that it draws on the terminals this is driven from, which put a fallback
+glyph into one cell. It is only ever drawn alone, at the end of a row or the start of the
+status line, so a fallback cannot drag a line out of true.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -309,6 +317,44 @@ bcache register script               41d
 syncthing share rename               52d
 smartd on one                        63d
 ────────────────────────────────────────
+Enter open   n new   c close   ? keys
+s shell
+```
+
+### Mockup 10 — The first frame, while the list is read
+```
+infra-dev · 812M of 1.0G
+────────────────────────────────────────
+
+⠋ reading sessions
+────────────────────────────────────────
+n new   ? keys   s shell
+```
+
+### Mockup 11 — Closing a session, the spinner turning
+```
+infra-dev · 6 open · 812M of 1.0G
+────────────────────────────────────────
+── Needs you · 1 ───────────────────────
+permission: write hosts/one           2m
+
+── Working · 1 ─────────────────────────
+loop: watch the base build           now
+
+── Idle · 3 ────────────────────────────
+retire the old tunnel                  ⠋
+immich upgrade                        3m
+claude                                5h
+
+── Offloaded · 1 ───────────────────────
+mount guards on one                   2d
+
+── Closed · 7 ──────────────────────────
+fix the dns records                   3d
+tunnel cutover notes                  4d
+… 5 more
+────────────────────────────────────────
+⠋ closing session
 Enter open   n new   c close   ? keys
 s shell
 ```

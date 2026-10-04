@@ -31,6 +31,7 @@ mod store;
 mod term;
 mod transcript;
 mod ui;
+mod work;
 
 use events::{Binding, Outcome};
 use fmt::{age, human};

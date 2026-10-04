@@ -225,3 +225,41 @@ infra-dev · 2 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
+
+### Mockup 10 — The first frame, while the list is read
+```
+infra-dev · 812M of 1.0G
+────────────────────────────────────────────────────────────────────────────────
+
+⠋ reading sessions
+────────────────────────────────────────────────────────────────────────────────
+n new   ? keys   s shell
+```
+
+### Mockup 11 — Closing a session, the spinner turning
+```
+infra-dev · 6 open · 812M of 1.0G
+────────────────────────────────────────────────────────────────────────────────
+── Needs you · 1 ───────────────────────────────────────────────────────────────
+  permission: write hosts/one                                                 2m
+
+── Working · 1 ─────────────────────────────────────────────────────────────────
+  loop: watch the base build                                                 now
+
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                        ⠋
+  immich upgrade                                                              3m
+  claude                                                                      5h
+
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
+
+── Closed · 7 ──────────────────────────────────────────────────────────────────
+  fix the dns records                                                         3d
+  tunnel cutover notes                                                        4d
+  bcache register script                                                      5d
+  … 4 more
+────────────────────────────────────────────────────────────────────────────────
+⠋ closing session
+Enter open   n new   c close   ? keys   s shell
+```

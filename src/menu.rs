@@ -31,7 +31,7 @@ use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
 use crate::render;
 use crate::store;
-use crate::ui::{Dialog, Group, Header, Key, Row, RowKey, Screen, View};
+use crate::ui::{Busy, Dialog, Group, Header, Key, Row, RowKey, Screen, View};
 
 /// What the loop should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +93,7 @@ pub struct Menu {
     screen: Screen,
     ask: Option<(Ask, Dialog)>,
     status: Option<String>,
+    busy: Option<Busy>,
 }
 
 impl Menu {
@@ -110,6 +111,7 @@ impl Menu {
             screen: Screen::List,
             ask: None,
             status: None,
+            busy: None,
         };
         m.replace_rows(rows, true);
         m
@@ -129,6 +131,12 @@ impl Menu {
 
     pub fn set_status(&mut self, status: Option<String>) {
         self.status = status;
+    }
+
+    /// Show, or stop showing, that something is being worked on.
+    pub fn set_busy(&mut self, busy: Option<Busy>) {
+        self.busy = busy;
+        self.keep_cursor_visible();
     }
 
     /// Take a fresh reading of the rows, keeping the order the owner has been looking at.
@@ -239,9 +247,15 @@ impl Menu {
 
     /// Lines of the list that fit between the header's rule and the closing rule.
     fn capacity(&self) -> usize {
-        let status = self
-            .status
+        // Work in progress takes the status line's place, as the renderer draws it.
+        let busy = self
+            .busy
+            .as_ref()
+            .filter(|b| !b.loading)
+            .map(|b| format!("{} {}", b.glyph(), b.what));
+        let status = busy
             .as_deref()
+            .or(self.status.as_deref())
             .map_or(0, |s| render::status_line_count(self.width, s));
         let fixed = 3 + status + self.hint_lines();
         usize::from(self.height).saturating_sub(fixed).max(1)
@@ -276,6 +290,7 @@ impl Menu {
             screen: self.screen,
             dialog,
             status: self.status.clone(),
+            busy: self.busy.clone(),
         }
     }
 

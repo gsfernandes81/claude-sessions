@@ -3,8 +3,9 @@
 //! **An idle menu emits zero bytes** (`CLAUDE.md`; the link is metered). Three things keep it
 //! so, and each is load-bearing:
 //!
-//! - **A frame is written only when it differs from the last one written.** Every wake-up
-//!   renders, compares, and usually writes nothing.
+//! - **Only the lines that differ from what is on the screen are written.** Every wake-up
+//!   renders, compares line by line, and usually writes nothing; a spinner turning writes the
+//!   line or two it is on.
 //! - **The registry is re-read every [`POLL`]**, which costs a few `stat`s and reads and no
 //!   bytes on the link unless a row actually changed.
 //! - **The header's memory figure is refreshed only with something else.** Memory moves by a
@@ -19,7 +20,9 @@ use crate::mem;
 use crate::menu::{self, Action, Menu};
 use crate::render;
 use crate::term::{self, Input, RawTerminal};
-use crate::ui::{Header, Key, Outcome, RowKey, TooNarrow};
+use crate::ui::{Busy, Header, Key, Outcome, RowKey, Terminal, TooNarrow};
+use crate::work::{self, Event, Spin, Work};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// How often the registry and abduco are looked at while nothing else happens.
@@ -46,45 +49,128 @@ fn too_narrow(t: &TooNarrow) -> String {
 
 /// Run the menu until the owner quits. `Err` carries why it could not run — the door prints
 /// it and falls through to a login shell.
+///
+/// **The first frame does not wait for the list.** The list is read on its own thread; given
+/// a quarter of a second it is usually done and the first frame is the list. If not, the
+/// frame is drawn with a spinner where the list will go (mockup 10), and `n`, `s` and `?`
+/// work while it is read.
 pub fn run() -> Result<(), String> {
     let (width, height) = term::size().ok_or("not a terminal")?;
     let workspace = menu::workspace();
-    let rows = menu::gather(clock::now(), &workspace);
-    let mut menu = Menu::new(width, height, header(), workspace, rows);
+    let first = {
+        let (tx, rx) = mpsc::channel();
+        let ws = workspace.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(menu::gather(clock::now(), &ws));
+        });
+        rx
+    };
+    let started = Instant::now();
+    let rows = first.recv_timeout(work::SHOW_AFTER).ok();
+    let loading = rows.is_none();
+    let mut menu = Menu::new(width, height, header(), workspace, rows.unwrap_or_default());
+    let mut spin = Spin::after(started, work::SHOW_AFTER);
+    if loading {
+        let frame = spin.tick(Instant::now()).unwrap_or(0);
+        menu.set_busy(Some(reading(frame)));
+    }
     // Refuse before touching the terminal: a door that falls through to a shell should find
     // the terminal exactly as the login left it.
     if let Err(t) = render::render(&menu.view()) {
         return Err(too_narrow(&t));
     }
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
-    let result = drive(&mut term, &mut menu);
+    let result = drive(&mut term, &mut menu, loading.then_some((first, spin)));
     drop(term);
     result
 }
 
-fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
+fn reading(frame: usize) -> Busy {
+    Busy {
+        frame,
+        row: None,
+        what: "reading sessions".to_string(),
+        loading: true,
+    }
+}
+
+/// What has been written to the terminal, line by line, so that only lines that changed are
+/// written again. `None` means the screen is in an unknown state and is drawn from nothing.
+type Screen = Option<Vec<String>>;
+
+/// Draw the menu, writing only what differs from what is on the screen. Nothing at all when
+/// nothing changed — the idle menu's zero bytes — and one line when one line did, such as
+/// the spinner turning.
+fn draw(term: &mut RawTerminal, menu: &Menu, screen: &mut Screen) -> Result<(), String> {
     let io = |e: std::io::Error| e.to_string();
-    let mut last: Option<String> = None;
+    let frame = render::render(&menu.view()).map_err(|t| too_narrow(&t))?;
+    let lines: Vec<String> = (0..frame.lines.len()).map(|i| frame.ansi_line(i)).collect();
+    let out = match screen.as_ref() {
+        Some(prev) if prev.len() == lines.len() => {
+            let mut out = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                if prev[i] != *line {
+                    out.push_str(&format!("\x1b[{};1H", i + 1));
+                    out.push_str(line);
+                }
+            }
+            out
+        }
+        _ => {
+            let mut out = String::from_utf8_lossy(CLEAR).into_owned();
+            out.push_str(&frame.ansi());
+            out
+        }
+    };
+    if !out.is_empty() {
+        term.write_all(out.as_bytes()).map_err(io)?;
+    }
+    *screen = Some(lines);
+    Ok(())
+}
+
+/// How often the loop looks at running work while it waits on the terminal: how late a
+/// worker's request for the terminal can be answered.
+const CHECK: Duration = Duration::from_millis(20);
+
+fn drive(
+    term: &mut RawTerminal,
+    menu: &mut Menu,
+    mut first: Option<(Receiver<Vec<crate::ui::Row>>, Spin)>,
+) -> Result<(), String> {
+    let io = |e: std::io::Error| e.to_string();
+    let mut screen: Screen = None;
     let mut minute = menu::age_clock(clock::now());
     let mut polled = Instant::now();
     loop {
-        match render::render(&menu.view()) {
-            Ok(frame) => {
-                let out = frame.ansi();
-                if last.as_deref() != Some(out.as_str()) {
-                    if last.is_none() {
-                        term.write_all(CLEAR).map_err(io)?;
+        // The first reading, if it was not ready for the first frame.
+        if let Some((rx, spin)) = first.as_mut() {
+            match rx.try_recv() {
+                Ok(rows) => {
+                    menu.set_busy(None);
+                    menu.replace_rows(rows, true);
+                    first = None;
+                    polled = Instant::now();
+                }
+                Err(_) => {
+                    if let Some(frame) = spin.tick(Instant::now()) {
+                        menu.set_busy(Some(reading(frame)));
                     }
-                    term.write_all(out.as_bytes()).map_err(io)?;
-                    last = Some(out);
                 }
             }
-            Err(t) => return Err(too_narrow(&t)),
         }
+        draw(term, menu, &mut screen)?;
 
-        let wait = POLL.saturating_sub(polled.elapsed());
+        let now = Instant::now();
+        let wait = match first.as_ref() {
+            Some((_, spin)) => spin.until_next(now).min(CHECK),
+            None => POLL.saturating_sub(polled.elapsed()),
+        };
         match term.wait(Some(wait)).map_err(io)? {
             Input::Timeout => {
+                if first.is_some() || polled.elapsed() < POLL {
+                    continue;
+                }
                 polled = Instant::now();
                 let now = clock::now();
                 let before = menu.rows().to_vec();
@@ -103,18 +189,17 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
                         if let Some((w, h)) = term::size() {
                             menu.resize(w, h);
                         }
-                        last = None;
+                        screen = None;
                     }
                     let action = menu.key(key);
                     if action == Action::Quit {
                         return Ok(());
                     }
-                    let done = act(term, menu, action);
-                    if done == Done::HandedOver {
-                        // A child had the terminal: the alternate screen came back blank.
-                        last = None;
+                    let done = act(term, menu, &mut screen, action)?;
+                    if done == Done::Quit {
+                        return Ok(());
                     }
-                    if done != Done::Nothing {
+                    if done != Done::Nothing && first.is_none() {
                         let rows = menu::gather(clock::now(), menu.workspace());
                         menu.replace_rows(rows, false);
                         menu.set_header(header());
@@ -129,59 +214,91 @@ fn drive(term: &mut RawTerminal, menu: &mut Menu) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Done {
     Nothing,
-    /// The registry or the archive changed: read the rows again.
+    /// The registry or the archive may have changed: read the rows again.
     Changed,
-    /// The terminal was handed to something else: read the rows again and redraw from
-    /// nothing.
-    HandedOver,
+    /// The owner quit while it was being worked on.
+    Quit,
 }
 
-/// Do what a key asked.
-fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> Done {
+/// Do what a key asked, on a worker thread, with a spinner if it takes long enough to need
+/// one (mockup 11).
+fn act(
+    term: &mut RawTerminal,
+    menu: &mut Menu,
+    screen: &mut Screen,
+    action: Action,
+) -> Result<Done, String> {
     let ws = menu.workspace().to_string();
     let rows = menu.rows().to_vec();
     let id = |i: usize| match rows.get(i).map(|r| &r.key) {
         Some(RowKey::Conversation { id, .. }) => Some(id.clone()),
         _ => None,
     };
-    let (outcome, then) = match action {
-        Action::None | Action::Redraw | Action::Quit => return Done::Nothing,
+    // What the spinner says, and the row it stands on. No title: the row says which (owner,
+    // 2026-10-04).
+    let resumes = |i: usize| rows.get(i).is_some_and(|r| r.offloaded || r.closed);
+    let (row, what): (Option<usize>, &str) = match action {
+        Action::None | Action::Redraw | Action::Quit => return Ok(Done::Nothing),
+        Action::Open(i) if resumes(i) => (Some(i), "resuming session"),
+        Action::Open(i) => (Some(i), "opening session"),
+        Action::New => (None, "starting new session"),
+        Action::Shell => (None, "starting shell"),
+        Action::Close(i) => (Some(i), "closing session"),
+        Action::OffloadThenOpen { victim, .. } => (Some(victim), "offloading session for room"),
+        Action::Archive(i) => (Some(i), "archiving session"),
+        Action::Unarchive(i) => (Some(i), "unarchiving session"),
+    };
+    let then = match action {
+        Action::Open(i) => Some(i),
+        Action::OffloadThenOpen { then, .. } => then,
+        _ => None,
+    };
+    let job: work::Job = match action {
+        Action::None | Action::Redraw | Action::Quit => return Ok(Done::Nothing),
         Action::Archive(i) | Action::Unarchive(i) => {
             let archiving = matches!(action, Action::Archive(_));
             let Some(id) = id(i) else {
-                return Done::Nothing;
+                return Ok(Done::Nothing);
             };
-            let now = clock::now();
-            let mark = if archiving {
-                Mark::Archived(now)
-            } else {
-                Mark::Kept(now)
-            };
-            menu.set_status(Some(match archive::set(&id, mark) {
-                Ok(()) if archiving => "archived · c under Archived undoes it".into(),
-                Ok(()) => "back under Closed".into(),
-                Err(e) => format!("could not change the archive: {e}"),
-            }));
-            return Done::Changed;
+            Box::new(move |_: &mut dyn Terminal| {
+                let now = clock::now();
+                let mark = if archiving {
+                    Mark::Archived(now)
+                } else {
+                    Mark::Kept(now)
+                };
+                Outcome::Back(Some(match archive::set(&id, mark) {
+                    Ok(()) if archiving => "archived · c under Archived undoes it".into(),
+                    Ok(()) => "back under Closed".into(),
+                    Err(e) => format!("could not change the archive: {e}"),
+                }))
+            })
         }
         Action::Open(i) => {
             // Resumed, it leaves the archive. Marked kept first, so a resume that fails does
             // not leave it folded straight back by its age; a kept mark lasts 30 days, so a
             // launch that was refused costs no more than that.
-            if rows.get(i).is_some_and(|r| r.archived) {
-                if let Some(id) = id(i) {
+            let unarchive = rows
+                .get(i)
+                .is_some_and(|r| r.archived)
+                .then(|| id(i))
+                .flatten();
+            Box::new(move |t: &mut dyn Terminal| {
+                if let Some(id) = unarchive {
                     let _ = archive::set(&id, Mark::Kept(clock::now()));
                 }
-            }
-            (launch::open(&rows, i, &ws, term), Some(i))
+                launch::open(&rows, i, &ws, t)
+            })
         }
-        Action::New => (launch::new_session(&rows, &ws, term), None),
-        Action::Shell => (launch::shell(&ws, term), None),
-        Action::Close(i) => (launch::close(&rows, i), None),
-        Action::OffloadThenOpen { victim, then } => (
-            launch::offload_then_open(&rows, victim, then, &ws, term),
-            then,
-        ),
+        Action::New => Box::new(move |t: &mut dyn Terminal| launch::new_session(&rows, &ws, t)),
+        Action::Shell => Box::new(move |t: &mut dyn Terminal| launch::shell(&ws, t)),
+        Action::Close(i) => Box::new(move |_: &mut dyn Terminal| launch::close(&rows, i)),
+        Action::OffloadThenOpen { victim, then } => Box::new(move |t: &mut dyn Terminal| {
+            launch::offload_then_open(&rows, victim, then, &ws, t)
+        }),
+    };
+    let Some(outcome) = wait_on(term, menu, screen, Work::spawn(job), row, what)? else {
+        return Ok(Done::Quit);
     };
     match outcome {
         Outcome::Back(status) => menu.set_status(status),
@@ -189,10 +306,91 @@ fn act(term: &mut RawTerminal, menu: &mut Menu, action: Action) -> Done {
         Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, then),
         Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, then.unwrap_or(0)),
     }
-    // Close never hands the terminal over; everything else might have.
-    if matches!(action, Action::Close(_)) {
-        Done::Changed
-    } else {
-        Done::HandedOver
+    Ok(Done::Changed)
+}
+
+/// Wait for work to finish, drawing its spinner once it has taken long enough, and handing
+/// the terminal over whenever it asks. `None` if the owner quit meanwhile.
+///
+/// Keys are not acted on while it works, so nothing can be done to a session mid-close —
+/// except `q` and Ctrl-C, which quit, and a resize, which redraws.
+fn wait_on(
+    term: &mut RawTerminal,
+    menu: &mut Menu,
+    screen: &mut Screen,
+    work: Work,
+    row: Option<usize>,
+    what: &str,
+) -> Result<Option<Outcome>, String> {
+    let io = |e: std::io::Error| e.to_string();
+    let mut spin = Spin::after(Instant::now(), work::SHOW_AFTER);
+    loop {
+        let now = Instant::now();
+        let wait = spin.until_next(now).min(CHECK);
+        match work.next(wait) {
+            Some(Event::Done(outcome)) => {
+                menu.set_busy(None);
+                return Ok(Some(outcome));
+            }
+            Some(Event::Suspend) => {
+                // The child gets a terminal with nothing of ours on it, and we touch the
+                // terminal again only when it is handed back.
+                menu.set_busy(None);
+                let suspended = term.suspend();
+                work.ack();
+                suspended.map_err(io)?;
+                loop {
+                    match work.next(Duration::from_secs(3600)) {
+                        Some(Event::Resume) => break,
+                        Some(Event::Done(outcome)) => {
+                            let _ = term.resume();
+                            *screen = None;
+                            return Ok(Some(outcome));
+                        }
+                        _ => {}
+                    }
+                }
+                let resumed = term.resume();
+                work.ack();
+                resumed.map_err(io)?;
+                // The alternate screen came back blank; and what follows — settling, reading
+                // the record — gets its own quarter second before a spinner shows.
+                *screen = None;
+                draw(term, menu, screen)?;
+                spin = Spin::after(Instant::now(), work::SHOW_AFTER);
+                continue;
+            }
+            Some(Event::Resume) => work.ack(),
+            None => {}
+        }
+        if let Some(frame) = spin.tick(Instant::now()) {
+            menu.set_busy(Some(Busy {
+                frame,
+                row,
+                what: what.to_string(),
+                loading: false,
+            }));
+            draw(term, menu, screen)?;
+        }
+        match term.wait(Some(Duration::ZERO)).map_err(io)? {
+            Input::Keys(keys) => {
+                for key in keys {
+                    match key {
+                        Key::Char('q') | Key::Char('\u{3}') => return Ok(None),
+                        Key::Resize => {
+                            if let Some((w, h)) = term::size() {
+                                menu.resize(w, h);
+                            }
+                            *screen = None;
+                            if spin.frame().is_some() {
+                                draw(term, menu, screen)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Input::Timeout => {}
+        }
     }
 }
