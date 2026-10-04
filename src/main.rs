@@ -8,6 +8,37 @@
 //! this binary is on the ssh path in a container pulled by checksum — every dependency is one
 //! more thing to cross-compile for musl and one more thing to read before trusting.
 
+// Every print goes through `say!`, `say_nl!` and `warn!` below, never `print!`/`println!`/
+// `eprintln!`: those panic when the write fails, and a write fails whenever the terminal or the
+// pipe on the other end has gone (issue #6: an ssh link dropped under the menu, its report
+// of that went to the same dead terminal, and the panic dumped core in a git checkout). The
+// lints hold the line; tests may print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
+/// `println!` to stdout that cannot panic: a reader that has gone is no reason to crash.
+macro_rules! say {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// `print!` to stdout that cannot panic.
+macro_rules! say_nl {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = write!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// `eprintln!` that cannot panic.
+macro_rules! warn {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 mod abduco;
 mod archive;
 mod bind;
@@ -43,25 +74,33 @@ use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The menu's exit status when its terminal went away: 128 + SIGHUP, what a shell reports
+/// for a hangup, so the door can tell it from a failure worth explaining.
+const TERMINAL_GONE: u8 = 129;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     match cmd {
         "--version" | "-V" => {
-            println!("claude-sessions {VERSION}");
+            say!("claude-sessions {VERSION}");
             ExitCode::SUCCESS
         }
         "--help" | "-h" | "help" => {
-            print!("{}", usage());
+            say_nl!("{}", usage());
             ExitCode::SUCCESS
         }
         // THE ONE SUBCOMMAND THAT MUST NOT FAIL. UserPromptSubmit and Stop are blocking
         // hooks: a non-zero exit on the first blocks the prompt, and on the second tells
         // Claude it has more to do. A registry bug must never wedge a session, so every
         // failure in here is logged and swallowed.
+        // A panic too: it is logged here rather than printed, and caught, so even a bug that
+        // panics exits 0.
         "hook" => {
-            if let Err(e) = cmd_hook() {
-                log(&format!("hook: {e}"));
+            std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
+            match std::panic::catch_unwind(cmd_hook) {
+                Ok(Ok(())) | Err(_) => {}
+                Ok(Err(e)) => log(&format!("hook: {e}")),
             }
             ExitCode::SUCCESS
         }
@@ -72,7 +111,9 @@ fn main() -> ExitCode {
         "" if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             match run::run() {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
+                // Nobody to tell: end quietly, with the status a shell gives a hangup.
+                Err(run::Stop::TerminalGone) => ExitCode::from(TERMINAL_GONE),
+                Err(run::Stop::Failed(e)) => fail(&e),
             }
         }
         "list" | "" => report(cmd_list()),
@@ -95,7 +136,7 @@ fn main() -> ExitCode {
                     }
                 },
             };
-            println!("{}", json::to_string_pretty(&hooks_config::settings(&exe)));
+            say!("{}", json::to_string_pretty(&hooks_config::settings(&exe)));
             ExitCode::SUCCESS
         }
         "offload" => match args.get(1).map(String::as_str) {
@@ -137,7 +178,7 @@ fn report(r: std::io::Result<()>) -> ExitCode {
 }
 
 fn fail(msg: &str) -> ExitCode {
-    eprintln!("claude-sessions: {msg}");
+    warn!("claude-sessions: {msg}");
     ExitCode::FAILURE
 }
 
@@ -290,7 +331,7 @@ fn cmd_reconcile() -> std::io::Result<()> {
             rec.busy = false;
             rec.updated_ms = now;
             registry::store(&rec)?;
-            println!("{}: process gone -> offloaded", rec.slot);
+            say!("{}: process gone -> offloaded", rec.slot);
             moved += 1;
         }
     }
@@ -306,18 +347,18 @@ fn cmd_reconcile() -> std::io::Result<()> {
         for sock in abduco::sockets() {
             if !live_names.contains(&sock.name) {
                 std::fs::remove_file(&sock.path)?;
-                println!("{}: socket with no server -> removed", sock.name);
+                say!("{}: socket with no server -> removed", sock.name);
                 swept += 1;
             }
         }
     } else {
-        eprintln!(
+        warn!(
             "claude-sessions: could not read /proc, or a live abduco's session could not be \
              named; no sockets swept"
         );
     }
 
-    println!("reconcile: {moved} slot(s) offloaded, {swept} socket(s) swept");
+    say!("reconcile: {moved} slot(s) offloaded, {swept} socket(s) swept");
     Ok(())
 }
 
@@ -368,7 +409,7 @@ fn cmd_list() -> std::io::Result<()> {
         .collect();
 
     if rows.is_empty() && unregistered.is_empty() {
-        println!("no slots. run claude-sessions at a terminal and press n to start one");
+        say!("no slots. run claude-sessions at a terminal and press n to start one");
         return Ok(());
     }
     for r in rows {
@@ -388,7 +429,7 @@ fn cmd_list() -> std::io::Result<()> {
             if r.state == State::Offloaded { "z" } else { "" },
         );
         let title = r.display_title();
-        println!(
+        say!(
             "{:<10} {:<4} {:<40} {}",
             r.slot,
             marks,
@@ -405,7 +446,7 @@ fn cmd_list() -> std::io::Result<()> {
         } else {
             "not started by claude-sessions"
         };
-        println!(
+        say!(
             "{:<10} {:<4} {:<40} --",
             sock.name,
             if sock.attached_bit { "u@" } else { "u" },
@@ -424,10 +465,10 @@ fn cmd_list() -> std::io::Result<()> {
 fn cmd_doctor() -> std::io::Result<()> {
     let now = clock::now();
     let m = mem::read();
-    println!("version   : {VERSION}");
-    println!("registry  : {}", registry::dir().display());
+    say!("version   : {VERSION}");
+    say!("registry  : {}", registry::dir().display());
     match (m.limit, m.current) {
-        (Some(limit), Some(cur)) => println!(
+        (Some(limit), Some(cur)) => say!(
             "memory    : {} of {} used in this container, room for another session: {}",
             human(cur),
             human(limit),
@@ -437,10 +478,10 @@ fn cmd_doctor() -> std::io::Result<()> {
                 "no"
             }
         ),
-        _ => println!("memory    : no cgroup limit readable; /proc/meminfo describes the host"),
+        _ => say!("memory    : no cgroup limit readable; /proc/meminfo describes the host"),
     }
     let sockets = abduco::sockets();
-    println!(
+    say!(
         "abduco    : {} socket(s): {}",
         sockets.len(),
         sockets
@@ -456,13 +497,13 @@ fn cmd_doctor() -> std::io::Result<()> {
     // What Claude Code says about itself, printed beside what we think — because when the two
     // disagree, that disagreement IS the finding, and nothing else in this tool would show it.
     let ours = live::all();
-    println!(
+    say!(
         "claude    : {} live session(s) by Claude Code's own account, {} interactive",
         ours.len(),
         ours.iter().filter(|s| s.is_interactive()).count()
     );
     for sess in &ours {
-        println!(
+        say!(
             "            pid {} {} {} {} {}",
             sess.pid,
             sess.kind.as_deref().unwrap_or("?"),
@@ -472,15 +513,15 @@ fn cmd_doctor() -> std::io::Result<()> {
         );
     }
     if let Some(sock) = abduco::socket_for("claude") {
-        println!(
+        say!(
             "            an abduco session literally named \"claude\" exists{} — one of \
              today's `ssh <container>` logins, not one of ours",
             if sock.attached_bit { ", attached" } else { "" }
         );
     }
     for rec in registry::all()? {
-        println!();
-        println!(
+        say!();
+        say!(
             "{} [{:?}]{}",
             rec.slot,
             rec.state,
@@ -488,13 +529,13 @@ fn cmd_doctor() -> std::io::Result<()> {
         );
         // Plain values, not Rust's debug spelling: this is read by a person (issue #4).
         let or_none = |v: Option<String>| v.unwrap_or_else(|| "none".into());
-        println!(
+        say!(
             "  pid       : {} start {}",
             or_none(rec.pid.map(|p| p.to_string())),
             or_none(rec.proc_start.map(|s| s.to_string()))
         );
-        println!("  session   : {}", or_none(rec.session_id.clone()));
-        println!(
+        say!("  session   : {}", or_none(rec.session_id.clone()));
+        say!(
             "  flags     : busy={} needs_you={} unread={} timers={}",
             rec.busy,
             rec.needs_you,
@@ -502,7 +543,7 @@ fn cmd_doctor() -> std::io::Result<()> {
             rec.timers.len()
         );
         if rec.last_event_ms.is_empty() {
-            println!("  events    : none seen — the hooks are not installed, or not firing");
+            say!("  events    : none seen — the hooks are not installed, or not firing");
         } else {
             for (name, at) in &rec.last_event_ms {
                 // "last seen now", not "last seen now ago".
@@ -510,7 +551,7 @@ fn cmd_doctor() -> std::io::Result<()> {
                     a if a == "now" => a,
                     a => format!("{a} ago"),
                 };
-                println!("  {name:<10}: last seen {when}");
+                say!("  {name:<10}: last seen {when}");
             }
         }
     }
@@ -544,6 +585,6 @@ fn cmd_close(slot: &str) -> std::io::Result<()> {
     rec.state = State::Closed;
     rec.updated_ms = clock::now();
     registry::store(&rec)?;
-    println!("{slot}: closed. the conversation is still on disk for claude --resume");
+    say!("{slot}: closed. the conversation is still on disk for claude --resume");
     Ok(())
 }

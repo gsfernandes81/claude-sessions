@@ -26,7 +26,9 @@ reads the registry and `abduco`, never guesses, and opens what the owner picks.
 - **`claude-sessions hook` always exits 0.** `UserPromptSubmit` and `Stop` are *blocking*
   hooks: a non-zero exit on the first blocks the prompt, and on the second makes Claude carry
   on as though it had more to do. A registry bug must never wedge a session. It logs its own
-  failures to its own log and returns 0. A test pins this, naming those two events.
+  failures to its own log and returns 0 — a panic included, which is caught. A test pins
+  this, naming those two events. Nothing in the binary uses `print!`/`println!`/`eprintln!`
+  (they panic on a closed terminal or pipe; issue #6), and a lint enforces it.
 - **Every lock has a timeout.** The menu is what an ssh login lands on, so a stuck lock would
   hold the door shut. `SessionEnd` hooks additionally share a **1.5-second** budget across
   all of them — a lock wait on that path must be well inside it, or the write that marks a

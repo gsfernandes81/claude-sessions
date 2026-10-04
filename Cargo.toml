@@ -32,4 +32,7 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# Panics unwind, as they do in the tests. Aborting made any panic a SIGABRT and a core dump
+# in the cwd — a git checkout, for the menu (issue #6) — let a panicking hook exit non-zero,
+# which blocks a prompt, and killed the whole menu where the tests had seen a worker thread's
+# panic caught and reported.

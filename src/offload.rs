@@ -329,7 +329,7 @@ pub fn teardown_abduco(slot: &str, server: Option<(u32, u64)>) -> Vec<String> {
 pub fn run(dry_run: bool) -> io::Result<()> {
     let m = mem::read();
     if let Some(free) = m.headroom() {
-        println!("memory: {} MB free in this container", free / (1024 * 1024));
+        say!("memory: {} MB free in this container", free / (1024 * 1024));
     }
     let (mut offloaded, mut closed) = (0usize, 0usize);
     // One snapshot of /proc for the whole pass, taken holding no lock. Reading every
@@ -346,7 +346,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         let verdict = match judge(&listed, clock::now(), &look(&listed, table.as_deref())) {
             Ok(verdict) => verdict,
             Err(hold) => {
-                println!("{}: kept — {hold}", listed.slot);
+                say!("{}: kept — {hold}", listed.slot);
                 continue;
             }
         };
@@ -354,9 +354,9 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         if dry_run {
             match verdict {
                 Verdict::Offload { idle } => {
-                    println!("{}: would offload, idle {}m", listed.slot, idle / 60_000)
+                    say!("{}: would offload, idle {}m", listed.slot, idle / 60_000)
                 }
-                Verdict::Close { idle } => println!(
+                Verdict::Close { idle } => say!(
                     "{}: would close, idle {}m — {NO_CONVERSATION}",
                     listed.slot,
                     idle / 60_000
@@ -374,7 +374,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             Ok(l) => l,
             // Somebody else is acting on it — the menu opening it, another pass. Theirs.
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                println!("{slot}: kept — its lock is busy; next pass");
+                say!("{slot}: kept — its lock is busy; next pass");
                 continue;
             }
             Err(e) => return Err(e),
@@ -390,24 +390,24 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         let verdict = match judge(&rec, clock::now(), &look(&rec, fresh.as_deref())) {
             Ok(verdict) => verdict,
             Err(hold) => {
-                println!("{slot}: kept — {hold}");
+                say!("{slot}: kept — {hold}");
                 continue;
             }
         };
         match stop_quiet(&mut rec, verdict, fresh.as_deref())? {
             Ok(line) => {
-                println!("{line}");
+                say!("{line}");
                 match verdict {
                     Verdict::Offload { .. } => offloaded += 1,
                     Verdict::Close { .. } => closed += 1,
                 }
             }
-            Err(why) => println!("{why}"),
+            Err(why) => say!("{why}"),
         }
     }
 
     sweep_orphans(dry_run);
-    println!(
+    say!(
         "offload: {offloaded} slot(s) offloaded, {closed} closed{}",
         if dry_run { " (dry run)" } else { "" }
     );
@@ -610,7 +610,7 @@ fn kill_tree(o: &Orphan<'_>, grace: Duration) -> usize {
 /// would stop and stops nothing.
 fn sweep_orphans(dry_run: bool) {
     let Some(table) = procinfo::table() else {
-        println!("sweep: could not list /proc; nothing to report");
+        say!("sweep: could not list /proc; nothing to report");
         return;
     };
     for o in orphans(&table) {
@@ -654,7 +654,7 @@ fn sweep_orphans(dry_run: bool) {
             },
         };
         log(&line);
-        println!("{line}");
+        say!("{line}");
     }
 }
 

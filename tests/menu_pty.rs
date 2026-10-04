@@ -461,3 +461,65 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
         .expect("the menu exits on q");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Issue #6: an ssh link dropping under the menu. The terminal hangs up and the menu ends
+/// quietly, with 129 — what a shell reports for a hangup — and not with a panic, a signal or a
+/// core file in its working directory. In the field it reported the hangup to the dead
+/// terminal, which panicked, and the abort dumped core into a git checkout.
+#[test]
+fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    let root = std::env::temp_dir().join(format!("cs-menu-hup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (reg, abd, cwd) = (root.join("registry"), root.join("abduco"), root.join("cwd"));
+    for d in [&reg, &abd, &cwd] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let mut cmd = Command::new(BIN);
+    cmd.env("CLAUDE_SESSIONS_DIR", &reg)
+        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
+        .env("CLAUDE_CONFIG_DIR", root.join("cc"))
+        .current_dir(&cwd);
+    let (mut master, mut child) = pty::spawn_bare(cmd, 40, 24).expect("spawn the menu");
+
+    // Calibration: it is up, drawing, before the link goes.
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("nothing open") {
+        assert!(std::time::Instant::now() < deadline, "the menu never drew");
+        match master.read(&mut buf) {
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "still running before the hangup"
+    );
+
+    // The link drops.
+    drop(master);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the menu outlived its terminal"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), None, "ended by a signal: {status:?}");
+    assert_eq!(status.code(), Some(129), "{status:?}");
+    let left: Vec<_> = std::fs::read_dir(&cwd)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind in its directory: {left:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

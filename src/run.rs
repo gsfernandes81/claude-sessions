@@ -54,8 +54,8 @@ fn too_narrow(t: &TooNarrow) -> String {
 /// a quarter of a second it is usually done and the first frame is the list. If not, the
 /// frame is drawn with a spinner where the list will go (mockup 10), and `n`, `s` and `?`
 /// work while it is read.
-pub fn run() -> Result<(), String> {
-    let (width, height) = term::size().ok_or("not a terminal")?;
+pub fn run() -> Result<(), Stop> {
+    let (width, height) = term::size().ok_or_else(|| Stop::Failed("not a terminal".into()))?;
     let workspace = menu::workspace();
     let first = {
         let (tx, rx) = mpsc::channel();
@@ -77,12 +77,44 @@ pub fn run() -> Result<(), String> {
     // Refuse before touching the terminal: a door that falls through to a shell should find
     // the terminal exactly as the login left it.
     if let Err(t) = render::render(&menu.view()) {
-        return Err(too_narrow(&t));
+        return Err(Stop::Failed(too_narrow(&t)));
     }
-    let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
+    let mut term = RawTerminal::enter().map_err(|e| match io(e) {
+        Stop::Failed(why) => Stop::Failed(format!("cannot set up the terminal: {why}")),
+        gone => gone,
+    })?;
     let result = drive(&mut term, &mut menu, loading.then_some((first, spin)));
     drop(term);
     result
+}
+
+/// Why the menu stopped, when it did not stop because the owner quit.
+#[derive(Debug)]
+pub enum Stop {
+    /// Something went wrong, and the door should say what before it falls back to a shell.
+    Failed(String),
+    /// The terminal is gone — an ssh link dropped under the menu, most often on a phone. There
+    /// is nobody to tell and nothing to write to: issue #6 was a report of exactly this
+    /// written to the dead terminal, which panicked. The menu ends quietly instead.
+    TerminalGone,
+}
+
+/// A terminal error as the menu treats it: gone, or a failure worth reporting.
+fn io(e: std::io::Error) -> Stop {
+    if terminal_gone(&e) {
+        Stop::TerminalGone
+    } else {
+        Stop::Failed(e.to_string())
+    }
+}
+
+/// What a terminal that has hung up answers with: `term.rs`'s end-of-file for a poll that
+/// reports the hangup, and from a read or a write `EIO` (5) — what Linux gives on a pty whose
+/// other side has closed — `ENXIO` (6), `EBADF` (9) or `EPIPE` (32). The numbers are Linux's
+/// own and the same on both targets.
+fn terminal_gone(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::UnexpectedEof
+        || matches!(e.raw_os_error(), Some(5 | 6 | 9 | 32))
 }
 
 fn reading(frame: usize) -> Busy {
@@ -101,9 +133,8 @@ type Screen = Option<Vec<String>>;
 /// Draw the menu, writing only what differs from what is on the screen. Nothing at all when
 /// nothing changed — the idle menu's zero bytes — and one line when one line did, such as
 /// the spinner turning.
-fn draw(term: &mut RawTerminal, menu: &Menu, screen: &mut Screen) -> Result<(), String> {
-    let io = |e: std::io::Error| e.to_string();
-    let frame = render::render(&menu.view()).map_err(|t| too_narrow(&t))?;
+fn draw(term: &mut RawTerminal, menu: &Menu, screen: &mut Screen) -> Result<(), Stop> {
+    let frame = render::render(&menu.view()).map_err(|t| Stop::Failed(too_narrow(&t)))?;
     let lines: Vec<String> = (0..frame.lines.len()).map(|i| frame.ansi_line(i)).collect();
     let out = match screen.as_ref() {
         Some(prev) if prev.len() == lines.len() => {
@@ -137,8 +168,7 @@ fn drive(
     term: &mut RawTerminal,
     menu: &mut Menu,
     mut first: Option<(Receiver<Vec<crate::ui::Row>>, Spin)>,
-) -> Result<(), String> {
-    let io = |e: std::io::Error| e.to_string();
+) -> Result<(), Stop> {
     let mut screen: Screen = None;
     let mut minute = menu::age_clock(clock::now());
     let mut polled = Instant::now();
@@ -227,7 +257,7 @@ fn act(
     menu: &mut Menu,
     screen: &mut Screen,
     action: Action,
-) -> Result<Done, String> {
+) -> Result<Done, Stop> {
     let ws = menu.workspace().to_string();
     let rows = menu.rows().to_vec();
     let id = |i: usize| match rows.get(i).map(|r| &r.key) {
@@ -321,8 +351,7 @@ fn wait_on(
     work: Work,
     row: Option<usize>,
     what: &str,
-) -> Result<Option<Outcome>, String> {
-    let io = |e: std::io::Error| e.to_string();
+) -> Result<Option<Outcome>, Stop> {
     let mut spin = Spin::after(Instant::now(), work::SHOW_AFTER);
     loop {
         let now = Instant::now();

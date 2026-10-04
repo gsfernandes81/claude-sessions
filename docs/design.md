@@ -87,7 +87,8 @@ from the hook upwards to the first `claude` whose parent is an `abduco` server.
 ## The event table
 
 `claude-sessions hook` reads the event's JSON on stdin. **It always exits 0** — see
-`CLAUDE.md`.
+`CLAUDE.md` — even if it panics: the panic is caught and written to `hook.log`, never to the
+terminal.
 
 | event | registry effect |
 |---|---|
@@ -402,7 +403,12 @@ offload, whose row would not be listed either way.
 `claude-sessions-door` (shipped by `infra`, beside its other container programs) runs
 `claude-sessions`; if that exits non-zero it prints why and `exec "$SHELL" -l`. `$SHELL`
 rather than a named shell, because some containers set `bash` and some `fish`. A clean quit
-exits 0 and ends the ssh session.
+exits 0 and ends the ssh session. **When the terminal goes away under the menu** — an ssh link
+dropping, routine on a phone — the menu exits **129** (128 + SIGHUP, what a shell reports for
+a hangup) and writes nothing: there is nobody to tell (issue #6). Nothing in the binary prints
+with `print!`/`println!`/`eprintln!`, which panic when the other end has gone; a lint holds
+that, and panics unwind rather than abort, so not even a bug dumps core into the menu's
+working directory, a git checkout.
 
 ## What `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` is, and why it is not enough
 
