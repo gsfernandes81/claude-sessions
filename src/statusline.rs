@@ -44,11 +44,19 @@ fn host_memory(meminfo: &str) -> Option<(u64, u64)> {
     Some((kb("MemTotal")? * 1024, kb("MemAvailable")? * 1024))
 }
 
-/// Read, and say the line. Claude Code writes its session as JSON on stdin; it is drained so
-/// the writer never meets a closed pipe, but not read when a person runs this at a terminal.
+/// Read, and say the line. Claude Code writes its session as JSON on stdin, straight after
+/// starting this; it is drained so the writer never meets a closed pipe, but never waited on —
+/// not at a terminal, and not past a moment's quiet on a pipe whose writer stays open (a
+/// person running this through `docker exec -i`).
 pub fn run() {
     if !std::io::stdin().is_terminal() {
-        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+        let mut buf = [0u8; 8192];
+        while crate::term::readable_within(0, std::time::Duration::from_millis(100)) {
+            match std::io::Read::read(&mut std::io::stdin().lock(), &mut buf) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+        }
     }
     let m = crate::mem::read();
     let (used, total) = match m.limit {

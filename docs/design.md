@@ -203,7 +203,9 @@ working agents. Three things close it:
   replies to a comment is attached, which already keeps the slot.
 - **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
   to the list, and **`SubagentStop` takes its payload's `background_tasks` whole, as `Stop`
-  does**: Claude Code builds both from the same task registry. This is what holds work started in a turn the owner ended with Esc (issue
+  does** — except that one with no list is no news, where `Stop` reads none (#12): Claude
+  Code builds both from the same task registry. This is what holds work started in a turn
+  the owner ended with Esc (issue
   #10): an Esc fires no `Stop`, so the list would otherwise be the previous turn's, and an agent
   launched in the interrupted turn would hold the slot only while it kept writing. Seen on
   2.1.291 under a pty on 2026-10-06: a background agent launched, the owner pressed Esc, and
@@ -392,29 +394,44 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   outside its tree). Every process a slot's claude starts inherits `CLAUDE_SESSIONS_SLOT`,
   including one that double-forks away to init, so `/proc/*/environ` finds them however they
   were reparented; the recorded claude and its descendants are added in case one cleared it.
-  Not `claude-sessions` itself — a hook, or a pass run from a slot's shell, carries the
-  variable too. A reaped child's counters are folded into its parent's by the kernel, so a
-  tool that ran and exited between passes is still counted. Agent view, which runs a service
-  outside any slot, stays off.
+  The recorded claude counts only while it is the process recorded, by start time. Not
+  `claude-sessions` itself — a hook, the status line, or a pass run from a slot's shell
+  carries the variable and descends from claude, and would count its own reading of `/proc`.
+  A reaped child's whole-lifetime counters are folded into its parent's by the kernel, so a
+  tool that ran and exited between passes is still counted — and one that lived across a pass
+  is counted twice in the window it exits, as is a reaped hook: both err towards active.
+  Agent view, which runs a service outside any slot, stays off.
 - **The line: each slot's own floor.** A slot's floor is its quietest window in the last
-  24 hours, hour by hour; it counts as active above ten times that, held between 512 B/s and
-  4 KB/s. A Claude Code that idles noisier raises its own floor; the cap stops a slot only
-  ever seen busy from setting a line real work could fall under; the base stops a near-silent
-  floor from making a stray read look like a turn. All bytes, so no device enters.
+  24 hours, hour by hour; a window counts as active above ten times the floor learned
+  *before* it, held between 512 B/s and 4 KB/s, and a slot with no floor yet is held to
+  512. A Claude Code that idles noisier raises its own floor; the base stops a near-silent
+  floor from making a stray read look like a turn. All bytes, so no device enters. **Its
+  blind spot:** a slot only ever seen busy learns that work as its floor, and then the
+  4 KB/s cap is its only protection — measured streaming is 9,342 B/s, about 2.3× the cap,
+  so work that averages under 4 KB/s from a slot's first windows can read as quiet. The
+  logs show the floor beside every rate, which is how to spot it.
 - **The verdict.** Quiet — under the line in every window — for the offloader's 10 minutes,
   and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
   first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
   `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, 1 process(es), line 945 B/s from
-  floor 95, quiet 14m; the activity rule would freeze it`.
+  floor 95, quiet 14m; the activity rule would freeze it`. Wake-ups read `?` in a window
+  where a thread exited, since its count leaves the sum.
 - **What is unknown counts as active**: a slot's first reading, a process not seen last time
-  (its whole history falls in the window), a window under a minute (a pass run by hand right
-  after the timer's is left for the next, with a line saying so).
+  (its whole history falls in the window), a process that is there but cannot be read (the
+  slot is reported as unknown and kept), and a window as long as the quiet period, which
+  cannot say when in it the bytes fell. A window under a minute — a pass run by hand right
+  after the timer's — is left for the next, with a line saying so.
 - **State** is `activity.state` beside the registry — not `.json`, which the registry reads
   as a slot — written whole and renamed into place. Two passes at once may each write it; the
   later wins and the other's window is measured again.
-- **What it cannot see**: a claude waiting in process, silently, for ten minutes — a tool
-  blocked on a remote that sends nothing. That is rare, and it is why the action is to be a
-  freeze: attached, it thaws and carries on.
+- **What it cannot see**: a claude waiting in process, silently. **The common case is its
+  own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
+  the reason the offloader never stops a slot with one pending (owner, 2026-10-01). The
+  activity verdict has no input for timers, so such a slot will read *would freeze* beside
+  the offloader's *kept — a timer is pending*; a freeze would stop the timer firing, and
+  thawing on attach is no substitute for a wake-up nobody is there to see. The freeze
+  decision has to keep that rule. Rarer: a tool blocked on a remote that sends nothing,
+  which a freeze pauses and an attach resumes.
 
 **Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
 2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.
@@ -427,7 +444,10 @@ container's limit — or the host's total and available memory where there is no
 one-minute load, and the hostname, which names the dev container. Anything unreadable is a
 `?`. `hooks-config` installs it as `statusLine` in the same drop-in as the hooks; a managed
 setting outranks a user's own, so it replaces any status line set per user. It reads a few
-small files and nothing else, because Claude Code runs it often.
+small files and nothing else, because Claude Code runs it often. The session JSON Claude
+Code writes on its stdin is drained, but for at most a moment's quiet, so a pipe whose writer
+stays open cannot hold it. The owner's example is 41 columns: on a 40-column phone Claude
+Code truncates it from the right, losing the hostname first.
 
 ## The menu
 

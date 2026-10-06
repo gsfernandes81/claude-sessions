@@ -138,6 +138,19 @@ unsafe extern "C" {
     fn __errno_location() -> *mut c_int;
 }
 
+/// Whether `fd` has something to read, or has reached its end, within `wait`. For a reader
+/// that must not block on a pipe whose writer never closes it.
+pub fn readable_within(fd: c_int, wait: std::time::Duration) -> bool {
+    let mut fds = [PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    }];
+    // SAFETY: one valid pollfd.
+    let rc = unsafe { poll(fds.as_mut_ptr(), 1, millis_up(wait)) };
+    rc > 0 && fds[0].revents != 0
+}
+
 // ── decoding ────────────────────────────────────────────────────────────────
 
 /// Bytes in, [`Key`]s out. Pure: it neither reads nor waits, so every split of every sequence

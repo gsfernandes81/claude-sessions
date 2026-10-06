@@ -12,26 +12,15 @@
 //! **Why bytes, not CPU.** A model turn is a stream from the API, and claude writes its
 //! transcript as it goes; both are bytes through `read`/`write`, counted in `/proc/<pid>/io`
 //! the same on a Pi 4 and an x86 box. CPU time is not: the same work costs a slow CPU more
-//! of it. Measured on 2.1.291 (2026-10-06): idle at the prompt, 60–130 B/s; a turn or a
-//! streaming reply, 14–26 KB/s. Wake-ups — voluntary context switches, a count of times the
-//! process blocked — are logged beside them as a second opinion, not used.
-//!
-//! **Which processes.** Everything a slot's claude starts inherits `CLAUDE_SESSIONS_SLOT`,
-//! including a process that double-forks away from it to init, so the environment finds them
-//! however they were reparented — plus the recorded claude and its descendants, should one
-//! have cleared it. A dead child's counters are folded into its parent's when it is reaped,
-//! so a tool that ran and exited between passes is still counted through claude.
-//!
-//! **The line.** Each slot learns its own floor — its quietest window of the last day — and
-//! counts as active above ten times that, held between 512 B/s and 4 KB/s. A future Claude
-//! Code that idles noisier raises its own floor; the cap keeps a slot that has only ever been
-//! seen busy from setting a line real work could fall under, and the base keeps a near-silent
-//! floor from making a stray read look like a turn. All three are bytes, so no device enters.
+//! of it. Wake-ups are logged beside the bytes as a second opinion, not used. The measured
+//! figures, the membership rule, the line and what the rule cannot see are in design.md,
+//! which is the one record of them.
 //!
 //! **Which way it errs.** Anything not known counts as active: a slot's first reading, a
-//! process not seen last time (its whole history is counted), an attachment `zmx` could not
-//! report. Concurrent passes may each write the state; the later write wins and the other's
-//! window is simply measured again.
+//! process not seen last time (its whole history is counted), a process that is there but
+//! cannot be read, a window as long as the quiet period, an attachment `zmx` could not report.
+//! Concurrent passes may each write the state; the later write wins and the other's window is
+//! simply measured again.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -97,13 +86,9 @@ pub fn line(floor: Option<f64>) -> f64 {
     floor.map_or(LINE_MIN, |f| (f * FLOOR_FACTOR).clamp(LINE_MIN, LINE_MAX))
 }
 
-/// One pass's step for one slot, pure. `None` when the window since the last reading is too
-/// short to count: the caller keeps the old state, so the next pass measures the whole span.
-pub fn step(
-    prev: Option<&SlotState>,
-    now: Millis,
-    readings: Vec<Reading>,
-) -> Option<(SlotState, Measure)> {
+/// One pass's step for one slot, pure. The caller has already left a window shorter than
+/// [`MIN_WINDOW_MS`] for the next pass.
+pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (SlotState, Measure) {
     let procs = readings.len();
     let Some(prev) = prev else {
         let state = SlotState {
@@ -121,13 +106,10 @@ pub fn step(
             quiet_ms: 0,
             procs,
         };
-        return Some((state, m));
+        return (state, m);
     };
     let window_ms = now.saturating_sub(prev.at);
-    if window_ms < MIN_WINDOW_MS {
-        return None;
-    }
-    let (mut bytes, mut wakeups) = (0u64, 0u64);
+    let (mut bytes, mut wakeups, mut threads_gone) = (0u64, 0u64, false);
     for r in &readings {
         match prev
             .procs
@@ -136,6 +118,9 @@ pub fn step(
         {
             Some(p) => {
                 bytes += r.bytes.saturating_sub(p.bytes);
+                // A thread that exited takes its count with it, so this sum can fall; a window
+                // where it did has no honest figure.
+                threads_gone |= r.wakeups < p.wakeups;
                 wakeups += r.wakeups.saturating_sub(p.wakeups);
             }
             // Not seen last time: everything it ever did falls in this window, as far as
@@ -148,6 +133,8 @@ pub fn step(
     }
     let secs = window_ms as f64 / 1000.0;
     let rate = bytes as f64 / secs;
+    // The line comes from the history *before* this window: a window never sets its own bar,
+    // so a slot with none is held to the low line, as unknown should be.
     let hour = now / HOUR_MS;
     let mut minima: Vec<(u64, f64)> = prev
         .minima
@@ -155,13 +142,19 @@ pub fn step(
         .copied()
         .filter(|&(h, _)| h + FLOOR_HOURS > hour)
         .collect();
+    let floor = minima.iter().map(|&(_, m)| m).reduce(f64::min);
+    let line = line(floor);
+    // A window as long as the quiet period cannot say when in it the bytes fell — a turn in its
+    // last minutes would be averaged away — so it counts as active, as anything unknown does.
+    let last_active = if rate > line || window_ms >= QUIET_FOR_MS {
+        now
+    } else {
+        prev.last_active
+    };
     match minima.last_mut() {
         Some((h, m)) if *h == hour => *m = m.min(rate),
         _ => minima.push((hour, rate)),
     }
-    let floor = minima.iter().map(|&(_, m)| m).reduce(f64::min);
-    let line = line(floor);
-    let last_active = if rate > line { now } else { prev.last_active };
     let state = SlotState {
         at: now,
         procs: readings,
@@ -170,14 +163,14 @@ pub fn step(
     };
     let m = Measure {
         rate: Some(rate),
-        wakeups: Some(wakeups as f64 / secs),
+        wakeups: (!threads_gone).then(|| wakeups as f64 / secs),
         window_ms,
         floor,
         line,
         quiet_ms: now.saturating_sub(last_active),
         procs,
     };
-    Some((state, m))
+    (state, m)
 }
 
 /// What the rule would do with a slot, given its window and whether a client is attached
@@ -197,12 +190,12 @@ pub fn verdict(m: &Measure, attached: Option<bool>) -> String {
 
 /// A pass's line for one slot.
 pub fn describe(slot: &str, m: &Measure, attached: Option<bool>) -> String {
-    let what = match (m.rate, m.wakeups) {
-        (Some(r), Some(w)) => format!(
-            "{:.0} B/s over {}s, {:.1} wakeups/s, {} process(es), line {:.0} B/s{}, quiet {}m",
+    let what = match m.rate {
+        Some(r) => format!(
+            "{:.0} B/s over {}s, {} wakeups/s, {} process(es), line {:.0} B/s{}, quiet {}m",
             r,
             m.window_ms / 1000,
-            w,
+            m.wakeups.map_or("?".to_string(), |w| format!("{w:.1}")),
             m.procs,
             m.line,
             m.floor
@@ -210,7 +203,7 @@ pub fn describe(slot: &str, m: &Measure, attached: Option<bool>) -> String {
                 .unwrap_or_default(),
             m.quiet_ms / 60_000
         ),
-        _ => format!("{} process(es) read", m.procs),
+        None => format!("{} process(es) read", m.procs),
     };
     format!("{slot}: measured — {what}; {}", verdict(m, attached))
 }
@@ -228,23 +221,47 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     let mut next = BTreeMap::new();
     let mut lines = Vec::new();
     for rec in records.iter().filter(|r| r.state == State::Live) {
-        let pids = members(table, env.get(&rec.slot), rec.pid);
-        let readings: Vec<Reading> = pids.into_iter().filter_map(read).collect();
-        if readings.is_empty() {
-            continue;
-        }
         let old = prev.get(&rec.slot);
-        let Some((state, m)) = step(old, now, readings) else {
+        if let Some(o) = old.filter(|o| now.saturating_sub(o.at) < MIN_WINDOW_MS) {
             lines.push(format!(
                 "{}: measured — {}s since the last reading, too short; the next pass counts it",
                 rec.slot,
-                now.saturating_sub(old.map_or(now, |o| o.at)) / 1000
+                now.saturating_sub(o.at) / 1000
             ));
+            next.insert(rec.slot.clone(), o.clone());
+            continue;
+        }
+        let root = rec.pid.zip(rec.proc_start);
+        let (mut readings, mut unreadable) = (Vec::new(), 0usize);
+        for pid in members(table, env.get(&rec.slot), root) {
+            match read(pid) {
+                Some(r) => readings.push(r),
+                // Gone since the snapshot is the truth; there but unreadable is unknown.
+                None if std::path::Path::new(&format!("/proc/{pid}")).exists() => unreadable += 1,
+                None => {}
+            }
+        }
+        if unreadable > 0 {
+            lines.push(format!(
+                "{}: measured — {unreadable} of its processes could not be read; the activity rule would keep it: unknown",
+                rec.slot
+            ));
+            // The span measured again next pass, and counted as active: unknown is.
             if let Some(o) = old {
-                next.insert(rec.slot.clone(), o.clone());
+                next.insert(
+                    rec.slot.clone(),
+                    SlotState {
+                        last_active: now,
+                        ..o.clone()
+                    },
+                );
             }
             continue;
-        };
+        }
+        if readings.is_empty() {
+            continue;
+        }
+        let (state, m) = step(old, now, readings);
         let attached = sessions.as_ref().and_then(|all| {
             all.iter()
                 .find(|s| s.name == rec.slot && s.answered)
@@ -270,16 +287,10 @@ fn slot_of(pid: u32) -> Option<String> {
     })
 }
 
-/// Every process of each slot in a snapshot, by the environment. Not this process, and not
-/// another `claude-sessions`: a hook or a pass run from a slot's own shell carries the
-/// variable too, and reading `/proc` would count as that slot's activity.
+/// Every process of each slot in a snapshot, by the environment.
 pub fn by_slot(table: &[Proc]) -> BTreeMap<String, Vec<u32>> {
-    let me = std::process::id();
     let mut out: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for p in table {
-        if p.pid == me || p.comm == "claude-sessions" {
-            continue;
-        }
         if let Some(slot) = slot_of(p.pid) {
             out.entry(slot).or_default().push(p.pid);
         }
@@ -287,11 +298,17 @@ pub fn by_slot(table: &[Proc]) -> BTreeMap<String, Vec<u32>> {
     out
 }
 
-/// A slot's members: those carrying its variable, and the recorded claude with its
-/// descendants, should any have cleared it.
-pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<u32>) -> Vec<u32> {
+/// A slot's members: those carrying its variable, and the recorded claude — only if it is
+/// still the process that was recorded, by start time — with its descendants, should any have
+/// cleared the variable. Not this process and not another `claude-sessions`: a hook, the
+/// status line, or a pass run from the slot's own shell would count its own reading of `/proc`
+/// as the slot's work. (One already reaped has been folded into its parent's counters by the
+/// kernel, which errs towards active.)
+pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)>) -> Vec<u32> {
     let mut pids: Vec<u32> = env.cloned().unwrap_or_default();
-    if let Some(root) = claude.filter(|&pid| table.iter().any(|p| p.pid == pid)) {
+    if let Some((root, _)) =
+        claude.filter(|&(pid, start)| table.iter().any(|p| p.pid == pid && p.start == start))
+    {
         pids.push(root);
         pids.extend(
             crate::procinfo::descendants(table, root)
@@ -299,6 +316,13 @@ pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<u32>) -> V
                 .map(|p| p.pid),
         );
     }
+    let me = std::process::id();
+    pids.retain(|&pid| {
+        pid != me
+            && !table
+                .iter()
+                .any(|p| p.pid == pid && p.comm == "claude-sessions")
+    });
     pids.sort_unstable();
     pids.dedup();
     pids
@@ -484,25 +508,121 @@ mod tests {
     }
 
     #[test]
-    fn a_first_reading_is_active_and_a_short_window_is_left_for_the_next_pass() {
-        let (s, m) = step(None, T0, vec![r(1, 7, 5_000)]).unwrap();
+    fn a_first_reading_is_active() {
+        let (s, m) = step(None, T0, vec![r(1, 7, 5_000)]);
         assert_eq!((m.rate, m.quiet_ms, s.last_active), (None, 0, T0));
         assert!(verdict(&m, Some(false)).contains("would keep"));
-        assert!(step(Some(&s), T0 + MIN_WINDOW_MS - 1, vec![r(1, 7, 5_001)]).is_none());
+    }
+
+    #[test]
+    fn a_window_is_held_to_the_line_from_before_it() {
+        // A slot with no history: its first window at 2 KB/s is held to the low line and is
+        // active — it must not set its own bar at ten times itself. Calibration: a slot whose
+        // floor of 100 was learned earlier holds 500 B/s to 1000 and calls it quiet.
+        let s = step(None, T0, vec![r(1, 7, 0)]).0;
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 360_000)]);
+        assert_eq!((m.floor, m.line, m.quiet_ms), (None, LINE_MIN, 0), "{m:?}");
+        let learned = SlotState {
+            minima: vec![(T0 / HOUR_MS, 100.0)],
+            ..s
+        };
+        let (_, m) = step(Some(&learned), T0 + 180_000, vec![r(1, 7, 90_000)]);
+        assert_eq!((m.floor, m.line), (Some(100.0), 1000.0));
+        assert_eq!(m.quiet_ms, 180_000);
+    }
+
+    #[test]
+    fn a_window_as_long_as_the_quiet_period_counts_as_active() {
+        // Two hours at an average under the line: when in it the bytes fell is unknown, so it
+        // is active. Calibration: the same average over three minutes is quiet.
+        let s = SlotState {
+            at: T0,
+            procs: vec![r(1, 7, 0)],
+            last_active: T0,
+            minima: vec![(T0 / HOUR_MS, 100.0)],
+        };
+        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 7_200 * 489)]);
+        assert_eq!(m.quiet_ms, 0, "{m:?}");
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 489)]);
+        assert_eq!(m.quiet_ms, 180_000, "{m:?}");
+    }
+
+    #[test]
+    fn wakeups_that_fell_have_no_figure() {
+        let s = step(
+            None,
+            T0,
+            vec![Reading {
+                pid: 1,
+                start: 7,
+                bytes: 0,
+                wakeups: 500,
+            }],
+        )
+        .0;
+        let (_, m) = step(
+            Some(&s),
+            T0 + 100_000,
+            vec![Reading {
+                pid: 1,
+                start: 7,
+                bytes: 0,
+                wakeups: 400,
+            }],
+        );
+        assert_eq!(m.wakeups, None);
+        assert!(describe("claude-1", &m, Some(false)).contains("? wakeups/s"));
+        let (_, m) = step(
+            Some(&s),
+            T0 + 100_000,
+            vec![Reading {
+                pid: 1,
+                start: 7,
+                bytes: 0,
+                wakeups: 600,
+            }],
+        );
+        assert_eq!(m.wakeups, Some(1.0));
+    }
+
+    #[test]
+    fn members_are_the_recorded_claude_by_start_time_and_never_this_tool() {
+        let me = std::process::id();
+        let proc = |pid, ppid, comm: &str, start| Proc {
+            pid,
+            ppid,
+            comm: comm.into(),
+            start,
+            state: 'S',
+            args: vec![],
+        };
+        let table = vec![
+            proc(100, 1, "claude", 7),
+            proc(101, 100, "bash", 9),
+            proc(102, 100, "claude-sessions", 9),
+            proc(me, 100, "claude-sessions", 9),
+        ];
+        assert_eq!(members(&table, None, Some((100, 7))), vec![100, 101]);
+        assert_eq!(
+            members(&table, None, Some((100, 8))),
+            Vec::<u32>::new(),
+            "pid 100 was reused"
+        );
+        assert_eq!(members(&table, Some(&vec![102, me, 101]), None), vec![101]);
     }
 
     #[test]
     fn idle_bytes_go_quiet_and_a_turn_wakes_it() {
         // 100 B/s for ten minutes in 3-minute passes, then a turn at 15 KB/s. Calibration in
         // both directions: the same rule calls the quiet slot freezable and the busy one not.
-        let mut s = step(None, T0, vec![r(1, 7, 0)]).unwrap().0;
+        let mut s = step(None, T0, vec![r(1, 7, 0)]).0;
         let mut bytes = 0;
         let mut at = T0;
         let mut last = None;
         for _ in 0..5 {
             at += 180_000;
             bytes += 18_000;
-            let (n, m) = step(Some(&s), at, vec![r(1, 7, bytes)]).unwrap();
+            let (n, m) = step(Some(&s), at, vec![r(1, 7, bytes)]);
             s = n;
             last = Some(m);
         }
@@ -522,20 +642,20 @@ mod tests {
         );
         at += 180_000;
         bytes += 180 * 15_000;
-        let (_, m) = step(Some(&s), at, vec![r(1, 7, bytes)]).unwrap();
+        let (_, m) = step(Some(&s), at, vec![r(1, 7, bytes)]);
         assert_eq!(m.quiet_ms, 0);
         assert!(verdict(&m, Some(false)).contains("quiet under 10m"));
     }
 
     #[test]
     fn a_new_process_counts_whole_and_a_reused_pid_is_a_new_process() {
-        let s = step(None, T0, vec![r(1, 7, 1_000)]).unwrap().0;
+        let s = step(None, T0, vec![r(1, 7, 1_000)]).0;
         // pid 1 again but started later: a different process, all of its bytes counted; and
         // a child seen for the first time, all of its own.
-        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 9, 2_000), r(2, 8, 3_000)]).unwrap();
+        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 9, 2_000), r(2, 8, 3_000)]);
         assert_eq!(m.rate, Some(50.0));
         // The same process: only what it did since.
-        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 1_500)]).unwrap();
+        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 1_500)]);
         assert_eq!(m.rate, Some(5.0));
     }
 
@@ -548,7 +668,7 @@ mod tests {
             minima: vec![(T0 / HOUR_MS - 30, 1.0)],
         };
         s.minima.push((T0 / HOUR_MS - 2, 80.0));
-        let (n, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 20_000)]).unwrap();
+        let (n, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 20_000)]);
         assert_eq!(
             m.floor,
             Some(80.0),
