@@ -92,9 +92,11 @@ scrolling its own buffer; and the inline renderer keeps older output in its view
 virtual scroll is off too. With all three, output lands in the terminal's buffer, scrolling
 is local and instant, and long-press selection works. Only the first has a settings key
 (`tui`), so the launcher — which makes the process — is where the mode is chosen. **Each is
-set only if the login has not set it**, so a value it brings (ssh `SendEnv`, or a later
-relaunch with the opposite) wins; the launcher leaves such a variable off the line and claude
-inherits it. These are the one deliberate exception to nothing of ours in claude's
+set only if the login has not set it**, so a value it brings (ssh `SendEnv`) wins; the
+launcher leaves such a variable off the line and claude inherits it. **Only an empty value
+turns a feature back on**: Claude Code tests all three for truthiness, so `=0` disables as
+surely as `=1` (infra's review of 0.3.8 read it in the binary), and a login wanting the
+fullscreen renderer back must bring `NAME=`, not `NAME=0`. These are the one deliberate exception to nothing of ours in claude's
 environment: they are meant for claude.
 
 The costs, accepted: the classic renderer flickers more and leaves debris after a resize
@@ -108,10 +110,20 @@ and a rename fails silently — passed, never read, and scrolling is back to rou
 no message:
 
 ```sh
-strings "$(command -v claude)" | grep -oE 'CLAUDE_CODE_DISABLE_(ALTERNATE_SCREEN|MOUSE|VIRTUAL_SCROLL)' | sort -u
+strings "$(command -v claude)" | grep -aowE 'CLAUDE_CODE_DISABLE_(ALTERNATE_SCREEN|MOUSE|VIRTUAL_SCROLL)' | sort -u
 ```
 
-Expect all three names.
+Expect all three names. **`-w` is load-bearing**: the binary also holds
+`CLAUDE_CODE_DISABLE_MOUSE_CLICKS`, which an unanchored match counts as `…_MOUSE`, so a rename
+of `…_MOUSE` alone would still read three of three (infra, 2026-10-04). infra runs this as
+`make verify`'s `scrollvars` line against the claude a container actually has, since Claude Code
+updates itself in place.
+
+**Open: `/tui` inside a slot.** Claude Code's `/tui` switch relaunches claude with
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` dropped and the other two kept, so `/tui fullscreen`
+puts that one session back on the alternate screen — where, with mouse reporting still off,
+a swipe is arrow keys again. Whether the relaunched process is still the zmx daemon's direct
+child, so the slot stays bound to it, is not yet known.
 
 **They only work because the holder keeps off the alternate screen.** v0.3.8 shipped them
 under abduco, whose client switches the terminal to the alternate screen on every attach; there,

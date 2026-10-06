@@ -83,8 +83,8 @@ pub const START_WRAP: &str = r#"e=$1; shift; exec "$@" 2>>"$e""#;
 /// lands in the terminal's buffer and scrolling is local. Only the first has a settings key,
 /// so the launcher, which makes the process, is where the mode is chosen.
 ///
-/// **Only if unset**, so a value the login brings (ssh `SendEnv`, or a later relaunch with the
-/// opposite) wins over this default. The names are read from the Claude Code binary, and a
+/// **Only if unset**, so a value the login brings (ssh `SendEnv`) wins over this default —
+/// and only an empty value turns a feature back on, since Claude Code reads `=0` as set. The names are read from the Claude Code binary, and a
 /// rename would fail silently — passed and never read — so `docs/design.md` gives the check to
 /// repeat at each Claude Code pin.
 pub const SCROLLBACK: [&str; 3] = [
