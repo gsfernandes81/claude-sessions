@@ -132,11 +132,16 @@ pub fn exchange_line(line: &str) -> bool {
 /// itself the last line reads as no marker, which is the safe answer.
 const INTERRUPT_TAIL: u64 = 64 * 1024;
 
-/// What Claude Code writes when the owner presses Esc: a `user` entry whose text begins with
-/// this — `[Request interrupted by user]` mid-reply, `… for tool use]` mid-tool — and **no
-/// hook at all**: not `Stop`, not `StopFailure`, not the tool's `PostToolUse`. Seen on
-/// 2.1.291 under a pty, with every hook logging, on 2026-10-06.
-const INTERRUPTED: &str = "[Request interrupted by user";
+/// What Claude Code writes when the owner presses Esc: a `user` entry whose content is one text
+/// part saying exactly one of these — mid-reply, mid-tool — and **no hook at all**: not `Stop`,
+/// not `StopFailure`, not the tool's `PostToolUse`. Seen on 2.1.291 under a pty, with every
+/// hook logging, on 2026-10-06. Matched whole, never by prefix: a prompt the owner types that
+/// merely begins with the phrase is a prompt (issue #10), and a typed prompt arrives as a
+/// string where these arrive as a list.
+const INTERRUPTED: [&str; 2] = [
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+];
 
 /// When the conversation's last turn was ended by an Esc: the timestamp of a trailing
 /// interrupt marker, if no reply or prompt follows it. `None` for a turn that ended any other
@@ -192,17 +197,22 @@ pub fn interrupted_in(text: &str, cut: bool) -> Option<u64> {
         // Not one whole line we can read: the last turn's shape is unknown, so no answer.
         let v = json::parse(line).ok()?;
         match v.get("type").and_then(Value::as_str) {
+            // A subagent's line, should one ever land here, says nothing about the main turn.
+            Some("user" | "assistant")
+                if matches!(v.get("isSidechain"), Some(Value::Bool(true))) =>
+            {
+                continue;
+            }
             // A reply after any marker: the turn that matters ended some other way.
             Some("assistant") => return None,
             Some("user") => {
                 let content = v.get("message").and_then(|m| m.get("content"));
                 let marked = match content {
-                    Some(Value::Str(c)) => c.trim_start().starts_with(INTERRUPTED),
                     Some(Value::Arr(parts)) => parts.iter().any(|p| {
                         p.get("type").and_then(Value::as_str) == Some("text")
                             && p.get("text")
                                 .and_then(Value::as_str)
-                                .is_some_and(|t| t.trim_start().starts_with(INTERRUPTED))
+                                .is_some_and(|t| INTERRUPTED.contains(&t.trim()))
                     }),
                     _ => false,
                 };
@@ -292,6 +302,19 @@ mod tests {
         );
         // A tool's result with no marker is a turn still going.
         assert_eq!(interrupted_in(&lines(&[REJECTED_TOOL]), false), None);
+    }
+
+    #[test]
+    fn only_the_marker_itself_is_an_interrupt() {
+        // Issue #10: a prompt the owner typed that begins with the phrase — a string, as typed
+        // prompts are — and a text part that only starts with it are prompts.
+        let typed = r#"{"type":"user","message":{"role":"user","content":"[Request interrupted by user] carry on"},"timestamp":"2026-10-06T09:24:00.000Z"}"#;
+        assert_eq!(interrupted_in(&lines(&[CUT_REPLY, typed]), false), None);
+        let longer = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user] carry on"}]},"timestamp":"2026-10-06T09:24:00.000Z"}"#;
+        assert_eq!(interrupted_in(&lines(&[CUT_REPLY, longer]), false), None);
+        // A subagent's line is skipped: the main turn's marker before it still answers.
+        let side = r#"{"type":"assistant","isSidechain":true,"message":{"content":[]},"timestamp":"2026-10-06T09:24:01.000Z"}"#;
+        assert!(interrupted_in(&lines(&[CUT_REPLY, MARK_REPLY, side]), false).is_some());
     }
 
     #[test]

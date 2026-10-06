@@ -89,6 +89,7 @@ exit 0"#,
         &format!(
             r#"echo $$ >> "{pids}"
 printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook
+printf '{{"hook_event_name":"SubagentStart","agent_id":"a-e2e","agent_type":"general-purpose","session_id":"conv-e2e"}}' | "{bin}" hook
 echo "claude said this on stderr" >&2
 exec sleep 600"#,
             pids = root.join("pids").display(),
@@ -179,6 +180,20 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
         "{body}"
     );
     assert!(!body.contains("very long reply"), "{body}");
+    // The slot's own claude announcing an agent: bound by the process tree although the
+    // payload names an `agent_id`, so the agent holds the slot (issue #10).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = std::fs::read_to_string(root.0.join("registry/claude-1.json")).unwrap();
+        if body.contains("a-e2e") || Instant::now() > deadline {
+            break body;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        body.contains("\"a-e2e\"") && body.contains("subagent: general-purpose"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -194,4 +209,19 @@ fn the_same_line_without_exec_is_not_bound() {
     assert!(!body.contains("\"conv-e2e\""), "{body}");
     // Calibration for the title: a nested claude's transcript names nothing about the slot.
     assert!(!body.contains("ai_title"), "{body}");
+    // And for the agent: once its SubagentStart has demonstrably been handled — the event is
+    // in the record's times — a nested claude's agent is activity, not the slot's work.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = std::fs::read_to_string(root.0.join("registry/claude-2.json")).unwrap();
+        if body.contains("\"SubagentStart\"") || Instant::now() > deadline {
+            break body;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        body.contains("\"SubagentStart\""),
+        "the event was seen: {body}"
+    );
+    assert!(!body.contains("a-e2e"), "and not listed: {body}");
 }

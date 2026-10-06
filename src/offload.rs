@@ -203,7 +203,9 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     // The turn ended, but what it started in the background has not (issue #9): a background
     // subagent, a Workflow run, a cloud session. None of them fires a hook the slot hears.
     if !rec.background.is_empty() {
-        return Err(Hold::Background(rec.background.clone()));
+        return Err(Hold::Background(
+            rec.background.iter().map(|t| t.what.clone()).collect(),
+        ));
     }
     // Idle from the last thing written, not only the last thing a hook said: a turn started by
     // a fired wake-up or a finished task's notification may announce itself to no hook, and a
@@ -783,7 +785,10 @@ mod tests {
     fn background_work_keeps_it_however_long_the_parent_has_been_stopped() {
         // Issue #9. The calibrating case is the idle slot above, which is offloaded.
         let (mut rec, seen) = idle();
-        rec.background = vec!["subagent: council reviewer".into()];
+        rec.background = vec![crate::registry::Task {
+            id: Some("a1".into()),
+            what: "subagent: council reviewer".into(),
+        }];
         assert_eq!(
             decide(&rec, NOW, &seen),
             Err(Hold::Background(vec!["subagent: council reviewer".into()]))
@@ -827,6 +832,27 @@ mod tests {
         seen.interrupted_at = Some(prompt - 1);
         rec.last_activity_ms = prompt;
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
+    }
+
+    #[test]
+    fn an_esc_does_not_release_work_its_turn_started() {
+        // Issue #10. The Esc ends the turn; the agent that turn started is in the list by its
+        // SubagentStart, so the slot is kept. Calibration: the same Esc with nothing running
+        // is stopped, as in the test above.
+        let (mut rec, mut seen) = idle();
+        let prompt = NOW - 2 * IDLE_AFTER_STOP_MS;
+        rec.busy = true;
+        rec.last_activity_ms = prompt;
+        seen.interrupted_at = Some(prompt + 5_000);
+        assert!(decide(&rec, NOW, &seen).is_ok(), "calibration");
+        rec.background = vec![crate::registry::Task {
+            id: Some("a90c".into()),
+            what: "subagent: general-purpose".into(),
+        }];
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::Background(vec!["subagent: general-purpose".into()]))
+        );
     }
 
     #[test]

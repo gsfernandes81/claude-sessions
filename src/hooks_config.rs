@@ -24,10 +24,12 @@ use crate::events::TIMER_TOOLS;
 use crate::json::Value;
 
 /// Every event `events::apply` acts on, in the order of the table in `docs/design.md`.
-pub const EVENTS: [&str; 6] = [
+pub const EVENTS: [&str; 8] = [
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
+    "SubagentStart",
+    "SubagentStop",
     "Notification",
     "PostToolUse",
     "SessionEnd",
@@ -98,6 +100,8 @@ mod tests {
             r#"{"hook_event_name":"SessionStart","session_id":"s"}"#,
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"p"}"#,
             r#"{"hook_event_name":"Stop"}"#,
+            r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-purpose"}"#,
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#,
             r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#,
             r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
             r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#,

@@ -219,7 +219,7 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     };
 
-    let binding = bind::binding_for(std::process::id(), ev.has_agent_id());
+    let binding = bind::binding_for(std::process::id(), ev.fired_in_subagent());
 
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.

@@ -16,7 +16,7 @@
 
 use crate::clock::Millis;
 use crate::json::{self, Value};
-use crate::registry::{SlotRecord, State, Timer};
+use crate::registry::{SlotRecord, State, Task, Timer};
 
 /// Whether the claude that fired this event is the slot's own process, or one nested under it.
 /// Decided in `bind.rs` from `/proc`, never from the payload alone.
@@ -85,7 +85,7 @@ impl Event {
     /// 2.1.291 binary). One `type: description` per task; `type` arrives already in words
     /// (`subagent`, `workflow`, `shell`, `monitor`, `teammate`, `cloud session`, …). Absent on a
     /// version that does not send it, which reads as none: no evidence either way.
-    pub fn background_tasks(&self) -> Vec<String> {
+    pub fn background_tasks(&self) -> Vec<Task> {
         let Some(tasks) = self.0.get("background_tasks").and_then(Value::as_arr) else {
             return Vec::new();
         };
@@ -93,19 +93,32 @@ impl Event {
             .iter()
             .map(|t| {
                 let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
-                match t.get("description").and_then(Value::as_str) {
+                let what = match t.get("description").and_then(Value::as_str) {
                     Some(d) if !d.trim().is_empty() => {
                         format!("{kind}: {}", one_line(d).unwrap_or_default())
                     }
                     _ => kind.to_string(),
+                };
+                Task {
+                    id: t.get("id").and_then(Value::as_str).map(str::to_string),
+                    what,
                 }
             })
             .collect()
     }
-    /// Present on subagents only, which is a cheaper nested test than the `/proc` walk — but
-    /// not a complete one: a `claude -p` from a Bash call carries no such field.
-    pub fn has_agent_id(&self) -> bool {
-        self.0.get("agent_id").is_some()
+    /// `SubagentStart` / `SubagentStop`: the agent the event is about.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.s("agent_id")
+    }
+    pub fn agent_type(&self) -> Option<&str> {
+        self.s("agent_type")
+    }
+    /// Fired in a subagent's own context — a tool call it made — which is a cheaper nested test
+    /// than the `/proc` walk, though not a complete one: a `claude -p` from a Bash call carries
+    /// no `agent_id`. Not `SubagentStart`/`SubagentStop`: there `agent_id` names the agent the
+    /// event is about, and the slot's own claude fires them (seen on 2.1.291).
+    pub fn fired_in_subagent(&self) -> bool {
+        self.0.get("agent_id").is_some() && !matches!(self.name(), "SubagentStart" | "SubagentStop")
     }
 }
 
@@ -235,6 +248,32 @@ pub fn apply(
             // merged: each `Stop` lists everything still running, and a task finishing wakes
             // claude for a turn that ends in another `Stop`.
             rec.background = ev.background_tasks();
+            Outcome::Changed
+        }
+        // An agent's life, between the parent's `Stop`s (issue #10). Both are activity, and an
+        // agent finishing after its parent's turn ended leaves the slot not stopped until the
+        // turn it wakes claude for ends in a `Stop` — seen on 2.1.291: SubagentStop, then that
+        // turn's UserPromptSubmit and Stop.
+        "SubagentStart" => {
+            if let Some(id) = ev.agent_id() {
+                if !rec.background.iter().any(|t| t.id.as_deref() == Some(id)) {
+                    let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
+                    rec.background.push(Task {
+                        id: Some(id.to_string()),
+                        what: format!("subagent: {kind}"),
+                    });
+                }
+            }
+            rec.last_activity_ms = now;
+            Outcome::Changed
+        }
+        // Claude Code also sends this for internal agents it never announced; removing an id
+        // that is not listed does nothing.
+        "SubagentStop" => {
+            if let Some(id) = ev.agent_id() {
+                rec.background.retain(|t| t.id.as_deref() != Some(id));
+            }
+            rec.last_activity_ms = now;
             Outcome::Changed
         }
         "Notification" => match ev.notification_type() {
@@ -425,13 +464,92 @@ mod tests {
           {"id":"w1","type":"workflow","status":"pending","description":"review\nchanges","name":"review"}],
         "session_crons":[]}"#;
 
+    fn whats(rec: &SlotRecord) -> Vec<&str> {
+        rec.background.iter().map(|t| t.what.as_str()).collect()
+    }
+
+    /// Issue #10, as 2.1.291 told it under a pty on 2026-10-06: a turn launches a background
+    /// agent, the owner presses Esc — no `Stop` — and the agent runs on, finishes, and wakes
+    /// claude for a turn of its own.
+    #[test]
+    fn an_agent_started_in_a_turn_esc_ended_holds_the_slot_until_it_is_done() {
+        let mut rec = slot();
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
+            1_500,
+        );
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#),
+            2_000,
+        );
+        own(
+            &mut rec,
+            &ev(
+                r#"{"hook_event_name":"SubagentStart","agent_id":"a90c","agent_type":"general-purpose"}"#,
+            ),
+            3_000,
+        );
+        assert_eq!(
+            whats(&rec),
+            ["subagent: general-purpose"],
+            "no Stop needed to hear of it"
+        );
+        // The Esc: nothing at all. Then an internal agent nobody announced ends.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#),
+            4_000,
+        );
+        assert_eq!(rec.background.len(), 1, "an unknown id removes nothing");
+        // The agent ends; its own payload still lists it as running, and is not believed.
+        own(
+            &mut rec,
+            &ev(
+                r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running"}]}"#,
+            ),
+            5_000,
+        );
+        assert!(rec.background.is_empty());
+        assert_eq!(
+            rec.last_activity_ms, 5_000,
+            "and the slot is not idle from before it"
+        );
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>"}"#),
+            5_010,
+        );
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
+            6_000,
+        );
+        assert!(rec.background.is_empty() && !rec.busy);
+    }
+
+    #[test]
+    fn subagent_events_bind_by_process_and_tool_calls_inside_an_agent_do_not() {
+        let start = ev(r#"{"hook_event_name":"SubagentStart","agent_id":"a1"}"#);
+        let stop = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#);
+        let inside = ev(r#"{"hook_event_name":"PostToolUse","agent_id":"a1","tool_name":"Bash"}"#);
+        assert!(!start.fired_in_subagent() && !stop.fired_in_subagent());
+        assert!(inside.fired_in_subagent());
+    }
+
     #[test]
     fn a_stop_records_the_background_work_it_leaves_running_and_the_next_replaces_it() {
         let mut rec = slot();
         own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
         assert_eq!(
-            rec.background,
+            whats(&rec),
             ["subagent: council reviewer", "workflow: review changes"]
+        );
+        assert_eq!(
+            rec.background[0].id.as_deref(),
+            Some("a1"),
+            "kept by its id"
         );
         assert!(!rec.busy, "the turn is over");
         // The task finishes; claude wakes for its notification, and that turn's Stop lists
@@ -491,6 +609,14 @@ mod tests {
         own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
         let back = SlotRecord::from_json(&rec.to_json(), "x").unwrap();
         assert_eq!(back.background, rec.background);
+        // As 0.4.1 to 0.4.3 wrote it — bare strings — it still holds after an upgrade.
+        let old_style = crate::json::parse(
+            r#"{"slot":"claude-1","background":["subagent: council reviewer"]}"#,
+        )
+        .unwrap();
+        let read = SlotRecord::from_json(&old_style, "x").unwrap();
+        assert_eq!(whats(&read), ["subagent: council reviewer"]);
+        assert_eq!(read.background[0].id, None);
         // An older record has none.
         let old = SlotRecord::from_json(&slot().to_json(), "x").unwrap();
         assert!(old.background.is_empty());

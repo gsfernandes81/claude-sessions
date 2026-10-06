@@ -146,6 +146,8 @@ terminal.
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
+| `SubagentStart` | the agent, by its `agent_id`, joins `background`; activity (issue #10) |
+| `SubagentStop` | that `agent_id` leaves `background` — an id never announced removes nothing; activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
 | `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
@@ -173,7 +175,7 @@ any of its subagents'**.
 reviewers and reproduced on v0.4.0). A background subagent, a Workflow run, a teammate or a
 cloud session runs inside claude's own process, so there is no descendant to see, and after the
 parent's `Stop` nothing moved the record: ten minutes later a live pass would have killed four
-working agents. Two things close it, and neither needs a new hook:
+working agents. Three things close it:
 
 - **`Stop` says what is still running.** Its payload carries `background_tasks` — Claude Code's
   task registry filtered to backgrounded work that is running or pending, each with a `type`
@@ -183,16 +185,27 @@ working agents. Two things close it, and neither needs a new hook:
   "description":"Sleep for 45 seconds",…}`, and a quiet turn sent `[]`. Recorded as
   `background`, it keeps the slot for as long as it is not empty. A task finishing wakes claude
   to handle its notification, and that turn ends in a `Stop` with the list as it now is — so
-  the hold releases itself, and the ten minutes start from that `Stop`. Only the parent's `Stop`
-  speaks for the slot; a subagent's `SubagentStop` is activity, nothing more. A `SessionStart`
-  from a different process clears the list, since a new process cannot be running the old one's
-  work.
+  the hold releases itself, and the ten minutes start from that `Stop`. A `SessionStart` from a
+  different process clears the list, since a new process cannot be running the old one's work.
+- **Between `Stop`s, agents announce themselves.** `SubagentStart` adds an agent to the list by
+  its `agent_id` — the same id `Stop`'s list gives its task — and `SubagentStop` removes it.
+  This is what holds work started in a turn the owner ended with Esc (issue #10): an Esc fires no
+  `Stop`, so the list would otherwise be the previous turn's, and an agent launched in the
+  interrupted turn would hold the slot only while it kept writing. Seen on 2.1.291 under a pty
+  on 2026-10-06: a background agent launched, the owner pressed Esc, and the agent ran on for
+  forty seconds, sent its `SubagentStop`, and woke claude for a turn that fired
+  `UserPromptSubmit` and ended in `Stop` with an empty list. Both events come from the slot's
+  own claude, so they are bound by the `/proc` walk, not by their `agent_id` (which there names
+  the agent, not the context the hook fired in); a nested `claude -p`'s agents stay activity
+  only. A `SubagentStop`'s own `background_tasks` still lists the agent that is ending, so only
+  `Stop`'s list is ever taken whole. An agent that ends without a `SubagentStop` — not seen —
+  would be listed until the next `Stop`: the keep direction.
 - **Writes are activity.** A turn writes its transcript as it goes, and a background subagent
   writes its own under `<conversation>/subagents/` (Workflow runs a level or two deeper). The
   offloader takes the newest of those modification times as one more "last thing that
-  happened". That covers turns no hook announces — one started by a fired `ScheduleWakeup` or by
-  a finished task's notification may never fire `UserPromptSubmit` — and a subagent that is
-  working between the parent's `Stop`s. It errs one way only: a write for some other reason
+  happened". That covers a turn no hook announces, should there be one — a finished task's
+  notification was seen to fire `UserPromptSubmit`, a fired `ScheduleWakeup` has not been
+  watched — and a subagent that is working between the parent's `Stop`s. It errs one way only: a write for some other reason
   delays an offload, never causes one.
 
 **An Esc fires no hook at all, and the transcript says so instead.** Seen on 2.1.291 under a
@@ -206,8 +219,15 @@ Esc, after the cut-off reply or the tool's rejected result, with only bookkeepin
 So when the hooks left a slot busy or waiting and its transcript's last conversational entry is
 that marker, newer than the last thing the hooks recorded, **the turn ended at the marker**: the
 offloader counts idleness from it as it would from a `Stop`, and the menu draws the row under
-Idle. Only the tail is read, and only for such a slot; a last line that cannot be read whole — a
-reply longer than the tail — is no answer, never an older marker's.
+Idle — unless `background` lists work, as it does for an agent the interrupted turn started.
+Only the tail is read, and only for such a slot; a last line that cannot be read whole — a
+reply longer than the tail — is no answer, never an older marker's. **Only the marker itself
+counts** (issue #10): a list holding one text part that says exactly
+`[Request interrupted by user]` or `[Request interrupted by user for tool use]`, as Claude Code
+writes it. A prompt the owner types arrives as a string, so one that begins with the phrase is
+a prompt; subagent (`isSidechain`) lines are skipped. An Esc also clears waiting-for-you
+without knowing whose question it was: the prompt on screen is the likely one, and a question
+from a background agent would be the cost — infra's reviewers and this tool agree on clearing.
 
 **Still open:** a turn started by something that neither writes nor hooks has not been found,
 and would not be seen.
@@ -607,7 +627,7 @@ claude-sessions hooks-config /usr/local/bin/claude-sessions \
 chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
 ```
 
-It installs the six events of the table, `PostToolUse` matched to exactly the three timer
+It installs the eight events of the table, `PostToolUse` matched to exactly the three timer
 tools, with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
 every `SessionEnd` hook on the box shares. `src/hooks_config.rs` has the reasons and the tests
 that hold it to the state machine. A drop-in rather
