@@ -434,7 +434,8 @@ pub fn run(dry_run: bool) -> io::Result<()> {
                 continue;
             }
         };
-        // A dry run writes nothing, so it has nothing to protect and takes no lock at all.
+        // A dry run changes no slot, so it has nothing to protect and takes no lock at all (the
+        // activity state it writes is lock-free by design).
         if dry_run {
             match verdict {
                 Verdict::Offload { idle } => {

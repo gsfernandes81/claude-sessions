@@ -10,8 +10,8 @@
 //! whatever font the terminal has (CLAUDE.md, on glyphs).
 //!
 //! **Colour** (owner, 2026-10-06): yellow, then red, as RAM passes 70% and 85% of its total
-//! and as the load passes 0.7 and 1.0 per logical core — the cores this process may use, as
-//! the kernel's affinity and the cgroup's CPU limit allow. The numbers carry the meaning;
+//! and as the load passes 0.7 and 1.0 per logical core of the machine — the machine's, because
+//! the load average counts the whole machine too. The numbers carry the meaning;
 //! colour is emphasis on top, and `NO_COLOR` turns it off. Yellow here is the owner's choice
 //! for this line; the menu's amber stays reserved for *waiting for you*.
 //!
@@ -76,6 +76,27 @@ fn gib(bytes: u64) -> String {
     format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
+/// The machine's logical CPUs, from a list like `0-3,6`: the same scope as `/proc/loadavg`,
+/// which counts the whole machine, whatever share of it this container may use.
+fn cpu_count(list: &str) -> Option<usize> {
+    let mut n = 0;
+    for part in list.trim().split(',') {
+        n += match part.split_once('-') {
+            Some((a, b)) => {
+                b.parse::<usize>()
+                    .ok()?
+                    .checked_sub(a.parse::<usize>().ok()?)?
+                    + 1
+            }
+            None => {
+                part.parse::<usize>().ok()?;
+                1
+            }
+        };
+    }
+    (n > 0).then_some(n)
+}
+
 /// `MemTotal` and `MemAvailable` from `/proc/meminfo`, in bytes.
 fn host_memory(meminfo: &str) -> Option<(u64, u64)> {
     let kb = |key: &str| {
@@ -116,7 +137,9 @@ pub fn run() {
         .ok()
         .and_then(|s| s.split_whitespace().next()?.parse().ok());
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
-    let cores = std::thread::available_parallelism().ok().map(|n| n.get());
+    let cores = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|s| cpu_count(&s));
     let colour = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     say!(
         "{}",
@@ -199,6 +222,15 @@ mod tests {
             line(Some(G / 2), Some(G), Some(0.0), None, Some(""), true),
             "RAM: 0.5G / 1.0G, Load: 0.0, ?"
         );
+    }
+
+    #[test]
+    fn the_cores_are_counted_from_the_online_list() {
+        assert_eq!(cpu_count("0-3\n"), Some(4));
+        assert_eq!(cpu_count("0-3,6,8-9"), Some(7));
+        assert_eq!(cpu_count("0"), Some(1));
+        assert_eq!(cpu_count(""), None);
+        assert_eq!(cpu_count("x"), None);
     }
 
     #[test]

@@ -40,7 +40,8 @@ pub const VAR: &str = "ZMX_SESSION";
 /// would otherwise measure a few seconds, too short to say anything; it is left for the next.
 pub const MIN_WINDOW_MS: Millis = 60_000;
 
-/// How long a slot must stay under its line before the rule would act: the offloader's own.
+/// How long a slot must go with no window over its budget — a minute's worth of bytes at its
+/// line — before the rule would act: the offloader's own.
 pub const QUIET_FOR_MS: Millis = crate::offload::IDLE_AFTER_STOP_MS;
 
 const FLOOR_FACTOR: f64 = 10.0;
@@ -82,9 +83,9 @@ pub struct Measure {
     /// Bytes per second over the window; `None` on a slot's first reading.
     pub rate: Option<f64>,
     pub wakeups: Option<f64>,
-    /// CPU milliseconds per second over the window — logged, not judged: it scales with the
-    /// device.
-    pub cpu: Option<f64>,
+    /// CPU milliseconds per second over the window (0 on a first reading) — logged, not
+    /// judged: it scales with the device.
+    pub cpu: f64,
     pub window_ms: Millis,
     pub floor: Option<f64>,
     pub line: f64,
@@ -111,7 +112,7 @@ pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (S
         let m = Measure {
             rate: None,
             wakeups: None,
-            cpu: None,
+            cpu: 0.0,
             window_ms: 0,
             floor: None,
             line: line(None),
@@ -189,7 +190,7 @@ pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (S
         rate: Some(rate),
         wakeups: (!threads_gone).then(|| wakeups as f64 / secs),
         // USER_HZ is 100 on every Linux, so a tick is 10 ms.
-        cpu: Some(cpu as f64 * 10.0 / secs),
+        cpu: cpu as f64 * 10.0 / secs,
         window_ms,
         floor,
         line,
@@ -218,13 +219,14 @@ pub fn verdict(m: &Measure, attached: Option<bool>) -> String {
 pub fn describe(slot: &str, m: &Measure, attached: Option<bool>) -> String {
     let what = match m.rate {
         Some(r) => format!(
-            "{:.0} B/s over {}s, {} wakeups/s, cpu {} ms/s, {} process(es), line {:.0} B/s{}, quiet {}m",
+            "{:.0} B/s over {}s, {} wakeups/s, cpu {:.1} ms/s, {} process(es), line {:.0} B/s ({:.0} B a window){}, quiet {}m",
             r,
             m.window_ms / 1000,
             m.wakeups.map_or("?".to_string(), |w| format!("{w:.1}")),
-            m.cpu.map_or("?".to_string(), |c| format!("{c:.1}")),
+            m.cpu,
             m.procs,
             m.line,
+            m.line * (MIN_WINDOW_MS as f64 / 1000.0),
             m.floor
                 .map(|f| format!(" from floor {f:.0}"))
                 .unwrap_or_default(),
@@ -333,7 +335,8 @@ pub fn by_slot(table: &[Proc]) -> BTreeMap<String, Vec<u32>> {
 /// those younger than it — and the recorded claude, only if it is still the process that was
 /// recorded, by start time, with its descendants. Not this process and not a running
 /// `claude-sessions`: a menu or a pass in the slot's shell would count its own reading of
-/// `/proc`. (One that has exited is already in its parent's counters — the kernel folds a
+/// `/proc`. Not `zmx` either: a daemon a slot's tool started keeps the slot's `ZMX_SESSION`,
+/// and its reads are the other session's terminal, not this slot's work. (One that has exited is already in its parent's counters — the kernel folds a
 /// reaped child's bytes in — which is why the status line raises every floor a little.)
 pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)>) -> Vec<u32> {
     let mut pids: Vec<u32> = env.cloned().unwrap_or_default();
@@ -355,7 +358,7 @@ pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)
         pid != me
             && !table
                 .iter()
-                .any(|p| p.pid == pid && p.comm == "claude-sessions")
+                .any(|p| p.pid == pid && (p.comm == "claude-sessions" || p.comm == "zmx"))
     });
     pids.sort_unstable();
     pids.dedup();
@@ -568,7 +571,8 @@ mod tests {
     fn a_window_is_held_to_the_line_from_before_it() {
         // A slot with no history: its first window at 2 KB/s is held to the low line and is
         // active — it must not set its own bar at ten times itself. Calibration: a slot whose
-        // floor of 100 was learned earlier holds 500 B/s to 1000 and calls it quiet.
+        // floor of 100 was learned earlier holds 54 KB over three minutes under its 60 KB budget and
+        // calls it quiet.
         let s = step(None, T0, vec![r(1, 7, 0)]).0;
         let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 360_000)]);
         assert_eq!((m.floor, m.line, m.quiet_ms), (None, LINE_MIN, 0), "{m:?}");
@@ -602,17 +606,18 @@ mod tests {
 
     #[test]
     fn a_window_as_long_as_the_quiet_period_counts_as_active() {
-        // Two hours at a third of the line: when in it the bytes fell is unknown, so it
-        // is active. Calibration: the same average over three minutes is quiet.
+        // Two hours with few bytes, under even a minute's budget: more likely a clock step or a
+        // stalled timer than two hours of quiet, and when in it anything fell is unknown — so
+        // active. Calibration: the same bytes over three minutes are quiet.
         let s = SlotState {
             at: T0,
             procs: vec![r(1, 7, 0)],
             last_active: T0,
             minima: vec![(T0 / HOUR_MS, 100.0)],
         };
-        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 7_200 * 300)]);
+        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 36_000)]);
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 300)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 36_000)]);
         assert_eq!(m.quiet_ms, 180_000, "{m:?}");
     }
 
@@ -690,6 +695,7 @@ mod tests {
             proc(101, 100, "bash", 9),
             proc(102, 100, "claude-sessions", 9),
             proc(me, 100, "claude-sessions", 9),
+            proc(103, 1, "zmx", 10),
         ];
         assert_eq!(members(&table, None, Some((100, 7))), vec![100, 101]);
         assert_eq!(
@@ -697,7 +703,10 @@ mod tests {
             Vec::<u32>::new(),
             "pid 100 was reused"
         );
-        assert_eq!(members(&table, Some(&vec![102, me, 101]), None), vec![101]);
+        assert_eq!(
+            members(&table, Some(&vec![102, me, 101, 103]), None),
+            vec![101]
+        );
         // An orphan of an earlier claude in this slot name, older than the current one.
         let mut table = table;
         table.push(proc(50, 1, "sleep", 3));

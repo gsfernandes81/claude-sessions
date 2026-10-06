@@ -413,9 +413,10 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   the raised line about four times over. A pass run by hand from a slot's shell lands in
   that shell's counters the same way and makes its next window active.
   Processes found by the environment count only if younger than the recorded claude: an
-  older one is an earlier claude's orphan in a slot name since reused. `zmx` is always run
-  without `ZMX_SESSION` (module note in `zmx.rs`), so a session started from inside a slot
-  does not have its daemon counted as that slot's. A member gone since the last reading makes the window
+  older one is an earlier claude's orphan in a slot name since reused. No `zmx` process is a
+  member: a daemon started from inside a slot — by this tool, which strips `ZMX_SESSION`, or
+  by a tool claude ran, which does not — reads the other session's terminal, which is that
+  session's work, not this slot's. A member gone since the last reading makes the window
   active: what it did since went to whoever reaped it — a member's counters (counted twice
   then, erring active), or init's for an orphan. Agent view, which runs a service outside any
   slot, stays off.
@@ -424,18 +425,23 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   between 512 B/s and 4 KB/s, and 512 for a slot with no floor yet. **A window is active when
   its bytes exceed a minute's worth at the line** — not when its average does, which would
   average away a turn that began in its last seconds. An idle slot at its floor stays quiet
-  for any window under ten minutes. A Claude Code that idles noisier raises its own floor; the base stops a near-silent
+  for any window under ten minutes while its line is ten times its floor — floors up to about
+  410 B/s. Above that the 4 KB/s cap shortens it to 245,760 ÷ floor seconds, so an idle
+  floor above about 1.4 KB/s never reads quiet at a 3-minute cadence: a noisier Claude Code
+  would make the rule keep everything, which errs the safe way, and the logged floor shows it. A Claude Code that idles noisier raises its own floor; the base stops a near-silent
   floor from making a stray read look like a turn. All bytes, so no device enters. **Its
   blind spot:** a slot only ever seen busy learns that work as its floor, and then the
   4 KB/s cap is its only protection — measured streaming is 9,342 B/s, about 2.3× the cap,
   so work that averages under 4 KB/s from a slot's first windows can read as quiet. The
   logs show the floor beside every rate, which is how to spot it.
-- **The verdict.** Quiet — under the line in every window — for the offloader's 10 minutes,
-  and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
+- **The verdict.** Quiet — no window over its budget, a minute's worth of bytes at the line —
+  for the offloader's 10 minutes, and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
   first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
-  `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, 1 process(es), line 945 B/s from
-  floor 95, quiet 14m; the activity rule would freeze it`, with `cpu N ms/s` beside the
-  wake-ups. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
+  `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, cpu 6.1 ms/s, 1 process(es), line
+  945 B/s (56700 B a window) from floor 95, quiet 14m; the activity rule would freeze it` —
+  the bracket is the budget actually applied. These lines go to the pass's stdout only, not
+  to `offload.log`; infra's loop keeps every pass's stdout in its pass log, which is where
+  the days of reading come from. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
   its count with it — and are low, unmarked, where newer threads outweighed it.
 - **What is unknown counts as active**: a slot's first reading, a member that left since the
   last one, a process that is there but cannot be read (the slot is reported as unknown and
@@ -474,8 +480,8 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
 menu's working-set figure against the container's limit — or the host's total and available
 memory where there is no limit — the one-minute load, and the hostname, which names the dev
 container. Anything unreadable is a `?`. **RAM turns yellow at 70% and red at 85%; load at
-0.7 and 1.0 per logical core**, the cores this process may use under the kernel's affinity
-and the cgroup's CPU limit. The figures carry the meaning, colour is emphasis on top, and
+0.7 and 1.0 per logical core of the machine** (`/sys/devices/system/cpu/online`) — the
+machine's, because the load average counts the whole machine too. The figures carry the meaning, colour is emphasis on top, and
 `NO_COLOR` turns it off. Yellow here is the owner's choice for this line (2026-10-06); the
 menu's amber stays reserved for *waiting for you*.
 
