@@ -152,10 +152,18 @@ done
     // The path is recorded either way, as the hooks record it from SessionStart on; only
     // whether the file is there differs.
     let transcript_path = root.join("conv-1.jsonl");
-    if transcript {
-        std::fs::write(&transcript_path, PROMPTED).unwrap();
-    }
     let stop = now_ms() - 11 * 60 * 1000;
+    if transcript {
+        // Last written when its turn ended, as a real one is: a write later than the stop is
+        // activity to the offloader (issue #9).
+        std::fs::write(&transcript_path, PROMPTED).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript_path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_millis(stop))
+            .unwrap();
+    }
     let record = format!(
         r#"{{"slot":"claude-1","state":"live","pid":{claude},"proc_start":{claude_start},
             "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}",
@@ -245,6 +253,53 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
     assert!(log.contains("claude-1: closed"), "logged: {log}");
+}
+
+/// Issue #9: a slot whose claude finished its turn 11 minutes ago but is still running
+/// in-process background work — four council agents, in the report — reads as idle to every
+/// hook. Calibrated by `an_idle_detached_slot_is_stopped_and_marked_offloaded`: the same
+/// fixture without the work is stopped.
+#[test]
+fn a_slot_running_background_work_is_kept_whatever_its_last_stop_says() {
+    let s = idle_slot("background", 0o600, false);
+    let path = s.root.join("registry/claude-1.json");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let with_work = body.replacen(
+        "\"timers\":[]",
+        "\"timers\":[],\"background\":[\"subagent: council reviewer\",\"workflow: review\"]",
+        1,
+    );
+    assert_ne!(body, with_work, "calibration: the fixture took the field");
+    std::fs::write(&path, with_work).unwrap();
+    for args in [&["--dry-run"][..], &[][..]] {
+        let (ok, out) = offload(&s.root, args);
+        assert!(ok, "offload failed: {out}");
+        assert!(
+            out.contains("claude-1: kept — background work running: subagent: council reviewer"),
+            "got: {out}"
+        );
+    }
+    assert!(alive(s.claude, s.claude_start), "the work goes on");
+    assert_eq!(state_of(&s.root), "live");
+}
+
+/// The other half of issue #9: work that tells no hook but writes — a subagent's transcript
+/// under the conversation's `subagents/`, or a turn a fired wake-up started — restarts the
+/// idle clock.
+#[test]
+fn a_subagent_writing_its_transcript_keeps_the_slot() {
+    let s = idle_slot("subagent-write", 0o600, false);
+    let agents = s.root.join("conv-1/subagents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("agent-a1.jsonl"), "{}\n").unwrap();
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "offload failed: {out}");
+    assert!(
+        out.contains("claude-1: kept — idle, offloadable in"),
+        "got: {out}"
+    );
+    assert!(alive(s.claude, s.claude_start));
+    assert_eq!(state_of(&s.root), "live");
 }
 
 #[test]

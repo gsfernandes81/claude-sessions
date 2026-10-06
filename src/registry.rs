@@ -113,6 +113,13 @@ pub struct SlotRecord {
     /// can fire mid-turn, and nothing in the vendor docs says otherwise.
     pub ready_ms: Option<Millis>,
     pub timers: Vec<Timer>,
+    /// The background work Claude Code said was running at the slot's last `Stop` — one
+    /// `type: description` per task (issue #9). In-process work — a background subagent, a
+    /// Workflow run, a teammate, a cloud session — fires none of the hooks installed, so this
+    /// is the only way the slot hears of it; while it is not empty the slot is never
+    /// offloaded. The next `Stop` replaces it, and a task finishing wakes claude for a turn
+    /// that ends in one.
+    pub background: Vec<String>,
     /// False for a session this tool did not start — a `zmx attach work claude` somebody
     /// typed. Listed, marked, and never assumed to behave like one of ours.
     pub registered: bool,
@@ -143,6 +150,7 @@ impl SlotRecord {
             last_stop_ms: None,
             ready_ms: None,
             timers: Vec::new(),
+            background: Vec::new(),
             registered: true,
             updated_ms: now,
             last_event_ms: BTreeMap::new(),
@@ -245,6 +253,12 @@ impl SlotRecord {
                     .collect(),
             ),
         );
+        if !self.background.is_empty() {
+            o.set(
+                "background",
+                Value::Arr(self.background.iter().map(Value::string).collect()),
+            );
+        }
         let mut ev = Value::obj();
         for (k, at) in &self.last_event_ms {
             ev.set(k, Value::num(*at as f64));
@@ -310,6 +324,16 @@ impl SlotRecord {
             last_stop_ms: v.get("last_stop_ms").and_then(Value::as_u64),
             ready_ms: v.get("ready_ms").and_then(Value::as_u64),
             timers,
+            background: v
+                .get("background")
+                .and_then(Value::as_arr)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,

@@ -80,6 +80,28 @@ impl Event {
     pub fn tool_response(&self) -> Option<&Value> {
         self.0.get("tool_response")
     }
+    /// `Stop`: the background work still running or pending — `background_tasks`, Claude
+    /// Code's own task registry filtered to what is backgrounded and not finished (read in the
+    /// 2.1.291 binary). One `type: description` per task; `type` arrives already in words
+    /// (`subagent`, `workflow`, `shell`, `monitor`, `teammate`, `cloud session`, …). Absent on a
+    /// version that does not send it, which reads as none: no evidence either way.
+    pub fn background_tasks(&self) -> Vec<String> {
+        let Some(tasks) = self.0.get("background_tasks").and_then(Value::as_arr) else {
+            return Vec::new();
+        };
+        tasks
+            .iter()
+            .map(|t| {
+                let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
+                match t.get("description").and_then(Value::as_str) {
+                    Some(d) if !d.trim().is_empty() => {
+                        format!("{kind}: {}", one_line(d).unwrap_or_default())
+                    }
+                    _ => kind.to_string(),
+                }
+            })
+            .collect()
+    }
     /// Present on subagents only, which is a cheaper nested test than the `/proc` walk — but
     /// not a complete one: a `claude -p` from a Bash call carries no such field.
     pub fn has_agent_id(&self) -> bool {
@@ -119,9 +141,10 @@ pub fn apply(
 ) -> Outcome {
     rec.last_event_ms.insert(ev.name().to_string(), now);
 
-    // A nested claude is work, not a new identity. Keeping the slot's activity fresh is the
-    // whole point: a subagent grinding away for twenty minutes must not look idle to the
-    // offloader.
+    // A nested claude is work, not a new identity, and its events keep the slot's activity
+    // fresh. Only the events it fires, though: with the hooks installed, an in-process
+    // background subagent fires none between the parent's `Stop`s, which is why `Stop` records
+    // `background` and the offloader also counts transcript writes (issue #9).
     if binding == Binding::Nested {
         rec.last_activity_ms = now;
         rec.updated_ms = now;
@@ -164,6 +187,12 @@ pub fn apply(
                 rec.title = Some(t.to_string());
             }
             if pid.is_some() {
+                // A different process cannot be running the old one's background work: a
+                // list recorded before a crash or an offload would otherwise hold the resumed
+                // slot until its first `Stop`.
+                if pid != rec.pid || proc_start != rec.proc_start {
+                    rec.background.clear();
+                }
                 rec.pid = pid;
                 rec.proc_start = proc_start;
             }
@@ -202,6 +231,10 @@ pub fn apply(
             rec.busy = false;
             rec.last_activity_ms = now;
             rec.last_stop_ms = Some(now);
+            // The turn is over but its background work may not be (issue #9). Replaced, not
+            // merged: each `Stop` lists everything still running, and a task finishing wakes
+            // claude for a turn that ends in another `Stop`.
+            rec.background = ev.background_tasks();
             Outcome::Changed
         }
         "Notification" => match ev.notification_type() {
@@ -379,6 +412,88 @@ mod tests {
     }
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
         apply(rec, e, now, Binding::Own, Some(100), Some(7))
+    }
+
+    // ── background work (issue #9) ──────────────────────────────────────────
+
+    /// A `Stop` as 2.1.291 sends it with two background tasks: its `background_tasks` is the
+    /// task registry, filtered to what is backgrounded and running or pending.
+    const STOP_WITH_WORK: &str = r#"{"hook_event_name":"Stop","stop_hook_active":false,
+        "background_tasks":[
+          {"id":"a1","type":"subagent","status":"running","description":"council reviewer",
+           "agent_type":"general-purpose"},
+          {"id":"w1","type":"workflow","status":"pending","description":"review\nchanges","name":"review"}],
+        "session_crons":[]}"#;
+
+    #[test]
+    fn a_stop_records_the_background_work_it_leaves_running_and_the_next_replaces_it() {
+        let mut rec = slot();
+        own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
+        assert_eq!(
+            rec.background,
+            ["subagent: council reviewer", "workflow: review changes"]
+        );
+        assert!(!rec.busy, "the turn is over");
+        // The task finishes; claude wakes for its notification, and that turn's Stop lists
+        // nothing.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
+            3_000,
+        );
+        assert!(rec.background.is_empty());
+        // A version that does not send the field is no evidence of work.
+        own(&mut rec, &ev(STOP_WITH_WORK), 4_000);
+        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 5_000);
+        assert!(rec.background.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_finishing_does_not_touch_the_list_and_a_new_process_clears_it() {
+        let mut rec = slot();
+        own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
+        // A background subagent's own end: nested by its agent_id, it is activity only.
+        apply(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[]}"#),
+            3_000,
+            Binding::Nested,
+            None,
+            None,
+        );
+        assert_eq!(
+            rec.background.len(),
+            2,
+            "only the parent's Stop speaks for the slot"
+        );
+        // The same process opening another conversation keeps it: the work may go on.
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
+            4_000,
+        );
+        assert_eq!(rec.background.len(), 2);
+        // A different process — a resume after an offload or a crash — cannot be running it.
+        apply(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SessionStart","source":"resume","session_id":"second"}"#),
+            5_000,
+            Binding::Own,
+            Some(200),
+            Some(9),
+        );
+        assert!(rec.background.is_empty());
+    }
+
+    #[test]
+    fn the_background_list_survives_the_registry() {
+        let mut rec = slot();
+        own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
+        let back = SlotRecord::from_json(&rec.to_json(), "x").unwrap();
+        assert_eq!(back.background, rec.background);
+        // An older record has none.
+        let old = SlotRecord::from_json(&slot().to_json(), "x").unwrap();
+        assert!(old.background.is_empty());
     }
 
     // ── /clear and resume: the two ends that are not ends ────────────────────

@@ -145,7 +145,7 @@ terminal.
 |---|---|
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
-| `Stop` | `last_activity = now`, idle since now |
+| `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
 | `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
@@ -164,8 +164,40 @@ Three details that cost something if missed, read from the vendor hook documenta
 ## The offloader
 
 Offloadable when: detached · `Stop`, or a start at the prompt, is the latest event · no
-`needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · no
-non-`claude` descendants · idle past the threshold.
+`needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · **no
+background work at the last `Stop`** · no non-`claude` descendants · idle past the threshold,
+counted from the later of that event and **the last write to the conversation's transcript or
+any of its subagents'**.
+
+**In-process background work fires no hook the slot hears** (issue #9, found by infra's
+reviewers and reproduced on v0.4.0). A background subagent, a Workflow run, a teammate or a
+cloud session runs inside claude's own process, so there is no descendant to see, and after the
+parent's `Stop` nothing moved the record: ten minutes later a live pass would have killed four
+working agents. Two things close it, and neither needs a new hook:
+
+- **`Stop` says what is still running.** Its payload carries `background_tasks` — Claude Code's
+  task registry filtered to backgrounded work that is running or pending, each with a `type`
+  in words (`subagent`, `workflow`, `shell`, `monitor`, `teammate`, `cloud session`, …) and a
+  description. Read in the 2.1.291 binary and then seen on the wire: a turn that left
+  `sleep 45` running in the background sent `{"type":"shell","status":"running",
+  "description":"Sleep for 45 seconds",…}`, and a quiet turn sent `[]`. Recorded as
+  `background`, it keeps the slot for as long as it is not empty. A task finishing wakes claude
+  to handle its notification, and that turn ends in a `Stop` with the list as it now is — so
+  the hold releases itself, and the ten minutes start from that `Stop`. Only the parent's `Stop`
+  speaks for the slot; a subagent's `SubagentStop` is activity, nothing more. A `SessionStart`
+  from a different process clears the list, since a new process cannot be running the old one's
+  work.
+- **Writes are activity.** A turn writes its transcript as it goes, and a background subagent
+  writes its own under `<conversation>/subagents/` (Workflow runs a level or two deeper). The
+  offloader takes the newest of those modification times as one more "last thing that
+  happened". That covers turns no hook announces — one started by a fired `ScheduleWakeup` or by
+  a finished task's notification may never fire `UserPromptSubmit` — and a subagent that is
+  working between the parent's `Stop`s. It errs one way only: a write for some other reason
+  delays an offload, never causes one.
+
+**Still open:** an Esc interrupt is said not to fire `Stop`, which leaves `busy` set and the
+slot kept until its next turn ends — the safe direction, at the cost of memory; and a turn
+started by something that neither writes nor hooks has not been found and would not be seen.
 
 **The threshold is 10 minutes** after `Stop` (owner, 2026-10-01). The hour floor the old
 shell script used existed only because self-scheduled wake-ups were invisible; the timer

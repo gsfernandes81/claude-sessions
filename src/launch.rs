@@ -1511,9 +1511,16 @@ exit 1"#,
         let (pid, start) = f.process();
         let mut r = live(slot, pid, start);
         let transcript = Path::new(&f.work()).join(format!("conv-of-{slot}.jsonl"));
-        std::fs::write(&transcript, PROMPTED).unwrap();
-        r.transcript_path = Some(transcript.display().to_string());
         let stop = clock::now() - 11 * 60 * 1000;
+        std::fs::write(&transcript, PROMPTED).unwrap();
+        // Last written when its turn ended: a later write is activity (issue #9).
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(stop))
+            .unwrap();
+        r.transcript_path = Some(transcript.display().to_string());
         r.last_stop_ms = Some(stop);
         r.last_activity_ms = stop;
         registry::store(&r).unwrap();

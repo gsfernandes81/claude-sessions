@@ -68,6 +68,11 @@ pub struct Seen {
     /// The record's current conversation has a transcript on disk
     /// ([`SlotRecord::has_conversation`]). Without one, a stop is a close.
     pub conversation: bool,
+    /// The newest write to the conversation's transcript or to any of its subagents'
+    /// (`<conversation>/subagents/…`), as file modification time. A turn writes as it goes,
+    /// whatever started it, and a background subagent writes its own transcript, so a write
+    /// later than the last `Stop` is activity no hook reported (issue #9).
+    pub last_write_ms: Option<Millis>,
 }
 
 /// Why a slot was kept. Every variant is a reason to do nothing.
@@ -81,6 +86,7 @@ pub enum Hold {
     PendingTimer,
     NotStopped,
     TooRecent { left_ms: Millis },
+    Background(Vec<String>),
     Attached,
     NoSession,
     ProcUnreadable,
@@ -102,6 +108,9 @@ impl fmt::Display for Hold {
             Hold::NotStopped => write!(f, "something happened since it last went idle"),
             Hold::TooRecent { left_ms } => {
                 write!(f, "idle, offloadable in {}s", left_ms.div_ceil(1000))
+            }
+            Hold::Background(tasks) => {
+                write!(f, "background work running: {}", tasks.join("; "))
             }
             Hold::Attached => write!(f, "attached"),
             Hold::NoSession => write!(
@@ -182,7 +191,16 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
         Some(stop) if stop >= rec.last_activity_ms && !rec.busy => stop,
         _ => return Err(Hold::NotStopped),
     };
-    let idle = now.saturating_sub(stop);
+    // The turn ended, but what it started in the background has not (issue #9): a background
+    // subagent, a Workflow run, a cloud session. None of them fires a hook the slot hears.
+    if !rec.background.is_empty() {
+        return Err(Hold::Background(rec.background.clone()));
+    }
+    // Idle from the last thing written, not only the last thing a hook said: a turn started by
+    // a fired wake-up or a finished task's notification may announce itself to no hook, and a
+    // subagent's transcript moves while the parent's record sits still.
+    let since = stop.max(seen.last_write_ms.unwrap_or(0));
+    let idle = now.saturating_sub(since);
     if idle < IDLE_AFTER_STOP_MS {
         return Err(Hold::TooRecent {
             left_ms: IDLE_AFTER_STOP_MS - idle,
@@ -221,7 +239,40 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
         table_readable: table.is_some(),
         foreign_descendant: table.and_then(|t| foreign_descendant(t, pid)),
         conversation: rec.has_conversation(),
+        last_write_ms: rec.conversation_path().and_then(|p| last_write(&p)),
     }
+}
+
+/// The newest modification time of a conversation's transcript and everything under its
+/// `subagents/` directory — subagent transcripts, and Workflow runs a level or two deeper.
+/// Bounded in depth: the layout is Claude Code's, and an unexpected tree must cost a few
+/// `stat`s, not a walk of the disk.
+pub fn last_write(transcript: &std::path::Path) -> Option<Millis> {
+    fn mtime(p: &std::path::Path) -> Option<Millis> {
+        let t = std::fs::metadata(p).ok()?.modified().ok()?;
+        Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as Millis)
+    }
+    fn walk(dir: &std::path::Path, depth: u32, newest: &mut Option<Millis>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if let Some(t) = mtime(&p) {
+                *newest = (*newest).max(Some(t));
+            }
+            if depth > 0 && e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(&p, depth - 1, newest);
+            }
+        }
+    }
+    let mut newest = mtime(transcript);
+    walk(
+        &transcript.with_extension("").join("subagents"),
+        3,
+        &mut newest,
+    );
+    newest
 }
 
 /// The first descendant of `pid` that is not Claude Code's own, described for a log line.
@@ -697,8 +748,102 @@ mod tests {
             table_readable: true,
             foreign_descendant: None,
             conversation: true,
+            last_write_ms: None,
         };
         (r, seen)
+    }
+
+    #[test]
+    fn background_work_keeps_it_however_long_the_parent_has_been_stopped() {
+        // Issue #9. The calibrating case is the idle slot above, which is offloaded.
+        let (mut rec, seen) = idle();
+        rec.background = vec!["subagent: council reviewer".into()];
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::Background(vec!["subagent: council reviewer".into()]))
+        );
+        assert_eq!(
+            decide(&rec, NOW + 60 * 60 * 1000, &seen),
+            Err(Hold::Background(vec!["subagent: council reviewer".into()])),
+            "an hour later, still kept"
+        );
+        rec.background.clear();
+        assert!(
+            decide(&rec, NOW, &seen).is_ok(),
+            "and released once it is gone"
+        );
+    }
+
+    #[test]
+    fn a_write_after_the_stop_restarts_the_idle_clock() {
+        // A turn started by a fired wake-up or a notification, or a background subagent's own
+        // transcript, writes without telling any hook (issue #9).
+        let (rec, mut seen) = idle();
+        seen.last_write_ms = Some(NOW - 60_000);
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::TooRecent {
+                left_ms: IDLE_AFTER_STOP_MS - 60_000
+            })
+        );
+        // Calibration: a write from before the stop changes nothing.
+        seen.last_write_ms = rec.last_stop_ms.map(|s| s - 1);
+        assert_eq!(decide(&rec, NOW, &seen), Ok(IDLE_AFTER_STOP_MS + 1));
+    }
+
+    #[test]
+    fn the_newest_write_is_found_in_the_transcript_or_any_subagent_under_it() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = std::env::temp_dir().join(format!("cs-lastwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let deep = root.join("conv/subagents/workflows/run-1");
+        std::fs::create_dir_all(&deep).unwrap();
+        let at = |ms: u64| UNIX_EPOCH + Duration::from_millis(ms);
+        let touch = |p: &std::path::Path, ms: u64| {
+            std::fs::write(p, "{}\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(at(ms))
+                .unwrap();
+        };
+        let transcript = root.join("conv.jsonl");
+        touch(&transcript, 1_000_000);
+        // Directories carry the time they were made; pin them old so only files decide.
+        let pin = |p: &std::path::Path| {
+            std::fs::File::open(p).unwrap().set_modified(at(1)).unwrap();
+        };
+        assert_eq!(
+            {
+                for d in [
+                    deep.as_path(),
+                    &root.join("conv/subagents/workflows"),
+                    &root.join("conv/subagents"),
+                ] {
+                    pin(d);
+                }
+                last_write(&transcript)
+            },
+            Some(1_000_000),
+            "calibration: the transcript alone"
+        );
+        touch(&root.join("conv/subagents/agent-a1.jsonl"), 2_000_000);
+        touch(&deep.join("agent-w1.jsonl"), 3_000_000);
+        for d in [
+            deep.as_path(),
+            &root.join("conv/subagents/workflows"),
+            &root.join("conv/subagents"),
+        ] {
+            pin(d);
+        }
+        assert_eq!(
+            last_write(&transcript),
+            Some(3_000_000),
+            "a workflow's agent, two levels down"
+        );
+        assert_eq!(last_write(&root.join("none.jsonl")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
