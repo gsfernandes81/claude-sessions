@@ -49,7 +49,8 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   under — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for
   unread and dim for attached are emphasis on top, the owner's choice over glyph marks
   (2026-10-03). Amber means *this one is waiting for you* — the Needs-you heading — and is
-  used for nothing else.
+  used for nothing else in the menu. (The status line's yellow and red for high RAM and load
+  are the owner's, 2026-10-06, outside the menu.)
 - **Never resume a conversation that is already running.** Two processes on one conversation
   fork it. Checked under the slot's lock, not before taking it.
 - **Never start, stop or offload anything on the fleet on your own initiative.** Bring-up is

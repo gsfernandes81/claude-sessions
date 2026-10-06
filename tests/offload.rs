@@ -286,6 +286,11 @@ fn every_pass_measures_and_a_short_window_waits_for_the_next() {
         out.contains("too short; the next pass counts it"),
         "got: {out}"
     );
+    assert_eq!(
+        std::fs::read_to_string(s.root.join("registry/activity.state")).unwrap(),
+        state,
+        "the short window left the first reading untouched for the next pass"
+    );
     assert!(
         !out.lines()
             .any(|l| l.starts_with("activity: kept") || l.starts_with("activity: would")),

@@ -17,7 +17,8 @@
 //! never reports a corpse as attached. It answers each daemon within a second (a stopped one
 //! reads `err=Timeout`), and the whole call is bounded here too: the menu is the door.
 //!
-//! **Every call strips `ZMX_SESSION` and `ZMX_SESSION_PREFIX`.** zmx sets the first inside
+//! **Every call strips `ZMX_SESSION` and `ZMX_SESSION_PREFIX`** (and `CLAUDE_SESSIONS_SLOT`,
+//! see [`command`]). zmx sets the first inside
 //! every session, and `zmx attach` from inside one *switches the calling terminal* to the
 //! other session rather than nesting. A claude-sessions run from a slot's own shell — the
 //! menu's `s`, or a tool call — must not move the terminal somebody is using.
@@ -56,11 +57,15 @@ pub fn program() -> String {
         .unwrap_or_else(|| "zmx".to_string())
 }
 
-/// A `zmx` command with the two variables stripped (module note).
+/// A `zmx` command with the two variables stripped (module note), and the caller's slot
+/// name too: a session started from inside a slot would otherwise have its daemon carry that
+/// slot's name, and be measured as part of it (`activity.rs`). The new slot's own claude gets
+/// its name from the launch line.
 pub fn command(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_remove("ZMX_SESSION")
-        .env_remove("ZMX_SESSION_PREFIX");
+        .env_remove("ZMX_SESSION_PREFIX")
+        .env_remove(crate::activity::VAR);
     cmd
 }
 

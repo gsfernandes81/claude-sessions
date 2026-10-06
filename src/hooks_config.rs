@@ -70,6 +70,9 @@ pub fn settings(exe: &str) -> Value {
         "command",
         Value::string(format!("{} statusline", shell_quote(exe))),
     );
+    // Its RAM and load move without any Claude Code event, so it is re-run on a timer too
+    // (seconds); Claude Code redraws only when the text changes.
+    status.set("refreshInterval", Value::num(60));
     doc.set("statusLine", status);
     doc
 }
@@ -224,6 +227,10 @@ mod tests {
         assert_eq!(
             status.get("command").and_then(Value::as_str),
             Some("/usr/local/bin/claude-sessions statusline")
+        );
+        assert_eq!(
+            status.get("refreshInterval").and_then(Value::as_u64),
+            Some(60)
         );
     }
 }

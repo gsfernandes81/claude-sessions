@@ -381,13 +381,17 @@ in place of killing. 0.4.5 is the first step: every pass, live or dry, says what
 would do beside what the offloader did, and nothing else changes. The freeze comes after the
 fleet's own numbers have been read. `src/activity.rs` has the details and the tests.
 
-- **Bytes, not CPU.** A model turn is a stream from the API and claude writes its transcript
-  as it goes, so work is bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`,
-  the same count on a Pi 4 as on x86. CPU time is not device-invariant: the same work costs a
-  slow CPU more of it. Wake-ups (voluntary context switches, summed over threads) are logged
-  beside the bytes as a second opinion. Measured on 2.1.291 with agent view off, here, under
-  a real `offload --dry-run`: idle 95–139 B/s and 21–25 wakeups/s; streaming a reply
-  9,342 B/s and 47 wakeups/s. Bytes part idle from work by about 70×, wake-ups by 2×.
+- **Bytes through `read`/`write`, which are not the network.** `rchar + wchar` in
+  `/proc/<pid>/io` counts the terminal claude repaints (zmx reads it whether or not anyone is
+  attached), the transcripts it writes, and pipes to its tools — the same count on a Pi 4 as
+  on x86, where CPU time is not. **It does not count sockets**: `send`/`recv`, which claude's
+  native build uses for the API, bypass it (checked: a megabyte through a socketpair moved
+  `rchar` by under a hundred bytes). So a model turn shows as the screen it redraws and the
+  transcript it appends, not as the stream itself. Measured on 2.1.291 with agent view off,
+  here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
+  reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. Wake-ups (voluntary
+  context switches over live threads) and CPU time (`utime + stime` with reaped children's)
+  are logged beside the bytes for the data and judged by nothing; CPU scales with the device.
 - **Which processes: the environment.** With agent view off, claude is one process: an
   in-process subagent shows as claude's own bytes, and its tools as claude's children
   (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
@@ -397,10 +401,13 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   The recorded claude counts only while it is the process recorded, by start time. Not
   `claude-sessions` itself — a hook, the status line, or a pass run from a slot's shell
   carries the variable and descends from claude, and would count its own reading of `/proc`.
-  A reaped child's whole-lifetime counters are folded into its parent's by the kernel, so a
-  tool that ran and exited between passes is still counted — and one that lived across a pass
-  is counted twice in the window it exits, as is a reaped hook: both err towards active.
-  Agent view, which runs a service outside any slot, stays off.
+  Processes found by the environment count only if younger than the recorded claude: an
+  older one is an earlier claude's orphan in a slot name since reused. `zmx` is run without
+  the caller's slot variable, so a session started from inside a slot does not have its
+  daemon counted as that slot's. A member gone since the last reading makes the window
+  active: what it did since went to whoever reaped it — a member's counters (counted twice
+  then, erring active), or init's for an orphan. Agent view, which runs a service outside any
+  slot, stays off.
 - **The line: each slot's own floor.** A slot's floor is its quietest window in the last
   24 hours, hour by hour; a window counts as active above ten times the floor learned
   *before* it, held between 512 B/s and 4 KB/s, and a slot with no floor yet is held to
@@ -414,40 +421,53 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
   first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
   `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, 1 process(es), line 945 B/s from
-  floor 95, quiet 14m; the activity rule would freeze it`. Wake-ups read `?` in a window
-  where a thread exited, since its count leaves the sum.
-- **What is unknown counts as active**: a slot's first reading, a process not seen last time
-  (its whole history falls in the window), a process that is there but cannot be read (the
-  slot is reported as unknown and kept), and a window as long as the quiet period, which
-  cannot say when in it the bytes fell. A window under a minute — a pass run by hand right
-  after the timer's — is left for the next, with a line saying so.
+  floor 95, quiet 14m; the activity rule would freeze it`, with `cpu N ms/s` beside the
+  wake-ups. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
+  its count with it — and are low, unmarked, where newer threads outweighed it.
+- **What is unknown counts as active**: a slot's first reading, a member that left since the
+  last one, a process that is there but cannot be read (the slot is reported as unknown and
+  kept), and a window as long as the quiet period, which cannot say when in it the bytes
+  fell. A process not seen last time is counted whole — all it ever did falls in the window
+  — which errs towards active without forcing it. A window under a minute — a pass run by
+  hand right after the timer's — is left for the next, with a line saying so.
 - **State** is `activity.state` beside the registry — not `.json`, which the registry reads
   as a slot — written whole and renamed into place. Two passes at once may each write it; the
-  later wins and the other's window is measured again.
+  later wins and the other's window is measured again. A pass that cannot save it removes
+  it, so the next one really starts over.
 - **What it cannot see**: a claude waiting in process, silently. **The common case is its
   own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
   the reason the offloader never stops a slot with one pending (owner, 2026-10-01). The
   activity verdict has no input for timers, so such a slot will read *would freeze* beside
   the offloader's *kept — a timer is pending*; a freeze would stop the timer firing, and
   thawing on attach is no substitute for a wake-up nobody is there to see. The freeze
-  decision has to keep that rule. Rarer: a tool blocked on a remote that sends nothing,
-  which a freeze pauses and an attach resumes.
+  decision has to keep that rule. **Then claude's own network**: a cloud session, a
+  websocket monitor, an HTTP MCP server, a wait on the API that redraws nothing — all
+  sockets, none in the bytes; the freeze decision must keep the background-task hold for
+  these, or find a signal that sees them. And a job that double-forked away and ran wholly
+  between two passes, reaped by init: nobody's counters ever hold it. Rarer: a tool blocked
+  on a remote that sends nothing, which a freeze pauses and an attach resumes.
 
 **Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
 2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.
 
 ## The status line
 
-`claude-sessions statusline` prints `RAM: 1.0G / 3.0G used, Load: 2.3, or3-dev` (owner,
-2026-10-06) for Claude Code's status line: the menu's working-set figure against the
-container's limit — or the host's total and available memory where there is no limit — the
-one-minute load, and the hostname, which names the dev container. Anything unreadable is a
-`?`. `hooks-config` installs it as `statusLine` in the same drop-in as the hooks; a managed
-setting outranks a user's own, so it replaces any status line set per user. It reads a few
-small files and nothing else, because Claude Code runs it often. The session JSON Claude
-Code writes on its stdin is drained, but for at most a moment's quiet, so a pipe whose writer
-stays open cannot hold it. The owner's example is 41 columns: on a 40-column phone Claude
-Code truncates it from the right, losing the hostname first.
+`claude-sessions statusline` prints `RAM: 1.0G / 3.0G, Load: 2.3, or3-dev` (owner,
+2026-10-06; 36 columns, inside the 40 a phone shows) for Claude Code's status line: the
+menu's working-set figure against the container's limit — or the host's total and available
+memory where there is no limit — the one-minute load, and the hostname, which names the dev
+container. Anything unreadable is a `?`. **RAM turns yellow at 70% and red at 85%; load at
+0.7 and 1.0 per logical core**, the cores this process may use under the kernel's affinity
+and the cgroup's CPU limit. The figures carry the meaning, colour is emphasis on top, and
+`NO_COLOR` turns it off. Yellow here is the owner's choice for this line (2026-10-06); the
+menu's amber stays reserved for *waiting for you*.
+
+`hooks-config` installs it as `statusLine` in the same drop-in as the hooks, with
+`refreshInterval: 60` — RAM and load move without any Claude Code event, and otherwise it
+would re-run only on one; Claude Code redraws only when the text changes. A managed setting
+outranks a user's own, so it replaces any status line set per user. It reads a few small
+files and nothing else. The session JSON Claude Code writes on its stdin is drained, but for
+at most a moment's quiet, so a pipe whose writer stays open cannot hold it.
 
 ## The menu
 
