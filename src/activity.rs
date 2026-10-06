@@ -183,14 +183,20 @@ pub fn step(
     // minute, so this covers the average too. A window as long as the quiet period cannot say
     // when in it the bytes fell, and one a member left is not known whole: both active.
     let budget = budget(line);
-    let last_active = if bytes as f64 > budget || window_ms >= QUIET_FOR_MS || vanished {
+    let unknown = window_ms >= QUIET_FOR_MS || vanished;
+    let last_active = if bytes as f64 > budget || unknown {
         now
     } else {
         prev.last_active
     };
-    match minima.last_mut() {
-        Some((h, m)) if *h == hour => *m = m.min(rate),
-        _ => minima.push((hour, rate)),
+    // Only a window known whole teaches the floor: one spanning an offload or a gap, or one a
+    // member left, holds a rate that never happened — a resumed claude's lifetime bytes over
+    // the whole offload would read as a quiet the slot never had.
+    if !unknown {
+        match minima.last_mut() {
+            Some((h, m)) if *h == hour => *m = m.min(rate),
+            _ => minima.push((hour, rate)),
+        }
     }
     let state = SlotState {
         at: now,
@@ -263,13 +269,14 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     let mut lines = Vec::new();
     for rec in records {
         let stored = prev.get(&rec.slot);
-        // The floor belongs to the slot's name for as long as it has a record: an offloaded
-        // slot resumes under the same name, and must not relearn its floor from its first,
-        // busy windows. Its old processes are gone by then, so that window reads active.
+        // The state belongs to the slot's name for as long as it has a record, and is carried
+        // as it was unless a reading below replaces it: an offloaded slot, a crashed one whose
+        // processes are gone, a pass too soon after the last. A resume under the same name
+        // must not relearn its floor from its first, busy windows.
+        if let Some(o) = stored {
+            next.insert(rec.slot.clone(), o.clone());
+        }
         if rec.state != State::Live {
-            if let Some(o) = stored {
-                next.insert(rec.slot.clone(), o.clone());
-            }
             continue;
         }
         // A reading from the future — the clock stepped back, or a pass that stored while this
@@ -281,7 +288,6 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
                 rec.slot,
                 now.saturating_sub(o.at) / 1000
             ));
-            next.insert(rec.slot.clone(), o.clone());
             continue;
         }
         let root = rec.pid.zip(rec.proc_start);
@@ -687,6 +693,25 @@ mod tests {
         assert_eq!(m.quiet_ms, 0, "{m:?}");
         let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], false);
         assert_eq!(m.quiet_ms, 180_000, "calibration: {m:?}");
+    }
+
+    #[test]
+    fn a_window_across_an_offload_does_not_teach_the_floor() {
+        // The slot's state from before an offload, ten hours later, with a resumed claude: every
+        // member is new, so the window is active — and its rate, a new claude's bytes over ten
+        // hours, never happened, so the floor keeps what it had. Calibration: a whole window of
+        // the same claude does teach it.
+        let s = SlotState {
+            at: T0,
+            procs: vec![r(1, 7, 0)],
+            last_active: T0,
+            minima: vec![(T0 / HOUR_MS, 250.0)],
+        };
+        let (n, m) = step(Some(&s), T0 + 10 * HOUR_MS, vec![r(9, 99, 360_000)], false);
+        assert_eq!(m.quiet_ms, 0);
+        assert_eq!(n.minima, vec![(T0 / HOUR_MS, 250.0)], "{:?}", n.minima);
+        let (n, _) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], false);
+        assert_eq!(n.minima, vec![(T0 / HOUR_MS, 100.0)]);
     }
 
     #[test]

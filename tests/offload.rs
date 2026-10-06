@@ -366,6 +366,22 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
     );
 }
 
+/// A live record whose claude died without a word — an OOM kill — has no processes to read;
+/// its floor is carried until the slot is resumed, not dropped.
+#[test]
+fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
+    let s = idle_slot("activity-dead", 0o600, false);
+    measured_before(&s, -180_000);
+    let path = s.root.join("registry/claude-1.json");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let dead = body.replacen(&format!("\"pid\":{}", s.claude), "\"pid\":4000000", 1);
+    assert_ne!(body, dead, "calibration: the fixture took the pid");
+    std::fs::write(&path, dead).unwrap();
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(floor_kept(&s), "{out}");
+}
+
 /// The floor belongs to the slot's name while it has a record: a pass that sees the slot
 /// offloaded keeps it, so a resume does not relearn it from busy windows. Calibration: the
 /// same pass with the record gone drops it.
