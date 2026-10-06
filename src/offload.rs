@@ -162,8 +162,8 @@ pub fn judge(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Verdict, Hold
 /// Whether that stop is an offload or a close is [`judge`]'s answer, not this one's.
 ///
 /// Stoppable when: live · its process alive · resumable · nothing waiting for you · no
-/// pending timer, whoever set it · a `Stop`, or a start at the prompt, is the latest thing that
-/// happened · idle past the threshold · detached · nothing but Claude Code under it.
+/// pending timer, whoever set it · a `Stop`, or a start at the prompt, is the latest activity
+/// (`SubagentStart`/`SubagentStop` are not activity) · idle past the threshold · detached · nothing but Claude Code under it.
 pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold> {
     // `Offloading` is a pass that died between deciding and finishing. Deciding again is
     // right: if the slot is still idle the job is finished, and if a SessionStart has since
@@ -192,7 +192,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     }
     // `Stop` and a start at the prompt each set `last_activity_ms` to their own time, and
     // everything that happens afterwards — a prompt, a nested claude's events, a compaction —
-    // moves `last_activity_ms` past them. So "the latest thing that happened left it idle" is
+    // moves `last_activity_ms` past them. So "the latest activity left it idle" is
     // exactly this, with `busy` as belt and braces. A resumed slot the owner looked at and
     // left is as idle as one that finished a turn.
     let stop = match (esc, rec.last_stop_ms.max(rec.ready_ms)) {
@@ -933,11 +933,16 @@ mod tests {
                 r#"{"hook_event_name":"Stop","background_tasks":[]}"#,
                 end + 1_000,
             );
-            seen.last_write_ms = Some(end + 1_000);
+            assert_eq!(
+                rec.esc_ended(seen.interrupted_at),
+                None,
+                "that turn is newer"
+            );
             assert!(decide(&rec, NOW, &seen).is_ok());
+            // Ten minutes after the Esc is under ten after that turn's Stop.
             assert!(
                 matches!(
-                    decide(&rec, end + 60_000, &seen),
+                    decide(&rec, marker + IDLE_AFTER_STOP_MS + 1, &seen),
                     Err(Hold::TooRecent { .. })
                 ),
                 "idle from that turn, not from the Esc"

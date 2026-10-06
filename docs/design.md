@@ -167,7 +167,8 @@ Three details that cost something if missed, read from the vendor hook documenta
 
 ## The offloader
 
-Offloadable when: detached · `Stop`, or a start at the prompt, is the latest event · no
+Offloadable when: detached · `Stop`, or a start at the prompt, is the latest activity
+(`SubagentStart`/`SubagentStop` are not activity) · no
 `needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · **no
 background work listed** (`Stop`'s list, kept between `Stop`s by `SubagentStart`/`SubagentStop`) · no non-`claude` descendants · idle past the threshold,
 counted from the later of that event and **the last write to the conversation's transcript or
@@ -194,8 +195,11 @@ working agents. Three things close it:
   and writing no transcript (read in the binary), so no later list would ever drop one, and the
   auto-dream fork's `SubagentStop` lists its own task as running. The cost is that one still
   running is invisible: a dream that outlasts the idle threshold can be stopped partway, and
-  Claude Code's lock and abort handling recover it. Claude Code has one more ambient kind, an
-  artifact's live-updates watch, but it is labelled `monitor` like any other and so is kept.
+  Claude Code's lock and abort handling recover it. **So is its watch on an artifact it
+  published** (owner, 2026-10-06), labelled `monitor` but told apart by its fixed description
+  `live updates for artifact …`: a listener, not work. An idle one is retired after 3.5 hours,
+  ambient again, so it would hold a slot for hours and then for good; and whoever wants the
+  replies to a comment is attached, which already keeps the slot.
 - **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
   to the list, and **`SubagentStop` takes its payload's `background_tasks` whole, as `Stop`
   does**: Claude Code builds both from the same task registry. This is what holds work started in a turn the owner ended with Esc (issue
@@ -209,7 +213,10 @@ working agents. Three things close it:
   never names a foreground agent (read in the binary: only backgrounded tasks pass its filter),
   and a foreground agent the Esc cut off sends no `SubagentStop` of its own (issue #11) — so
   it is listed from its `SubagentStart` until the next `SubagentStop` or `Stop` says otherwise:
-  the keep direction, and a turn still running holds the slot regardless. Both events come
+  the keep direction, and a turn still running holds the slot regardless. The other side of
+  the same rule: a foreground agent whose entry an earlier `SubagentStop` already replaced, then
+  sent to the background with no hook (Ctrl+B, or Claude Code's auto-background), then left by
+  an Esc, is held only by its writes until a later `SubagentStop` lists it — as in 0.4.3. Both events come
   from the slot's own claude, so they are bound by the `/proc` walk, not by their `agent_id`
   (which there names the agent, not the context the hook fired in); a nested `claude -p`'s
   agents stay activity only. **Neither event is activity**: they edit the list and nothing
@@ -292,7 +299,7 @@ Built 2026-10-01 in `src/offload.rs`. One pass per invocation, run from the box'
 `--dry-run` decides and reports without signalling. Where the rules above left a choice, this
 is the choice and why:
 
-- **"`Stop` is the latest event"** is the later of `last_stop_ms` and `ready_ms` being at or
+- **"`Stop` is the latest activity"** is the later of `last_stop_ms` and `ready_ms` being at or
   after `last_activity_ms`, and not `busy`. `ready_ms` is the last `SessionStart` that opened a
   conversation at its prompt — `startup`, `resume`, `clear` or `fork`, which the vendor docs
   describe as "you can type right away" — so a slot resumed or started and then left is

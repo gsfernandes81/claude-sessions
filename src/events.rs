@@ -99,10 +99,11 @@ impl Event {
             .iter()
             .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
-                if AMBIENT.contains(&kind) {
+                let desc = t.get("description").and_then(Value::as_str);
+                if AMBIENT.contains(&kind) || desc.is_some_and(|d| d.starts_with(ARTIFACT_WATCH)) {
                     return None;
                 }
-                Some(match t.get("description").and_then(Value::as_str) {
+                Some(match desc {
                     Some(d) if !d.trim().is_empty() => {
                         format!("{kind}: {}", one_line(d).unwrap_or_default())
                     }
@@ -128,9 +129,13 @@ impl Event {
 /// scan and the memory import. Each ends "ambient" — no notification, no turn, no transcript
 /// (read in the 2.1.291 binary) — so nothing would ever take one off the list again. The cost:
 /// one still running is invisible, so a dream that outlasts the idle threshold can be stopped
-/// partway, and Claude Code's own lock and abort handling recover it. Not every ambient task:
-/// an artifact's live-updates watch is labelled `monitor`, like the owner's own, and is kept.
+/// partway, and Claude Code's own lock and abort handling recover it.
 const AMBIENT: [&str; 3] = ["dream", "auto-mode scan", "memory import"];
+/// Claude Code's watch on an artifact it published, labelled `monitor` like the owner's own and
+/// told apart by its fixed description. A listener, not work (owner, 2026-10-06): an idle one
+/// is retired after hours, silently, and holding a slot for comments costs more than missing
+/// them — someone who wants the replies is attached, and an attached slot is never offloaded.
+const ARTIFACT_WATCH: &str = "live updates for artifact ";
 
 /// What `apply` did, so the caller knows whether to write and `doctor` can say why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,9 +536,19 @@ mod tests {
             Outcome::Ignored(_)
         ));
         assert!(rec.background.is_empty());
+        // Nor is its watch on an artifact it published, though the owner's own monitor is.
+        let watch = r#",{"id":"m1","type":"monitor","status":"running","description":"live updates for artifact abc (Fleet board)"}"#;
+        assert!(matches!(
+            own(&mut rec, &dream(watch), 2_500),
+            Outcome::Ignored(_)
+        ));
         let shell = r#",{"id":"b1","type":"shell","status":"running","description":"sleep 45"}"#;
-        own(&mut rec, &dream(shell), 3_000);
-        assert_eq!(rec.background, ["shell: sleep 45"]);
+        let mine = r#",{"id":"m2","type":"monitor","status":"running","description":"tail the build log"}"#;
+        own(&mut rec, &dream(&format!("{shell}{mine}")), 3_000);
+        assert_eq!(
+            rec.background,
+            ["shell: sleep 45", "monitor: tail the build log"]
+        );
     }
 
     #[test]
