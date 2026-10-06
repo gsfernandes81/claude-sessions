@@ -126,7 +126,10 @@ impl Event {
 
 /// Claude Code's own housekeeping, as `background_tasks` names it: auto-dream, the auto-mode
 /// scan and the memory import. Each ends "ambient" — no notification, no turn, no transcript
-/// (read in the 2.1.291 binary) — so nothing would ever take one off the list again.
+/// (read in the 2.1.291 binary) — so nothing would ever take one off the list again. The cost:
+/// one still running is invisible, so a dream that outlasts the idle threshold can be stopped
+/// partway, and Claude Code's own lock and abort handling recover it. Not every ambient task:
+/// an artifact's live-updates watch is labelled `monitor`, like the owner's own, and is kept.
 const AMBIENT: [&str; 3] = ["dream", "auto-mode scan", "memory import"];
 
 /// What `apply` did, so the caller knows whether to write and `doctor` can say why not.
@@ -472,10 +475,6 @@ mod tests {
           {"id":"w1","type":"workflow","status":"pending","description":"review\nchanges","name":"review"}],
         "session_crons":[]}"#;
 
-    fn whats(rec: &SlotRecord) -> Vec<&str> {
-        rec.background.iter().map(String::as_str).collect()
-    }
-
     #[test]
     fn subagent_events_edit_the_list_and_are_not_activity() {
         // The sequences themselves, through the offloader, are in `offload.rs`.
@@ -490,7 +489,7 @@ mod tests {
         );
         assert_eq!(own(&mut rec, &start, 3_000), Outcome::Changed);
         assert_eq!(
-            whats(&rec),
+            rec.background,
             ["subagent: general-purpose"],
             "no Stop needed to hear of it"
         );
@@ -503,7 +502,7 @@ mod tests {
             r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running","description":"look"}]}"#,
         );
         assert_eq!(own(&mut rec, &still, 4_000), Outcome::Changed);
-        assert_eq!(whats(&rec), ["subagent: look"]);
+        assert_eq!(rec.background, ["subagent: look"]);
         assert!(
             matches!(own(&mut rec, &still, 4_100), Outcome::Ignored(_)),
             "unchanged"
@@ -534,7 +533,7 @@ mod tests {
         assert!(rec.background.is_empty());
         let shell = r#",{"id":"b1","type":"shell","status":"running","description":"sleep 45"}"#;
         own(&mut rec, &dream(shell), 3_000);
-        assert_eq!(whats(&rec), ["shell: sleep 45"]);
+        assert_eq!(rec.background, ["shell: sleep 45"]);
     }
 
     #[test]
@@ -551,7 +550,7 @@ mod tests {
         let mut rec = slot();
         own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
         assert_eq!(
-            whats(&rec),
+            rec.background,
             ["subagent: council reviewer", "workflow: review changes"]
         );
         assert!(!rec.busy, "the turn is over");

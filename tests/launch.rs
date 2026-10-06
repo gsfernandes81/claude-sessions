@@ -220,5 +220,8 @@ fn the_same_line_without_exec_is_not_bound() {
         body.contains("\"SubagentStart\""),
         "the event was seen: {body}"
     );
-    assert!(!body.contains("a-e2e"), "and not listed: {body}");
+    assert!(
+        !body.contains("subagent: general-purpose"),
+        "and not listed: {body}"
+    );
 }

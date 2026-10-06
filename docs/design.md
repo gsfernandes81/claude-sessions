@@ -192,7 +192,10 @@ working agents. Three things close it:
   **Claude Code's own housekeeping is left out** — `dream` (auto-dream, which tidies its memory
   files after a turn), `auto-mode scan` and `memory import`: each ends "ambient", waking no turn
   and writing no transcript (read in the binary), so no later list would ever drop one, and the
-  auto-dream fork's `SubagentStop` lists its own task as running.
+  auto-dream fork's `SubagentStop` lists its own task as running. The cost is that one still
+  running is invisible: a dream that outlasts the idle threshold can be stopped partway, and
+  Claude Code's lock and abort handling recover it. Claude Code has one more ambient kind, an
+  artifact's live-updates watch, but it is labelled `monitor` like any other and so is kept.
 - **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
   to the list, and **`SubagentStop` takes its payload's `background_tasks` whole, as `Stop`
   does**: Claude Code builds both from the same task registry. This is what holds work started in a turn the owner ended with Esc (issue

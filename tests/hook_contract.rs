@@ -45,7 +45,7 @@ fn run_hook(dir: &std::path::Path, slot: Option<&str>, body: &str) -> i32 {
 }
 
 #[test]
-fn hook_exits_zero_on_the_two_blocking_events_whatever_the_payload() {
+fn hook_exits_zero_on_the_blocking_events_whatever_the_payload() {
     let dir = tmpdir("blocking");
     // Each of these is a payload the hook could actually be handed: well-formed, malformed,
     // truncated, and well-formed-but-wrong-shape.
@@ -55,6 +55,9 @@ fn hook_exits_zero_on_the_two_blocking_events_whatever_the_payload() {
         r#"{"hook_event_name":"UserPromptSubmit","session_id":null}"#,
         r#"{"hook_event_name":"Stop""#,
         r#"{"hook_event_name":"Stop","tool_input":"not an object"}"#,
+        // A subagent's Stop, installed since issue #10: exit 2 would keep the agent running.
+        r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":"not an array"}"#,
+        r#"{"hook_event_name":"SubagentStop","background_tasks":[{"type":"#,
     ];
     for body in payloads {
         let code = run_hook(&dir, Some("claude-1"), body);
