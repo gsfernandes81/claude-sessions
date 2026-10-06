@@ -357,9 +357,11 @@ pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)
     let root =
         claude.filter(|&(pid, start)| table.iter().any(|p| p.pid == pid && p.start == start));
     if let Some((root, start)) = root {
-        // Everything the current claude started is younger than it. An older process carrying
-        // the name is an earlier claude's orphan, in a slot name since reused, and not this one's.
-        pids.retain(|&pid| table.iter().any(|p| p.pid == pid && p.start >= start));
+        // Everything the current claude started is younger than it — strictly: claude boots for
+        // longer than a clock tick before it starts anything, while whatever ran it may share
+        // its tick. An older process carrying the name is an earlier claude's orphan, in a slot
+        // name since reused, or whatever started this one, and not this slot's work.
+        pids.retain(|&pid| table.iter().any(|p| p.pid == pid && p.start > start));
         pids.push(root);
         pids.extend(
             crate::procinfo::descendants(table, root)
@@ -747,8 +749,9 @@ mod tests {
         let mut table = table;
         table.push(proc(50, 1, "sleep", 3));
         table.push(proc(150, 1, "cargo", 12));
+        table.push(proc(160, 1, "sh", 7)); // whatever started claude, in its own tick
         assert_eq!(
-            members(&table, Some(&vec![50, 150]), Some((100, 7))),
+            members(&table, Some(&vec![50, 150, 160]), Some((100, 7))),
             vec![100, 101, 150]
         );
         assert_eq!(

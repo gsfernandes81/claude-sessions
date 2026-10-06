@@ -33,11 +33,13 @@ impl Drop for Slot {
     fn drop(&mut self) {
         if let Some(grandchild) = child_of(self.claude) {
             let _ = Command::new("kill")
+                .env_remove("ZMX_SESSION")
                 .args(["-9", &grandchild.to_string()])
                 .stderr(Stdio::null())
                 .status();
         }
         let _ = Command::new("kill")
+            .env_remove("ZMX_SESSION")
             .args(["-9", &self.claude.to_string()])
             .stderr(Stdio::null())
             .status();
@@ -122,6 +124,7 @@ done
     // `; :` keeps the shell as the parent rather than letting it exec the command, which is
     // what zmx does too: its daemon outlives its command by a couple of seconds.
     let server = Command::new(root.join("bin/zmx"))
+        .env_remove("ZMX_SESSION")
         .arg("-c")
         .arg(format!(
             "{} {claude_args}; :",
@@ -186,6 +189,7 @@ done
 
 fn offload(root: &Path, extra: &[&str]) -> (bool, String) {
     let out = Command::new(BIN)
+        .env_remove("ZMX_SESSION")
         .arg("offload")
         .args(extra)
         .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
@@ -298,6 +302,9 @@ fn every_pass_measures_and_a_short_window_waits_for_the_next() {
     );
 }
 
+/// Every process these tests start has `ZMX_SESSION` stripped: run from inside a zmx session
+/// named like the fixture's slot, the activity measurement would count them as its members.
+///
 /// A slot measured before: its claude read 3 minutes ago at nothing, quiet for 11 minutes.
 /// `at_offset_ms` moves the last reading (negative is the past).
 fn measured_before(s: &Slot, at_offset_ms: i64) {
@@ -477,6 +484,7 @@ fn work_running_under_the_slot_keeps_it() {
 /// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.
 fn hold_lock(path: &Path, secs: f64) -> Child {
     let child = Command::new("flock")
+        .env_remove("ZMX_SESSION")
         .arg(path)
         .args(["sleep", &secs.to_string()])
         .spawn()

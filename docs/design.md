@@ -389,8 +389,9 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   for the API (checked: a megabyte through a socketpair by `send`/`recv` moved `rchar` by
   under a hundred bytes). So claude's own network is invisible here, and a model turn shows
   as the screen it redraws and the transcript it appends, not as the stream itself. A child's
-  network shows or not by what it is written in: Node, Go and ssh use `read`/`write`; Rust's
-  and Python's sockets use `send`/`recv`. Measured on 2.1.291 with agent view off,
+  network shows or not by how it does I/O, not by its language: `read`/`write` is counted
+  (Node, Go, ssh, and blocking TLS through OpenSSL — Python's `ssl` module, `requests`);
+  `send`/`recv` is not (Bun, Rust's std sockets, Python's plain sockets and asyncio). Measured on 2.1.291 with agent view off,
   here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
   reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. Wake-ups (voluntary
   context switches over live threads) and CPU time (`utime + stime` with reaped children's)
@@ -416,9 +417,9 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   container rewrites it (Claude Code watches it for other processes' writes: feature-flag
   refreshes, usage counters, a start), so one slot's housekeeping lands in every idle slot's
   window. Read a burst that appears in every slot at once with that in mind.
-  Processes found by the environment count only if younger than the recorded claude: an
-  older one is an earlier claude's orphan in a slot name since reused. No `zmx` process is a
-  member: a daemon started from inside a slot — by this tool, which strips `ZMX_SESSION`, or
+  Processes found by the environment count only if younger than the recorded claude,
+  strictly: an older one is an earlier claude's orphan in a slot name since reused, and one
+  in claude's own first clock tick is whatever started it. No `zmx` process is a member: a daemon started from inside a slot — by this tool, which strips `ZMX_SESSION`, or
   by a tool claude ran, which does not — reads the other session's terminal, which is that
   session's work, not this slot's. A member gone since the last reading makes the window
   active: what it did since went to whoever reaped it — a member's counters (counted twice
@@ -446,7 +447,7 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   for the offloader's 10 minutes, and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
   first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
   `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, cpu 6.1 ms/s, 1 process(es), line
-  945 B/s (56700 B a window) from floor 95, quiet 14m; the activity rule would freeze it` —
+  950 B/s (57000 B a window) from floor 95, quiet 14m; the activity rule would freeze it` —
   the bracket is the budget actually applied. These lines go to the pass's stdout only, not
   to `offload.log`; infra's loop keeps every pass's stdout in its pass log, which is where
   the days of reading come from. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
