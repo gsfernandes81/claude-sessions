@@ -13,7 +13,7 @@
 //! the terminal claude repaints, the transcripts it writes, pipes to its tools. The same count
 //! on a Pi 4 and an x86 box, where CPU time is not. The kernel counts by call: `read`/`write`
 //! on a socket count, but `send`/`recv` do not, and claude's own network uses those — so it
-//! is invisible to these counters. CPU time and wake-ups are
+//! is invisible to these counters, as is file I/O through a mapping. CPU time and wake-ups are
 //! logged beside the bytes for the data, not judged. The measured figures, the membership rule,
 //! the line and what the rule cannot see are in design.md, which is the one record of them.
 //!

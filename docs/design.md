@@ -402,7 +402,8 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   outside its tree). zmx sets `ZMX_SESSION` to the session's name for the program it runs, so
   everything a slot's claude starts carries it — one that double-forks away to init too, and
   in a session somebody attached by hand as much as in one of ours — and `/proc/*/environ`
-  finds them however they were reparented; the recorded claude and its descendants are added
+  finds them however they were reparented, unless a process writes its title over its
+  environment; the recorded claude and its descendants are added
   in case one cleared it.
   The recorded claude counts only while it is the process recorded, by start time. A
   `claude-sessions` still running when the pass reads is left out — the pass itself, or a menu
@@ -449,8 +450,9 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, cpu 6.1 ms/s, 1 process(es), line
   950 B/s (57000 B a window) from floor 95, quiet 14m; the activity rule would freeze it` —
   the bracket is the budget actually applied. These lines go to the pass's stdout only, not
-  to `offload.log`; infra's loop keeps every pass's stdout in its pass log, which is where
-  the days of reading come from. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
+  to `offload.log`. **The days of reading depend on infra keeping that stdout**: its live
+  loop writes each pass, timestamped, to `~/.local/share/claude-sessions-passes.log` (infra#9,
+  2026-10-06), and it must go on doing so until the owner has read the numbers. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
   its count with it — and are low, unmarked, where newer threads outweighed it.
 - **What is unknown counts as active**: a slot's first reading, a member that left since the
   last one, a process that is there but cannot be read (the slot is reported as unknown and
@@ -475,7 +477,11 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   these, or find a signal that sees them. **And a tool that computes without reading or
   writing** — a background build's link step, a script crunching numbers — adds no bytes
   while claude sits at its prompt; the CPU figure on the same line will show it, and the hold
-  has to cover it too. And a job that double-forked away and ran wholly
+  has to cover it too. So does file I/O through a mapping — a linker (lld, mold, gold),
+  sqlite with `mmap_size`, LMDB — which never passes through `read`/`write`. **And a server
+  that writes its title over its environment** (postgres, nginx, `setproctitle` users such as
+  gunicorn and celery) is in no slot once it has left claude's tree, nor is anything it
+  forks. And a job that double-forked away and ran wholly
   between two passes, reaped by init: nobody's counters ever hold it. Rarer: a tool blocked
   on a remote that sends nothing, which a freeze pauses and an attach resumes.
 
