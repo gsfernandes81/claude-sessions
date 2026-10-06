@@ -92,8 +92,8 @@ fn main() -> ExitCode {
         }
         // THE ONE SUBCOMMAND THAT MUST NOT FAIL. UserPromptSubmit, Stop and SubagentStop are
         // blocking hooks: a non-zero exit on the first blocks the prompt, and on the others
-        // tells Claude (or its subagent) it has more to do. A registry bug must never wedge a session, so every
-        // failure in here is logged and swallowed.
+        // tells Claude (or its subagent) it has more to do. A registry bug must never wedge a
+        // session, so every failure in here is logged and swallowed.
         // A panic too: it is logged here rather than printed, and caught, so even a bug that
         // panics exits 0.
         "hook" => {

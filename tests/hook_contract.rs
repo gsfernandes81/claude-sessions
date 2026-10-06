@@ -1,9 +1,9 @@
 //! The two promises the rest of the design leans on, tested against the real binary.
 //!
-//! **`hook` always exits 0.** `UserPromptSubmit` and `Stop` are *blocking* hooks: a non-zero
-//! exit on the first blocks the owner's prompt, and on the second tells Claude it has more to
-//! do. A bug in the registry must never wedge a session, so those two are asserted by name as
-//! well as in the general sweep.
+//! **`hook` always exits 0.** `UserPromptSubmit`, `Stop` and `SubagentStop` are *blocking*
+//! hooks: a non-zero exit on the first blocks the owner's prompt, and on the others tells Claude
+//! (or its subagent) it has more to do. A bug in the registry must never wedge a session, so
+//! those three are asserted by name as well as in the general sweep.
 //!
 //! **A record is never caught half-written.** The registry is read on the ssh path, so a
 //! reader landing mid-write must still get valid JSON. That is what the temp-file-then-rename
