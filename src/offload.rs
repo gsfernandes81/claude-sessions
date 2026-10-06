@@ -835,28 +835,43 @@ mod tests {
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
     }
 
-    /// Issue #10 end to end, as 2.1.291 told it under a pty on 2026-10-06, through
-    /// `events::apply` into `decide`: a turn launches a background agent and the owner presses
-    /// Esc — no hook, only the transcript's marker. An internal agent nobody announced sends a
-    /// `SubagentStop`; then the agent finishes, writing as it goes. Calibration: the same turn
-    /// without the agent, which is offloadable at every step, so the hold is the agent's.
+    /// Issue #10 end to end, through `events::apply` into `decide`, as 2.1.291 told it under a
+    /// pty on 2026-10-06: a turn starts an agent and the owner presses Esc — no hook, only the
+    /// transcript's marker. An internal agent nobody announced then sends a `SubagentStop`
+    /// carrying the task list. A background agent is on that list until the turn its end wakes
+    /// claude for; a foreground one never is, and the Esc cut it off without a `SubagentStop`
+    /// of its own (issue #11). Calibration: the same turn with no agent, offloadable throughout.
     #[test]
-    fn an_agent_started_in_a_turn_esc_ended_holds_the_slot_until_it_is_done() {
+    fn an_agent_started_in_a_turn_esc_ended_holds_the_slot_while_it_runs() {
         use crate::events::{Binding, Event, apply};
+        #[derive(PartialEq)]
+        enum Agent {
+            None,
+            Background,
+            Foreground,
+        }
         let t0 = NOW - 3 * IDLE_AFTER_STOP_MS;
         let marker = t0 + 4_000;
-        for with_agent in [false, true] {
+        let hook = |rec: &mut SlotRecord, body: &str, at: Millis| {
+            apply(
+                rec,
+                &Event::parse(body).unwrap(),
+                at,
+                Binding::Own,
+                Some(100),
+                Some(7),
+            );
+        };
+        const RUNNING: &str =
+            r#"[{"id":"a90c","type":"subagent","status":"running","description":"look"}]"#;
+        for agent in [Agent::None, Agent::Background, Agent::Foreground] {
             let (mut rec, mut seen) = idle();
-            let hook = |rec: &mut SlotRecord, body: &str, at: Millis| {
-                let ev = Event::parse(body).unwrap();
-                apply(rec, &ev, at, Binding::Own, Some(100), Some(7));
-            };
             hook(
                 &mut rec,
                 r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#,
                 t0,
             );
-            if with_agent {
+            if agent != Agent::None {
                 hook(
                     &mut rec,
                     r#"{"hook_event_name":"SubagentStart","agent_id":"a90c","agent_type":"general-purpose"}"#,
@@ -864,44 +879,73 @@ mod tests {
                 );
             }
             seen.interrupted_at = Some(marker);
-            let held = |rec: &SlotRecord, seen: &Seen| {
-                assert_eq!(
-                    rec.esc_ended(seen.interrupted_at),
-                    Some(marker),
-                    "the menu's Idle"
-                );
-                if with_agent {
-                    assert_eq!(
-                        decide(rec, NOW, seen),
-                        Err(Hold::Background(vec!["subagent: general-purpose".into()]))
-                    );
-                } else {
-                    assert!(decide(rec, NOW, seen).is_ok(), "calibration");
-                }
+            assert_eq!(
+                rec.esc_ended(seen.interrupted_at),
+                Some(marker),
+                "the menu's Idle"
+            );
+            let verdict = decide(&rec, NOW, &seen);
+            match agent {
+                Agent::None => assert!(verdict.is_ok(), "calibration"),
+                _ => assert_eq!(
+                    verdict,
+                    Err(Hold::Background(vec!["subagent: general-purpose".into()])),
+                    "held until something says otherwise"
+                ),
+            }
+            let listed = if agent == Agent::Background {
+                RUNNING
+            } else {
+                "[]"
             };
-            held(&rec, &seen);
             hook(
                 &mut rec,
-                r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#,
+                &format!(
+                    r#"{{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":"","background_tasks":{listed}}}"#
+                ),
                 t0 + 30_000,
             );
-            held(&rec, &seen);
-            // The agent ends; its own payload still lists it as running, and is not believed.
+            assert_eq!(
+                rec.esc_ended(seen.interrupted_at),
+                Some(marker),
+                "still Idle"
+            );
+            if agent != Agent::Background {
+                assert!(decide(&rec, NOW, &seen).is_ok(), "nothing running");
+                continue;
+            }
+            assert_eq!(
+                decide(&rec, NOW, &seen),
+                Err(Hold::Background(vec!["subagent: look".into()]))
+            );
+            // Its own `SubagentStop` still lists it; the notification turn's `Stop` does not.
             let end = t0 + 45_000;
             hook(
                 &mut rec,
-                r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running"}]}"#,
+                &format!(
+                    r#"{{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":{RUNNING}}}"#
+                ),
                 end,
             );
-            seen.last_write_ms = Some(end);
-            assert!(rec.background.is_empty());
+            assert!(matches!(decide(&rec, NOW, &seen), Err(Hold::Background(_))));
+            hook(
+                &mut rec,
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>"}"#,
+                end + 10,
+            );
+            hook(
+                &mut rec,
+                r#"{"hook_event_name":"Stop","background_tasks":[]}"#,
+                end + 1_000,
+            );
+            seen.last_write_ms = Some(end + 1_000);
             assert!(decide(&rec, NOW, &seen).is_ok());
             assert!(
                 matches!(
                     decide(&rec, end + 60_000, &seen),
                     Err(Hold::TooRecent { .. })
                 ),
-                "idle from the agent's last write, not from the Esc"
+                "idle from that turn, not from the Esc"
             );
         }
     }

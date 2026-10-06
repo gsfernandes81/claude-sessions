@@ -155,9 +155,8 @@ pub fn apply(
     rec.last_event_ms.insert(ev.name().to_string(), now);
 
     // A nested claude is work, not a new identity, and its events keep the slot's activity
-    // fresh. Only the events it fires, though: with the hooks installed, an in-process
-    // background subagent fires none between the parent's `Stop`s, which is why `Stop` records
-    // `background` and the offloader also counts transcript writes (issue #9).
+    // fresh. In-process agents are not nested: the slot's own claude fires their
+    // `SubagentStart`/`SubagentStop`, which keep `background` (issues #9, #10).
     if binding == Binding::Nested {
         rec.last_activity_ms = now;
         rec.updated_ms = now;
@@ -250,11 +249,11 @@ pub fn apply(
             rec.background = ev.background_tasks();
             Outcome::Changed
         }
-        // An agent's life between the parent's `Stop`s (issue #10): the list, and nothing else.
-        // Neither is activity. An agent's work reaches the offloader as writes to its own
-        // transcript, and Claude Code sends a `SubagentStop` for internal agents it never
-        // announced, at any time — after a `Stop` or an Esc too, where counting it would make
-        // an idle slot read as busy until the owner's next turn.
+        // Agents between the parent's `Stop`s (issue #10), editing the list and nothing else:
+        // neither event is activity. An agent's work reaches the offloader as writes to its own
+        // transcript, and Claude Code sends `SubagentStop` for internal agents it never
+        // announced, at any time — after a `Stop` or an Esc too, where counting it would make an
+        // idle slot read busy until the owner's next turn.
         "SubagentStart" => match ev.agent_id() {
             Some(id) if !rec.background.iter().any(|t| t.id.as_deref() == Some(id)) => {
                 let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
@@ -266,14 +265,17 @@ pub fn apply(
             }
             _ => Outcome::Ignored("no agent that is not already listed"),
         },
+        // Its payload carries the same list as `Stop`'s, so it is taken whole the same way. That
+        // list never names a foreground agent, so one an Esc cut off — which sends no
+        // `SubagentStop` of its own — leaves at the next one; and a background agent's own
+        // `SubagentStop` still names it, so it is held until the turn it wakes claude for.
         "SubagentStop" => {
-            let (id, before) = (ev.agent_id(), rec.background.len());
-            rec.background
-                .retain(|t| id.is_none() || t.id.as_deref() != id);
-            if rec.background.len() < before {
-                Outcome::Changed
+            let now_running = ev.background_tasks();
+            if rec.background == now_running {
+                Outcome::Ignored("the list is unchanged")
             } else {
-                Outcome::Ignored("agent not listed")
+                rec.background = now_running;
+                Outcome::Changed
             }
         }
         "Notification" => match ev.notification_type() {
@@ -470,7 +472,7 @@ mod tests {
 
     #[test]
     fn subagent_events_edit_the_list_and_are_not_activity() {
-        // The sequence itself, through the offloader, is in `offload.rs`.
+        // The sequences themselves, through the offloader, are in `offload.rs`.
         let mut rec = slot();
         own(
             &mut rec,
@@ -490,13 +492,20 @@ mod tests {
             matches!(own(&mut rec, &start, 3_100), Outcome::Ignored(_)),
             "listed once"
         );
-        let unknown = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#);
-        assert!(matches!(
-            own(&mut rec, &unknown, 4_000),
-            Outcome::Ignored(_)
-        ));
-        let stop = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a90c"}"#);
-        assert_eq!(own(&mut rec, &stop, 5_000), Outcome::Changed);
+        // A `SubagentStop` says what is running, as `Stop` does — its own agent included.
+        let still = ev(
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running","description":"look"}]}"#,
+        );
+        assert_eq!(own(&mut rec, &still, 4_000), Outcome::Changed);
+        assert_eq!(whats(&rec), ["subagent: look"]);
+        assert!(
+            matches!(own(&mut rec, &still, 4_100), Outcome::Ignored(_)),
+            "unchanged"
+        );
+        let none = ev(
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":"","background_tasks":[]}"#,
+        );
+        assert_eq!(own(&mut rec, &none, 5_000), Outcome::Changed);
         assert!(rec.background.is_empty());
         assert_eq!(rec.last_activity_ms, 1_500, "still idle from the Stop");
     }
@@ -539,23 +548,20 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_finishing_does_not_touch_the_list_and_a_new_process_clears_it() {
+    fn a_new_process_clears_the_list_and_the_same_one_keeps_it() {
         let mut rec = slot();
         own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
-        // A background subagent's own end: nested by its agent_id, it is activity only.
+        // A nested claude's agent is activity only, whatever its payload lists.
         apply(
             &mut rec,
-            &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[]}"#),
+            &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"n1","background_tasks":[]}"#),
             3_000,
             Binding::Nested,
             None,
             None,
         );
-        assert_eq!(
-            rec.background.len(),
-            2,
-            "only the parent's Stop speaks for the slot"
-        );
+        assert_eq!(rec.background.len(), 2);
+        assert_eq!(rec.last_activity_ms, 3_000);
         // The same process opening another conversation keeps it: the work may go on.
         own(
             &mut rec,
@@ -581,14 +587,6 @@ mod tests {
         own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
         let back = SlotRecord::from_json(&rec.to_json(), "x").unwrap();
         assert_eq!(back.background, rec.background);
-        // As 0.4.1 to 0.4.3 wrote it — bare strings — it still holds after an upgrade.
-        let old_style = crate::json::parse(
-            r#"{"slot":"claude-1","background":["subagent: council reviewer"]}"#,
-        )
-        .unwrap();
-        let read = SlotRecord::from_json(&old_style, "x").unwrap();
-        assert_eq!(whats(&read), ["subagent: council reviewer"]);
-        assert_eq!(read.background[0].id, None);
         // An older record has none.
         let old = SlotRecord::from_json(&slot().to_json(), "x").unwrap();
         assert!(old.background.is_empty());

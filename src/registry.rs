@@ -359,15 +359,8 @@ impl SlotRecord {
     }
 }
 
-/// One background entry: `{"id","what"}`, or a bare string as 0.4.1 to 0.4.3 wrote it — kept
-/// readable, because a record still holding work must not lose its hold across an upgrade.
+/// One background entry: `{"id","what"}`.
 fn task_of(v: &Value) -> Option<Task> {
-    if let Some(what) = v.as_str() {
-        return Some(Task {
-            id: None,
-            what: what.to_string(),
-        });
-    }
     Some(Task {
         id: str_of(v, "id"),
         what: str_of(v, "what")?,

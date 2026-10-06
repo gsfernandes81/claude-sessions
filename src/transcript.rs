@@ -208,12 +208,11 @@ pub fn interrupted_in(text: &str, cut: bool) -> Option<u64> {
             Some("user") => {
                 let content = v.get("message").and_then(|m| m.get("content"));
                 let marked = match content {
-                    Some(Value::Arr(parts)) => parts.iter().any(|p| {
-                        p.get("type").and_then(Value::as_str) == Some("text")
+                    Some(Value::Arr(parts)) => matches!(parts.as_slice(), [p]
+                        if p.get("type").and_then(Value::as_str) == Some("text")
                             && p.get("text")
                                 .and_then(Value::as_str)
-                                .is_some_and(|t| INTERRUPTED.contains(&t.trim()))
-                    }),
+                                .is_some_and(|t| INTERRUPTED.contains(&t.trim()))),
                     _ => false,
                 };
                 return if marked {
@@ -312,6 +311,9 @@ mod tests {
         assert_eq!(interrupted_in(&lines(&[CUT_REPLY, typed]), false), None);
         let longer = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user] carry on"}]},"timestamp":"2026-10-06T09:24:00.000Z"}"#;
         assert_eq!(interrupted_in(&lines(&[CUT_REPLY, longer]), false), None);
+        // The marker as one part of several is not what Claude Code writes, nor what it reads.
+        let more = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"},{"type":"text","text":"and this"}]},"timestamp":"2026-10-06T09:24:00.000Z"}"#;
+        assert_eq!(interrupted_in(&lines(&[CUT_REPLY, more]), false), None);
         // A subagent's line is skipped: the main turn's marker before it still answers.
         let side = r#"{"type":"assistant","isSidechain":true,"message":{"content":[]},"timestamp":"2026-10-06T09:24:01.000Z"}"#;
         assert!(interrupted_in(&lines(&[CUT_REPLY, MARK_REPLY, side]), false).is_some());
