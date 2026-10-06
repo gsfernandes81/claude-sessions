@@ -36,7 +36,7 @@ place of a title (owner, 2026-10-03); that file is no longer read for titles at 
 
 ## Slots, conversations, and what is stored
 
-A **slot** is one `abduco` session named `claude-<n>`, i.e. one running `claude` process. A
+A **slot** is one `zmx` session named `claude-<n>`, i.e. one running `claude` process. A
 slot holds a sequence of **conversations** (Claude session ids): `/clear` starts a new one in
 the same process, `--resume` re-enters an old one.
 
@@ -46,7 +46,7 @@ The registry is keyed by slot and records:
 `session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
 `needs_you` · `timers` (each with its due time, and whether it recurs)
 
-**States:** `attached` / `detached` — read from `abduco`, never stored — plus `offloaded` and
+**States:** `attached` / `detached` — read from `zmx list`, never stored — plus `offloaded` and
 `closed`. **Unread is derived, not stored:** a `Stop` later than `last_attach` means the
 session finished something while you were away.
 
@@ -65,7 +65,7 @@ across two simultaneous ssh logins rather than merely likely.
 The menu starts each slot as:
 
 ```
-abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> \
+zmx attach claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> \
   CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_DISABLE_MOUSE=1 \
   CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1 \
   sh -c 'e=$1; shift; exec "$@" 2>>"$e"' sh <registry>/claude-<n>.stderr claude …
@@ -73,11 +73,11 @@ abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> \
 
 so every hook inherits the name. The `sh -c` captures claude's stderr to a file the
 failed-resume dialog reads (mockup 5), and **its `exec` is load-bearing**: it replaces the
-shell with claude, so claude is still the abduco server's direct child, which is the binding
+shell with claude, so claude is still the zmx daemon's direct child, which is the binding
 test below. Without it the shell stays in between and no hook ever binds — `tests/launch.rs`
 runs this exact line under the real hook to pin that. The capture path is an argument, not an
 environment variable, so nothing of ours leaks into claude's environment. **A hook binds to the slot only when its `claude` is the
-direct child of that slot's `abduco` server**, checked in `/proc`. A nested claude — a
+direct child of that slot's `zmx` daemon**, checked in `/proc`. A nested claude — a
 `claude -p` from a Bash tool call, or a subagent — inherits the variable too and must count
 as *work running under* the slot, never rebind its `session_id`. Hook payloads carry
 `agent_id`/`agent_type` **on subagents only**, which is a cheaper test than the `/proc` walk
@@ -98,9 +98,7 @@ inherits it. These are the one deliberate exception to nothing of ours in claude
 environment: they are meant for claude.
 
 The costs, accepted: the classic renderer flickers more and leaves debris after a resize
-(Termux resizes on every keyboard show and hide); abduco redraws only the current screen on
-attach, so output from before a dropped link lives only in a terminal that stayed open —
-Ctrl+E redraws the whole transcript; what needs the fullscreen renderer (focus view, the diff
+(Termux resizes on every keyboard show and hide); what needs the fullscreen renderer (focus view, the diff
 panel) refuses and says so; and menus, links and collapsible blocks are keyboard-only. It
 applies to every login, a laptop's too, because it is about claude over ssh rather than about
 a device; if that proves wrong, the follow-up is a toggle key, not a revert.
@@ -115,8 +113,15 @@ strings "$(command -v claude)" | grep -oE 'CLAUDE_CODE_DISABLE_(ALTERNATE_SCREEN
 
 Expect all three names.
 
-Sessions started without the menu (see *Unregistered sessions*) are found by walking `/proc`
-from the hook upwards to the first `claude` whose parent is an `abduco` server.
+**They only work because the holder keeps off the alternate screen.** v0.3.8 shipped them
+under abduco, whose client switches the terminal to the alternate screen on every attach; there,
+with mouse reporting off, Termux and Windows Terminal turn a swipe or the wheel into Up/Down
+keys, so scrolling became prompt history, and the terminal's own buffer was out of reach
+anyway. Every test passed, against a stand-in holder. That is why zmx replaced abduco
+(*zmx, measured*), and why `tests/zmx_real.rs` drives the real zmx.
+
+Sessions started without the menu (see *Unregistered sessions*) are found from `ZMX_SESSION`,
+which zmx sets inside every session, when a `zmx` daemon is above the hook.
 
 ## The event table
 
@@ -155,7 +160,7 @@ shell script used existed only because self-scheduled wake-ups were invisible; t
 records make them visible, so the floor goes.
 
 It holds the slot lock from decision through kill, marks the slot `offloading` before
-signalling and `offloaded` after, and keeps `TERM` → grace → `KILL` → `abduco` teardown with
+signalling and `offloaded` after, and keeps `TERM` → grace → `KILL` → zmx teardown with
 the pid-plus-start-time check at each step.
 
 **A slot with no conversation on disk is closed, not offloaded** (issue #5). A slot opened
@@ -214,7 +219,8 @@ is the choice and why:
 - **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
   offload, because the dialog promises it is resumable from disk; accepted, the stop is
   `judge`'s again under the lock, so a transcript that went in between makes it a close.
-- **Not being able to look keeps it.** No abduco socket (attached cannot be ruled out), a
+- **Not being able to look keeps it.** A zmx that does not answer for the slot (attached cannot
+  be ruled out), a
   `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
   is a reason to keep, because the offloader needs evidence to act, never to hold off.
 - **"No non-`claude` descendants"** walks the whole tree under the slot's claude, through any
@@ -228,10 +234,10 @@ is the choice and why:
   prints the cgroup headroom and stops whatever is idle regardless.
 - **Signals go through a pidfd**, opened before the start-time check, so a pid reused between
   the check and the signal cannot be hit. `TERM`, 5 s, `KILL`, 3 s; a process still there is
-  reported and the slot left `offloading` for the next pass to decide again. Then the abduco
-  server, recorded at decision time and only if the claude's parent really is `abduco`, gets
-  2 s to exit by itself and a `TERM` if it does not; its socket is removed only once that
-  server is known dead.
+  reported and the slot left `offloading` for the next pass to decide again. Then, if the
+  claude's parent really was a `zmx` daemon, zmx is given up to 2 s to drop the session —
+  it does so the moment its program exits; its daemon lingers about 2.4 s more and exits by
+  itself, which nothing waits for.
 - **The lock is taken only by a slot about to be stopped** (issue #1). The pass reads `/proc`
   once, holding no lock, and decides every slot from that and its record as listed; a slot
   that is kept — nearly every slot, nearly always — never touches its lock, and `--dry-run`
@@ -256,7 +262,7 @@ is the choice and why:
 
 ## The menu
 
-- **Lists every live and offloaded slot, every unregistered `abduco` session, and every
+- **Lists every live and offloaded slot, every unregistered `zmx` session, and every
   conversation on disk started in the workspace that is not running**, **grouped by state**
   (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`, `Closed`, `Archived`, an
   empty group not drawn, one blank line between groups. **A heading is a labelled rule with a
@@ -297,7 +303,7 @@ is the choice and why:
   own `timestamp`, never the file's modification time, which `/clear` was seen to touch on
   other conversations' files. Files are re-read only when their size or modification time
   changes, so the two-second poll stays cheap.
-- **`Enter` on a closed row resumes it in a slot**, `claude --resume <id>` under `abduco` in
+- **`Enter` on a closed row resumes it in a slot**, `claude --resume <id>` under `zmx` in
   its start directory. If a slot's record already names the conversation, that slot resumes
   it — both ways in then take one slot lock; otherwise a new slot is allocated, the never-
   resume-running check made under the allocation lock, and the record, naming the
@@ -307,15 +313,20 @@ is the choice and why:
   — with an exchange in it. A slot offloaded before its first prompt, or `/clear`ed and left,
   has nothing to resume (issue #5), and the resume path refuses such a slot too, for one whose
   transcript went after the list was read.
-- **Opening a row:** live → `abduco -a`; offloaded → start a new slot running
-  `claude --resume <session_id>` in its `cwd`. `abduco` runs as a **child**, so on detach the
+- **Opening a row:** live → `zmx attach <slot> false`; offloaded → start a new slot running
+  `claude --resume <session_id>` in its `cwd`. The `false` is a guard: `zmx attach` *creates*
+  a session that is not there, so one that ended between the list and the keypress would come
+  back as a stray shell; given a command, zmx ignores it for a session that exists and runs
+  it for one that does not, where `false` ends at once and leaves nothing. `zmx` runs as a
+  **child**, so on detach the
   menu comes back rather than the login ending — a fresh login costs a Cloudflare Access
   handshake on a metered link. Coming back from an attach is what writes `last_attach_ms`,
   the only writer it has, so that is what clears `unread`.
 
 ### How the menu acts, where the rules above left a choice
 
-Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco` and `claude`.
+Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `zmx` and `claude`,
+and the start, attach and close paths again against the real zmx in `tests/zmx_real.rs`.
 
 - **A resume keeps the slot's name.** The record is reused — same title — and marked
   registered, so an unregistered slot comes back as one of ours.
@@ -323,16 +334,22 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
   record is re-read, the conversation is checked not to be running anywhere — Claude Code's
   own live-session files and every other record — and the record is marked live with its pid
   cleared before the lock is let go. A second menu then sees a slot that is starting, not one
-  it may resume. If the conversation *is* running in another abduco slot, that slot is
+  it may resume. If the conversation *is* running in another zmx slot, that slot is
   attached instead; anywhere else, the resume is refused.
-- **A live record with no pid** is a slot starting elsewhere: attached if its socket exists,
+- **A live record with no pid** is a slot starting elsewhere: attached if zmx lists it,
   refused for 30 s otherwise, and after that treated as a start that died and is resumable —
   so a menu killed mid-start cannot strand a slot.
 - **A failed resume** is a start that ends within 10 s without a `SessionStart` binding it: the
   record goes back to offloaded or closed, whichever it was, and mockup 5 shows the last lines
   of the captured stderr, control characters removed — or says it wrote nothing to stderr,
-  rather than leaving a gap that reads as a lost reason. A start into a `cwd` that no longer exists is refused before it
-  runs, and a leftover socket of the same name is refused with a pointer to `reconcile`.
+  rather than leaving a gap that reads as a lost reason. **zmx does not report its program's
+  exit status** — `zmx attach` returns 0 for a detach and for a program that ended alike, and 1
+  only when the program was gone before the client connected — so mockup 5 says `ended`
+  (owner, 2026-10-06), or `was killed for memory` when the container's OOM-kill count
+  (`memory.events`) rose during the start: the one thing the number used to tell. A start into a `cwd` that no
+  longer exists is refused before it runs, and a zmx session already holding the slot's name
+  with nothing recorded in it is refused, naming `zmx kill`: zmx would attach to it and
+  ignore the resume.
 - **New slots take the lowest free `claude-<n>`** under a registry-wide lock with a timeout,
   writing the record before the lock goes. A closed slot's name is reused: closed slots are
   not listed, their conversations are, from the store, under their own ids. A new slot that
@@ -340,11 +357,11 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 - **Room is checked once.** After offloading to make room, the open goes ahead without asking
   the cgroup again: its figure includes page cache that is not freed at once, and a second
   check could refuse the room just made.
-- **`c` on a live slot stops it** with the offloader's own `TERM` → `KILL` path and abduco
+- **`c` on a live slot stops it** with the offloader's own `TERM` → `KILL` path and zmx
   teardown, pid and start time checked at each step, then marks it closed. A row with no record
   at all is refused: there is nothing to identify its process by safely.
-- **The programs are overridable** for tests and odd installs: `CLAUDE_SESSIONS_ABDUCO` and
-  `CLAUDE_SESSIONS_CLAUDE` name `abduco` and `claude`; `CLAUDE_SESSIONS_WORKSPACE` names where
+- **The programs are overridable** for tests and odd installs: `CLAUDE_SESSIONS_ZMX` and
+  `CLAUDE_SESSIONS_CLAUDE` name `zmx` and `claude`; `CLAUDE_SESSIONS_WORKSPACE` names where
   `n` and `s` start (default `/workspace` where it exists, else home).
 - **Ctrl-C quits the menu**, as `q` and `Esc` do; raw mode delivers it as a byte, and a menu
   that ignored it would read as hung. While a child has the terminal, the menu itself ignores
@@ -420,7 +437,7 @@ Built 2026-10-02 in `src/launch.rs`; each is tested there with stand-in `abduco`
 
 ## Ending a session
 
-`/exit` ends it — the process exits, `abduco` goes with it, `SessionEnd` marks the slot
+`/exit` ends it — the process exits, zmx drops the session, `SessionEnd` marks the slot
 closed. **`/clear` does not**: it starts a new conversation in the same process, which is
 right for *same session, new task* and wrong for *done*. `c` in the menu closes without
 opening, for something offloaded last week. Stale slots are never closed automatically; they
@@ -457,31 +474,56 @@ state that moves with the binary, it is pid-keyed so dead files accumulate, and 
 records *when you last looked*, which is exactly what `unread` is. The hooks remain the
 source of truth.
 
-## abduco, measured 2026-10-01
+## zmx, measured 2026-10-06
 
-- **Attached is a file mode, not a listing to parse.** `~/.abduco/<name>@<hostname>` has the
-  owner-execute bit set while a client is attached: `srwx------` attached, `srw-------`
-  detached. One `stat` per slot, no subprocess.
-- **The socket name carries the hostname**, which these containers derive from their alias —
-  so renaming a container orphans every session in it.
-- **Two clients can attach to one session at once.** *Attached elsewhere* is not an exclusive
-  lock, and opening a row must not assume it is alone at the terminal.
-- **A session's name is read from its abduco's command line the way abduco reads it** —
-  getopt-style, so `-fA work` names `work`, and only `-e` takes a value. `reconcile` sweeps a
-  socket only when every live abduco could be named and none names it; one it cannot name
-  turns the sweep off, because that process might own any socket in the directory (issue #3).
-- **A killed server leaves its socket behind with the attached bit still set.** This is the
-  calibration catch: a menu built on the mode alone shows a dead session as attached and
-  refuses to offer it. The liveness test is the pid plus its start time; the mode only ever
-  answers *attached?* for a slot already known to be alive.
+zmx 0.8.1 replaced abduco on the owner's choice after v0.3.8 (*Binding a hook to a slot*), over
+dtach and shpool: dtach keeps no history, so a dropped link loses the screen; shpool runs one
+daemon for every session and is not packaged for the Pi. zmx is one daemon per session, as
+abduco was, and keeps a terminal emulator (libghostty-vt) fed with the session's output.
+Measured against the release binary here, and against its source:
+
+- **No alternate screen.** Its client sends no `?1049h`; output reaches the terminal's own
+  buffer, which is the point. `tests/zmx_real.rs` holds that, calibrated by abduco's bytes.
+- **Every attach replays the session's history into the terminal:** about 1.08× the bytes the
+  session printed, the same on every attach, capped near 10,000 lines (≈480 KB at 80 columns,
+  ≈120 KB once ssh compresses it; ≈90 KB compressed at 40 columns). That is the price, on the
+  metered link, of history surviving a dropped link. Reattaching at a narrower width rewraps
+  the stored lines and uses up the cap, so moving between phone and laptop trims history.
+- **Detaching resets the terminal** (`ESC c`), which Termux answers by clearing its scrollback:
+  history lives in the session, not the terminal, and comes back on the next attach.
+- **The very first attach misses the first few milliseconds** — what the program wrote before
+  the creating client connected — and replays them on the next attach. Creating the session
+  from a client with no terminal and attaching after loses them outright, so the menu does not.
+  Claude takes far longer to draw anything.
+- **`zmx list` is the reading.** Tab-separated `name= pid= clients= created=` per session —
+  `pid` is the program, so a slot's claude — or `name= err= status=` for a daemon that did not
+  answer within its second. It removes a dead daemon's socket itself when the connection is
+  refused, so it never reports a corpse as attached, as abduco's socket bit did. The menu calls
+  it when the socket directory changes, after anything it does, and at most a minute apart
+  otherwise: every listing connects to every daemon and each logs it, and a two-second poll
+  would rewrite the logs (2 MB each, then wiped) all day. A session attached from another
+  terminal shows dim up to a minute late.
+- **`zmx attach` creates what is not there** — hence `zmx attach <slot> false` to attach — and on
+  a name that exists ignores the command, hence a start only ever on a free name.
+- **It must be installed as `zmx`.** A slot's claude binds only when its parent's comm — the
+  executable's file name — is `zmx`; a copy under another name starts sessions that never
+  bind, which is what a renamed binary did in this repo's own test run.
+- **`ZMX_SESSION` is set inside every session**, and `zmx attach` from inside one switches the
+  calling terminal rather than nesting. Every zmx call the binary makes strips it, and
+  `ZMX_SESSION_PREFIX`.
+- **The daemon outlives its program by about 2.4 s**, though the session leaves the listing at
+  once. **A daemon killed with `KILL` leaves its program running**, reparented to init — abduco
+  hung up its child; zmx does not — so such a claude reads as a live slot with no zmx above it.
+- **Its exit status is not reported**, by the client or the logs.
+- **An upgrade that changes zmx's protocol kills every session** (its README). A container
+  recreate ends them all anyway; an in-place zmx upgrade must be treated as one.
 
 ## Unregistered sessions
 
-Until every client is reconfigured, `ssh <container>` still runs `abduco -A claude claude`,
-and so does `make claude` in several repos. The menu lists **`abduco`'s sessions ∪ the
-registry**, under Idle, since nothing reports what they are doing. They cannot be named while
-they run — there is no session id to map to a transcript, so all there is to show is the
-`abduco` session name. Matching `cwd` and start time against transcripts would work and is
+A `zmx attach work claude` somebody types is real work that nothing here started. The menu
+lists **zmx's sessions ∪ the registry**, under Idle, since nothing reports what they are
+doing. They cannot be named while they run — there is no session id to map to a transcript,
+so all there is to show is the zmx session name. Matching `cwd` and start time against transcripts would work and is
 guesswork. Once one ends, its conversation is in Claude Code's store like any other, and is
 listed under Closed, by its own title, to resume in a slot of ours.
 
@@ -510,7 +552,7 @@ tool without editing a shared one.
 consent dialog — *"Managed settings require approval"*, *"unchanged since your last
 approval"*, and the error `Managed-settings consent dialog exited without an answer` — found
 by grepping 2.1.286. Had hooks in a managed settings *file* triggered it, every launch after a
-hook change would block on a keypress inside `abduco`, and a non-interactive path would die.
+hook change would block on a keypress inside the session, and a non-interactive path would die.
 
 **It does not, by the documentation's own scoping.** The dialog is a feature of
 *server-managed* settings, the ones fetched from the claude.ai admin console:

@@ -39,7 +39,6 @@ macro_rules! warn {
     }};
 }
 
-mod abduco;
 mod archive;
 mod bind;
 mod clock;
@@ -63,6 +62,7 @@ mod term;
 mod transcript;
 mod ui;
 mod work;
+mod zmx;
 
 use events::{Binding, Outcome};
 use fmt::{age, human};
@@ -222,7 +222,7 @@ fn cmd_hook() -> std::io::Result<()> {
     let binding = bind::binding_for(std::process::id(), ev.has_agent_id());
 
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
-    // under abduco — not this hook, and not a nested claude.
+    // under its zmx daemon — not this hook, and not a nested claude.
     let own_pid = procinfo::ancestor_named(std::process::id(), "claude", 8)
         .filter(|_| binding == Binding::Own);
     let own_start = own_pid.and_then(procinfo::start_time);
@@ -280,33 +280,26 @@ fn cmd_hook() -> std::io::Result<()> {
 /// The slot this hook belongs to, and whether we started it.
 ///
 /// The environment is the fast answer: the menu sets `CLAUDE_SESSIONS_SLOT` when it starts a
-/// slot. Failing that — one of today's `abduco -A claude claude` logins, which nothing here
-/// started — the abduco server above us names the session on its own command line, so the
-/// slot can be recovered from `/proc` and listed as unregistered rather than ignored.
+/// slot. Failing that — a `zmx attach work claude` somebody typed, which nothing here started —
+/// zmx names its own session in `ZMX_SESSION`, so the session is listed as unregistered rather
+/// than ignored. Only with a zmx daemon above us: the variable is inherited, and a process that
+/// merely carries it out of a session is not in one.
 fn slot_for_hook() -> Option<(String, bool)> {
     if let Some(slot) = bind::slot_from_env() {
         return Some((slot, true));
     }
-    let abduco = procinfo::ancestor_named(std::process::id(), "abduco", 10)?;
-    session_name_of_abduco(abduco).map(|name| (name, false))
-}
-
-/// The session name on an abduco process's command line, read the way abduco reads it.
-fn session_name_of_abduco(pid: u32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let argv: Vec<String> = raw
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).to_string())
-        .collect();
-    abduco::session_name(&argv)
+    let name = std::env::var("ZMX_SESSION")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    procinfo::ancestor_named(std::process::id(), "zmx", 10)?;
+    Some((name, false))
 }
 
 // ── reconcile ───────────────────────────────────────────────────────────────
 
 /// Make the registry agree with reality.
 ///
-/// Run at container start, because a `stop`/`start` keeps `~/.abduco` on disk and hands out
+/// Run at container start, because a `stop`/`start` keeps the registry on disk and hands out
 /// the same pids again: without this, every slot still reads `live` and points at a pid that
 /// now belongs to something else.
 fn cmd_reconcile() -> std::io::Result<()> {
@@ -336,52 +329,23 @@ fn cmd_reconcile() -> std::io::Result<()> {
         }
     }
 
-    // Stale sockets: a killed abduco server leaves its socket behind WITH THE ATTACHED BIT
-    // STILL SET, so a menu built on the mode alone would show a corpse as busy and refuse to
-    // offer the session. Only a socket whose name no live abduco process claims is removed,
-    // and only if we could read /proc at all — deleting on a failed enumeration would take
-    // every live session's socket with it.
-    let live_names = abduco_session_names();
-    let mut swept = 0usize;
-    if let Some(live_names) = live_names {
-        for sock in abduco::sockets() {
-            if !live_names.contains(&sock.name) {
-                std::fs::remove_file(&sock.path)?;
-                say!("{}: socket with no server -> removed", sock.name);
-                swept += 1;
-            }
+    // Dead sessions: `zmx list` removes a dead daemon's socket itself when its connection is
+    // refused, so one listing is the whole sweep. A daemon that does not answer is left alone:
+    // it may be busy, and its session may be somebody's work.
+    match zmx::sessions() {
+        Some(all) => {
+            let quiet = all.iter().filter(|s| !s.answered).count();
+            say!(
+                "reconcile: {moved} slot(s) offloaded, {} zmx session(s), {quiet} not answering",
+                all.len()
+            );
         }
-    } else {
-        warn!(
-            "claude-sessions: could not read /proc, or a live abduco's session could not be \
-             named; no sockets swept"
-        );
+        None => {
+            warn!("claude-sessions: zmx could not be asked; its sessions were not checked");
+            say!("reconcile: {moved} slot(s) offloaded");
+        }
     }
-
-    say!("reconcile: {moved} slot(s) offloaded, {swept} socket(s) swept");
     Ok(())
-}
-
-/// The session names of every live abduco process, or `None` if `/proc` could not be read or
-/// any live abduco's session could not be named — either way, nothing may be swept.
-fn abduco_session_names() -> Option<Vec<String>> {
-    let entries = std::fs::read_dir("/proc").ok()?;
-    let mut out = Vec::new();
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        if procinfo::comm(pid).as_deref() != Some("abduco") {
-            continue;
-        }
-        // A live abduco whose session cannot be named might own any socket in the directory.
-        // Unknown means keep — the offloader's rule — so the whole sweep is off rather than
-        // one session made unreattachable (issue #3).
-        out.push(session_name_of_abduco(pid)?);
-    }
-    Some(out)
 }
 
 // ── list and doctor ─────────────────────────────────────────────────────────
@@ -389,7 +353,12 @@ fn abduco_session_names() -> Option<Vec<String>> {
 fn cmd_list() -> std::io::Result<()> {
     let now = clock::now();
     let recs = registry::all()?;
-    let sockets = abduco::sockets();
+    let sessions = zmx::sessions().unwrap_or_else(|| {
+        warn!(
+            "claude-sessions: zmx did not answer; attached and unregistered sessions are not shown"
+        );
+        Vec::new()
+    });
     let mut rows: Vec<&SlotRecord> = recs.iter().filter(|r| r.state != State::Closed).collect();
     // The order the menu will use: wants you, then unread, then most recent activity.
     rows.sort_by_key(|r| {
@@ -399,11 +368,10 @@ fn cmd_list() -> std::io::Result<()> {
             std::cmp::Reverse(r.last_activity_ms),
         )
     });
-    // The menu lists abduco's sessions UNION the registry, not just the registry: until every
-    // client has been reconfigured, `ssh <container>` still runs `abduco -A claude claude` and
-    // those sessions are real work that nothing here started. Showing only our own would mean
-    // a list that disagrees with the box.
-    let unregistered: Vec<&abduco::Socket> = sockets
+    // The menu lists zmx's sessions UNION the registry, not just the registry: a `zmx attach`
+    // somebody typed is real work that nothing here started, and showing only our own would
+    // mean a list that disagrees with the box.
+    let unregistered: Vec<&zmx::Session> = sessions
         .iter()
         .filter(|s| !recs.iter().any(|r| r.slot == s.name))
         .collect();
@@ -413,7 +381,7 @@ fn cmd_list() -> std::io::Result<()> {
         return Ok(());
     }
     for r in rows {
-        let sock = sockets.iter().find(|s| s.name == r.slot);
+        let sess = sessions.iter().find(|s| s.name == r.slot);
         let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
         let marks = format!(
             "{}{}{}{}{}",
@@ -421,7 +389,7 @@ fn cmd_list() -> std::io::Result<()> {
             if r.unread() { "*" } else { "" },
             if r.has_pending_timer(now) { "t" } else { "" },
             // Attached is only meaningful for a session we know to be alive.
-            if alive && sock.is_some_and(|s| s.attached_bit) {
+            if alive && sess.is_some_and(|s| s.attached) {
                 "@"
             } else {
                 ""
@@ -441,7 +409,7 @@ fn cmd_list() -> std::io::Result<()> {
         // `u` is the mark for "not started by claude-sessions". A name that is not of the form
         // claude-<n> is certainly not ours; one that IS could be a slot whose record went
         // missing, which `reconcile` is what repairs.
-        let why = if abduco::is_slot_name(&sock.name) {
+        let why = if zmx::is_slot_name(&sock.name) {
             "no record — run reconcile"
         } else {
             "not started by claude-sessions"
@@ -449,7 +417,7 @@ fn cmd_list() -> std::io::Result<()> {
         say!(
             "{:<10} {:<4} {:<40} --",
             sock.name,
-            if sock.attached_bit { "u@" } else { "u" },
+            if sock.attached { "u@" } else { "u" },
             why
         );
     }
@@ -480,20 +448,30 @@ fn cmd_doctor() -> std::io::Result<()> {
         ),
         _ => say!("memory    : no cgroup limit readable; /proc/meminfo describes the host"),
     }
-    let sockets = abduco::sockets();
-    say!(
-        "abduco    : {} socket(s): {}",
-        sockets.len(),
-        sockets
-            .iter()
-            .map(|s| format!(
-                "{}{}",
-                s.name,
-                if s.attached_bit { "(attached)" } else { "" }
-            ))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    match zmx::sessions() {
+        Some(all) => say!(
+            "zmx       : {} session(s): {}",
+            all.len(),
+            all.iter()
+                .map(|s| format!(
+                    "{}{}",
+                    s.name,
+                    if !s.answered {
+                        "(not answering)"
+                    } else if s.attached {
+                        "(attached)"
+                    } else {
+                        ""
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        None => say!(
+            "zmx       : could not be asked ({} list failed or timed out)",
+            zmx::program()
+        ),
+    }
     // What Claude Code says about itself, printed beside what we think — because when the two
     // disagree, that disagreement IS the finding, and nothing else in this tool would show it.
     let ours = live::all();
@@ -510,13 +488,6 @@ fn cmd_doctor() -> std::io::Result<()> {
             sess.status.as_deref().unwrap_or("?"),
             sess.session_id.as_deref().unwrap_or("-"),
             sess.cwd.as_deref().unwrap_or("-"),
-        );
-    }
-    if let Some(sock) = abduco::socket_for("claude") {
-        say!(
-            "            an abduco session literally named \"claude\" exists{} — one of \
-             today's `ssh <container>` logins, not one of ours",
-            if sock.attached_bit { ", attached" } else { "" }
         );
     }
     for rec in registry::all()? {

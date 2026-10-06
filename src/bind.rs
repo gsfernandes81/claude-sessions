@@ -1,14 +1,14 @@
 //! Which slot a hook belongs to, and whether it is the slot's own claude.
 //!
 //! The slot name arrives in the environment, because the menu starts every slot as
-//! `abduco -c claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> claude …` and a hook inherits
+//! `zmx attach claude-<n> env CLAUDE_SESSIONS_SLOT=claude-<n> … claude …` and a hook inherits
 //! it. That is the easy half.
 //!
 //! The hard half is that **a nested claude inherits it too** — a `claude -p` from a Bash
 //! tool call, or a subagent — and would otherwise rebind the slot to its own short-lived
 //! conversation, so the menu would offer to resume a conversation that ended seconds later.
-//! A hook's claude is the slot's own only when it is the direct child of that slot's abduco
-//! server. Anything else is work running under the slot.
+//! A hook's claude is the slot's own only when it is the direct child of that slot's zmx
+//! daemon. Anything else is work running under the slot.
 
 use crate::events::Binding;
 use crate::procinfo;
@@ -23,10 +23,10 @@ pub fn slot_from_env() -> Option<String> {
 /// Decide the binding for the claude that fired this hook.
 ///
 /// `hook_pid` is the hook process itself; its claude is an ancestor. We look for the nearest
-/// `claude` above us, then ask whether ITS parent is an `abduco` server. One `abduco`
-/// generation is the whole test: the server forks the session's command directly, so the
-/// slot's own claude has abduco as its parent and a nested one has another claude (or a
-/// shell) in between.
+/// `claude` above us, then ask whether ITS parent is a `zmx` daemon. One generation is the
+/// whole test: the daemon forks the session's command directly (seen on zmx 0.8.1), so the
+/// slot's own claude has zmx as its parent and a nested one has another claude (or a shell)
+/// in between.
 ///
 /// `agent_id` on the payload marks a subagent and is a cheaper answer when present, so the
 /// caller passes it; a `claude -p` from a shell carries no such field and still needs this.
@@ -42,7 +42,7 @@ pub fn binding_for(hook_pid: u32, payload_has_agent_id: bool) -> Binding {
         return Binding::Nested;
     };
     match procinfo::parent(claude).and_then(procinfo::comm) {
-        Some(parent) if parent == "abduco" => Binding::Own,
+        Some(parent) if parent == "zmx" => Binding::Own,
         _ => Binding::Nested,
     }
 }

@@ -1,11 +1,11 @@
 //! A slot started the way the menu starts one is bound by the real hook.
 //!
 //! The menu starts a slot as
-//! `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> CLAUDE_CODE_DISABLE_…=1 sh -c '<wrap>' sh <stderr> claude …`,
-//! and a hook binds to a slot only when its claude is the direct child of the abduco server
+//! `zmx attach <slot> env CLAUDE_SESSIONS_SLOT=<slot> CLAUDE_CODE_DISABLE_…=1 sh -c '<wrap>' sh <stderr> claude …`,
+//! and a hook binds to a slot only when its claude is the direct child of the zmx daemon
 //! (`src/bind.rs`). The shell in the middle is there to capture stderr and must `exec` itself
 //! away, or no `SessionStart` would ever bind the slot's own claude and every slot would read
-//! as unbound for good. The launcher's unit tests check claude's parent is abduco; this checks
+//! as unbound for good. The launcher's unit tests check claude's parent is zmx; this checks
 //! the thing that parent is for — that `claude-sessions hook` then binds it.
 //!
 //! **The command line is spelled out here**, because a binary crate cannot be imported. The
@@ -50,15 +50,16 @@ fn script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// A stand-in abduco whose client detaches at once: a forked copy of itself — named `abduco`,
-/// as a real server is — runs the command, and the client returns 0. And a stand-in claude
+/// A stand-in zmx whose client detaches at once: a forked copy of itself — named `zmx`, as a
+/// real daemon is — runs the command, and the client returns 0. `tests/zmx_real.rs` does the
+/// same against the real zmx when one is provided. And a stand-in claude
 /// that fires a `SessionStart` through the real hook, says something on stderr, and stays up.
 /// Its transcript holds a long reply and an `ai-title`, so the title the hook records can be
 /// checked to be the title and never the reply (0.3.1).
 fn setup(tag: &str) -> Root {
     let root = std::env::temp_dir().join(format!("cs-launch-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    for d in ["bin", "registry", "abduco", "work"] {
+    for d in ["bin", "registry", "zmx", "work"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
     std::fs::write(
@@ -72,15 +73,15 @@ fn setup(tag: &str) -> Root {
     )
     .unwrap();
     script(
-        &root.join("bin/abduco"),
+        &root.join("bin/zmx"),
         &format!(
-            r#"[ "$1" = -c ] || exit 2
+            r#"[ "$1" = attach ] || exit 2
 name=$2; shift 2
-sock="{}/$name@test"
-: > "$sock"
-( "$@" </dev/null >/dev/null 2>&1; rm -f "$sock" ) &
+sess="{}/$name"
+: > "$sess"
+( "$@" </dev/null >/dev/null 2>&1; rm -f "$sess" ) &
 exit 0"#,
-            root.join("abduco").display()
+            root.join("zmx").display()
         ),
     );
     script(
@@ -99,8 +100,8 @@ exec sleep 600"#,
 }
 
 fn start(root: &Path, slot: &str, wrap: &str) {
-    let status = Command::new(root.join("bin/abduco"))
-        .arg("-c")
+    let status = Command::new(root.join("bin/zmx"))
+        .arg("attach")
         .arg(slot)
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
@@ -117,9 +118,8 @@ fn start(root: &Path, slot: &str, wrap: &str) {
         .arg(root.join("bin/claude"))
         .current_dir(root.join("work"))
         .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
-        .env("ABDUCO_SOCKET_DIR", root.join("abduco"))
         .status()
-        .expect("the stand-in abduco runs");
+        .expect("the stand-in zmx runs");
     assert!(status.success());
 }
 
@@ -189,7 +189,7 @@ fn the_same_line_without_exec_is_not_bound() {
     assert_eq!(
         number(&body, "pid"),
         None,
-        "a shell between the server and claude makes it look nested: {body}"
+        "a shell between the daemon and claude makes it look nested: {body}"
     );
     assert!(!body.contains("\"conv-e2e\""), "{body}");
     // Calibration for the title: a nested claude's transcript names nothing about the slot.

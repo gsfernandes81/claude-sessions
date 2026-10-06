@@ -1,6 +1,6 @@
 //! The menu's state: which rows there are, where the cursor is, what is being asked, and
 //! what a key does to all of that. Pure, apart from [`gather`], which reads the registry and
-//! abduco — so every key in `docs/design.md` § *The menu* is a test here rather than
+//! zmx — so every key in `docs/design.md` § *The menu* is a test here rather than
 //! something to try by hand over ssh.
 //!
 //! Two behaviours that are decisions, not accidents:
@@ -22,7 +22,6 @@
 //! Floored, every age changes together, once a minute at most — the rule in `CLAUDE.md`, on
 //! a metered link.
 
-use crate::abduco;
 use crate::archive;
 use crate::clock::Millis;
 use crate::fmt;
@@ -32,6 +31,7 @@ use crate::registry::{self, SlotRecord, State};
 use crate::render;
 use crate::store;
 use crate::ui::{Busy, Dialog, Group, Header, Key, Row, RowKey, Screen, View};
+use crate::zmx;
 
 /// What the loop should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,19 +477,19 @@ pub fn age_clock(now: Millis) -> Millis {
     now - now % 60_000
 }
 
-/// Read the rows: every slot in the registry that is not closed, every abduco session the
+/// Read the rows: every slot in the registry that is not closed, every zmx session the
 /// registry has never heard of, and every conversation started in `workspace` that is not
-/// running. In recency order; `Menu::replace_rows` does the grouping.
-pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
+/// running. In recency order; `Menu::replace_rows` does the grouping. `sessions` is zmx's
+/// listing, which the caller refreshes when it can have changed (`zmx::Watch`).
+pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Row> {
     let clock = age_clock(now);
     let recs = registry::all().unwrap_or_default();
-    let sockets = abduco::sockets();
     let mut dated: Vec<(Millis, Row)> = recs
         .iter()
         // Closed slots are not listed as slots: their conversations are in Claude Code's own
         // store, with every other conversation, and are listed from there (below).
         .filter(|r| r.state != State::Closed)
-        .map(|r| (r, slot_row(r, clock, &sockets)))
+        .map(|r| (r, slot_row(r, clock, sessions)))
         // An offloaded slot with no conversation on disk is nothing to open: offloaded
         // before its first prompt, or `/clear`ed and left, `Enter` on it would fail at once
         // (issue #5). Not listed.
@@ -536,37 +536,32 @@ pub fn gather(now: Millis, workspace: &str) -> Vec<Row> {
     }
     dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let mut rows: Vec<Row> = dated.into_iter().map(|(_, row)| row).collect();
-    for sock in sockets {
-        if recs.iter().any(|r| r.slot == sock.name) {
+    for sess in sessions {
+        if recs.iter().any(|r| r.slot == sess.name) {
             continue;
         }
-        // A socket's own age is the only clock a session with no record has.
-        let since = std::fs::metadata(&sock.path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as Millis)
-            .unwrap_or(clock);
+        // When zmx made it is the only clock a session with no record has.
+        let since = sess.created.map(|s| s * 1000).unwrap_or(clock);
         rows.push(Row {
-            key: RowKey::Socket(sock.name.clone()),
+            key: RowKey::Socket(sess.name.clone()),
             wants_you: false,
             // Nothing says what a session with no hooks is doing; it is listed as Idle.
             busy: false,
             unread: false,
-            attached: sock.attached_bit,
+            attached: sess.attached,
             offloaded: false,
             closed: false,
             archived: false,
-            title: sock.name.clone(),
+            title: sess.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
         });
     }
     rows
 }
 
-fn slot_row(r: &SlotRecord, clock: Millis, sockets: &[abduco::Socket]) -> Row {
+fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
     let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
-    let attached = alive && sockets.iter().any(|s| s.name == r.slot && s.attached_bit);
+    let attached = alive && sessions.iter().any(|s| s.name == r.slot && s.attached);
     Row {
         key: RowKey::Slot(r.slot.clone()),
         wants_you: r.needs_you,
@@ -1094,7 +1089,7 @@ mod tests {
         let failed = Dialog::ResumeFailed {
             title: "b".into(),
             session: "0f9c4a1e".into(),
-            status: 1,
+            killed_for_memory: false,
             output: vec![],
             closed: false,
         };

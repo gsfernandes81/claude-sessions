@@ -6,7 +6,7 @@
 //! - `term.rs` owns the terminal: raw mode, size, and bytes in as [`Key`]s.
 //! - `launch.rs` does what a keypress asks — attach, resume, start, a shell, close — with the
 //!   terminal handed over through [`Terminal`] while a child has it.
-//! - `menu.rs` holds the state, builds the [`View`] from the registry and abduco, and maps a
+//! - `menu.rs` holds the state, builds the [`View`] from the registry and zmx, and maps a
 //!   [`Key`] to what happens next.
 //!
 //! Nothing in this file does anything. It is the shape the others agree on, so each can be
@@ -17,7 +17,7 @@
 pub enum RowKey {
     /// A slot with a registry record, ours or not (`registered` on the record says which).
     Slot(String),
-    /// An abduco session with no record at all — a session started before the hooks were
+    /// A zmx session with no record at all — a session started before the hooks were
     /// installed, listed under Idle. All there is to show is its name.
     Socket(String),
     /// A conversation in Claude Code's own store that is not running (`store.rs`), listed
@@ -138,13 +138,14 @@ pub enum Dialog {
         want: u64,
         offer: Option<(usize, String, String)>,
     },
-    /// Mockup 5. `session` is the conversation id as shown (its first 8 characters), `status`
-    /// the exit status, `output` the last lines claude wrote to stderr, and `closed` whether
-    /// the row went back to Closed rather than Offloaded.
+    /// Mockup 5. `session` is the conversation id as shown (its first 8 characters),
+    /// `killed_for_memory` whether the container's OOM-kill count rose while it started,
+    /// `output` the last lines claude wrote to stderr, and `closed` whether the row went back
+    /// to Closed rather than Offloaded. There is no exit status: zmx does not report it.
     ResumeFailed {
         title: String,
         session: String,
-        status: i32,
+        killed_for_memory: bool,
         output: Vec<String>,
         closed: bool,
     },
@@ -271,7 +272,7 @@ pub enum Key {
 }
 
 /// Handing the terminal to a child process and taking it back. `launch.rs` suspends before
-/// it runs `abduco`, `claude` or a shell, and resumes after, so the child gets an ordinary
+/// it runs `zmx`, `claude` or a shell, and resumes after, so the child gets an ordinary
 /// cooked terminal and the menu gets its raw one back.
 pub trait Terminal {
     fn suspend(&mut self) -> std::io::Result<()>;

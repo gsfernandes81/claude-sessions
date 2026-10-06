@@ -11,11 +11,11 @@ not exist yet.
 
 ## What it is, in one paragraph
 
-A **slot** is one `abduco` session, i.e. one running `claude` process. A slot holds a
+A **slot** is one `zmx` session, i.e. one running `claude` process. A slot holds a
 sequence of **conversations** (Claude session ids): `/clear` starts a new one in the same
 process, `--resume` re-enters an old one. A **registry** keyed by slot records what each one
 is doing, written only by `claude-sessions hook` from Claude Code's own hook events. The menu
-reads the registry and `abduco`, never guesses, and opens what the owner picks.
+reads the registry and `zmx list`, never guesses, and opens what the owner picks.
 [`docs/design.md`](docs/design.md) is the specification; read it before writing code.
 
 ## The rules that have teeth

@@ -1,7 +1,7 @@
 //! What a keypress in the menu does: attach to a slot, resume an offloaded one, start a new
 //! one, open a shell, close a slot, or offload one to make room for another.
 //!
-//! **Every child runs as a child.** `abduco -a` returns when the owner detaches, and the menu
+//! **Every child runs as a child.** `zmx attach` returns when the owner detaches, and the menu
 //! comes back instead of the login ending — a fresh login costs a Cloudflare Access handshake
 //! on a metered link. The terminal is handed over through [`Terminal`] for exactly as long as
 //! the child has it.
@@ -20,10 +20,9 @@
 //! the record goes back to `offloaded`.
 //!
 //! **Two environment overrides**, so tests can stand programs in for the real ones:
-//! `CLAUDE_SESSIONS_ABDUCO` names the abduco to run (default `abduco`) and
+//! `CLAUDE_SESSIONS_ZMX` names the zmx to run (default `zmx`) and
 //! `CLAUDE_SESSIONS_CLAUDE` the claude (default `claude`). An empty value is the default.
 
-use crate::abduco;
 use crate::clock::{self, Millis};
 use crate::fmt;
 use crate::live;
@@ -33,8 +32,8 @@ use crate::offload;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
 use crate::ui::{Dialog, Outcome, Row, RowKey, Terminal};
+use crate::zmx;
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::thread::sleep;
@@ -46,16 +45,16 @@ use std::time::{Duration, Instant};
 /// resumes a conversation, reads it and `/exit`s in under ten.
 pub const QUICK_FAIL: Duration = Duration::from_secs(10);
 
-/// How long a `live` record with no pid and no abduco socket is taken to be starting
-/// somewhere else. Between one menu writing that record and its abduco creating the socket
+/// How long a `live` record with no pid and no zmx session is taken to be starting
+/// somewhere else. Between one menu writing that record and its zmx creating the session
 /// there are milliseconds; a record still like that half a minute later is a start whose menu
 /// died before it could clean up, and treating it as starting forever would strand the slot.
 const STARTING_GRACE: Millis = 30_000;
 
-/// For abduco's server to remove its socket once its command has exited. The client can
-/// return with the exit status a moment before the server has unlinked the socket, and a
-/// failed resume would otherwise read as still running for want of a few milliseconds.
-const SOCKET_SETTLE: Duration = Duration::from_secs(1);
+/// For zmx to drop a session once its command has exited. The client can return a moment
+/// before the daemon has removed the session, and a failed resume would otherwise read as
+/// still running for want of a few milliseconds.
+const SESSION_SETTLE: Duration = Duration::from_secs(1);
 
 /// The most stderr lines a failed resume shows. Mockup 5 has room for two at 40 columns; the
 /// renderer cuts to fit, and the last lines are where a program says why it stopped.
@@ -67,7 +66,7 @@ const MAX_SLOTS: u32 = 999;
 
 /// Between `env` and claude: send claude's stderr to the slot's capture file, then become
 /// claude. **The `exec` is load-bearing.** A hook binds to a slot only when its claude is the
-/// direct child of the slot's abduco server (`bind.rs`), and a shell left in between would make
+/// direct child of the slot's zmx daemon (`bind.rs`), and a shell left in between would make
 /// the slot's own claude look nested, so no `SessionStart` would ever bind it. The file path
 /// is an argument rather than an environment variable so that nothing of ours leaks into
 /// claude's environment, or into every tool call it makes. `tests/launch.rs` runs this exact
@@ -96,13 +95,15 @@ pub const SCROLLBACK: [&str; 3] = [
 
 /// What the launcher runs and reads, gathered so tests can substitute each of them.
 pub struct Deps {
-    pub abduco: String,
+    pub zmx: String,
     pub claude: String,
     /// `$SHELL`, because some containers set bash and some fish.
     pub shell: String,
     /// The memory reading behind the no-room check.
     pub memory: fn() -> mem::Memory,
     pub quick: Duration,
+    /// The container's OOM-kill count (`mem::oom_kills`), read around each start.
+    pub oom_kills: fn() -> Option<u64>,
     /// Whether the login has set this environment variable, which the slot's claude then
     /// inherits as it is (`SCROLLBACK`).
     pub preset: fn(&str) -> bool,
@@ -111,10 +112,11 @@ pub struct Deps {
 impl Deps {
     pub fn from_env() -> Deps {
         Deps {
-            abduco: env_or("CLAUDE_SESSIONS_ABDUCO", "abduco"),
+            zmx: zmx::program(),
             claude: env_or("CLAUDE_SESSIONS_CLAUDE", "claude"),
             shell: env_or("SHELL", "/bin/sh"),
             memory: mem::read,
+            oom_kills: mem::oom_kills,
             quick: QUICK_FAIL,
             preset: |key| std::env::var_os(key).is_some(),
         }
@@ -168,7 +170,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
     let n = label(row);
     let slot = match &row.key {
         RowKey::Slot(slot) => slot,
-        // An abduco session with no record has no pid and start time on file, and a process
+        // A zmx session with no record has no pid and start time on file, and a process
         // found by walking /proc for it now would be a guess. Signalling a guess is exactly
         // what the pid-plus-start-time rule exists to prevent.
         RowKey::Socket(_) => {
@@ -197,21 +199,22 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         State::Offloaded => {}
         State::Live | State::Offloading => match (rec.pid, rec.proc_start) {
             (Some(pid), Some(start)) if procinfo::is_alive(pid, start) => {
-                // The server is found before the stop, while the claude is still under it to
-                // be found by.
+                // The daemon is looked for before the stop, while the claude is still under it
+                // to be found by.
                 let table = procinfo::table();
-                let server = offload::abduco_server(table.as_deref(), pid);
+                let was_under_zmx = offload::under_zmx(table.as_deref(), pid);
                 if let Err(e) = offload::stop(pid, start, offload::TERM_GRACE, offload::KILL_GRACE)
                 {
                     // Not marked closed: a claude still running behind a row that says it
                     // has ended is the one outcome worse than this.
                     return Outcome::Refused(format!("could not stop {n}: {e}"));
                 }
-                offload::teardown_abduco(slot, server);
+                offload::teardown_zmx(slot, was_under_zmx);
             }
             // Recorded, and already gone: nothing to stop.
             (Some(_), Some(_)) => {}
-            _ if abduco::socket_for(slot).is_some() => {
+            // Not knowing whether zmx has a session for it is not knowing that it does not.
+            _ if listed(slot) != Some(false) => {
                 return Outcome::Refused(format!(
                     "{n} is running but no process is recorded for it yet, so there is \
                      nothing to stop it by safely — try again in a moment"
@@ -257,8 +260,8 @@ pub(crate) fn open_with(
     };
     let rec = match registry::load(slot) {
         Ok(Some(rec)) => rec,
-        // The record went between the list and the keypress. What is left is the socket.
-        Ok(None) if abduco::socket_for(slot).is_some() => {
+        // The record went between the list and the keypress. What is left is the session.
+        Ok(None) if listed(slot) == Some(true) => {
             return attach_socket(slot, &n, term, deps);
         }
         Ok(None) => return Outcome::Refused(format!("{n} is gone")),
@@ -275,14 +278,14 @@ pub(crate) fn open_with(
     }
 }
 
-/// What a record says about its slot, read with `/proc` and the socket directory.
+/// What a record says about its slot, read with `/proc` and zmx.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// A process is there to attach to.
     Running,
     /// Nothing is running, and the record says what to bring back.
     Resumable,
-    /// Another menu marked it live a moment ago and its abduco has not appeared yet.
+    /// Another menu marked it live a moment ago and its zmx session has not appeared yet.
     Starting,
     Closed,
 }
@@ -302,8 +305,8 @@ fn classify(rec: &SlotRecord, now: Millis) -> Kind {
                 }
             }
             // No pid: just started or resumed and not yet bound by `SessionStart`, or running
-            // without hooks. The socket is the evidence that something is there.
-            _ if abduco::socket_for(&rec.slot).is_some() => Kind::Running,
+            // without hooks. zmx's session is the evidence that something is there.
+            _ if listed(&rec.slot) == Some(true) => Kind::Running,
             _ if now.saturating_sub(rec.updated_ms) < STARTING_GRACE => Kind::Starting,
             _ => Kind::Resumable,
         },
@@ -341,10 +344,9 @@ fn label_of(rows: &[Row], slot: &str) -> String {
 
 fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -> Outcome {
     let n = label_of(rows, slot);
-    let mut cmd = Command::new(&deps.abduco);
-    cmd.arg("-a").arg(slot);
-    // abduco's own exit status is not consulted: a session that ended while attached and one
-    // that was gone before we got there both read the same afterwards, from the record.
+    let mut cmd = attach_command(slot, deps);
+    // zmx's exit status says nothing here — 0 for a detach and for a session that ended while
+    // attached alike — so what happened is read afterwards, from the record.
     if let Err(why) = run_child(&mut cmd, term) {
         return Outcome::Refused(why);
     }
@@ -354,19 +356,37 @@ fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -
     }
 }
 
-/// A session with no record: all there is to go on afterwards is whether its socket is still
-/// there, which abduco removes when its command exits.
+/// A session with no record: all there is to go on afterwards is whether zmx still lists it,
+/// which it stops doing when its command exits.
 fn attach_socket(name: &str, n: &str, term: &mut dyn Terminal, deps: &Deps) -> Outcome {
-    let mut cmd = Command::new(&deps.abduco);
-    cmd.arg("-a").arg(name);
+    let mut cmd = attach_command(name, deps);
     if let Err(why) = run_child(&mut cmd, term) {
         return Outcome::Refused(why);
     }
-    if abduco::socket_for(name).is_some() {
+    if listed(name) != Some(false) {
         detached()
     } else {
         ended(n)
     }
+}
+
+/// `zmx attach <name> false`: attach to `name` and never create it.
+///
+/// **`zmx attach` creates a session that is not there**, where `abduco -a` refused, so a
+/// session that ended between the list and the keypress would come back as a stray shell
+/// under the slot's name. The command is the guard: zmx ignores it for a session that exists
+/// (seen on 0.8.1: same pid before and after), and for one that does not it starts `false`,
+/// which ends at once and leaves nothing behind — the attach exits 1, `cannot connect`.
+fn attach_command(name: &str, deps: &Deps) -> Command {
+    let mut cmd = zmx::command(&deps.zmx);
+    cmd.arg("attach").arg(name).arg("false");
+    cmd
+}
+
+/// Whether zmx lists a session called `name`: `None` when zmx could not be asked, which every
+/// caller weighs as "cannot rule it out" in whichever direction is safe.
+fn listed(name: &str) -> Option<bool> {
+    zmx::session_for(name).map(|s| s.is_some())
 }
 
 /// Mockup 6. The cursor is still on the session, so the line need not say which.
@@ -419,7 +439,7 @@ fn resume(
         Plan::Refuse(why) => return Outcome::Refused(why),
     };
     let args = ["--resume".to_string(), session.clone()];
-    let (status, took) = match start_slot(slot, &cwd, &args, term, deps) {
+    let (took, oom) = match start_slot(slot, &cwd, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(slot, back_to);
@@ -435,7 +455,7 @@ fn resume(
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
             title: title.to_string(),
             session: session.chars().take(8).collect(),
-            status: exit_code(status),
+            killed_for_memory: oom,
             output: stderr_tail(&stderr_path(slot), STDERR_LINES),
             closed: back_to == State::Closed,
         }),
@@ -466,15 +486,22 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
     } else {
         State::Offloaded
     };
-    // A socket with nothing recorded running behind it: a server the offloader could not
-    // stop, or one killed without cleanup. `abduco -c` on a taken name fails at once, and the
-    // socket still being there would then read as a slot that started — so refuse, and let
-    // reconcile, which can tell a dead server's socket from a live one, clear it.
-    if abduco::socket_for(slot).is_some() {
-        return Plan::Refuse(format!(
-            "{n} still has an abduco session on disk with nothing recorded running in it — \
-             run claude-sessions reconcile"
-        ));
+    // A zmx session with nothing recorded running in it: a claude the offloader could not
+    // stop, or one started by hand under a slot's name. `zmx attach` on a taken name would
+    // attach to it and ignore the resume — so refuse rather than call that a resume.
+    match listed(slot) {
+        Some(false) => {}
+        Some(true) => {
+            return Plan::Refuse(format!(
+                "{n} still has a zmx session with nothing recorded running in it — open it \
+                 from its row, or stop it with zmx kill {slot}"
+            ));
+        }
+        None => {
+            return Plan::Refuse(format!(
+                "{n}: zmx did not answer, so whether it is still running cannot be ruled out"
+            ));
+        }
     }
     let (Some(session), Some(cwd)) = (rec.session_id.clone(), rec.cwd.clone()) else {
         return Plan::Refuse(format!(
@@ -554,7 +581,7 @@ fn running_elsewhere(slot: &str, session: &str, now: Millis) -> io::Result<Optio
             r.pid == Some(pid)
                 && r.proc_start
                     .is_some_and(|start| procinfo::is_alive(pid, start))
-                && abduco::socket_for(&r.slot).is_some()
+                && listed(&r.slot) == Some(true)
         })
     };
     for running in live::all() {
@@ -574,12 +601,12 @@ fn running_elsewhere(slot: &str, session: &str, now: Millis) -> io::Result<Optio
             continue;
         }
         match classify(other, now) {
-            Kind::Running if abduco::socket_for(&other.slot).is_some() => {
+            Kind::Running if listed(&other.slot) == Some(true) => {
                 return Ok(Some(Elsewhere::Slot(other.slot.clone())));
             }
             Kind::Running => {
                 return Ok(Some(Elsewhere::Unattachable(format!(
-                    "its conversation is already running in {}, which has no abduco session \
+                    "its conversation is already running in {}, which has no zmx session \
                      to attach to",
                     other.slot
                 ))));
@@ -651,7 +678,7 @@ fn resume_conversation(
         Err(why) => return Outcome::Refused(why),
     };
     let args = ["--resume".to_string(), id.to_string()];
-    let (status, took) = match start_slot(&slot, cwd, &args, term, deps) {
+    let (took, oom) = match start_slot(&slot, cwd, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(&slot, State::Closed);
@@ -664,7 +691,7 @@ fn resume_conversation(
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
             title: title.to_string(),
             session: id.chars().take(8).collect(),
-            status: exit_code(status),
+            killed_for_memory: oom,
             output: stderr_tail(&stderr_path(&slot), STDERR_LINES),
             closed: true,
         }),
@@ -693,7 +720,7 @@ pub(crate) fn new_session_with(
         Ok(slot) => slot,
         Err(why) => return Outcome::Refused(why),
     };
-    let (status, took) = match start_slot(&slot, workspace, &[], term, deps) {
+    let (took, oom) = match start_slot(&slot, workspace, &[], term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(&slot, State::Closed);
@@ -707,9 +734,13 @@ pub(crate) fn new_session_with(
         After::Ended => ended("the new session"),
         After::DiedUnbound if took < deps.quick => {
             let said = stderr_tail(&stderr_path(&slot), 1);
+            let how = if oom {
+                "was killed for memory"
+            } else {
+                "ended at once"
+            };
             Outcome::Refused(format!(
-                "{slot} did not start: claude exited {}{}",
-                exit_code(status),
+                "{slot} did not start: claude {how}{}",
                 said.first().map(|l| format!(": {l}")).unwrap_or_default()
             ))
         }
@@ -728,7 +759,7 @@ pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
 /// The lowest free `claude-<n>` for a slot starting in `cwd`, resuming `(id, title)` if
 /// given; `Ok(Err(..))` when that conversation is running somewhere already.
 ///
-/// Free means no record that is live, offloading or offloaded, and no abduco socket of that
+/// Free means no record that is live, offloading or offloaded, and no zmx session of that
 /// name — a session started by hand as `claude-3` is still `claude-3`. A closed record's name
 /// is reused: closed slots are not listed, their conversations are, from Claude Code's own
 /// store, under their own ids (owner, 2026-10-03).
@@ -762,10 +793,12 @@ fn allocate_for(
             }
         }
     }
-    let sockets = abduco::sockets();
+    let sessions = zmx::sessions().ok_or_else(|| {
+        "zmx did not answer, so which slot names are free cannot be told — try again".to_string()
+    })?;
     for n in 1..=MAX_SLOTS {
         let slot = format!("claude-{n}");
-        if sockets.iter().any(|s| s.name == slot) {
+        if sessions.iter().any(|s| s.name == slot) {
             continue;
         }
         // A late hook could still be writing a closed record, so the slot's own lock too.
@@ -908,14 +941,23 @@ fn stderr_path(slot: &str) -> PathBuf {
 
 /// The command line a slot is started with:
 ///
-/// `abduco -c <slot> env CLAUDE_SESSIONS_SLOT=<slot> [SCROLLBACK=1…] sh -c START_WRAP sh <stderr> <claude> <args…>`
+/// `zmx attach <slot> env CLAUDE_SESSIONS_SLOT=<slot> [SCROLLBACK=1…] sh -c START_WRAP sh <stderr> <claude> <args…>`
 ///
 /// `env` sets the name every hook inherits, and each of `SCROLLBACK` the login has not set,
 /// and execs the shell; the shell points stderr at the capture file and execs claude: one pid
-/// from the abduco server's fork to claude, so claude is that server's direct child.
+/// from the zmx daemon's fork to claude, so claude is that daemon's direct child. The slot
+/// name is free when this runs (`allocate_for`, `plan_resume`): on a taken name zmx would
+/// attach to what is there and ignore the command.
+///
+/// **It creates and attaches in one, on the terminal.** What claude writes in the first few
+/// milliseconds, before the client has connected, is not shown on that first attach, but zmx
+/// keeps it and replays it on the next one. Creating the session from a client with no terminal
+/// and then attaching was tried and is worse: that early output was lost outright (zmx 0.8.1,
+/// 2026-10-06). Claude draws nothing for far longer than the gap, so in practice nothing is
+/// missed; `tests/zmx_real.rs` pins both halves.
 fn start_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Command {
-    let mut cmd = Command::new(&deps.abduco);
-    cmd.arg("-c")
+    let mut cmd = zmx::command(&deps.zmx);
+    cmd.arg("attach")
         .arg(slot)
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
@@ -935,16 +977,17 @@ fn start_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Com
     cmd
 }
 
-/// Start `slot` in `cwd` and wait for the owner to come back from it. Returns how abduco
-/// exited and how long it took, which together are how a failed start is told from a
-/// session that was used and left.
+/// Start `slot` in `cwd` and wait for the owner to come back from it. Returns how long it took,
+/// which with whether a `SessionStart` bound it is how a failed start is told from a session
+/// that was used and left, and whether the container's OOM-kill count rose meanwhile. zmx's exit status is no help: 0 for a detach and for a claude that
+/// ended, whatever claude's own status, and 1 for a claude gone before the client connected.
 fn start_slot(
     slot: &str,
     cwd: &str,
     args: &[String],
     term: &mut dyn Terminal,
     deps: &Deps,
-) -> Result<(ExitStatus, Duration), String> {
+) -> Result<(Duration, bool), String> {
     let stderr = stderr_path(slot);
     if let Some(dir) = stderr.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -953,9 +996,16 @@ fn start_slot(
     std::fs::File::create(&stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
     let mut cmd = start_command(slot, &stderr, args, deps);
     cmd.current_dir(cwd);
+    let oom_before = (deps.oom_kills)();
     let started = Instant::now();
-    let status = run_child(&mut cmd, term)?;
-    Ok((status, started.elapsed()))
+    run_child(&mut cmd, term)?;
+    let took = started.elapsed();
+    // Only an answer both times counts: an unreadable file is "not known", never "killed".
+    let killed_for_memory = matches!(
+        (oom_before, (deps.oom_kills)()),
+        (Some(before), Some(after)) if after > before
+    );
+    Ok((took, killed_for_memory))
 }
 
 /// Run a child with the terminal handed over, and take the terminal back whatever happened.
@@ -997,11 +1047,11 @@ fn settle(slot: &str, unbound_death: Option<State>, just_started: bool) -> After
             .flatten()
             .is_some_and(|r| r.pid.is_none())
     {
-        wait_socket_gone(slot, SOCKET_SETTLE);
+        wait_session_gone(slot, SESSION_SETTLE);
     }
     let lock = SlotLock::acquire(&registry::lock_path(slot), INTERACTIVE_WAIT).ok();
     let Ok(Some(mut rec)) = registry::load(slot) else {
-        return if abduco::socket_for(slot).is_some() {
+        return if listed(slot) != Some(false) {
             After::Running
         } else {
             After::Ended
@@ -1037,18 +1087,20 @@ fn settle(slot: &str, unbound_death: Option<State>, just_started: bool) -> After
     }
 }
 
-/// Is something running in this slot? The recorded process when there is one; otherwise the
-/// socket, which is all a slot not yet bound, or running without hooks, has to show.
+/// Is something running in this slot? The recorded process when there is one; otherwise zmx's
+/// session, which is all a slot not yet bound, or running without hooks, has to show. A zmx
+/// that does not answer reads as running: the safe mistake, since the other one puts a live
+/// slot back to offloaded.
 fn is_running(rec: &SlotRecord) -> bool {
     match (rec.pid, rec.proc_start) {
         (Some(pid), Some(start)) => procinfo::is_alive(pid, start),
-        _ => abduco::socket_for(&rec.slot).is_some(),
+        _ => listed(&rec.slot) != Some(false),
     }
 }
 
-fn wait_socket_gone(slot: &str, within: Duration) {
+fn wait_session_gone(slot: &str, within: Duration) {
     let deadline = Instant::now() + within;
-    while abduco::socket_for(slot).is_some() && Instant::now() < deadline {
+    while listed(slot) != Some(false) && Instant::now() < deadline {
         sleep(Duration::from_millis(20));
     }
 }
@@ -1065,13 +1117,6 @@ fn put_back(slot: &str, state: State) {
             let _ = registry::store(&rec);
         }
     }
-}
-
-/// abduco exits with its command's status; a signal reads as a shell would print it.
-fn exit_code(status: ExitStatus) -> i32 {
-    status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 fn lock_slot(slot: &str, n: &str) -> Result<SlotLock, String> {
@@ -1129,18 +1174,19 @@ fn printable(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Against stand-in programs: an `abduco` shell script that makes and removes a socket
-    //! file and runs its command, and `claude` scripts that either stay up or fail the way a
+    //! Against stand-in programs: a `zmx` shell script that keeps a file per session, lists
+    //! them as `zmx list` does and runs its command, and `claude` scripts that either stay up or fail the way a
     //! resume of a missing transcript does. Real processes, real signals, the real registry.
     //!
-    //! **Why a mutex rather than explicit paths.** The registry, abduco's socket directory and
+    //! **Why a mutex rather than explicit paths.** The registry, the zmx program to list with and
     //! Claude Code's sessions directory are each found from an environment variable by the
     //! module that owns them, and launch calls straight through to those modules — threading
     //! a path through every one of them would change four modules to suit a test. So each
     //! test here takes `ENV` and points the three variables at its own temporary tree. No
     //! test outside this module reads those variables (checked when this was written; the
     //! integration tests run in their own processes), so the mutex covers every reader.
-    //! The program names do not need it: they are passed in `Deps`.
+    //! The programs to start and attach with are passed in `Deps`; the one to list with is
+    //! `CLAUDE_SESSIONS_ZMX`, pointed at the same stand-in.
 
     use super::*;
     use crate::ui::Row;
@@ -1161,21 +1207,24 @@ mod tests {
             let guard = ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let root = std::env::temp_dir().join(format!("cs-launch-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            for d in ["registry", "abduco", "config/sessions", "bin", "work"] {
+            for d in ["registry", "zmx", "config/sessions", "bin", "work"] {
                 std::fs::create_dir_all(root.join(d)).unwrap();
             }
             // SAFETY: every reader of these variables in this test binary holds ENV (see the
             // module note), and std serialises its own environment access.
             unsafe {
                 std::env::set_var("CLAUDE_SESSIONS_DIR", root.join("registry"));
-                std::env::set_var("ABDUCO_SOCKET_DIR", root.join("abduco"));
+                std::env::set_var("CLAUDE_SESSIONS_ZMX", root.join("bin/zmx"));
                 std::env::set_var("CLAUDE_CONFIG_DIR", root.join("config"));
             }
-            Fixture {
+            let f = Fixture {
                 root,
                 kids: Vec::new(),
                 _env: guard,
-            }
+            };
+            // Listing works from the start, before a test chooses how attaching behaves.
+            f.zmx(":");
+            f
         }
 
         fn path(&self, rel: &str) -> PathBuf {
@@ -1193,38 +1242,50 @@ mod tests {
             p.display().to_string()
         }
 
-        /// The stand-in abduco. Every call is appended to `calls`, which is also how the fake
+        /// The stand-in zmx, at `bin/zmx`, which is also what `CLAUDE_SESSIONS_ZMX` names.
+        /// Every attach is appended to `calls` (a listing is not), which is also how the fake
         /// terminal tells whether a child ran between its suspend and its resume.
         ///
-        /// `-c` makes the socket and runs the command. With `detach`, it behaves like a
-        /// client the owner detached from at once: a forked copy of itself — still named
-        /// `abduco`, as a real server is — runs the command and removes the socket when the
-        /// command exits, and the client returns 0. Without, it stays attached until the
-        /// command exits and returns its status, as abduco does.
-        fn abduco(&self, detach: bool, on_attach: &str) -> String {
+        /// A session is a file `zmx/<name>` holding `<pid> <clients>`, and `list` prints one
+        /// line per file the way zmx 0.8.1 does. `attach <name> <command…>` on a name that is
+        /// not there creates the session as zmx's daemon does — a forked copy of itself, still
+        /// named `zmx`, runs the command and removes the file when it exits — and then is the
+        /// attached client: it runs `on_attach` and returns 0. `attach <name> false` on a session that is there runs
+        /// `on_attach` — the owner's time attached — and returns 0, as zmx does whether the
+        /// owner detached or the session ended meanwhile. On a session that is not there it
+        /// exits 1, starting nothing.
+        fn zmx(&self, on_attach: &str) -> String {
             let calls = self.path("calls");
-            let socks = self.path("abduco");
-            let run = if detach {
-                r#"( "$@" </dev/null >/dev/null 2>&1; rm -f "$sock" ) &
-       exit 0"#
-            } else {
-                r#""$@" </dev/null >/dev/null; st=$?; rm -f "$sock"; exit $st"#
-            };
+            let dir = self.path("zmx");
             self.script(
-                "abduco",
+                "zmx",
                 &format!(
-                    r#"echo "abduco $*" >> "{calls}"
+                    r#"dir="{dir}"
 case "$1" in
-  -a) {on_attach}
-      exit 0 ;;
-  -c) name=$2; shift 2
-      sock="{socks}/$name@test"
-      : > "$sock"
-      {run} ;;
+  list)
+    for f in "$dir"/*; do
+      [ -e "$f" ] || continue
+      read pid clients < "$f"
+      printf 'name=%s\tpid=%s\tclients=%s\tcreated=0\n' "${{f##*/}}" "$pid" "$clients"
+    done
+    exit 0 ;;
+  attach)
+    echo "zmx $*" >> "{calls}"
+    name=$2; shift 2
+    if [ "$1" = false ]; then
+      [ -e "$dir/$name" ] || exit 1
+      {on_attach}
+      exit 0
+    fi
+    [ -e "$dir/$name" ] && exit 0
+    echo "0 0" > "$dir/$name"
+    ( "$@" </dev/null >/dev/null 2>&1 & p=$!; echo "$p 0" > "$dir/$name"; wait $p; rm -f "$dir/$name" ) &
+    {on_attach}
+    exit 0 ;;
 esac
 exit 2"#,
                     calls = calls.display(),
-                    socks = socks.display(),
+                    dir = dir.display(),
                 ),
             )
         }
@@ -1267,12 +1328,13 @@ exit 1"#,
             )
         }
 
-        fn deps(&self, abduco: String, claude: String) -> Deps {
+        fn deps(&self, zmx: String, claude: String) -> Deps {
             Deps {
-                abduco,
+                zmx,
                 claude,
                 shell: "/bin/false".into(),
                 memory: room,
+                oom_kills: || Some(0),
                 quick: QUICK_FAIL,
                 preset: |_| false,
             }
@@ -1306,10 +1368,10 @@ exit 1"#,
             (pid, procinfo::start_time(pid).unwrap())
         }
 
-        fn socket(&self, slot: &str, mode: u32) {
-            let p = self.path(&format!("abduco/{slot}@test"));
-            std::fs::write(&p, "").unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        /// A zmx session that nothing in the test started, attached or not.
+        fn session(&self, slot: &str, attached: bool) {
+            let p = self.path(&format!("zmx/{slot}"));
+            std::fs::write(&p, format!("0 {}\n", u8::from(attached))).unwrap();
         }
     }
 
@@ -1455,7 +1517,7 @@ exit 1"#,
         r.last_stop_ms = Some(stop);
         r.last_activity_ms = stop;
         registry::store(&r).unwrap();
-        f.socket(slot, 0o600);
+        f.session(slot, false);
         (pid, start)
     }
 
@@ -1483,10 +1545,10 @@ exit 1"#,
         let mut rec = live("claude-1", pid, start);
         rec.last_stop_ms = Some(clock::now() - 1_000);
         registry::store(&rec).unwrap();
-        f.socket("claude-1", 0o600);
+        f.session("claude-1", false);
         assert!(load("claude-1").unread(), "calibration: it starts unread");
 
-        let deps = f.deps(f.abduco(false, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
         let before = clock::now();
@@ -1496,7 +1558,7 @@ exit 1"#,
             out,
             Outcome::Back(Some("detached · it is still running".into()))
         );
-        assert_eq!(f.calls(), ["abduco -a claude-1"]);
+        assert_eq!(f.calls(), ["zmx attach claude-1 false"]);
         term.assert_handed_over(1);
         let after = load("claude-1");
         assert!(after.last_attach_ms >= before, "the look is recorded");
@@ -1509,12 +1571,9 @@ exit 1"#,
         let mut f = Fixture::new("attach-ends");
         let (pid, start) = f.process();
         registry::store(&live("claude-1", pid, start)).unwrap();
-        f.socket("claude-1", 0o600);
-        // The owner /exits while attached: the process is gone by the time abduco returns.
-        let deps = f.deps(
-            f.abduco(false, &format!("kill {pid}; sleep 0.2")),
-            f.claude_ok(),
-        );
+        f.session("claude-1", false);
+        // The owner /exits while attached: the process is gone by the time zmx returns.
+        let deps = f.deps(f.zmx(&format!("kill {pid}; sleep 0.2")), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1525,8 +1584,8 @@ exit 1"#,
     #[test]
     fn an_unregistered_row_is_attached_by_name() {
         let f = Fixture::new("socket-row");
-        f.socket("claude", 0o600);
-        let deps = f.deps(f.abduco(false, ":"), f.claude_ok());
+        f.session("claude", false);
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut rows = vec![row("x", "claude")];
         rows[0].key = RowKey::Socket("claude".into());
         let mut term = Term::new(&f);
@@ -1535,17 +1594,17 @@ exit 1"#,
             out,
             Outcome::Back(Some("detached · it is still running".into()))
         );
-        assert_eq!(f.calls(), ["abduco -a claude"]);
+        assert_eq!(f.calls(), ["zmx attach claude false"]);
         term.assert_handed_over(1);
     }
 
     // ── resume ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn an_offloaded_slot_is_resumed_in_its_own_directory_as_abducos_direct_child() {
+    fn an_offloaded_slot_is_resumed_in_its_own_directory_as_zmxs_direct_child() {
         let f = Fixture::new("resume");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1566,7 +1625,7 @@ exit 1"#,
         let parent = procinfo::parent(pid).and_then(procinfo::comm);
         assert_eq!(
             parent.as_deref(),
-            Some("abduco"),
+            Some("zmx"),
             "no shell may stay between the server and claude, or no hook would ever bind it"
         );
         let rec = load("claude-1");
@@ -1598,7 +1657,7 @@ exit 1"#,
         )
         .unwrap();
 
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1618,7 +1677,9 @@ exit 1"#,
             out,
             Outcome::Back(Some("detached · it is still running".into()))
         );
-        assert_eq!(f.calls().len(), 1);
+        let calls = f.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].contains("--resume conv-1"), "{calls:?}");
     }
 
     #[test]
@@ -1629,9 +1690,9 @@ exit 1"#,
         let mut other = live("claude-2", pid, start);
         other.session_id = Some("conv-1".into());
         registry::store(&other).unwrap();
-        f.socket("claude-2", 0o600);
+        f.session("claude-2", false);
 
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1639,7 +1700,11 @@ exit 1"#,
             out,
             Outcome::Back(Some("detached · it is still running".into()))
         );
-        assert_eq!(f.calls(), ["abduco -a claude-2"], "attached, not resumed");
+        assert_eq!(
+            f.calls(),
+            ["zmx attach claude-2 false"],
+            "attached, not resumed"
+        );
         assert_eq!(load("claude-1").state, State::Offloaded);
         assert!(load("claude-2").last_attach_ms > 0);
     }
@@ -1659,7 +1724,7 @@ exit 1"#,
     fn a_stored_conversation_is_resumed_in_a_new_slot_from_where_it_started() {
         // Owner, 2026-10-03: any conversation on disk, whoever started it, is one Enter away.
         let f = Fixture::new("stored");
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "fix the dns")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1699,7 +1764,7 @@ exit 1"#,
             format!(r#"{{"pid":{pid},"sessionId":"conv-9","procStart":{start}}}"#),
         )
         .unwrap();
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "t")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1726,7 +1791,7 @@ exit 1"#,
         // Both ways in to one conversation take the same slot lock.
         let f = Fixture::new("stored-held");
         registry::store(&offloaded("claude-4", "conv-9", &f.work())).unwrap();
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "t")];
         let mut term = Term::new(&f);
         open_with(&rows, 0, &mut term, &deps, true);
@@ -1738,7 +1803,7 @@ exit 1"#,
     #[test]
     fn a_stored_conversation_that_fails_to_resume_leaves_its_slot_closed() {
         let f = Fixture::new("stored-fails");
-        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows = [stored("0f9c4a1e-7d", &f.work(), "fix the dns")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1747,7 +1812,7 @@ exit 1"#,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "fix the dns".into(),
                 session: "0f9c4a1e".into(),
-                status: 1,
+                killed_for_memory: false,
                 output: vec!["No conversation found with that session id".into()],
                 closed: true,
             })
@@ -1760,12 +1825,12 @@ exit 1"#,
         // The calibrating case is the resume test above: the same record, no socket, resumes.
         let f = Fixture::new("leftover");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
-        f.socket("claude-1", 0o700);
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        f.session("claude-1", true);
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
         let out = open_with(&[row("claude-1", "a")], 0, &mut term, &deps, true);
         assert!(
-            matches!(&out, Outcome::Refused(why) if why.contains("reconcile")),
+            matches!(&out, Outcome::Refused(why) if why.contains("zmx kill")),
             "{out:?}"
         );
         assert!(f.calls().is_empty() && term.events.is_empty());
@@ -1773,10 +1838,41 @@ exit 1"#,
     }
 
     #[test]
+    fn a_resume_killed_for_memory_says_so() {
+        // The calibrating case is the test below: the same failure, with the count unchanged,
+        // says only that it ended.
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3);
+        fn rising() -> Option<u64> {
+            Some(COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        }
+        let f = Fixture::new("resume-oom");
+        registry::store(&offloaded("claude-5", "0f9c4a1e-7d", &f.work())).unwrap();
+        let mut deps = f.deps(f.zmx(":"), f.claude_fails());
+        deps.oom_kills = rising;
+        let rows: Vec<Row> = (1..=5).map(|n| row(&format!("claude-{n}"), "t")).collect();
+        let mut term = Term::new(&f);
+        match open_with(&rows, 4, &mut term, &deps, true) {
+            Outcome::ResumeFailed(Dialog::ResumeFailed {
+                killed_for_memory, ..
+            }) => assert!(killed_for_memory),
+            other => panic!("{other:?}"),
+        }
+        // A count that cannot be read is not a kill.
+        deps.oom_kills = || None;
+        let mut term = Term::new(&f);
+        match open_with(&rows, 4, &mut term, &deps, true) {
+            Outcome::ResumeFailed(Dialog::ResumeFailed {
+                killed_for_memory, ..
+            }) => assert!(!killed_for_memory),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn a_failed_resume_says_why_and_leaves_the_slot_offloaded() {
         let f = Fixture::new("resume-fails");
         registry::store(&offloaded("claude-5", "0f9c4a1e-7d", &f.work())).unwrap();
-        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows: Vec<Row> = (1..=5).map(|n| row(&format!("claude-{n}"), "t")).collect();
         let mut term = Term::new(&f);
         let out = open_with(&rows, 4, &mut term, &deps, true);
@@ -1786,7 +1882,7 @@ exit 1"#,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "t".into(),
                 session: "0f9c4a1e".into(),
-                status: 1,
+                killed_for_memory: false,
                 output: vec!["No conversation found with that session id".into()],
                 closed: false,
             })
@@ -1805,7 +1901,7 @@ exit 1"#,
         );
         assert_eq!(rec.pid, None);
         assert_eq!(rec.last_attach_ms, 0, "a failed start is not a look");
-        assert!(abduco::socket_for("claude-5").is_none());
+        assert!(listed("claude-5") == Some(false));
     }
 
     #[test]
@@ -1816,7 +1912,7 @@ exit 1"#,
         let mut closed = offloaded("claude-1", "conv-1", &f.work());
         closed.state = State::Closed;
         registry::store(&closed).unwrap();
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1838,7 +1934,7 @@ exit 1"#,
         let mut closed = offloaded("claude-2", "0f9c4a1e-7d", &f.work());
         closed.state = State::Closed;
         registry::store(&closed).unwrap();
-        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 1, &mut term, &deps, true);
@@ -1854,7 +1950,7 @@ exit 1"#,
         let rec = offloaded("claude-1", "conv-1", &f.work());
         std::fs::remove_file(rec.transcript_path.as_ref().unwrap()).unwrap();
         registry::store(&rec).unwrap();
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         let out = open_with(&rows, 0, &mut term, &deps, true);
@@ -1875,7 +1971,7 @@ exit 1"#,
         let mut f = Fixture::new("no-room");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
         idle(&mut f, "claude-2");
-        let mut deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
         deps.memory = full;
         let rows = [row("claude-1", "a"), row("claude-2", "mount guards on one")];
         let mut term = Term::new(&f);
@@ -1893,7 +1989,7 @@ exit 1"#,
         assert_eq!(load("claude-1").state, State::Offloaded);
 
         // With nothing offloadable the dialog can only say so.
-        f.socket("claude-2", 0o700);
+        f.session("claude-2", true);
         let out = open_with(&rows, 0, &mut term, &deps, true);
         assert!(
             matches!(out, Outcome::NoRoom(Dialog::NoRoom { offer: None, .. })),
@@ -1904,7 +2000,7 @@ exit 1"#,
         for memory in [room as fn() -> mem::Memory, unknown] {
             deps.memory = memory;
             registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
-            let _ = std::fs::remove_file(f.path("abduco/claude-1@test"));
+            let _ = std::fs::remove_file(f.path("zmx/claude-1"));
             let out = open_with(&rows, 0, &mut term, &deps, true);
             assert!(matches!(out, Outcome::Back(_)), "{out:?}");
         }
@@ -1914,13 +2010,13 @@ exit 1"#,
     fn offload_then_open_stops_the_victim_and_starts_the_new_one() {
         let mut f = Fixture::new("make-room");
         let (pid, start) = idle(&mut f, "claude-1");
-        let mut deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
         deps.memory = full;
         let rows = [row("claude-1", "mount guards on one")];
         let mut term = Term::new(&f);
 
         // Refused while it no longer qualifies: attached since the offer was made.
-        f.socket("claude-1", 0o700);
+        f.session("claude-1", true);
         let out = offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains("attached")),
@@ -1928,7 +2024,7 @@ exit 1"#,
         );
         assert!(procinfo::is_alive(pid, start), "calibration: still running");
 
-        f.socket("claude-1", 0o600);
+        f.session("claude-1", false);
         let out = offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
@@ -1957,7 +2053,7 @@ exit 1"#,
 
         // Accepted all the same — the transcript went after the offer was drawn — the stop is
         // a close, as the offloader's would be.
-        let mut deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
         deps.memory = full;
         let mut term = Term::new(&f);
         offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
@@ -1974,7 +2070,7 @@ exit 1"#,
         let (pid, start) = f.process();
         registry::store(&live("claude-1", pid, start)).unwrap();
         registry::store(&offloaded("claude-3", "c", "/")).unwrap();
-        f.socket("claude-4", 0o600); // started by hand under one of our names
+        f.session("claude-4", false); // started by hand under one of our names
         assert_eq!(
             allocate("/w").unwrap(),
             "claude-2",
@@ -2033,7 +2129,7 @@ exit 1"#,
     #[test]
     fn a_new_session_starts_claude_in_the_workspace() {
         let f = Fixture::new("new");
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
         let out = new_session_with(&[], &f.work(), &mut term, &deps, true);
         assert_eq!(
@@ -2059,14 +2155,14 @@ exit 1"#,
     #[test]
     fn a_new_session_that_dies_at_once_is_closed_and_says_what_it_said() {
         let f = Fixture::new("new-fails");
-        let deps = f.deps(f.abduco(false, ":"), f.claude_fails());
+        let deps = f.deps(f.zmx(":"), f.claude_fails());
         let mut term = Term::new(&f);
         let out = new_session_with(&[], &f.work(), &mut term, &deps, true);
         assert_eq!(
             out,
             Outcome::Refused(
-                "claude-1 did not start: claude exited 1: No conversation found with that \
-                 session id"
+                "claude-1 did not start: claude ended at once: No conversation found with \
+                 that session id"
                     .into()
             )
         );
@@ -2078,7 +2174,7 @@ exit 1"#,
     #[test]
     fn closing_a_running_slot_stops_it_and_marks_it_closed() {
         let f = Fixture::new("close");
-        let deps = f.deps(f.abduco(true, ":"), f.claude_ok());
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
         new_session_with(&[], &f.work(), &mut term, &deps, true);
         // Play the hook's part: SessionStart binds the slot's own claude.
@@ -2094,7 +2190,7 @@ exit 1"#,
         rec.transcript_path = Some(transcript.display().to_string());
         registry::store(&rec).unwrap();
         assert!(procinfo::is_alive(pid, start), "calibration: it is running");
-        assert!(abduco::socket_for("claude-1").is_some());
+        assert!(listed("claude-1") == Some(true));
 
         let rows = [row("claude-1", "a")];
         let out = close(&rows, 0);
@@ -2105,8 +2201,8 @@ exit 1"#,
         assert!(!procinfo::is_alive(pid, start), "the process is stopped");
         assert_eq!(load("claude-1").state, State::Closed);
         assert!(
-            abduco::socket_for("claude-1").is_none(),
-            "and its server's socket went with it"
+            listed("claude-1") == Some(false),
+            "and zmx dropped its session"
         );
     }
 
@@ -2121,10 +2217,10 @@ exit 1"#,
         );
         assert_eq!(load("claude-1").state, State::Closed);
 
-        f.socket("claude", 0o600);
+        f.session("claude", false);
         rows[1].key = RowKey::Socket("claude".into());
         assert!(matches!(close(&rows, 1), Outcome::Refused(_)));
-        assert!(abduco::socket_for("claude").is_some(), "left alone");
+        assert!(listed("claude") == Some(true), "left alone");
     }
 
     #[test]
@@ -2144,10 +2240,11 @@ exit 1"#,
     #[test]
     fn a_scrollback_variable_the_login_set_is_left_to_it() {
         let deps = Deps {
-            abduco: "abduco".into(),
+            zmx: "zmx".into(),
             claude: "claude".into(),
             shell: String::new(),
             memory: room,
+            oom_kills: || Some(0),
             quick: QUICK_FAIL,
             preset: |key| key == "CLAUDE_CODE_DISABLE_MOUSE",
         };
@@ -2188,10 +2285,11 @@ exit 1"#,
         // binding can be shown end to end; it spells the line out because a binary crate
         // cannot be imported. If this changes, change it there too.
         let deps = Deps {
-            abduco: "abduco".into(),
+            zmx: "zmx".into(),
             claude: "claude".into(),
             shell: String::new(),
             memory: room,
+            oom_kills: || Some(0),
             quick: QUICK_FAIL,
             preset: |_| false,
         };
@@ -2208,8 +2306,8 @@ exit 1"#,
         assert_eq!(
             argv,
             [
-                "abduco",
-                "-c",
+                "zmx",
+                "attach",
                 "claude-3",
                 "env",
                 "CLAUDE_SESSIONS_SLOT=claude-3",

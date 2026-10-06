@@ -1,10 +1,11 @@
 //! The offloader end to end, against the real binary and real processes.
 //!
-//! A slot here is the shape the menu will make: an `abduco` server with a `claude` as its
-//! direct child. Both are stand-ins — a shell named `abduco` running a `sleep` named `claude`,
-//! by symlink, because comm is taken from the name a program was started by — so the test
-//! exercises the real `/proc` walk, the real signals and the real teardown without either
-//! program installed.
+//! A slot here is the shape the menu will make: a `zmx` daemon with a `claude` as its direct
+//! child. Both are stand-ins — a shell named `zmx` running a `sleep` named `claude`, by
+//! symlink, because comm is taken from the name a program was started by — and `zmx list` is
+//! a script that lists the session while its claude lives, as zmx does. So the test exercises
+//! the real `/proc` walk, the real signals and the real teardown without either program
+//! installed.
 //!
 //! **Calibrated both ways.** The same slot, attached, must survive; asked with `--dry-run`, it
 //! must survive too. A test that only ever saw the process die could be passing because
@@ -75,7 +76,8 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// An idle slot `claude-1`: stopped eleven minutes ago, nothing pending, socket `mode`, and a
+/// An idle slot `claude-1`: stopped eleven minutes ago, nothing pending, attached when
+/// `socket_mode` has the owner-execute bit (abduco's old signal, kept as the parameter), and a
 /// transcript on disk for its conversation.
 /// With `child`, the stand-in claude has a `sleep` running under it — work a stop would kill.
 fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
@@ -87,17 +89,35 @@ fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
 fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    for d in ["bin", "registry", "abduco"] {
+    for d in ["bin", "registry", "zmx"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
-    symlink("/bin/sh", root.join("bin/abduco")).unwrap();
+    symlink("/bin/sh", root.join("bin/zmx")).unwrap();
+    let list = root.join("bin/zmx-list");
+    std::fs::write(
+        &list,
+        format!(
+            r#"#!/bin/sh
+[ "$1" = list ] || exit 2
+for f in "{}"/*; do
+  [ -e "$f" ] || continue
+  read pid clients < "$f"
+  kill -0 "$pid" 2>/dev/null || continue
+  printf 'name=%s\tpid=%s\tclients=%s\tcreated=0\n' "${{f##*/}}" "$pid" "$clients"
+done
+"#,
+            root.join("zmx").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&list, std::fs::Permissions::from_mode(0o755)).unwrap();
     let claude_bin = if child { "/bin/sh" } else { "/bin/sleep" };
     symlink(claude_bin, root.join("bin/claude")).unwrap();
     let claude_args = if child { "-c 'sleep 600; :'" } else { "600" };
 
     // `; :` keeps the shell as the parent rather than letting it exec the command, which is
-    // what abduco does too: it outlives its command only long enough to notice it has gone.
-    let server = Command::new(root.join("bin/abduco"))
+    // what zmx does too: its daemon outlives its command by a couple of seconds.
+    let server = Command::new(root.join("bin/zmx"))
         .arg("-c")
         .arg(format!(
             "{} {claude_args}; :",
@@ -126,9 +146,8 @@ fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) ->
     };
     let claude_start: u64 = stat_fields(claude).unwrap()[19].parse().unwrap();
 
-    let sock = root.join("abduco/claude-1@test");
-    std::fs::write(&sock, "").unwrap();
-    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(socket_mode)).unwrap();
+    let attached = u8::from(socket_mode & 0o100 != 0);
+    std::fs::write(root.join("zmx/claude-1"), format!("{claude} {attached}\n")).unwrap();
 
     // The path is recorded either way, as the hooks record it from SessionStart on; only
     // whether the file is there differs.
@@ -158,7 +177,7 @@ fn offload(root: &Path, extra: &[&str]) -> (bool, String) {
         .arg("offload")
         .args(extra)
         .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
-        .env("ABDUCO_SOCKET_DIR", root.join("abduco"))
+        .env("CLAUDE_SESSIONS_ZMX", root.join("bin/zmx-list"))
         // Never the real config directory, should a record ever fall back to the derived path.
         .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
         .output()
@@ -189,8 +208,8 @@ fn an_idle_detached_slot_is_stopped_and_marked_offloaded() {
     assert!(!alive(s.claude, s.claude_start), "the claude is gone");
     assert_eq!(state_of(&s.root), "offloaded");
     assert!(
-        !s.root.join("abduco/claude-1@test").exists(),
-        "the dead server's socket is cleared, or the menu would read it as attached"
+        !out.contains("still lists"),
+        "zmx dropped the session with its claude: {out}"
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
     assert!(log.contains("claude-1: offloaded"), "logged: {log}");
@@ -221,8 +240,8 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     assert!(!alive(s.claude, s.claude_start), "the claude is gone");
     assert_eq!(state_of(&s.root), "closed");
     assert!(
-        !s.root.join("abduco/claude-1@test").exists(),
-        "torn down exactly as an offload is"
+        !out.contains("still lists"),
+        "torn down exactly as an offload is: {out}"
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
     assert!(log.contains("claude-1: closed"), "logged: {log}");

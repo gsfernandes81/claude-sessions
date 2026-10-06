@@ -22,10 +22,12 @@ use crate::render;
 use crate::term::{self, Input, RawTerminal};
 use crate::ui::{Busy, Header, Key, Outcome, RowKey, Terminal, TooNarrow};
 use crate::work::{self, Event, Spin, Work};
+use crate::zmx;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-/// How often the registry and abduco are looked at while nothing else happens.
+/// How often the registry is looked at while nothing else happens. zmx is looked at less
+/// often: see `zmx::Watch`.
 const POLL: Duration = Duration::from_secs(2);
 
 /// Clear the screen, for the first frame and after anything that leaves it in an unknown
@@ -61,7 +63,8 @@ pub fn run() -> Result<(), Stop> {
         let (tx, rx) = mpsc::channel();
         let ws = workspace.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(menu::gather(clock::now(), &ws));
+            let sessions = zmx::sessions().unwrap_or_default();
+            let _ = tx.send(menu::gather(clock::now(), &ws, &sessions));
         });
         rx
     };
@@ -172,6 +175,7 @@ fn drive(
     let mut screen: Screen = None;
     let mut minute = menu::age_clock(clock::now());
     let mut polled = Instant::now();
+    let mut zmx = zmx::Watch::default();
     loop {
         // The first reading, if it was not ready for the first frame.
         if let Some((rx, spin)) = first.as_mut() {
@@ -204,7 +208,7 @@ fn drive(
                 polled = Instant::now();
                 let now = clock::now();
                 let before = menu.rows().to_vec();
-                let rows = menu::gather(now, menu.workspace());
+                let rows = menu::gather(now, menu.workspace(), zmx.sessions(false));
                 menu.replace_rows(rows, false);
                 let turned = menu::age_clock(now) != minute;
                 if turned || menu.rows() != before.as_slice() {
@@ -230,7 +234,7 @@ fn drive(
                         return Ok(());
                     }
                     if done != Done::Nothing && first.is_none() {
-                        let rows = menu::gather(clock::now(), menu.workspace());
+                        let rows = menu::gather(clock::now(), menu.workspace(), zmx.sessions(true));
                         menu.replace_rows(rows, false);
                         menu.set_header(header());
                     }

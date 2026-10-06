@@ -46,7 +46,7 @@ fn is_process(pid: u32) -> bool {
 /// Is this the same process we recorded, rather than a reuse of its pid?
 ///
 /// **A zombie is not alive.** It keeps its pid and its start time until its parent reaps it,
-/// so a start-time match alone calls a dead claude alive for as long as a stuck abduco server
+/// so a start-time match alone calls a dead claude alive for as long as a stuck zmx daemon
 /// fails to collect it — and the offloader would then wait out its grace on a corpse and
 /// report that `KILL` did not work.
 pub fn is_alive(pid: u32, recorded_start: u64) -> bool {

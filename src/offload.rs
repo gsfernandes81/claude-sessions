@@ -22,13 +22,13 @@
 //! Run as a pass: `claude-sessions offload`, from whatever timer the box uses. `--dry-run`
 //! decides and reports without signalling anything.
 
-use crate::abduco;
 use crate::clock::{self, Millis};
 use crate::lockfile;
 use crate::mem;
 use crate::procinfo::{self, Proc};
 use crate::registry::{self, SlotRecord, State};
 use crate::signal::{self, SIGKILL, SIGTERM, Sent};
+use crate::zmx;
 use std::fmt;
 use std::io::{self, Write};
 use std::thread::sleep;
@@ -46,16 +46,18 @@ pub const TERM_GRACE: Duration = Duration::from_secs(5);
 /// after this is stuck in the kernel, and waiting longer will not change that.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 
-/// For the abduco server to notice its command has gone and exit on its own, which it does.
-const ABDUCO_GRACE: Duration = Duration::from_secs(2);
+/// For zmx to drop a session whose program has gone. It removes the session at once; this is
+/// margin. Its daemon process lingers about 2.4 s more and exits by itself (measured on zmx
+/// 0.8.1), which nothing waits for.
+const ZMX_GRACE: Duration = Duration::from_secs(2);
 
 /// What this pass could see of a slot's process, gathered before deciding.
 #[derive(Debug, Clone, Default)]
 pub struct Seen {
     /// The recorded pid is alive with its recorded start time.
     pub alive: bool,
-    /// The owner-execute bit on the slot's abduco socket, or `None` when there is no socket.
-    /// Only ever read for a slot already known to be alive — see `abduco.rs`.
+    /// Whether a client is attached to the slot's zmx session, or `None` when zmx did not
+    /// answer for it. Only ever read for a slot already known to be alive.
     pub attached: Option<bool>,
     /// Whether `/proc` could be listed at all. Without it there is no knowing what is
     /// running under the slot.
@@ -80,7 +82,7 @@ pub enum Hold {
     NotStopped,
     TooRecent { left_ms: Millis },
     Attached,
-    NoSocket,
+    NoSession,
     ProcUnreadable,
     Running(String),
 }
@@ -102,7 +104,10 @@ impl fmt::Display for Hold {
                 write!(f, "idle, offloadable in {}s", left_ms.div_ceil(1000))
             }
             Hold::Attached => write!(f, "attached"),
-            Hold::NoSocket => write!(f, "no abduco socket, so attached cannot be ruled out"),
+            Hold::NoSession => write!(
+                f,
+                "zmx did not answer for it, so attached cannot be ruled out"
+            ),
             Hold::ProcUnreadable => write!(f, "could not list /proc to see what runs under it"),
             Hold::Running(what) => write!(f, "{what} is running under it"),
         }
@@ -185,7 +190,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     }
     match seen.attached {
         Some(true) => return Err(Hold::Attached),
-        None => return Err(Hold::NoSocket),
+        None => return Err(Hold::NoSession),
         Some(false) => {}
     }
     if !seen.table_readable {
@@ -206,7 +211,10 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
     Seen {
         alive,
         attached: if alive {
-            abduco::socket_for(&rec.slot).map(|s| s.attached_bit)
+            zmx::session_for(&rec.slot)
+                .flatten()
+                .filter(|s| s.answered)
+                .map(|s| s.attached)
         } else {
             None
         },
@@ -285,44 +293,37 @@ fn wait_gone(pid: u32, start: u64, within: Duration) -> bool {
     }
 }
 
-/// The abduco server above a slot's claude, if that is what its parent is.
-pub fn abduco_server(table: Option<&[Proc]>, pid: u32) -> Option<(u32, u64)> {
-    let ppid = table?.iter().find(|p| p.pid == pid)?.ppid;
-    let parent = table?.iter().find(|p| p.pid == ppid)?;
-    (parent.comm == "abduco").then_some((parent.pid, parent.start))
+/// Whether a slot's claude is its zmx daemon's direct child — the shape every slot has.
+pub fn under_zmx(table: Option<&[Proc]>, pid: u32) -> bool {
+    let Some(table) = table else { return false };
+    let Some(ppid) = table.iter().find(|p| p.pid == pid).map(|p| p.ppid) else {
+        return false;
+    };
+    table.iter().any(|p| p.pid == ppid && p.comm == "zmx")
 }
 
-/// After the claude is gone, make sure its abduco server and socket went with it.
+/// After the claude is gone, make sure zmx dropped its session.
 ///
-/// The server exits by itself when its command does, and takes its socket with it, so this
-/// is normally a wait that ends at once. A server still there after its grace gets `TERM`.
-/// The socket is removed only once the recorded server is known dead — a killed server
-/// leaves its socket behind with the attached bit set, and a socket left like that would show
-/// the slot as attached to a menu that has not been taught otherwise.
-pub fn teardown_abduco(slot: &str, server: Option<(u32, u64)>) -> Vec<String> {
+/// zmx removes a session the moment its program exits, so this is normally one listing. Its
+/// daemon lingers a couple of seconds and exits by itself; nothing waits for that. A slot whose
+/// claude was not under zmx — its daemon killed — has no session to wait for.
+pub fn teardown_zmx(slot: &str, was_under_zmx: bool) -> Vec<String> {
     let mut notes = Vec::new();
-    let Some((spid, sstart)) = server else {
-        notes.push("no abduco server above it; socket left for reconcile".into());
+    if !was_under_zmx {
+        notes.push("no zmx daemon above it".into());
         return notes;
-    };
-    if !wait_gone(spid, sstart, ABDUCO_GRACE) {
-        match signal::send(spid, sstart, SIGTERM) {
-            Ok(Sent::Delivered) => notes.push(format!("abduco server {spid} lingered; sent TERM")),
-            Ok(Sent::Gone) => {}
-            Err(e) => notes.push(format!("abduco server {spid}: {e}")),
-        }
-        if !wait_gone(spid, sstart, ABDUCO_GRACE) {
-            notes.push(format!("abduco server {spid} still running; socket left"));
-            return notes;
+    }
+    let deadline = Instant::now() + ZMX_GRACE;
+    loop {
+        match zmx::session_for(slot) {
+            Some(None) => return notes,
+            _ if Instant::now() >= deadline => {
+                notes.push("zmx still lists its session".into());
+                return notes;
+            }
+            _ => sleep(Duration::from_millis(50)),
         }
     }
-    if let Some(sock) = abduco::socket_for(slot) {
-        match std::fs::remove_file(&sock.path) {
-            Ok(()) => notes.push("stale socket removed".into()),
-            Err(e) => notes.push(format!("stale socket: {e}")),
-        }
-    }
-    notes
 }
 
 /// One pass over every slot, plus the orphan sweep.
@@ -435,7 +436,7 @@ pub fn stop_quiet(
             rec.slot
         )));
     };
-    let server = abduco_server(table, pid);
+    let was_under_zmx = under_zmx(table, pid);
     let offload = matches!(verdict, Verdict::Offload { .. });
 
     // An offload is written BEFORE the signal: the SessionEnd it provokes must read as an
@@ -457,7 +458,7 @@ pub fn stop_quiet(
             return Ok(Err(line));
         }
     };
-    let notes = teardown_abduco(&rec.slot, server);
+    let notes = teardown_zmx(&rec.slot, was_under_zmx);
 
     rec.state = if offload {
         State::Offloaded
@@ -785,7 +786,7 @@ mod tests {
         seen.attached = Some(true);
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::Attached));
         seen.attached = None;
-        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NoSocket));
+        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NoSession));
     }
 
     #[test]

@@ -97,7 +97,7 @@ infra-dev · 6 open · 812M of 1.0G
                     │ This session did not resume          │
                     │   mount guards on one                │
                     │                                      │
-                    │ claude --resume 0f9c4a1e exited 1    │
+                    │ claude --resume 0f9c4a1e ended       │
                     │   No conversation found with that    │
                     │   session id                         │
                     │                                      │

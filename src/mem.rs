@@ -61,5 +61,37 @@ impl Memory {
     }
 }
 
+/// How many processes in this container the kernel has killed for memory, ever — `oom_kill`
+/// in the cgroup's `memory.events`. Read before and after a start, it says whether a claude
+/// that died at once was killed for memory: zmx does not report its program's exit status, so
+/// the 137 that used to say so is gone (owner, 2026-10-06). It counts the whole container, so
+/// an unrelated kill in the same moment would be misread as this one; that is rare enough for
+/// a dialog that only ever adds a hint.
+pub fn oom_kills() -> Option<u64> {
+    oom_kill_in(&fs::read_to_string("/sys/fs/cgroup/memory.events").ok()?)
+}
+
+fn oom_kill_in(events: &str) -> Option<u64> {
+    events
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// What one idle session costs, with the agent view off.
 pub const SESSION_COST: u64 = 250 * 1024 * 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_oom_kill_count_is_read_from_memory_events() {
+        // As cgroup v2 writes it; `oom_group_kill` must not be mistaken for it.
+        let events = "low 0\nhigh 0\nmax 12\noom 2\noom_kill 2\noom_group_kill 0\n";
+        assert_eq!(oom_kill_in(events), Some(2));
+        assert_eq!(oom_kill_in("low 0\n"), None);
+    }
+}

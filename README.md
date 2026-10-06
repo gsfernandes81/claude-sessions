@@ -18,7 +18,7 @@ Measured 2026-10-01 against Claude Code 2.1.286: ~250 MB idle, ~1,260 MB after o
 ~690 MB still resident after the session exited. On a 4 GB box with four containers that is
 the whole budget, spent by a key nobody meant to press.
 
-**And there is no way back to a session.** `ssh <container>` is one fixed `abduco` session,
+**And there was no way back to a session.** `ssh <container>` was one fixed `abduco` session,
 so after the old idle-offloader stopped it, the next login started a *fresh* Claude and the
 command to resume the real one sat in a log. No list, no "which one wants me", no way to end
 one deliberately.

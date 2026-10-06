@@ -85,11 +85,22 @@ fn clear_of_the_minute(term: &mut pty::Pty, window: Duration) {
     }
 }
 
+/// A stand-in `zmx` in `dir` whose listing is empty, so the menu never reads the sessions of
+/// whoever runs the tests. Returns its path.
+fn no_sessions(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let p = dir.join("zmx-stub");
+    std::fs::write(&p, "#!/bin/sh\n[ \"$1\" = list ] && exit 0\nexit 2\n").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
 #[test]
 fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     let root = std::env::temp_dir().join(format!("cs-menu-pty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let (reg, abd) = (root.join("registry"), root.join("abduco"));
+    let (reg, abd) = (root.join("registry"), root.join("zmx"));
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
     let transcript = root.join("s-claude-1.jsonl");
@@ -151,7 +162,8 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
 
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
-        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
+        .env("ZMX_DIR", &abd)
         .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
         .env("CLAUDE_CONFIG_DIR", root.join("cc"));
     let mut term = pty::Pty::spawn(cmd, 80, 24).expect("spawn the menu on a pty");
@@ -245,7 +257,8 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     std::fs::create_dir_all(&root).unwrap();
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", root.join("registry"))
-        .env("ABDUCO_SOCKET_DIR", root.join("abduco"));
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&root.join("zmx")))
+        .env("ZMX_DIR", root.join("zmx"));
     let mut term = pty::Pty::spawn(cmd, 6, 24).expect("spawn");
     let out = term.read_for(Duration::from_millis(800));
     let status = term.wait(Duration::from_secs(3)).expect("it exits");
@@ -268,7 +281,7 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let root = std::env::temp_dir().join(format!("cs-menu-spin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let (reg, abd) = (root.join("registry"), root.join("abduco"));
+    let (reg, abd) = (root.join("registry"), root.join("zmx"));
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
 
@@ -296,7 +309,8 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
 
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
-        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
+        .env("ZMX_DIR", &abd)
         .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
         .env("CLAUDE_CONFIG_DIR", root.join("cc"));
     let mut term = pty::Pty::spawn(cmd, 40, 24).expect("spawn the menu on a pty");
@@ -403,7 +417,7 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
 fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
     let root = std::env::temp_dir().join(format!("cs-menu-first-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let (reg, abd) = (root.join("registry"), root.join("abduco"));
+    let (reg, abd) = (root.join("registry"), root.join("zmx"));
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
     let pipe = reg.join("claude-1.json");
@@ -412,7 +426,8 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
 
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
-        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
+        .env("ZMX_DIR", &abd)
         .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
         .env("CLAUDE_CONFIG_DIR", root.join("cc"));
     let mut term = pty::Pty::spawn(cmd, 40, 24).expect("spawn the menu on a pty");
@@ -472,13 +487,14 @@ fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
     use std::os::unix::process::ExitStatusExt;
     let root = std::env::temp_dir().join(format!("cs-menu-hup-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let (reg, abd, cwd) = (root.join("registry"), root.join("abduco"), root.join("cwd"));
+    let (reg, abd, cwd) = (root.join("registry"), root.join("zmx"), root.join("cwd"));
     for d in [&reg, &abd, &cwd] {
         std::fs::create_dir_all(d).unwrap();
     }
     let mut cmd = Command::new(BIN);
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
-        .env("ABDUCO_SOCKET_DIR", &abd)
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
+        .env("ZMX_DIR", &abd)
         .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
         .env("CLAUDE_CONFIG_DIR", root.join("cc"))
         .current_dir(&cwd);

@@ -190,7 +190,7 @@ mount guards on one                   2d
 │ This session did not resume          │
 │   mount guards on one                │
 │                                      │
-│ claude --resume 0f9c4a1e exited 1    │
+│ claude --resume 0f9c4a1e ended       │
 │   No conversation found with that    │
 │   session id                         │
 │                                      │
@@ -200,6 +200,11 @@ mount guards on one                   2d
 │ r retry   c close it   Esc back      │
 ╰──────────────────────────────────────╯
 ```
+
+The command line read `exited 1` until 2026-10-06, when the owner approved `ended`: zmx, which
+replaced abduco, does not report its program's exit status. The one case the number told
+something, a kill for memory, reads `claude --resume 0f9c4a1e was killed for memory`, from
+the container's own OOM-kill count, wrapped like any other line.
 
 ### Mockup 6 — Back from a session, after detaching
 ```

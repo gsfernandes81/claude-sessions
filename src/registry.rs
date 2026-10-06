@@ -6,8 +6,8 @@
 //! `offloading` state. That split is what keeps "what happened" and "what we did about it"
 //! from racing.
 //!
-//! **Attached is not stored.** Whether a client is on a slot right now is a fact about
-//! abduco's socket, readable in one `stat`, and a stored copy would be stale every time a
+//! **Attached is not stored.** Whether a client is on a slot right now is a fact zmx
+//! reports (`zmx list`'s `clients`), and a stored copy would be stale every time a
 //! session is attached from a login this process never saw.
 //!
 //! **Reading is tolerant and writing is exact.** A record from an older version parses with
@@ -29,7 +29,7 @@ pub fn dir() -> PathBuf {
     Path::new(&home).join(".local/share/claude-sessions")
 }
 
-/// The states that are *stored*. `attached` and `detached` are read from abduco and are
+/// The states that are *stored*. `attached` and `detached` are read from zmx and are
 /// deliberately absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -113,8 +113,8 @@ pub struct SlotRecord {
     /// can fire mid-turn, and nothing in the vendor docs says otherwise.
     pub ready_ms: Option<Millis>,
     pub timers: Vec<Timer>,
-    /// False for a session this tool did not start — one of today's `abduco -A claude claude`
-    /// logins. Listed, marked, and never assumed to behave like one of ours.
+    /// False for a session this tool did not start — a `zmx attach work claude` somebody
+    /// typed. Listed, marked, and never assumed to behave like one of ours.
     pub registered: bool,
     pub updated_ms: Millis,
     /// Last time each hook event was seen, for `doctor`. A slot whose `Stop` is months old
