@@ -435,11 +435,12 @@ fn cmd_doctor() -> std::io::Result<()> {
     let m = mem::read();
     say!("version   : {VERSION}");
     say!("registry  : {}", registry::dir().display());
-    match (m.limit, m.current) {
-        (Some(limit), Some(cur)) => say!(
-            "memory    : {} of {} used in this container, room for another session: {}",
-            human(cur),
+    match (m.limit, m.used()) {
+        (Some(limit), Some(used)) => say!(
+            "memory    : {} of {} used in this container, {} more in reclaimable page cache; room for another session: {}",
+            human(used),
             human(limit),
+            human(m.reclaimable.unwrap_or(0)),
             if m.room_for(mem::SESSION_COST) {
                 "yes"
             } else {

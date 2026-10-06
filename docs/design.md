@@ -411,9 +411,16 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   writing the record before the lock goes. A closed slot's name is reused: closed slots are
   not listed, their conversations are, from the store, under their own ids. A new slot that
   dies before binding is marked closed and reported, since it has no row yet.
+- **Room is what the working set leaves** (claude-sessions#7): `memory.current` less the
+  cgroup's `inactive_file`, the page cache the kernel reclaims first. Raw `memory.current`
+  counted cache as use — an interrupted self-update's ~650 MB once read as a session's worth of
+  RAM with nothing running — and the menu would have offered to offload a session for room the
+  kernel would simply have taken back. The header, mockup 4's figures, `doctor` and the
+  offloader's `memory:` line all use it, and the last two say the cache apart.
 - **Room is checked once.** After offloading to make room, the open goes ahead without asking
-  the cgroup again: its figure includes page cache that is not freed at once, and a second
-  check could refuse the room just made.
+  the cgroup again: what the stopped claude read stays charged as active page cache for a
+  while, which the working set still counts, and a second check could refuse the room just
+  made.
 - **`c` on a live slot stops it** with the offloader's own `TERM` → `KILL` path and zmx
   teardown, pid and start time checked at each step, then marks it closed. A row with no record
   at all is refused: there is nothing to identify its process by safely.

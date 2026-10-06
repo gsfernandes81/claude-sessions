@@ -396,7 +396,13 @@ pub fn teardown_zmx(slot: &str, was_under_zmx: bool) -> Vec<String> {
 pub fn run(dry_run: bool) -> io::Result<()> {
     let m = mem::read();
     if let Some(free) = m.headroom() {
-        say!("memory: {} MB free in this container", free / (1024 * 1024));
+        // The cache is said apart, so a reader can tell it from use (claude-sessions#7): the
+        // free figure counts it as free, as the kernel would.
+        say!(
+            "memory: {} MB free in this container ({} MB of it reclaimable page cache)",
+            free / (1024 * 1024),
+            m.reclaimable.unwrap_or(0) / (1024 * 1024)
+        );
     }
     let (mut offloaded, mut closed) = (0usize, 0usize);
     // One snapshot of /proc for the whole pass, taken holding no lock. Reading every

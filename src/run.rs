@@ -38,7 +38,7 @@ fn header() -> Header {
     let m = mem::read();
     Header {
         host: menu::host(),
-        memory: m.limit.zip(m.current).map(|(limit, cur)| (cur, limit)),
+        memory: m.limit.zip(m.used()).map(|(limit, used)| (used, limit)),
     }
 }
 

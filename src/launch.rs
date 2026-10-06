@@ -870,9 +870,10 @@ pub(crate) fn offload_then_open_with(
             Err(e) => return Outcome::Refused(format!("{n}: {e}")),
         }
     }
-    // No second room check. The owner has just accepted the trade, and the cgroup's figure
-    // counts page cache that is not handed back the instant a process exits, so asking again
-    // could answer no for the very room just made — and offer to stop another slot.
+    // No second room check. The owner has just accepted the trade, and what a stopped claude
+    // read stays charged as active page cache for a while, which even the working set counts
+    // (`mem.rs`), so asking again could answer no for the very room just made — and offer to
+    // stop another slot.
     match then {
         Some(index) => open_with(rows, index, term, deps, false),
         None => new_session_with(rows, workspace, term, deps, false),
@@ -889,7 +890,7 @@ fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
         return None;
     }
     Some(Outcome::NoRoom(Dialog::NoRoom {
-        used: m.current.unwrap_or(0),
+        used: m.used().unwrap_or(0),
         limit: m.limit.unwrap_or(0),
         want: mem::SESSION_COST,
         offer: offer(rows),
@@ -1397,18 +1398,21 @@ exit 1"#,
         mem::Memory {
             limit: Some(4 << 30),
             current: Some(1 << 30),
+            reclaimable: None,
         }
     }
     fn full() -> mem::Memory {
         mem::Memory {
             limit: Some(1 << 30),
             current: Some((1 << 30) - (100 << 20)),
+            reclaimable: None,
         }
     }
     fn unknown() -> mem::Memory {
         mem::Memory {
             limit: None,
             current: Some(1 << 30),
+            reclaimable: None,
         }
     }
 
