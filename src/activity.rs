@@ -337,11 +337,11 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
         next.insert(rec.slot.clone(), state);
     }
     if let Err(e) = store(&next) {
-        // Gone, so the next pass really does start over — a first reading, which keeps every
-        // slot — rather than measuring one window across the pass that could not save.
-        let _ = std::fs::remove_file(state_path());
+        // The last saved state stays, floors and all: counters are cumulative, so the next
+        // pass's window from it holds every byte of the one that could not save — and a longer
+        // window is held to the same budget, so it errs active.
         lines.push(format!(
-            "activity: state not saved ({e}); the next pass starts over"
+            "activity: state not saved ({e}); the next pass measures from the last saved reading"
         ));
     }
     lines
@@ -712,6 +712,26 @@ mod tests {
         assert_eq!(n.minima, vec![(T0 / HOUR_MS, 250.0)], "{:?}", n.minima);
         let (n, _) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], false);
         assert_eq!(n.minima, vec![(T0 / HOUR_MS, 100.0)]);
+        // Each half of "not known whole" on its own: the same claude over two hours, and a
+        // member that left a three-minute window. Either would teach a floor under 250.
+        let (n, _) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 36_000)], false);
+        assert_eq!(
+            n.minima,
+            vec![(T0 / HOUR_MS, 250.0)],
+            "long window: {:?}",
+            n.minima
+        );
+        let two = SlotState {
+            procs: vec![r(1, 7, 0), r(2, 8, 0)],
+            ..s
+        };
+        let (n, _) = step(Some(&two), T0 + 180_000, vec![r(1, 7, 6_000)], false);
+        assert_eq!(
+            n.minima,
+            vec![(T0 / HOUR_MS, 250.0)],
+            "member left: {:?}",
+            n.minima
+        );
     }
 
     #[test]

@@ -470,8 +470,9 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   waited on zmx) starts over but keeps the floor. **Only a window known whole teaches the
   floor**: one as long as the quiet period, or one a member left — the first after a resume
   spans the whole offload — is active and teaches nothing, since its rate never happened. A name
-  closed and reused inherits it, which mostly carries the container's idle noise across. A pass that cannot save it removes
-  it, so the next one really starts over.
+  closed and reused inherits it, which mostly carries the container's idle noise across.
+  A pass that cannot save it leaves the last saved state in place: counters are cumulative,
+  so the next window from it holds every byte, and floors survive a full disk.
 - **What it cannot see**: a claude waiting in process, silently. **The common case is its
   own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
   the reason the offloader never stops a slot with one pending (owner, 2026-10-01). The
