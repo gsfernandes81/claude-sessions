@@ -166,6 +166,13 @@ impl SlotRecord {
         }
     }
 
+    /// When an Esc ended the turn, given the transcript's trailing interrupt marker: the marker,
+    /// if it is no older than everything the hooks recorded (an Esc fires no hook). The one rule
+    /// the offloader and the menu both read, so they cannot disagree about a slot.
+    pub fn esc_ended(&self, interrupted_at: Option<Millis>) -> Option<Millis> {
+        interrupted_at.filter(|&at| at >= self.last_activity_ms)
+    }
+
     /// Where the current conversation's transcript is: the path the hooks reported, else —
     /// for a record written before 0.3.3 recorded it — where Claude Code puts one, under
     /// `projects/` named for the directory with every character that is not a letter, a

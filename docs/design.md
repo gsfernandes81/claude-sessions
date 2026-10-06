@@ -79,9 +79,11 @@ runs this exact line under the real hook to pin that. The capture path is an arg
 environment variable, so nothing of ours leaks into claude's environment. **A hook binds to the slot only when its `claude` is the
 direct child of that slot's `zmx` daemon**, checked in `/proc`. A nested claude — a
 `claude -p` from a Bash tool call, or a subagent — inherits the variable too and must count
-as *work running under* the slot, never rebind its `session_id`. Hook payloads carry
-`agent_id`/`agent_type` **on subagents only**, which is a cheaper test than the `/proc` walk
-for that case; a `claude -p` spawned from a shell still needs the walk.
+as *work running under* the slot, never rebind its `session_id`. A hook fired in a subagent's
+own context — a tool call it makes — carries `agent_id`, which is a cheaper test than the
+`/proc` walk for that case; a `claude -p` spawned from a shell still needs the walk. **Except
+`SubagentStart` and `SubagentStop`:** the slot's own claude fires them, and there `agent_id`
+names the agent the event is about, so they are bound by the walk like any other (issue #10).
 
 **The three `CLAUDE_CODE_DISABLE_*` give claude the terminal's own scrollback** (owner,
 2026-10-04, issue #8), for a new slot and a resume alike. Every slot is reached over ssh,
@@ -146,8 +148,8 @@ terminal.
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
-| `SubagentStart` | the agent, by its `agent_id`, joins `background`; activity (issue #10) |
-| `SubagentStop` | that `agent_id` leaves `background` — an id never announced removes nothing; activity |
+| `SubagentStart` | the agent, by its `agent_id`, joins `background` (issue #10); **not** activity |
+| `SubagentStop` | that `agent_id` leaves `background` — an id never announced is ignored; **not** activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
 | `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
@@ -167,11 +169,11 @@ Three details that cost something if missed, read from the vendor hook documenta
 
 Offloadable when: detached · `Stop`, or a start at the prompt, is the latest event · no
 `needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · **no
-background work at the last `Stop`** · no non-`claude` descendants · idle past the threshold,
+background work listed** (`Stop`'s list, kept between `Stop`s by `SubagentStart`/`SubagentStop`) · no non-`claude` descendants · idle past the threshold,
 counted from the later of that event and **the last write to the conversation's transcript or
 any of its subagents'**.
 
-**In-process background work fires no hook the slot hears** (issue #9, found by infra's
+**In-process background work is invisible to the process table** (issue #9, found by infra's
 reviewers and reproduced on v0.4.0). A background subagent, a Workflow run, a teammate or a
 cloud session runs inside claude's own process, so there is no descendant to see, and after the
 parent's `Stop` nothing moved the record: ten minutes later a live pass would have killed four
@@ -198,8 +200,14 @@ working agents. Three things close it:
   own claude, so they are bound by the `/proc` walk, not by their `agent_id` (which there names
   the agent, not the context the hook fired in); a nested `claude -p`'s agents stay activity
   only. A `SubagentStop`'s own `background_tasks` still lists the agent that is ending, so only
-  `Stop`'s list is ever taken whole. An agent that ends without a `SubagentStop` — not seen —
-  would be listed until the next `Stop`: the keep direction.
+  `Stop`'s list is ever taken whole. **Neither event is activity**: they edit the list and
+  nothing else. Claude Code also sends `SubagentStop`, with an empty `agent_type`, for internal
+  agents it never announced — seen about thirty seconds into both runs, after a `Stop` once
+  and after the Esc once — and as activity one would make an idle slot read busy until the
+  owner's next turn. An agent's work is seen as its transcript's writes (below), so the ten
+  minutes after it ends start from its last one. An agent that ends without a `SubagentStop`
+  would be listed until the next `Stop`: the keep direction. Read in the 2.1.291 binary but not
+  seen, a foreground agent cut off by Esc may be one (issue #11).
 - **Writes are activity.** A turn writes its transcript as it goes, and a background subagent
   writes its own under `<conversation>/subagents/` (Workflow runs a level or two deeper). The
   offloader takes the newest of those modification times as one more "last thing that
@@ -219,7 +227,9 @@ Esc, after the cut-off reply or the tool's rejected result, with only bookkeepin
 So when the hooks left a slot busy or waiting and its transcript's last conversational entry is
 that marker, newer than the last thing the hooks recorded, **the turn ended at the marker**: the
 offloader counts idleness from it as it would from a `Stop`, and the menu draws the row under
-Idle — unless `background` lists work, as it does for an agent the interrupted turn started.
+Idle. The two read one rule (`SlotRecord::esc_ended`). The offloader still holds the slot for
+anything `background` lists, as it does for an agent the interrupted turn started; the menu
+does not read the list, so that row is Idle either way.
 Only the tail is read, and only for such a slot; a last line that cannot be read whole — a
 reply longer than the tail — is no answer, never an older marker's. **Only the marker itself
 counts** (issue #10): a list holding one text part that says exactly

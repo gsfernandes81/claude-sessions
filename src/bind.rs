@@ -28,10 +28,11 @@ pub fn slot_from_env() -> Option<String> {
 /// slot's own claude has zmx as its parent and a nested one has another claude (or a shell)
 /// in between.
 ///
-/// `agent_id` on the payload marks a subagent and is a cheaper answer when present, so the
-/// caller passes it; a `claude -p` from a shell carries no such field and still needs this.
-pub fn binding_for(hook_pid: u32, payload_has_agent_id: bool) -> Binding {
-    if payload_has_agent_id {
+/// A hook fired in a subagent's own context is a cheaper answer when the payload says so
+/// (`Event::fired_in_subagent`), so the caller passes it; a `claude -p` from a shell carries
+/// no such field and still needs this.
+pub fn binding_for(hook_pid: u32, fired_in_subagent: bool) -> Binding {
+    if fired_in_subagent {
         return Binding::Nested;
     }
     // At most a few generations: hook -> sh -> claude is the usual shape, and a deep walk

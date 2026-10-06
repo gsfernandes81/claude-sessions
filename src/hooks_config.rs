@@ -93,7 +93,8 @@ mod tests {
     #[test]
     fn every_event_the_state_machine_handles_is_installed() {
         // Calibration in both directions: each installed event changes a record when given a
-        // payload that should change it, and an event NOT installed is one apply ignores.
+        // payload that should change it, and an event NOT installed is one apply ignores. One
+        // record through the table, in order: a `SubagentStop` changes one that lists its agent.
         let doc = installed();
         let hooks = doc.get("hooks").expect("a hooks key");
         let payloads = [
@@ -106,9 +107,9 @@ mod tests {
             r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
             r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#,
         ];
+        let mut rec = SlotRecord::new("claude-1", 0);
         for (event, body) in EVENTS.iter().zip(payloads) {
             assert!(hooks.get(event).is_some(), "{event} is not installed");
-            let mut rec = SlotRecord::new("claude-1", 0);
             let ev = Event::parse(body).unwrap();
             assert_eq!(ev.name(), *event, "payload table out of step");
             let out = events::apply(&mut rec, &ev, 1_000, Binding::Own, None, None);

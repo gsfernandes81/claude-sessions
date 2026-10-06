@@ -250,31 +250,31 @@ pub fn apply(
             rec.background = ev.background_tasks();
             Outcome::Changed
         }
-        // An agent's life, between the parent's `Stop`s (issue #10). Both are activity, and an
-        // agent finishing after its parent's turn ended leaves the slot not stopped until the
-        // turn it wakes claude for ends in a `Stop` — seen on 2.1.291: SubagentStop, then that
-        // turn's UserPromptSubmit and Stop.
-        "SubagentStart" => {
-            if let Some(id) = ev.agent_id() {
-                if !rec.background.iter().any(|t| t.id.as_deref() == Some(id)) {
-                    let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
-                    rec.background.push(Task {
-                        id: Some(id.to_string()),
-                        what: format!("subagent: {kind}"),
-                    });
-                }
+        // An agent's life between the parent's `Stop`s (issue #10): the list, and nothing else.
+        // Neither is activity. An agent's work reaches the offloader as writes to its own
+        // transcript, and Claude Code sends a `SubagentStop` for internal agents it never
+        // announced, at any time — after a `Stop` or an Esc too, where counting it would make
+        // an idle slot read as busy until the owner's next turn.
+        "SubagentStart" => match ev.agent_id() {
+            Some(id) if !rec.background.iter().any(|t| t.id.as_deref() == Some(id)) => {
+                let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
+                rec.background.push(Task {
+                    id: Some(id.to_string()),
+                    what: format!("subagent: {kind}"),
+                });
+                Outcome::Changed
             }
-            rec.last_activity_ms = now;
-            Outcome::Changed
-        }
-        // Claude Code also sends this for internal agents it never announced; removing an id
-        // that is not listed does nothing.
+            _ => Outcome::Ignored("no agent that is not already listed"),
+        },
         "SubagentStop" => {
-            if let Some(id) = ev.agent_id() {
-                rec.background.retain(|t| t.id.as_deref() != Some(id));
+            let (id, before) = (ev.agent_id(), rec.background.len());
+            rec.background
+                .retain(|t| id.is_none() || t.id.as_deref() != id);
+            if rec.background.len() < before {
+                Outcome::Changed
+            } else {
+                Outcome::Ignored("agent not listed")
             }
-            rec.last_activity_ms = now;
-            Outcome::Changed
         }
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
@@ -468,65 +468,37 @@ mod tests {
         rec.background.iter().map(|t| t.what.as_str()).collect()
     }
 
-    /// Issue #10, as 2.1.291 told it under a pty on 2026-10-06: a turn launches a background
-    /// agent, the owner presses Esc — no `Stop` — and the agent runs on, finishes, and wakes
-    /// claude for a turn of its own.
     #[test]
-    fn an_agent_started_in_a_turn_esc_ended_holds_the_slot_until_it_is_done() {
+    fn subagent_events_edit_the_list_and_are_not_activity() {
+        // The sequence itself, through the offloader, is in `offload.rs`.
         let mut rec = slot();
         own(
             &mut rec,
             &ev(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
             1_500,
         );
-        own(
-            &mut rec,
-            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#),
-            2_000,
+        let start = ev(
+            r#"{"hook_event_name":"SubagentStart","agent_id":"a90c","agent_type":"general-purpose"}"#,
         );
-        own(
-            &mut rec,
-            &ev(
-                r#"{"hook_event_name":"SubagentStart","agent_id":"a90c","agent_type":"general-purpose"}"#,
-            ),
-            3_000,
-        );
+        assert_eq!(own(&mut rec, &start, 3_000), Outcome::Changed);
         assert_eq!(
             whats(&rec),
             ["subagent: general-purpose"],
             "no Stop needed to hear of it"
         );
-        // The Esc: nothing at all. Then an internal agent nobody announced ends.
-        own(
-            &mut rec,
-            &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#),
-            4_000,
+        assert!(
+            matches!(own(&mut rec, &start, 3_100), Outcome::Ignored(_)),
+            "listed once"
         );
-        assert_eq!(rec.background.len(), 1, "an unknown id removes nothing");
-        // The agent ends; its own payload still lists it as running, and is not believed.
-        own(
-            &mut rec,
-            &ev(
-                r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running"}]}"#,
-            ),
-            5_000,
-        );
+        let unknown = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#);
+        assert!(matches!(
+            own(&mut rec, &unknown, 4_000),
+            Outcome::Ignored(_)
+        ));
+        let stop = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a90c"}"#);
+        assert_eq!(own(&mut rec, &stop, 5_000), Outcome::Changed);
         assert!(rec.background.is_empty());
-        assert_eq!(
-            rec.last_activity_ms, 5_000,
-            "and the slot is not idle from before it"
-        );
-        own(
-            &mut rec,
-            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"<task-notification>"}"#),
-            5_010,
-        );
-        own(
-            &mut rec,
-            &ev(r#"{"hook_event_name":"Stop","background_tasks":[]}"#),
-            6_000,
-        );
-        assert!(rec.background.is_empty() && !rec.busy);
+        assert_eq!(rec.last_activity_ms, 1_500, "still idle from the Stop");
     }
 
     #[test]

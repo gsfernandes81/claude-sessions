@@ -566,9 +566,11 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
     // dismissed — would read Working or Needs you until the next turn ended. The transcript's
     // trailing marker says it is over (`transcript::interrupted_at`).
     let interrupted = (r.busy || r.needs_you)
-        && r.conversation_path()
-            .and_then(|p| crate::transcript::interrupted_at_cached(&p))
-            .is_some_and(|at| at >= r.last_activity_ms);
+        && r.esc_ended(
+            r.conversation_path()
+                .and_then(|p| crate::transcript::interrupted_at_cached(&p)),
+        )
+        .is_some();
     Row {
         key: RowKey::Slot(r.slot.clone()),
         wants_you: r.needs_you && !interrupted,

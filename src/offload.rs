@@ -183,7 +183,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     }
     // An Esc after the last thing the hooks recorded ended that turn, whatever they say: a
     // prompt or a permission request it interrupted is gone, and claude is at its prompt.
-    let esc = seen.interrupted_at.filter(|&at| at >= rec.last_activity_ms);
+    let esc = rec.esc_ended(seen.interrupted_at);
     if rec.needs_you && esc.is_none() {
         return Err(Hold::NeedsYou);
     }
@@ -201,7 +201,8 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
         _ => return Err(Hold::NotStopped),
     };
     // The turn ended, but what it started in the background has not (issue #9): a background
-    // subagent, a Workflow run, a cloud session. None of them fires a hook the slot hears.
+    // subagent, a Workflow run, a cloud session — listed by `Stop`, and kept between `Stop`s by
+    // `SubagentStart`/`SubagentStop` (issue #10). None is a process of its own to see.
     if !rec.background.is_empty() {
         return Err(Hold::Background(
             rec.background.iter().map(|t| t.what.clone()).collect(),
@@ -834,25 +835,75 @@ mod tests {
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
     }
 
+    /// Issue #10 end to end, as 2.1.291 told it under a pty on 2026-10-06, through
+    /// `events::apply` into `decide`: a turn launches a background agent and the owner presses
+    /// Esc — no hook, only the transcript's marker. An internal agent nobody announced sends a
+    /// `SubagentStop`; then the agent finishes, writing as it goes. Calibration: the same turn
+    /// without the agent, which is offloadable at every step, so the hold is the agent's.
     #[test]
-    fn an_esc_does_not_release_work_its_turn_started() {
-        // Issue #10. The Esc ends the turn; the agent that turn started is in the list by its
-        // SubagentStart, so the slot is kept. Calibration: the same Esc with nothing running
-        // is stopped, as in the test above.
-        let (mut rec, mut seen) = idle();
-        let prompt = NOW - 2 * IDLE_AFTER_STOP_MS;
-        rec.busy = true;
-        rec.last_activity_ms = prompt;
-        seen.interrupted_at = Some(prompt + 5_000);
-        assert!(decide(&rec, NOW, &seen).is_ok(), "calibration");
-        rec.background = vec![crate::registry::Task {
-            id: Some("a90c".into()),
-            what: "subagent: general-purpose".into(),
-        }];
-        assert_eq!(
-            decide(&rec, NOW, &seen),
-            Err(Hold::Background(vec!["subagent: general-purpose".into()]))
-        );
+    fn an_agent_started_in_a_turn_esc_ended_holds_the_slot_until_it_is_done() {
+        use crate::events::{Binding, Event, apply};
+        let t0 = NOW - 3 * IDLE_AFTER_STOP_MS;
+        let marker = t0 + 4_000;
+        for with_agent in [false, true] {
+            let (mut rec, mut seen) = idle();
+            let hook = |rec: &mut SlotRecord, body: &str, at: Millis| {
+                let ev = Event::parse(body).unwrap();
+                apply(rec, &ev, at, Binding::Own, Some(100), Some(7));
+            };
+            hook(
+                &mut rec,
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#,
+                t0,
+            );
+            if with_agent {
+                hook(
+                    &mut rec,
+                    r#"{"hook_event_name":"SubagentStart","agent_id":"a90c","agent_type":"general-purpose"}"#,
+                    t0 + 1_000,
+                );
+            }
+            seen.interrupted_at = Some(marker);
+            let held = |rec: &SlotRecord, seen: &Seen| {
+                assert_eq!(
+                    rec.esc_ended(seen.interrupted_at),
+                    Some(marker),
+                    "the menu's Idle"
+                );
+                if with_agent {
+                    assert_eq!(
+                        decide(rec, NOW, seen),
+                        Err(Hold::Background(vec!["subagent: general-purpose".into()]))
+                    );
+                } else {
+                    assert!(decide(rec, NOW, seen).is_ok(), "calibration");
+                }
+            };
+            held(&rec, &seen);
+            hook(
+                &mut rec,
+                r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#,
+                t0 + 30_000,
+            );
+            held(&rec, &seen);
+            // The agent ends; its own payload still lists it as running, and is not believed.
+            let end = t0 + 45_000;
+            hook(
+                &mut rec,
+                r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running"}]}"#,
+                end,
+            );
+            seen.last_write_ms = Some(end);
+            assert!(rec.background.is_empty());
+            assert!(decide(&rec, NOW, &seen).is_ok());
+            assert!(
+                matches!(
+                    decide(&rec, end + 60_000, &seen),
+                    Err(Hold::TooRecent { .. })
+                ),
+                "idle from the agent's last write, not from the Esc"
+            );
+        }
     }
 
     #[test]
