@@ -93,14 +93,25 @@ pub struct Measure {
     pub procs: usize,
 }
 
+/// What a window may carry and still be quiet: a minute's worth of bytes at the line.
+pub fn budget(line: f64) -> f64 {
+    line * (MIN_WINDOW_MS as f64 / 1000.0)
+}
+
 /// The line a slot's rate is held against, from its floor.
 pub fn line(floor: Option<f64>) -> f64 {
     floor.map_or(LINE_MIN, |f| (f * FLOOR_FACTOR).clamp(LINE_MIN, LINE_MAX))
 }
 
 /// One pass's step for one slot, pure. The caller has already left a window shorter than
-/// [`MIN_WINDOW_MS`] for the next pass.
-pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (SlotState, Measure) {
+/// [`MIN_WINDOW_MS`] for the next pass. `left` says a member in this pass's snapshot was gone
+/// by the time it was read.
+pub fn step(
+    prev: Option<&SlotState>,
+    now: Millis,
+    readings: Vec<Reading>,
+    left: bool,
+) -> (SlotState, Measure) {
     let procs = readings.len();
     let Some(prev) = prev else {
         let state = SlotState {
@@ -148,11 +159,12 @@ pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (S
     }
     // A member seen last time and gone now: what it did since went to whoever reaped it — a
     // member's counters, or init's for an orphan — so this window's bytes are not known whole.
-    let vanished = prev.procs.iter().any(|p| {
-        !readings
-            .iter()
-            .any(|r| r.pid == p.pid && r.start == p.start)
-    });
+    let vanished = left
+        || prev.procs.iter().any(|p| {
+            !readings
+                .iter()
+                .any(|r| r.pid == p.pid && r.start == p.start)
+        });
     let secs = window_ms as f64 / 1000.0;
     let rate = bytes as f64 / secs;
     // The line comes from the history *before* this window: a window never sets its own bar,
@@ -170,7 +182,7 @@ pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (S
     // that starts in a window's last seconds would be averaged away. Every window is at least a
     // minute, so this covers the average too. A window as long as the quiet period cannot say
     // when in it the bytes fell, and one a member left is not known whole: both active.
-    let budget = line * (MIN_WINDOW_MS as f64 / 1000.0);
+    let budget = budget(line);
     let last_active = if bytes as f64 > budget || window_ms >= QUIET_FOR_MS || vanished {
         now
     } else {
@@ -226,7 +238,7 @@ pub fn describe(slot: &str, m: &Measure, attached: Option<bool>) -> String {
             m.cpu,
             m.procs,
             m.line,
-            m.line * (MIN_WINDOW_MS as f64 / 1000.0),
+            budget(m.line),
             m.floor
                 .map(|f| format!(" from floor {f:.0}"))
                 .unwrap_or_default(),
@@ -262,13 +274,15 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
             continue;
         }
         let root = rec.pid.zip(rec.proc_start);
-        let (mut readings, mut unreadable) = (Vec::new(), 0usize);
+        let (mut readings, mut unreadable, mut left) = (Vec::new(), 0usize, false);
         for pid in members(table, env.get(&rec.slot), root) {
             match read(pid) {
                 Some(r) => readings.push(r),
                 // Gone since the snapshot is the truth; there but unreadable is unknown.
                 None if std::path::Path::new(&format!("/proc/{pid}")).exists() => unreadable += 1,
-                None => {}
+                // Gone since the snapshot: its bytes went to whoever reaped it, perhaps after
+                // that one was read — a member that left, as in `step`.
+                None => left = true,
             }
         }
         if unreadable > 0 {
@@ -291,7 +305,7 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
         if readings.is_empty() {
             continue;
         }
-        let (state, m) = step(old, now, readings);
+        let (state, m) = step(old, now, readings, left);
         let attached = sessions.as_ref().and_then(|all| {
             all.iter()
                 .find(|s| s.name == rec.slot && s.answered)
@@ -562,7 +576,7 @@ mod tests {
 
     #[test]
     fn a_first_reading_is_active() {
-        let (s, m) = step(None, T0, vec![r(1, 7, 5_000)]);
+        let (s, m) = step(None, T0, vec![r(1, 7, 5_000)], false);
         assert_eq!((m.rate, m.quiet_ms, s.last_active), (None, 0, T0));
         assert!(verdict(&m, Some(false)).contains("would keep"));
     }
@@ -573,14 +587,14 @@ mod tests {
         // active — it must not set its own bar at ten times itself. Calibration: a slot whose
         // floor of 100 was learned earlier holds 54 KB over three minutes under its 60 KB budget and
         // calls it quiet.
-        let s = step(None, T0, vec![r(1, 7, 0)]).0;
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 360_000)]);
+        let s = step(None, T0, vec![r(1, 7, 0)], false).0;
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 360_000)], false);
         assert_eq!((m.floor, m.line, m.quiet_ms), (None, LINE_MIN, 0), "{m:?}");
         let learned = SlotState {
             minima: vec![(T0 / HOUR_MS, 100.0)],
             ..s
         };
-        let (_, m) = step(Some(&learned), T0 + 180_000, vec![r(1, 7, 54_000)]);
+        let (_, m) = step(Some(&learned), T0 + 180_000, vec![r(1, 7, 54_000)], false);
         assert_eq!((m.floor, m.line), (Some(100.0), 1000.0));
         assert_eq!(m.quiet_ms, 180_000);
     }
@@ -597,10 +611,10 @@ mod tests {
             minima: vec![(T0 / HOUR_MS, 100.0)],
         };
         let burst = 165 * 100 + 15 * 9_342;
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, burst)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, burst)], false);
         assert!(m.rate.unwrap() < m.line, "{m:?}");
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 100)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 100)], false);
         assert!(m.quiet_ms > QUIET_FOR_MS, "{m:?}");
     }
 
@@ -615,9 +629,9 @@ mod tests {
             last_active: T0,
             minima: vec![(T0 / HOUR_MS, 100.0)],
         };
-        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 36_000)]);
+        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 36_000)], false);
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 36_000)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 36_000)], false);
         assert_eq!(m.quiet_ms, 180_000, "{m:?}");
     }
 
@@ -632,10 +646,29 @@ mod tests {
             last_active: T0,
             minima: vec![(T0 / HOUR_MS, 100.0)],
         };
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], false);
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000), r(2, 8, 0)]);
+        let (_, m) = step(
+            Some(&s),
+            T0 + 180_000,
+            vec![r(1, 7, 18_000), r(2, 8, 0)],
+            false,
+        );
         assert_eq!(m.quiet_ms, 180_000, "{m:?}");
+    }
+
+    #[test]
+    fn a_member_gone_before_it_was_read_counts_as_active() {
+        let s = SlotState {
+            at: T0,
+            procs: vec![r(1, 7, 0)],
+            last_active: T0,
+            minima: vec![(T0 / HOUR_MS, 100.0)],
+        };
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], true);
+        assert_eq!(m.quiet_ms, 0, "{m:?}");
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 18_000)], false);
+        assert_eq!(m.quiet_ms, 180_000, "calibration: {m:?}");
     }
 
     #[test]
@@ -650,6 +683,7 @@ mod tests {
                 wakeups: 500,
                 cpu: 0,
             }],
+            false,
         )
         .0;
         let (_, m) = step(
@@ -662,6 +696,7 @@ mod tests {
                 wakeups: 400,
                 cpu: 0,
             }],
+            false,
         );
         assert_eq!(m.wakeups, None);
         assert!(describe("claude-1", &m, Some(false)).contains("? wakeups/s"));
@@ -675,6 +710,7 @@ mod tests {
                 wakeups: 600,
                 cpu: 0,
             }],
+            false,
         );
         assert_eq!(m.wakeups, Some(1.0));
     }
@@ -694,7 +730,7 @@ mod tests {
             proc(100, 1, "claude", 7),
             proc(101, 100, "bash", 9),
             proc(102, 100, "claude-sessions", 9),
-            proc(me, 100, "claude-sessions", 9),
+            proc(me, 100, "cs", 9),
             proc(103, 1, "zmx", 10),
         ];
         assert_eq!(members(&table, None, Some((100, 7))), vec![100, 101]);
@@ -726,14 +762,14 @@ mod tests {
     fn idle_bytes_go_quiet_and_a_turn_wakes_it() {
         // 100 B/s for ten minutes in 3-minute passes, then a turn at 15 KB/s. Calibration in
         // both directions: the same rule calls the quiet slot freezable and the busy one not.
-        let mut s = step(None, T0, vec![r(1, 7, 0)]).0;
+        let mut s = step(None, T0, vec![r(1, 7, 0)], false).0;
         let mut bytes = 0;
         let mut at = T0;
         let mut last = None;
         for _ in 0..5 {
             at += 180_000;
             bytes += 18_000;
-            let (n, m) = step(Some(&s), at, vec![r(1, 7, bytes)]);
+            let (n, m) = step(Some(&s), at, vec![r(1, 7, bytes)], false);
             s = n;
             last = Some(m);
         }
@@ -753,20 +789,25 @@ mod tests {
         );
         at += 180_000;
         bytes += 180 * 15_000;
-        let (_, m) = step(Some(&s), at, vec![r(1, 7, bytes)]);
+        let (_, m) = step(Some(&s), at, vec![r(1, 7, bytes)], false);
         assert_eq!(m.quiet_ms, 0);
         assert!(verdict(&m, Some(false)).contains("quiet under 10m"));
     }
 
     #[test]
     fn a_new_process_counts_whole_and_a_reused_pid_is_a_new_process() {
-        let s = step(None, T0, vec![r(1, 7, 1_000)]).0;
+        let s = step(None, T0, vec![r(1, 7, 1_000)], false).0;
         // pid 1 again but started later: a different process, all of its bytes counted; and
         // a child seen for the first time, all of its own.
-        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 9, 2_000), r(2, 8, 3_000)]);
+        let (_, m) = step(
+            Some(&s),
+            T0 + 100_000,
+            vec![r(1, 9, 2_000), r(2, 8, 3_000)],
+            false,
+        );
         assert_eq!(m.rate, Some(50.0));
         // The same process: only what it did since.
-        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 1_500)]);
+        let (_, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 1_500)], false);
         assert_eq!(m.rate, Some(5.0));
     }
 
@@ -779,7 +820,7 @@ mod tests {
             minima: vec![(T0 / HOUR_MS - 30, 1.0)],
         };
         s.minima.push((T0 / HOUR_MS - 2, 80.0));
-        let (n, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 20_000)]);
+        let (n, m) = step(Some(&s), T0 + 100_000, vec![r(1, 7, 20_000)], false);
         assert_eq!(
             m.floor,
             Some(80.0),
@@ -856,15 +897,13 @@ mod tests {
     fn bytes_through_a_process_are_counted() {
         let me = std::process::id();
         let a = read(me).unwrap();
-        let _ = std::fs::read(format!("/proc/{me}/maps"));
-        std::fs::write(
-            std::env::temp_dir().join(format!("cs-activity-w-{me}")),
-            vec![0u8; 100_000],
-        )
-        .unwrap();
+        // Written and read back: either half of the count missing falls short.
+        let path = std::env::temp_dir().join(format!("cs-activity-w-{me}"));
+        std::fs::write(&path, vec![0u8; 100_000]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 100_000);
         let b = read(me).unwrap();
-        let _ = std::fs::remove_file(std::env::temp_dir().join(format!("cs-activity-w-{me}")));
-        assert!(b.bytes >= a.bytes + 100_000, "{a:?} {b:?}");
+        let _ = std::fs::remove_file(&path);
+        assert!(b.bytes >= a.bytes + 200_000, "{a:?} {b:?}");
         assert_eq!(a.start, b.start);
     }
 }

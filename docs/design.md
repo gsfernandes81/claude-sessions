@@ -411,14 +411,22 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   Code's events — at least ~124 B/s in every slot's claude, so every floor rises by about
   that, near doubling the measured idle, and the line with it. A streaming turn still clears
   the raised line about four times over. A pass run by hand from a slot's shell lands in
-  that shell's counters the same way and makes its next window active.
+  that shell's counters the same way and makes its next window active. **And every claude
+  re-reads the shared `~/.claude.json` whole** — about 54 KB here — when any claude in the
+  container rewrites it (Claude Code watches it for other processes' writes: feature-flag
+  refreshes, usage counters, a start), so one slot's housekeeping lands in every idle slot's
+  window. Read a burst that appears in every slot at once with that in mind.
   Processes found by the environment count only if younger than the recorded claude: an
   older one is an earlier claude's orphan in a slot name since reused. No `zmx` process is a
   member: a daemon started from inside a slot — by this tool, which strips `ZMX_SESSION`, or
   by a tool claude ran, which does not — reads the other session's terminal, which is that
   session's work, not this slot's. A member gone since the last reading makes the window
   active: what it did since went to whoever reaped it — a member's counters (counted twice
-  then, erring active), or init's for an orphan. Agent view, which runs a service outside any
+  then, erring active), or init's for an orphan; so does one in this pass's snapshot that is
+  gone by the time it is read. An earlier claude's orphan is left out, but children it forks
+  after the new claude started are younger and carry the name, so they count — and their
+  turnover keeps the window active: the safe direction, and visible as a slot that never
+  goes quiet. Agent view, which runs a service outside any
   slot, stays off.
 - **The line: each slot's own floor.** A slot's floor is its quietest window in the last
   24 hours, hour by hour; the line is ten times the floor learned *before* the window, held

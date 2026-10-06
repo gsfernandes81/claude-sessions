@@ -298,6 +298,55 @@ fn every_pass_measures_and_a_short_window_waits_for_the_next() {
     );
 }
 
+/// A slot measured before: its claude read 3 minutes ago at nothing, quiet for 11 minutes.
+/// `at_offset_ms` moves the last reading (negative is the past).
+fn measured_before(s: &Slot, at_offset_ms: i64) {
+    let now = now_ms() as i64;
+    std::fs::write(
+        s.root.join("registry/activity.state"),
+        format!(
+            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[[{},{},0,0,0]],"minima":[]}}}}"#,
+            now + at_offset_ms,
+            now - 11 * 60_000,
+            s.claude,
+            s.claude_start
+        ),
+    )
+    .unwrap();
+}
+
+/// A pass past the first reading, through the real `zmx list` stand-in: quiet and detached
+/// would freeze, attached would keep, and a reading from the future is no reading.
+#[test]
+fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
+    let s = idle_slot("activity-freeze", 0o600, false);
+    measured_before(&s, -180_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("claude-1: measured — ") && out.contains("the activity rule would freeze it"),
+        "got: {out}"
+    );
+
+    let s = idle_slot("activity-attached", 0o700, false);
+    measured_before(&s, -180_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the activity rule would keep it: attached"),
+        "got: {out}"
+    );
+
+    let s = idle_slot("activity-future", 0o600, false);
+    measured_before(&s, 60 * 60_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the activity rule would keep it: first reading"),
+        "got: {out}"
+    );
+}
+
 /// Issue #9: a slot whose claude finished its turn 11 minutes ago but is still running
 /// in-process background work — four council agents, in the report — reads as idle to every
 /// hook. Calibrated by `an_idle_detached_slot_is_stopped_and_marked_offloaded`: the same
