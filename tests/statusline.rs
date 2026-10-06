@@ -10,8 +10,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 /// Runs `program args` with a payload written to its stdin and the pipe left open, and says
 /// whether it exited within `within`, with its stdout.
 fn run_with_open_stdin(program: &str, args: &[&str], within: Duration) -> (bool, String) {
+    // No colour, so the line starts with its text whatever this machine's memory reads —
+    // and NO_COLOR is checked end to end.
     let mut child = Command::new(program)
         .args(args)
+        .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -52,5 +55,5 @@ fn it_prints_one_line_and_exits_although_stdin_stays_open() {
     let (ok, out) = run_with_open_stdin(BIN, &["statusline"], Duration::from_secs(3));
     assert!(ok, "statusline did not exit 0 in time; printed {out:?}");
     assert_eq!(out.lines().count(), 1, "{out:?}");
-    assert!(out.starts_with("RAM: "), "{out:?}");
+    assert!(out.starts_with("RAM: ") && !out.contains('\x1b'), "{out:?}");
 }

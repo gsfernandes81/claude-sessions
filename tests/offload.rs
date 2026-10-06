@@ -312,14 +312,22 @@ fn measured_before(s: &Slot, at_offset_ms: i64) {
     std::fs::write(
         s.root.join("registry/activity.state"),
         format!(
-            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[[{},{},0,0,0]],"minima":[]}}}}"#,
+            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[[{},{},0,0,0]],"minima":[[{},87.5]]}}}}"#,
             now + at_offset_ms,
             now - 11 * 60_000,
             s.claude,
-            s.claude_start
+            s.claude_start,
+            now / 3_600_000
         ),
     )
     .unwrap();
+}
+
+/// The floor the state file holds for claude-1, as written.
+fn floor_kept(s: &Slot) -> bool {
+    std::fs::read_to_string(s.root.join("registry/activity.state"))
+        .unwrap()
+        .contains("87.5")
 }
 
 /// A pass past the first reading, through the real `zmx list` stand-in: quiet and detached
@@ -352,6 +360,31 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
         out.contains("the activity rule would keep it: first reading"),
         "got: {out}"
     );
+    assert!(
+        floor_kept(&s),
+        "a future reading starts over but keeps the slot's floor"
+    );
+}
+
+/// The floor belongs to the slot's name while it has a record: a pass that sees the slot
+/// offloaded keeps it, so a resume does not relearn it from busy windows. Calibration: the
+/// same pass with the record gone drops it.
+#[test]
+fn an_offloaded_slot_keeps_its_floor() {
+    let s = idle_slot("activity-offloaded", 0o600, false);
+    measured_before(&s, -180_000);
+    let path = s.root.join("registry/claude-1.json");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let offloaded = body.replacen("\"state\":\"live\"", "\"state\":\"offloaded\"", 1);
+    assert_ne!(body, offloaded, "calibration: the fixture took the state");
+    std::fs::write(&path, offloaded).unwrap();
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(floor_kept(&s), "{out}");
+    std::fs::remove_file(&path).unwrap();
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(!floor_kept(&s), "calibration: no record, no floor");
 }
 
 /// Issue #9: a slot whose claude finished its turn 11 minutes ago but is still running

@@ -462,7 +462,12 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   hand right after the timer's — is left for the next, with a line saying so.
 - **State** is `activity.state` beside the registry — not `.json`, which the registry reads
   as a slot — written whole and renamed into place. Two passes at once may each write it; the
-  later wins and the other's window is measured again. A pass that cannot save it removes
+  later wins and the other's window is measured again. **The floor belongs to the slot's
+  name** for as long as it has a record: a pass that sees the slot offloaded keeps it, so a
+  resume under the same name — whose first window reads active, its old processes gone —
+  does not relearn it from busy windows; a reading dated after the pass (a clock stepped
+  back, or a pass that stored while this one waited on zmx) starts over but keeps it. A name
+  closed and reused inherits it, which mostly carries the container's idle noise across. A pass that cannot save it removes
   it, so the next one really starts over.
 - **What it cannot see**: a claude waiting in process, silently. **The common case is its
   own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
@@ -482,8 +487,10 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   that writes its title over its environment** (postgres, nginx, `setproctitle` users such as
   gunicorn and celery) is in no slot once it has left claude's tree, nor is anything it
   forks. And a job that double-forked away and ran wholly
-  between two passes, reaped by init: nobody's counters ever hold it. Rarer: a tool blocked
-  on a remote that sends nothing, which a freeze pauses and an attach resumes.
+  between two passes, reaped by init: nobody's counters ever hold it. **And a tool waiting
+  locally** — a background `sleep N && gh run view`, `tail -f` on a quiet log,
+  `inotifywait` — adds no bytes either, and the hold has to cover it too. Rarer: a tool
+  blocked on a remote that sends nothing, which a freeze pauses and an attach resumes.
 
 **Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
 2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.
@@ -502,7 +509,9 @@ menu's amber stays reserved for *waiting for you*.
 
 `hooks-config` installs it as `statusLine` in the same drop-in as the hooks, with
 `refreshInterval: 60` — RAM and load move without any Claude Code event, and otherwise it
-would re-run only on one; Claude Code redraws only when the text changes. A managed setting
+would re-run only on one; Claude Code redraws only when the text changes. Each run is a
+child of claude for a few milliseconds, so an offload pass whose snapshot catches one counts
+it as work under the slot and keeps the slot for that pass: the safe direction, one pass late. A managed setting
 outranks a user's own, so it replaces any status line set per user. It reads a few small
 files and nothing else. The session JSON Claude Code writes on its stdin is drained, but for
 at most a moment's quiet, so a pipe whose writer stays open cannot hold it.

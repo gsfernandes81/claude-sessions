@@ -261,9 +261,20 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     let prev = load();
     let mut next = BTreeMap::new();
     let mut lines = Vec::new();
-    for rec in records.iter().filter(|r| r.state == State::Live) {
-        // A reading from the future — the clock stepped back — is no reading.
-        let old = prev.get(&rec.slot).filter(|o| o.at <= now);
+    for rec in records {
+        let stored = prev.get(&rec.slot);
+        // The floor belongs to the slot's name for as long as it has a record: an offloaded
+        // slot resumes under the same name, and must not relearn its floor from its first,
+        // busy windows. Its old processes are gone by then, so that window reads active.
+        if rec.state != State::Live {
+            if let Some(o) = stored {
+                next.insert(rec.slot.clone(), o.clone());
+            }
+            continue;
+        }
+        // A reading from the future — the clock stepped back, or a pass that stored while this
+        // one was reading zmx — is no reading; its floor is still the slot's.
+        let old = stored.filter(|o| o.at <= now);
         if let Some(o) = old.filter(|o| now.saturating_sub(o.at) < MIN_WINDOW_MS) {
             lines.push(format!(
                 "{}: measured — {}s since the last reading, too short; the next pass counts it",
@@ -305,7 +316,12 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
         if readings.is_empty() {
             continue;
         }
-        let (state, m) = step(old, now, readings, left);
+        let (mut state, m) = step(old, now, readings, left);
+        if old.is_none() {
+            if let Some(o) = stored {
+                state.minima = o.minima.clone();
+            }
+        }
         let attached = sessions.as_ref().and_then(|all| {
             all.iter()
                 .find(|s| s.name == rec.slot && s.answered)
