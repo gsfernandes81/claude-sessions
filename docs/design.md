@@ -381,13 +381,16 @@ in place of killing. 0.4.5 is the first step: every pass, live or dry, says what
 would do beside what the offloader did, and nothing else changes. The freeze comes after the
 fleet's own numbers have been read. `src/activity.rs` has the details and the tests.
 
-- **Bytes through `read`/`write`, which are not the network.** `rchar + wchar` in
+- **Bytes through `read`/`write`, which is not all of the network.** `rchar + wchar` in
   `/proc/<pid>/io` counts the terminal claude repaints (zmx reads it whether or not anyone is
   attached), the transcripts it writes, and pipes to its tools — the same count on a Pi 4 as
-  on x86, where CPU time is not. **It does not count sockets**: `send`/`recv`, which claude's
-  native build uses for the API, bypass it (checked: a megabyte through a socketpair moved
-  `rchar` by under a hundred bytes). So a model turn shows as the screen it redraws and the
-  transcript it appends, not as the stream itself. Measured on 2.1.291 with agent view off,
+  on x86, where CPU time is not. The kernel counts by call, not by file: `read`/`write` on a
+  socket are counted, **`send`/`recv` are not** — and claude's native build uses `send`/`recv`
+  for the API (checked: a megabyte through a socketpair by `send`/`recv` moved `rchar` by
+  under a hundred bytes). So claude's own network is invisible here, and a model turn shows
+  as the screen it redraws and the transcript it appends, not as the stream itself. A child's
+  network shows or not by what it is written in: Node, Go and ssh use `read`/`write`; Rust's
+  and Python's sockets use `send`/`recv`. Measured on 2.1.291 with agent view off,
   here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
   reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. Wake-ups (voluntary
   context switches over live threads) and CPU time (`utime + stime` with reaped children's)
@@ -395,23 +398,33 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
 - **Which processes: the environment.** With agent view off, claude is one process: an
   in-process subagent shows as claude's own bytes, and its tools as claude's children
   (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
-  outside its tree). Every process a slot's claude starts inherits `CLAUDE_SESSIONS_SLOT`,
-  including one that double-forks away to init, so `/proc/*/environ` finds them however they
-  were reparented; the recorded claude and its descendants are added in case one cleared it.
-  The recorded claude counts only while it is the process recorded, by start time. Not
-  `claude-sessions` itself — a hook, the status line, or a pass run from a slot's shell
-  carries the variable and descends from claude, and would count its own reading of `/proc`.
+  outside its tree). zmx sets `ZMX_SESSION` to the session's name for the program it runs, so
+  everything a slot's claude starts carries it — one that double-forks away to init too, and
+  in a session somebody attached by hand as much as in one of ours — and `/proc/*/environ`
+  finds them however they were reparented; the recorded claude and its descendants are added
+  in case one cleared it.
+  The recorded claude counts only while it is the process recorded, by start time. A
+  `claude-sessions` still running when the pass reads is left out — the pass itself, or a menu
+  open in a slot's shell. **One that has exited is in its parent's counters already**: the
+  kernel folds a reaped child's bytes into its parent's, and nothing can take them out. The
+  status line is the steady case: about 7.4 KB a run, measured, once a minute and on Claude
+  Code's events — at least ~124 B/s in every slot's claude, so every floor rises by about
+  that, near doubling the measured idle, and the line with it. A streaming turn still clears
+  the raised line about four times over. A pass run by hand from a slot's shell lands in
+  that shell's counters the same way and makes its next window active.
   Processes found by the environment count only if younger than the recorded claude: an
-  older one is an earlier claude's orphan in a slot name since reused. `zmx` is run without
-  the caller's slot variable, so a session started from inside a slot does not have its
-  daemon counted as that slot's. A member gone since the last reading makes the window
+  older one is an earlier claude's orphan in a slot name since reused. `zmx` is always run
+  without `ZMX_SESSION` (module note in `zmx.rs`), so a session started from inside a slot
+  does not have its daemon counted as that slot's. A member gone since the last reading makes the window
   active: what it did since went to whoever reaped it — a member's counters (counted twice
   then, erring active), or init's for an orphan. Agent view, which runs a service outside any
   slot, stays off.
 - **The line: each slot's own floor.** A slot's floor is its quietest window in the last
-  24 hours, hour by hour; a window counts as active above ten times the floor learned
-  *before* it, held between 512 B/s and 4 KB/s, and a slot with no floor yet is held to
-  512. A Claude Code that idles noisier raises its own floor; the base stops a near-silent
+  24 hours, hour by hour; the line is ten times the floor learned *before* the window, held
+  between 512 B/s and 4 KB/s, and 512 for a slot with no floor yet. **A window is active when
+  its bytes exceed a minute's worth at the line** — not when its average does, which would
+  average away a turn that began in its last seconds. An idle slot at its floor stays quiet
+  for any window under ten minutes. A Claude Code that idles noisier raises its own floor; the base stops a near-silent
   floor from making a stray read look like a turn. All bytes, so no device enters. **Its
   blind spot:** a slot only ever seen busy learns that work as its floor, and then the
   4 KB/s cap is its only protection — measured streaming is 9,342 B/s, about 2.3× the cap,
@@ -442,8 +455,12 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   thawing on attach is no substitute for a wake-up nobody is there to see. The freeze
   decision has to keep that rule. **Then claude's own network**: a cloud session, a
   websocket monitor, an HTTP MCP server, a wait on the API that redraws nothing — all
-  sockets, none in the bytes; the freeze decision must keep the background-task hold for
-  these, or find a signal that sees them. And a job that double-forked away and ran wholly
+  claude's own sockets, none in the bytes; a child's monitor or server may or may not show,
+  by what it is written in. The freeze decision must keep the background-task hold for
+  these, or find a signal that sees them. **And a tool that computes without reading or
+  writing** — a background build's link step, a script crunching numbers — adds no bytes
+  while claude sits at its prompt; the CPU figure on the same line will show it, and the hold
+  has to cover it too. And a job that double-forked away and ran wholly
   between two passes, reaped by init: nobody's counters ever hold it. Rarer: a tool blocked
   on a remote that sends nothing, which a freeze pauses and an attach resumes.
 

@@ -11,8 +11,9 @@
 //!
 //! **What is counted.** Bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`:
 //! the terminal claude repaints, the transcripts it writes, pipes to its tools. The same count
-//! on a Pi 4 and an x86 box, where CPU time is not. **Not sockets**: `send`/`recv` bypass these
-//! counters, so claude's own network traffic is invisible to them. CPU time and wake-ups are
+//! on a Pi 4 and an x86 box, where CPU time is not. The kernel counts by call: `read`/`write`
+//! on a socket count, but `send`/`recv` do not, and claude's own network uses those — so it
+//! is invisible to these counters. CPU time and wake-ups are
 //! logged beside the bytes for the data, not judged. The measured figures, the membership rule,
 //! the line and what the rule cannot see are in design.md, which is the one record of them.
 //!
@@ -30,8 +31,10 @@ use crate::json::{self, Value};
 use crate::procinfo::Proc;
 use crate::registry::{SlotRecord, State};
 
-/// The variable every process of a slot carries, set by the launch line.
-pub const VAR: &str = "CLAUDE_SESSIONS_SLOT";
+/// The variable every process of a slot carries: zmx sets it to the session's name for the
+/// program it runs, and so for everything that program starts — a slot this tool started and
+/// one somebody attached by hand alike.
+pub const VAR: &str = "ZMX_SESSION";
 
 /// The shortest window a reading counts over. A pass run by hand straight after the timer's
 /// would otherwise measure a few seconds, too short to say anything; it is left for the next.
@@ -53,8 +56,8 @@ pub struct Reading {
     pub pid: u32,
     pub start: u64,
     /// `rchar + wchar`: every byte through `read` and `write` — files, the terminal, pipes.
-    /// **Not sockets**: `send`/`recv` bypass these counters, so claude's own network traffic
-    /// is not in them (design.md § Activity, measured).
+    /// Sockets only through `read`/`write`: `send`/`recv` bypass these counters, so claude's
+    /// own network traffic is not in them (design.md § Activity, measured).
     pub bytes: u64,
     /// Voluntary context switches, summed over the process's live threads.
     pub wakeups: u64,
@@ -162,10 +165,12 @@ pub fn step(prev: Option<&SlotState>, now: Millis, readings: Vec<Reading>) -> (S
         .collect();
     let floor = minima.iter().map(|&(_, m)| m).reduce(f64::min);
     let line = line(floor);
-    // A window as long as the quiet period cannot say when in it the bytes fell — a turn in its
-    // last minutes would be averaged away — so it counts as active, as anything unknown does;
-    // so does one a member left.
-    let last_active = if rate > line || window_ms >= QUIET_FOR_MS || vanished {
+    // Active above a minute's worth of bytes at the line, not above the line on average: a turn
+    // that starts in a window's last seconds would be averaged away. Every window is at least a
+    // minute, so this covers the average too. A window as long as the quiet period cannot say
+    // when in it the bytes fell, and one a member left is not known whole: both active.
+    let budget = line * (MIN_WINDOW_MS as f64 / 1000.0);
+    let last_active = if bytes as f64 > budget || window_ms >= QUIET_FOR_MS || vanished {
         now
     } else {
         prev.last_active
@@ -243,7 +248,8 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     let mut next = BTreeMap::new();
     let mut lines = Vec::new();
     for rec in records.iter().filter(|r| r.state == State::Live) {
-        let old = prev.get(&rec.slot);
+        // A reading from the future — the clock stepped back — is no reading.
+        let old = prev.get(&rec.slot).filter(|o| o.at <= now);
         if let Some(o) = old.filter(|o| now.saturating_sub(o.at) < MIN_WINDOW_MS) {
             lines.push(format!(
                 "{}: measured — {}s since the last reading, too short; the next pass counts it",
@@ -303,7 +309,7 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     lines
 }
 
-/// `CLAUDE_SESSIONS_SLOT` in a process's environment, if it carries one.
+/// The slot a process belongs to, by [`VAR`] in its environment, if it carries one.
 fn slot_of(pid: u32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
     raw.split(|b| *b == 0).find_map(|kv| {
@@ -323,12 +329,12 @@ pub fn by_slot(table: &[Proc]) -> BTreeMap<String, Vec<u32>> {
     out
 }
 
-/// A slot's members: those carrying its variable, and the recorded claude — only if it is
-/// still the process that was recorded, by start time — with its descendants, should any have
-/// cleared the variable. Not this process and not another `claude-sessions`: a hook, the
-/// status line, or a pass run from the slot's own shell would count its own reading of `/proc`
-/// as the slot's work. (One already reaped has been folded into its parent's counters by the
-/// kernel, which errs towards active.)
+/// A slot's members: those carrying its variable — if the recorded claude is known, only
+/// those younger than it — and the recorded claude, only if it is still the process that was
+/// recorded, by start time, with its descendants. Not this process and not a running
+/// `claude-sessions`: a menu or a pass in the slot's shell would count its own reading of
+/// `/proc`. (One that has exited is already in its parent's counters — the kernel folds a
+/// reaped child's bytes in — which is why the status line raises every floor a little.)
 pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)>) -> Vec<u32> {
     let mut pids: Vec<u32> = env.cloned().unwrap_or_default();
     let root =
@@ -570,14 +576,33 @@ mod tests {
             minima: vec![(T0 / HOUR_MS, 100.0)],
             ..s
         };
-        let (_, m) = step(Some(&learned), T0 + 180_000, vec![r(1, 7, 90_000)]);
+        let (_, m) = step(Some(&learned), T0 + 180_000, vec![r(1, 7, 54_000)]);
         assert_eq!((m.floor, m.line), (Some(100.0), 1000.0));
         assert_eq!(m.quiet_ms, 180_000);
     }
 
     #[test]
+    fn a_turn_in_a_windows_last_seconds_is_not_averaged_away() {
+        // Quiet since T0 at a floor of 100, then 15 s of streaming at the end of a 3-minute
+        // window: 870 B/s on average, under the line of 1000, but far more than a minute's
+        // worth at it. Calibration: the same window idle throughout is quiet.
+        let s = SlotState {
+            at: T0,
+            procs: vec![r(1, 7, 0)],
+            last_active: T0 - 10 * 60_000,
+            minima: vec![(T0 / HOUR_MS, 100.0)],
+        };
+        let burst = 165 * 100 + 15 * 9_342;
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, burst)]);
+        assert!(m.rate.unwrap() < m.line, "{m:?}");
+        assert_eq!(m.quiet_ms, 0, "{m:?}");
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 100)]);
+        assert!(m.quiet_ms > QUIET_FOR_MS, "{m:?}");
+    }
+
+    #[test]
     fn a_window_as_long_as_the_quiet_period_counts_as_active() {
-        // Two hours at an average under the line: when in it the bytes fell is unknown, so it
+        // Two hours at a third of the line: when in it the bytes fell is unknown, so it
         // is active. Calibration: the same average over three minutes is quiet.
         let s = SlotState {
             at: T0,
@@ -585,9 +610,9 @@ mod tests {
             last_active: T0,
             minima: vec![(T0 / HOUR_MS, 100.0)],
         };
-        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 7_200 * 489)]);
+        let (_, m) = step(Some(&s), T0 + 2 * HOUR_MS, vec![r(1, 7, 7_200 * 300)]);
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 489)]);
+        let (_, m) = step(Some(&s), T0 + 180_000, vec![r(1, 7, 180 * 300)]);
         assert_eq!(m.quiet_ms, 180_000, "{m:?}");
     }
 
