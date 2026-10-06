@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "support/iso.rs"]
+mod iso;
+use iso::iso;
+
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
 struct Slot {
@@ -300,6 +304,45 @@ fn a_subagent_writing_its_transcript_keeps_the_slot() {
     );
     assert!(alive(s.claude, s.claude_start));
     assert_eq!(state_of(&s.root), "live");
+}
+
+/// An Esc fires no hook, so the record says busy from its prompt for good. The transcript's
+/// trailing `[Request interrupted by user]` says the turn is over. Calibrated in the same
+/// test: without the marker the same slot is kept.
+#[test]
+fn a_turn_ended_by_esc_is_idle_from_the_esc() {
+    let s = idle_slot("esc", 0o600, false);
+    let path = s.root.join("registry/claude-1.json");
+    let body = std::fs::read_to_string(&path).unwrap();
+    let busy = body.replacen("\"busy\":false", "\"busy\":true", 1);
+    assert_ne!(body, busy, "calibration: the fixture took the change");
+    std::fs::write(&path, busy).unwrap();
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "offload failed: {out}");
+    assert!(
+        out.contains("claude-1: kept — something happened since it last went idle"),
+        "calibration, busy and no marker: {out}"
+    );
+
+    // The marker, eleven minutes old, as the last conversational line.
+    let at = now_ms() - 11 * 60 * 1000;
+    let transcript = s.root.join("conv-1.jsonl");
+    let mut text = std::fs::read_to_string(&transcript).unwrap();
+    text.push_str(&format!(
+        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}}]}},\"timestamp\":\"{}\"}}\n",
+        iso(at)
+    ));
+    std::fs::write(&transcript, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&transcript)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_millis(at))
+        .unwrap();
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "offload failed: {out}");
+    assert!(out.contains("claude-1: offloaded"), "got: {out}");
+    assert!(!alive(s.claude, s.claude_start));
 }
 
 #[test]

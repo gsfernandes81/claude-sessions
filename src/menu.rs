@@ -562,10 +562,17 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
 fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
     let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
     let attached = alive && sessions.iter().any(|s| s.name == r.slot && s.attached);
+    // An Esc fires no hook, so a turn the owner interrupted — or a permission prompt they
+    // dismissed — would read Working or Needs you until the next turn ended. The transcript's
+    // trailing marker says it is over (`transcript::interrupted_at`).
+    let interrupted = (r.busy || r.needs_you)
+        && r.conversation_path()
+            .and_then(|p| crate::transcript::interrupted_at_cached(&p))
+            .is_some_and(|at| at >= r.last_activity_ms);
     Row {
         key: RowKey::Slot(r.slot.clone()),
-        wants_you: r.needs_you,
-        busy: r.busy,
+        wants_you: r.needs_you && !interrupted,
+        busy: r.busy && !interrupted,
         unread: r.unread(),
         attached,
         // A record whose process has gone is resumable whatever its state says — reconcile
@@ -609,6 +616,31 @@ pub fn workspace() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_interrupted_with_esc_is_not_drawn_as_working_or_waiting() {
+        let dir = std::env::temp_dir().join(format!("cs-menu-esc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("conv.jsonl");
+        let prompted = r#"{"type":"user","message":{"role":"user","content":"go"},"timestamp":"2026-10-06T09:23:28.476Z"}"#;
+        std::fs::write(&transcript, format!("{prompted}\n")).unwrap();
+        let mut r = SlotRecord::new("claude-1", 0);
+        r.transcript_path = Some(transcript.display().to_string());
+        r.busy = true;
+        r.needs_you = true;
+        r.last_activity_ms = crate::store::iso_ms("2026-10-06T09:23:28.500Z").unwrap();
+        let row = slot_row(&r, r.last_activity_ms, &[]);
+        assert!(
+            row.busy && row.wants_you,
+            "calibration: as the hooks left it"
+        );
+        let mark = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2026-10-06T09:23:35.516Z"}"#;
+        std::fs::write(&transcript, format!("{prompted}\n{mark}\n")).unwrap();
+        let row = slot_row(&r, r.last_activity_ms, &[]);
+        assert!(!row.busy && !row.wants_you, "at its prompt, so Idle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn row(name: &str) -> Row {
         Row {

@@ -73,6 +73,11 @@ pub struct Seen {
     /// whatever started it, and a background subagent writes its own transcript, so a write
     /// later than the last `Stop` is activity no hook reported (issue #9).
     pub last_write_ms: Option<Millis>,
+    /// When the owner's Esc ended the last turn, read from the transcript's trailing
+    /// `[Request interrupted by user…]` entry. An interrupt fires no hook, so without this a
+    /// slot interrupted mid-turn read `busy` — or waiting for you, if the Esc answered a
+    /// permission prompt — until its next turn ended.
+    pub interrupted_at: Option<Millis>,
 }
 
 /// Why a slot was kept. Every variant is a reason to do nothing.
@@ -176,7 +181,10 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     if rec.session_id.is_none() || rec.cwd.is_none() {
         return Err(Hold::NotResumable);
     }
-    if rec.needs_you {
+    // An Esc after the last thing the hooks recorded ended that turn, whatever they say: a
+    // prompt or a permission request it interrupted is gone, and claude is at its prompt.
+    let esc = seen.interrupted_at.filter(|&at| at >= rec.last_activity_ms);
+    if rec.needs_you && esc.is_none() {
         return Err(Hold::NeedsYou);
     }
     if rec.has_pending_timer(now) {
@@ -187,8 +195,9 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     // moves `last_activity_ms` past them. So "the latest thing that happened left it idle" is
     // exactly this, with `busy` as belt and braces. A resumed slot the owner looked at and
     // left is as idle as one that finished a turn.
-    let stop = match rec.last_stop_ms.max(rec.ready_ms) {
-        Some(stop) if stop >= rec.last_activity_ms && !rec.busy => stop,
+    let stop = match (esc, rec.last_stop_ms.max(rec.ready_ms)) {
+        (Some(at), _) => at,
+        (None, Some(stop)) if stop >= rec.last_activity_ms && !rec.busy => stop,
         _ => return Err(Hold::NotStopped),
     };
     // The turn ended, but what it started in the background has not (issue #9): a background
@@ -240,6 +249,12 @@ pub fn look(rec: &SlotRecord, table: Option<&[Proc]>) -> Seen {
         foreign_descendant: table.and_then(|t| foreign_descendant(t, pid)),
         conversation: rec.has_conversation(),
         last_write_ms: rec.conversation_path().and_then(|p| last_write(&p)),
+        // Read only when the hooks left the slot mid-turn or waiting: an idle slot's tail
+        // would say nothing new.
+        interrupted_at: (rec.busy || rec.needs_you)
+            .then(|| rec.conversation_path())
+            .flatten()
+            .and_then(|p| crate::transcript::interrupted_at(&p)),
     }
 }
 
@@ -749,6 +764,7 @@ mod tests {
             foreign_descendant: None,
             conversation: true,
             last_write_ms: None,
+            interrupted_at: None,
         };
         (r, seen)
     }
@@ -772,6 +788,47 @@ mod tests {
             decide(&rec, NOW, &seen).is_ok(),
             "and released once it is gone"
         );
+    }
+
+    #[test]
+    fn an_esc_ends_the_turn_the_hooks_left_running() {
+        // An interrupt fires no hook: the record still says busy from its prompt.
+        let (mut rec, mut seen) = idle();
+        let prompt = NOW - 2 * IDLE_AFTER_STOP_MS;
+        rec.busy = true;
+        rec.last_activity_ms = prompt;
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::NotStopped),
+            "calibration"
+        );
+        seen.interrupted_at = Some(prompt + 5_000);
+        assert_eq!(decide(&rec, NOW, &seen), Ok(NOW - prompt - 5_000));
+        // A fresh Esc counts from itself, as a Stop would.
+        seen.interrupted_at = Some(NOW - 60_000);
+        rec.last_activity_ms = NOW - 70_000;
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::TooRecent {
+                left_ms: IDLE_AFTER_STOP_MS - 60_000
+            })
+        );
+        // A marker older than the last thing the hooks saw is an earlier turn's.
+        seen.interrupted_at = Some(prompt - 1);
+        rec.last_activity_ms = prompt;
+        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));
+    }
+
+    #[test]
+    fn an_esc_answers_a_permission_prompt_too() {
+        let (mut rec, mut seen) = idle();
+        let asked = NOW - 2 * IDLE_AFTER_STOP_MS;
+        rec.busy = true;
+        rec.needs_you = true;
+        rec.last_activity_ms = asked;
+        assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NeedsYou), "calibration");
+        seen.interrupted_at = Some(asked + 1_000);
+        assert!(decide(&rec, NOW, &seen).is_ok());
     }
 
     #[test]

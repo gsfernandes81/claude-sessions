@@ -195,9 +195,22 @@ working agents. Two things close it, and neither needs a new hook:
   working between the parent's `Stop`s. It errs one way only: a write for some other reason
   delays an offload, never causes one.
 
-**Still open:** an Esc interrupt is said not to fire `Stop`, which leaves `busy` set and the
-slot kept until its next turn ends — the safe direction, at the cost of memory; and a turn
-started by something that neither writes nor hooks has not been found and would not be seen.
+**An Esc fires no hook at all, and the transcript says so instead.** Seen on 2.1.291 under a
+pty with every hook logging (2026-10-06): Esc mid-reply and Esc mid-tool each left
+`UserPromptSubmit` as the last event — no `Stop`, no `StopFailure`, no `PostToolUse` for the
+interrupted tool — so the record read `busy` (and, if the Esc dismissed a permission prompt,
+waiting for you) until the next turn ended: the slot was never offloaded and the menu drew it
+under Working. What the interrupt does write is a `user` entry whose text begins
+`[Request interrupted by user` — `]` mid-reply, ` for tool use]` mid-tool — timestamped at the
+Esc, after the cut-off reply or the tool's rejected result, with only bookkeeping after it.
+So when the hooks left a slot busy or waiting and its transcript's last conversational entry is
+that marker, newer than the last thing the hooks recorded, **the turn ended at the marker**: the
+offloader counts idleness from it as it would from a `Stop`, and the menu draws the row under
+Idle. Only the tail is read, and only for such a slot; a last line that cannot be read whole — a
+reply longer than the tail — is no answer, never an older marker's.
+
+**Still open:** a turn started by something that neither writes nor hooks has not been found,
+and would not be seen.
 
 **The threshold is 10 minutes** after `Stop` (owner, 2026-10-01). The hour floor the old
 shell script used existed only because self-scheduled wake-ups were invisible; the timer

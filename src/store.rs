@@ -249,7 +249,7 @@ fn timestamp_of(line: &str) -> Option<Millis> {
 
 /// `2026-10-03T13:24:22.511Z` in milliseconds since the epoch. Only the UTC form Claude Code
 /// writes; anything else is `None`, and the row falls back to the file's own time.
-fn iso_ms(s: &str) -> Option<Millis> {
+pub(crate) fn iso_ms(s: &str) -> Option<Millis> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || !s.ends_with('Z') {
         return None;

@@ -127,6 +127,99 @@ pub fn exchange_line(line: &str) -> bool {
     }
 }
 
+/// How much of the end of a transcript is read for an interrupt. The marker is the last
+/// conversational line and the bookkeeping after it is small; a reply longer than this that is
+/// itself the last line reads as no marker, which is the safe answer.
+const INTERRUPT_TAIL: u64 = 64 * 1024;
+
+/// What Claude Code writes when the owner presses Esc: a `user` entry whose text begins with
+/// this — `[Request interrupted by user]` mid-reply, `… for tool use]` mid-tool — and **no
+/// hook at all**: not `Stop`, not `StopFailure`, not the tool's `PostToolUse`. Seen on
+/// 2.1.291 under a pty, with every hook logging, on 2026-10-06.
+const INTERRUPTED: &str = "[Request interrupted by user";
+
+/// When the conversation's last turn was ended by an Esc: the timestamp of a trailing
+/// interrupt marker, if no reply or prompt follows it. `None` for a turn that ended any other
+/// way, is still going, or cannot be read — all of which leave the slot as its hooks last said.
+pub fn interrupted_at(path: &Path) -> Option<u64> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(INTERRUPT_TAIL);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut raw = Vec::new();
+    f.take(INTERRUPT_TAIL).read_to_end(&mut raw).ok()?;
+    interrupted_in(&String::from_utf8_lossy(&raw), from > 0)
+}
+
+/// [`interrupted_at`], remembered per transcript until its size or modification time changes:
+/// the menu asks every two seconds for every busy row, and a working turn's transcript is the
+/// only thing that moves.
+pub fn interrupted_at_cached(path: &Path) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Size and modification time, then the answer they gave.
+    type Seen = HashMap<std::path::PathBuf, ((u64, Option<std::time::SystemTime>), Option<u64>)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (meta.len(), meta.modified().ok());
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = seen.lock() {
+        if let Some((k, at)) = map.get(path) {
+            if *k == key {
+                return *at;
+            }
+        }
+    }
+    let at = interrupted_at(path);
+    if let Ok(mut map) = seen.lock() {
+        map.insert(path.to_path_buf(), (key, at));
+    }
+    at
+}
+
+/// [`interrupted_at`]'s rule over transcript text, read from the end. Pure. `cut` says the
+/// text starts mid-file, so its first line may be a fragment and is not read.
+pub fn interrupted_in(text: &str, cut: bool) -> Option<u64> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if cut && !lines.is_empty() {
+        lines.remove(0);
+    }
+    for line in lines.iter().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Not one whole line we can read: the last turn's shape is unknown, so no answer.
+        let v = json::parse(line).ok()?;
+        match v.get("type").and_then(Value::as_str) {
+            // A reply after any marker: the turn that matters ended some other way.
+            Some("assistant") => return None,
+            Some("user") => {
+                let content = v.get("message").and_then(|m| m.get("content"));
+                let marked = match content {
+                    Some(Value::Str(c)) => c.trim_start().starts_with(INTERRUPTED),
+                    Some(Value::Arr(parts)) => parts.iter().any(|p| {
+                        p.get("type").and_then(Value::as_str) == Some("text")
+                            && p.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| t.trim_start().starts_with(INTERRUPTED))
+                    }),
+                    _ => false,
+                };
+                return if marked {
+                    crate::store::iso_ms(v.get("timestamp")?.as_str()?)
+                } else {
+                    None
+                };
+            }
+            // Bookkeeping — modes, snapshots, titles, attachments, system lines — says nothing
+            // about how the turn ended.
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// The latest titles among the transcript lines in `text`. Pure.
 pub fn titles_in(text: &str) -> Titles {
     let mut out = Titles::default();
@@ -160,6 +253,57 @@ pub fn titles_in(text: &str) -> Titles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lines an Esc left, from a 2.1.291 transcript (2026-10-06), trimmed to the fields
+    /// read: the reply it cut off, the marker, and the bookkeeping written after.
+    const CUT_REPLY: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"1. The ocean covers about 71%"}],"stop_reason":null},"timestamp":"2026-10-06T09:23:35.508Z"}"#;
+    const MARK_REPLY: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2026-10-06T09:23:35.516Z","isSidechain":false,"userType":"external"}"#;
+    const REJECTED_TOOL: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"The user doesn't want to proceed with this tool use.","is_error":true}]},"timestamp":"2026-10-06T09:23:47.336Z"}"#;
+    const MARK_TOOL: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"timestamp":"2026-10-06T09:23:47.340Z","isSidechain":false,"userType":"external"}"#;
+    const SNAPSHOT: &str = r#"{"type":"file-history-snapshot","messageId":"m","snapshot":{},"isSnapshotUpdate":false}"#;
+    const LAST_PROMPT: &str =
+        r#"{"type":"last-prompt","lastPrompt":"x","leafUuid":"u","sessionId":"s"}"#;
+
+    fn lines(ls: &[&str]) -> String {
+        ls.join("\n") + "\n"
+    }
+
+    #[test]
+    fn an_esc_mid_reply_or_mid_tool_is_read_from_the_tail() {
+        let at = interrupted_in(&lines(&[CUT_REPLY, MARK_REPLY, SNAPSHOT]), false);
+        assert_eq!(at, crate::store::iso_ms("2026-10-06T09:23:35.516Z"));
+        let at = interrupted_in(
+            &lines(&[REJECTED_TOOL, MARK_TOOL, LAST_PROMPT, SNAPSHOT]),
+            false,
+        );
+        assert_eq!(at, crate::store::iso_ms("2026-10-06T09:23:47.340Z"));
+    }
+
+    #[test]
+    fn a_turn_that_ended_otherwise_or_went_on_is_not_an_interrupt() {
+        // Calibration for the test above: the same transcript up to the cut-off reply.
+        assert_eq!(interrupted_in(&lines(&[CUT_REPLY, SNAPSHOT]), false), None);
+        // A marker followed by a new prompt and its reply: that later turn is what matters.
+        let typed = r#"{"type":"user","message":{"role":"user","content":"go on"},"timestamp":"2026-10-06T09:24:00.000Z"}"#;
+        assert_eq!(interrupted_in(&lines(&[MARK_REPLY, typed]), false), None);
+        assert_eq!(
+            interrupted_in(&lines(&[MARK_REPLY, typed, CUT_REPLY]), false),
+            None
+        );
+        // A tool's result with no marker is a turn still going.
+        assert_eq!(interrupted_in(&lines(&[REJECTED_TOOL]), false), None);
+    }
+
+    #[test]
+    fn what_cannot_be_read_whole_is_no_answer() {
+        // The tail began inside a line: that fragment is skipped, the marker after it read.
+        let fragment = &CUT_REPLY[40..];
+        assert!(interrupted_in(&lines(&[fragment, MARK_REPLY]), true).is_some());
+        // The last line is itself a fragment — a reply longer than the tail — so nothing is
+        // known about how the turn ended, and an older marker must not answer for it.
+        let torn = &CUT_REPLY[..60];
+        assert_eq!(interrupted_in(&lines(&[MARK_REPLY, torn]), false), None);
+    }
 
     /// Lines in the shape 2.1.287 writes them (read 2026-10-03), messages abbreviated.
     const FIXTURE: &str = r#"{"type":"user","message":{"role":"user","content":"Pick up the handoff"},"sessionId":"s"}
