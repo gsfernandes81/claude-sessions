@@ -398,10 +398,14 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     if let Some(free) = m.headroom() {
         // The cache is said apart, so a reader can tell it from use (claude-sessions#7): the
         // free figure counts it as free, as the kernel would.
+        // A cache figure that could not be read is left out rather than said as zero.
+        let cache = m
+            .reclaimable
+            .map(|r| format!(" ({} MB of it reclaimable page cache)", r / (1024 * 1024)))
+            .unwrap_or_default();
         say!(
-            "memory: {} MB free in this container ({} MB of it reclaimable page cache)",
-            free / (1024 * 1024),
-            m.reclaimable.unwrap_or(0) / (1024 * 1024)
+            "memory: {} MB free in this container{cache}",
+            free / (1024 * 1024)
         );
     }
     let (mut offloaded, mut closed) = (0usize, 0usize);

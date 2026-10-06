@@ -437,10 +437,15 @@ fn cmd_doctor() -> std::io::Result<()> {
     say!("registry  : {}", registry::dir().display());
     match (m.limit, m.used()) {
         (Some(limit), Some(used)) => say!(
-            "memory    : {} of {} used in this container, {} more in reclaimable page cache; room for another session: {}",
+            "memory    : {} of {} used in this container{}; room for another session: {}",
             human(used),
             human(limit),
-            human(m.reclaimable.unwrap_or(0)),
+            m.reclaimable
+                .map(|r| format!(
+                    " (page cache the kernel reclaims first, {}, not counted)",
+                    human(r)
+                ))
+                .unwrap_or_else(|| " (memory.stat unreadable: page cache counted as used)".into()),
             if m.room_for(mem::SESSION_COST) {
                 "yes"
             } else {

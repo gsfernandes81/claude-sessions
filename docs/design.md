@@ -231,9 +231,12 @@ the same path, but marked `closed`: an `offloaded` row would promise a resume th
 happen.
 
 **Low memory is the container's, not the host's.** `/proc/meminfo` inside a container reports
-the whole machine; the ceiling is the cgroup. Read `/sys/fs/cgroup/memory.max` and
-`memory.current` — both readable unprivileged on cgroup v2, verified 2026-10-01 — and fall
-back to `MemAvailable` only when the limit reads `max`.
+the whole machine; the ceiling is the cgroup. Read `/sys/fs/cgroup/memory.max`,
+`memory.current` and `memory.stat` — readable unprivileged on cgroup v2, verified 2026-10-01 —
+and count as used `memory.current` less `inactive_file` (claude-sessions#7; `src/mem.rs` says
+why the inactive list only). There is no host fallback: `MemAvailable` once stood in for an
+unreadable `memory.current`, which against a container limit read the host's free memory as
+use. With no limit, or nothing readable, room is unknown, and unknown never refuses.
 
 **The orphan sweep** collects `daemon run --origin transient` trees whose spawning pid and
 start time are gone, with their `bg-pty-host` / `bg-spare` children. It shipped logging
