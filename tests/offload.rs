@@ -31,18 +31,22 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let Some(grandchild) = child_of(self.claude) {
+        // Only the claude this slot recorded: once it has gone, its pid, and any child of that
+        // pid, may be another test's process or anything on the machine running the tests.
+        if alive(self.claude, self.claude_start) {
+            if let Some(grandchild) = child_of(self.claude) {
+                let _ = Command::new("kill")
+                    .env_remove("ZMX_SESSION")
+                    .args(["-9", &grandchild.to_string()])
+                    .stderr(Stdio::null())
+                    .status();
+            }
             let _ = Command::new("kill")
                 .env_remove("ZMX_SESSION")
-                .args(["-9", &grandchild.to_string()])
+                .args(["-9", &self.claude.to_string()])
                 .stderr(Stdio::null())
                 .status();
         }
-        let _ = Command::new("kill")
-            .env_remove("ZMX_SESSION")
-            .args(["-9", &self.claude.to_string()])
-            .stderr(Stdio::null())
-            .status();
         let _ = self.server.kill();
         let _ = self.server.wait();
         let _ = std::fs::remove_dir_all(&self.root);

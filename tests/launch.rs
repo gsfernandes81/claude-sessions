@@ -34,15 +34,29 @@ struct Root(PathBuf);
 
 impl Drop for Root {
     fn drop(&mut self) {
+        // Each stand-in by pid and start time: a pid alone may by now be another test's
+        // process, or anything on the machine running the tests.
         let pids = std::fs::read_to_string(self.0.join("pids")).unwrap_or_default();
-        for pid in pids.split_whitespace() {
-            let _ = Command::new("kill")
-                .args(["-9", pid])
-                .stderr(Stdio::null())
-                .status();
+        for line in pids.lines() {
+            let mut f = line.split_whitespace();
+            if let (Some(pid), Some(start)) = (f.next(), f.next()) {
+                if start_time(pid).as_deref() == Some(start) {
+                    let _ = Command::new("kill")
+                        .args(["-9", pid])
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Field 22 of `/proc/<pid>/stat`, as text.
+fn start_time(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = &stat[stat.rfind(')')? + 2..];
+    tail.split_whitespace().nth(19).map(str::to_string)
 }
 
 fn script(path: &Path, body: &str) {
@@ -87,7 +101,7 @@ exit 0"#,
     script(
         &root.join("bin/claude"),
         &format!(
-            r#"echo $$ >> "{pids}"
+            r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
 printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook
 printf '{{"hook_event_name":"SubagentStart","agent_id":"a-e2e","agent_type":"general-purpose","session_id":"conv-e2e"}}' | "{bin}" hook
 echo "claude said this on stderr" >&2
@@ -161,7 +175,9 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
 
     let claude: u64 = std::fs::read_to_string(root.0.join("pids"))
         .unwrap()
-        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap()
         .parse()
         .unwrap();
     assert_eq!(
@@ -171,7 +187,16 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     );
     assert!(body.contains("\"conv-e2e\""), "{body}");
     assert!(number(&body, "proc_start").is_some(), "with its start time");
-    let stderr = std::fs::read_to_string(root.0.join("registry/claude-1.stderr")).unwrap();
+    // The stand-in speaks on stderr after its hooks return, so the record can land first.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stderr = loop {
+        let s =
+            std::fs::read_to_string(root.0.join("registry/claude-1.stderr")).unwrap_or_default();
+        if !s.is_empty() || Instant::now() > deadline {
+            break s;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(stderr, "claude said this on stderr\n", "stderr is captured");
     // The row's title is the transcript's title — what Claude Code's own selector shows —
     // and never a reply (0.3.1).

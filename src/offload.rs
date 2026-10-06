@@ -1369,7 +1369,13 @@ mod tests {
             .map(|p| (p.pid, p.start))
             .collect();
         assert!(all.iter().all(|&(p, s)| procinfo::is_alive(p, s)));
-        assert_eq!(kill_tree(o, Duration::from_secs(2)), 0, "nothing survives");
+        let left = kill_tree(o, Duration::from_secs(2));
+        let stats: Vec<String> = all
+            .iter()
+            .filter(|&&(p, s)| procinfo::is_alive(p, s))
+            .map(|&(p, _)| std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default())
+            .collect();
+        assert_eq!(left, 0, "nothing survives: {stats:?}");
         assert!(all.iter().all(|&(p, s)| !procinfo::is_alive(p, s)));
         daemon.wait().ok();
     }

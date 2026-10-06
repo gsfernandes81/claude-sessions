@@ -1299,10 +1299,12 @@ exit 2"#,
                 "claude",
                 &format!(
                     r#"echo "$$ $PWD $CLAUDE_SESSIONS_SLOT $*" >> "{}"
+echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{}"
 echo "${{CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN-unset}} ${{CLAUDE_CODE_DISABLE_MOUSE-unset}} ${{CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL-unset}}" >> "{}"
 echo "a warning on stderr" >&2
 exec sleep 600"#,
                     self.path("claude.log").display(),
+                    self.path("claude.started").display(),
                     self.path("claude.env").display()
                 ),
             )
@@ -1378,12 +1380,13 @@ exit 1"#,
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            for line in self.claude_log() {
-                if let Some(pid) = line.split_whitespace().next() {
-                    let _ = Command::new("kill")
-                        .args(["-9", pid])
-                        .stderr(Stdio::null())
-                        .status();
+            // Each stand-in that stayed up, by pid and start time: a pid alone may by now be
+            // another test's process, or anything on the machine running the tests.
+            let started = std::fs::read_to_string(self.path("claude.started")).unwrap_or_default();
+            for line in started.lines() {
+                let mut f = line.split_whitespace().map(str::parse::<u64>);
+                if let (Some(Ok(pid)), Some(Ok(start))) = (f.next(), f.next()) {
+                    let _ = crate::signal::send(pid as u32, start, crate::signal::SIGKILL);
                 }
             }
             for kid in &mut self.kids {
