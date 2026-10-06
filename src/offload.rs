@@ -204,9 +204,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     // subagent, a Workflow run, a cloud session — listed by `Stop`, and kept between `Stop`s by
     // `SubagentStart`/`SubagentStop` (issue #10). None is a process of its own to see.
     if !rec.background.is_empty() {
-        return Err(Hold::Background(
-            rec.background.iter().map(|t| t.what.clone()).collect(),
-        ));
+        return Err(Hold::Background(rec.background.clone()));
     }
     // Idle from the last thing written, not only the last thing a hook said: a turn started by
     // a fired wake-up or a finished task's notification may announce itself to no hook, and a
@@ -786,10 +784,7 @@ mod tests {
     fn background_work_keeps_it_however_long_the_parent_has_been_stopped() {
         // Issue #9. The calibrating case is the idle slot above, which is offloaded.
         let (mut rec, seen) = idle();
-        rec.background = vec![crate::registry::Task {
-            id: Some("a1".into()),
-            what: "subagent: council reviewer".into(),
-        }];
+        rec.background = vec!["subagent: council reviewer".into()];
         assert_eq!(
             decide(&rec, NOW, &seen),
             Err(Hold::Background(vec!["subagent: council reviewer".into()]))

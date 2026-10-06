@@ -76,15 +76,6 @@ pub struct Timer {
     pub recurring: bool,
 }
 
-/// A piece of background work running in a slot's claude, by Claude Code's own id where it
-/// gave one — a subagent's `agent_id`, which is also its task id in `Stop`'s list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Task {
-    pub id: Option<String>,
-    /// `type: description`, as a dry-run line names what holds the slot.
-    pub what: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct SlotRecord {
     pub slot: String,
@@ -122,13 +113,14 @@ pub struct SlotRecord {
     /// can fire mid-turn, and nothing in the vendor docs says otherwise.
     pub ready_ms: Option<Millis>,
     pub timers: Vec<Timer>,
-    /// The background work running in the slot's claude (issues #9, #10). In-process work — a
-    /// background subagent, a Workflow run, a teammate, a cloud session — has no process of its
-    /// own to see, so the slot keeps a list, and while it is not empty the slot is never
-    /// offloaded. Each `Stop` replaces it with Claude Code's own list; between `Stop`s a
-    /// `SubagentStart` adds an agent and its `SubagentStop` removes it — which is what keeps an
-    /// agent started in a turn the owner ended with Esc, since an Esc fires no `Stop`.
-    pub background: Vec<Task>,
+    /// The background work running in the slot's claude, one `type: description` per task
+    /// (issues #9, #10). In-process work — a background subagent, a Workflow run, a teammate, a
+    /// cloud session — has no process of its own to see, so the slot keeps a list, and while it
+    /// is not empty the slot is never offloaded. Each `Stop` and each `SubagentStop` replaces it
+    /// with Claude Code's own list; between them a `SubagentStart` adds the agent it announces —
+    /// which is what keeps an agent started in a turn the owner ended with Esc, since an Esc
+    /// fires no `Stop`.
+    pub background: Vec<String>,
     /// False for a session this tool did not start — a `zmx attach work claude` somebody
     /// typed. Listed, marked, and never assumed to behave like one of ours.
     pub registered: bool,
@@ -270,17 +262,10 @@ impl SlotRecord {
             ),
         );
         if !self.background.is_empty() {
-            let tasks = self
-                .background
-                .iter()
-                .map(|t| {
-                    let mut v = Value::obj();
-                    set_opt_str(&mut v, "id", t.id.as_deref());
-                    v.set("what", Value::string(&t.what));
-                    v
-                })
-                .collect();
-            o.set("background", Value::Arr(tasks));
+            o.set(
+                "background",
+                Value::Arr(self.background.iter().map(Value::string).collect()),
+            );
         }
         let mut ev = Value::obj();
         for (k, at) in &self.last_event_ms {
@@ -350,21 +335,18 @@ impl SlotRecord {
             background: v
                 .get("background")
                 .and_then(Value::as_arr)
-                .map(|arr| arr.iter().filter_map(task_of).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,
         })
     }
-}
-
-/// One background entry: `{"id","what"}`.
-fn task_of(v: &Value) -> Option<Task> {
-    Some(Task {
-        id: str_of(v, "id"),
-        what: str_of(v, "what")?,
-    })
 }
 
 fn str_of(v: &Value, key: &str) -> Option<String> {

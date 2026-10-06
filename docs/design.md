@@ -148,7 +148,7 @@ terminal.
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
-| `SubagentStart` | the agent, by its `agent_id`, joins `background` unless listed (issue #10); **not** activity |
+| `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
 | `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`; **not** activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
@@ -189,10 +189,13 @@ working agents. Three things close it:
   to handle its notification, and that turn ends in a `Stop` with the list as it now is — so
   the hold releases itself, and the ten minutes start from that `Stop`. A `SessionStart` from a
   different process clears the list, since a new process cannot be running the old one's work.
-- **Between `Stop`s, agents announce themselves.** `SubagentStart` adds an agent to the list by
-  its `agent_id` — the same id `Stop`'s list gives its task — and **`SubagentStop` takes its
-  payload's `background_tasks` whole, as `Stop` does**: Claude Code builds both from the same
-  task registry. This is what holds work started in a turn the owner ended with Esc (issue
+  **Claude Code's own housekeeping is left out** — `dream` (auto-dream, which tidies its memory
+  files after a turn), `auto-mode scan` and `memory import`: each ends "ambient", waking no turn
+  and writing no transcript (read in the binary), so no later list would ever drop one, and the
+  auto-dream fork's `SubagentStop` lists its own task as running.
+- **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
+  to the list, and **`SubagentStop` takes its payload's `background_tasks` whole, as `Stop`
+  does**: Claude Code builds both from the same task registry. This is what holds work started in a turn the owner ended with Esc (issue
   #10): an Esc fires no `Stop`, so the list would otherwise be the previous turn's, and an agent
   launched in the interrupted turn would hold the slot only while it kept writing. Seen on
   2.1.291 under a pty on 2026-10-06: a background agent launched, the owner pressed Esc, and

@@ -16,7 +16,7 @@
 
 use crate::clock::Millis;
 use crate::json::{self, Value};
-use crate::registry::{SlotRecord, State, Task, Timer};
+use crate::registry::{SlotRecord, State, Timer};
 
 /// Whether the claude that fired this event is the slot's own process, or one nested under it.
 /// Decided in `bind.rs` from `/proc`, never from the payload alone.
@@ -80,36 +80,38 @@ impl Event {
     pub fn tool_response(&self) -> Option<&Value> {
         self.0.get("tool_response")
     }
-    /// `Stop`: the background work still running or pending — `background_tasks`, Claude
-    /// Code's own task registry filtered to what is backgrounded and not finished (read in the
-    /// 2.1.291 binary). One `type: description` per task; `type` arrives already in words
-    /// (`subagent`, `workflow`, `shell`, `monitor`, `teammate`, `cloud session`, …). Absent on a
-    /// version that does not send it, which reads as none: no evidence either way.
-    pub fn background_tasks(&self) -> Vec<Task> {
+    /// `Stop` / `SubagentStop`: the background work still running or pending —
+    /// `background_tasks`, Claude Code's own task registry filtered to what is not foreground
+    /// and not finished (read in the 2.1.291 binary). One `type: description` per task; `type`
+    /// arrives already in words (`subagent`, `workflow`, `shell`, `monitor`, `teammate`,
+    /// `cloud session`, …). Absent on a version that does not send it, which reads as none: no
+    /// evidence either way.
+    ///
+    /// Not [`AMBIENT`] tasks: Claude Code's own housekeeping ends without waking a turn, so no
+    /// later list would ever drop one. The auto-dream fork's `SubagentStop` lists its own
+    /// `dream` task as running, and taken in, it would hold an idle slot until the owner's
+    /// next turn there.
+    pub fn background_tasks(&self) -> Vec<String> {
         let Some(tasks) = self.0.get("background_tasks").and_then(Value::as_arr) else {
             return Vec::new();
         };
         tasks
             .iter()
-            .map(|t| {
+            .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
-                let what = match t.get("description").and_then(Value::as_str) {
+                if AMBIENT.contains(&kind) {
+                    return None;
+                }
+                Some(match t.get("description").and_then(Value::as_str) {
                     Some(d) if !d.trim().is_empty() => {
                         format!("{kind}: {}", one_line(d).unwrap_or_default())
                     }
                     _ => kind.to_string(),
-                };
-                Task {
-                    id: t.get("id").and_then(Value::as_str).map(str::to_string),
-                    what,
-                }
+                })
             })
             .collect()
     }
-    /// `SubagentStart` / `SubagentStop`: the agent the event is about.
-    pub fn agent_id(&self) -> Option<&str> {
-        self.s("agent_id")
-    }
+    /// `SubagentStart`: the kind of agent it announces.
     pub fn agent_type(&self) -> Option<&str> {
         self.s("agent_type")
     }
@@ -121,6 +123,11 @@ impl Event {
         self.0.get("agent_id").is_some() && !matches!(self.name(), "SubagentStart" | "SubagentStop")
     }
 }
+
+/// Claude Code's own housekeeping, as `background_tasks` names it: auto-dream, the auto-mode
+/// scan and the memory import. Each ends "ambient" — no notification, no turn, no transcript
+/// (read in the 2.1.291 binary) — so nothing would ever take one off the list again.
+const AMBIENT: [&str; 3] = ["dream", "auto-mode scan", "memory import"];
 
 /// What `apply` did, so the caller knows whether to write and `doctor` can say why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,17 +261,16 @@ pub fn apply(
         // transcript, and Claude Code sends `SubagentStop` for internal agents it never
         // announced, at any time — after a `Stop` or an Esc too, where counting it would make an
         // idle slot read busy until the owner's next turn.
-        "SubagentStart" => match ev.agent_id() {
-            Some(id) if !rec.background.iter().any(|t| t.id.as_deref() == Some(id)) => {
-                let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
-                rec.background.push(Task {
-                    id: Some(id.to_string()),
-                    what: format!("subagent: {kind}"),
-                });
+        "SubagentStart" => {
+            let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
+            let what = format!("subagent: {kind}");
+            if rec.background.contains(&what) {
+                Outcome::Ignored("an agent of that type is already listed")
+            } else {
+                rec.background.push(what);
                 Outcome::Changed
             }
-            _ => Outcome::Ignored("no agent that is not already listed"),
-        },
+        }
         // Its payload carries the same list as `Stop`'s, so it is taken whole the same way. That
         // list never names a foreground agent, so one an Esc cut off — which sends no
         // `SubagentStop` of its own — leaves at the next one; and a background agent's own
@@ -467,7 +473,7 @@ mod tests {
         "session_crons":[]}"#;
 
     fn whats(rec: &SlotRecord) -> Vec<&str> {
-        rec.background.iter().map(|t| t.what.as_str()).collect()
+        rec.background.iter().map(String::as_str).collect()
     }
 
     #[test]
@@ -511,6 +517,27 @@ mod tests {
     }
 
     #[test]
+    fn claude_codes_own_housekeeping_is_not_background_work() {
+        // The auto-dream fork's own `SubagentStop`, its task still running: that task ends
+        // without waking a turn, so nothing would take it off the list again. Calibration: the
+        // same payload with a shell in it is held.
+        let mut rec = slot();
+        let dream = |also: &str| {
+            ev(&format!(
+                r#"{{"hook_event_name":"SubagentStop","agent_id":"f1","agent_type":"","background_tasks":[{{"id":"d1","type":"dream","status":"running","description":"dreaming"}}{also}]}}"#
+            ))
+        };
+        assert!(matches!(
+            own(&mut rec, &dream(""), 2_000),
+            Outcome::Ignored(_)
+        ));
+        assert!(rec.background.is_empty());
+        let shell = r#",{"id":"b1","type":"shell","status":"running","description":"sleep 45"}"#;
+        own(&mut rec, &dream(shell), 3_000);
+        assert_eq!(whats(&rec), ["shell: sleep 45"]);
+    }
+
+    #[test]
     fn subagent_events_bind_by_process_and_tool_calls_inside_an_agent_do_not() {
         let start = ev(r#"{"hook_event_name":"SubagentStart","agent_id":"a1"}"#);
         let stop = ev(r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#);
@@ -526,11 +553,6 @@ mod tests {
         assert_eq!(
             whats(&rec),
             ["subagent: council reviewer", "workflow: review changes"]
-        );
-        assert_eq!(
-            rec.background[0].id.as_deref(),
-            Some("a1"),
-            "kept by its id"
         );
         assert!(!rec.busy, "the turn is over");
         // The task finishes; claude wakes for its notification, and that turn's Stop lists

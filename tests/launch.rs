@@ -185,15 +185,12 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let body = loop {
         let body = std::fs::read_to_string(root.0.join("registry/claude-1.json")).unwrap();
-        if body.contains("a-e2e") || Instant::now() > deadline {
+        if body.contains("subagent: general-purpose") || Instant::now() > deadline {
             break body;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(
-        body.contains("\"a-e2e\"") && body.contains("subagent: general-purpose"),
-        "{body}"
-    );
+    assert!(body.contains("subagent: general-purpose"), "{body}");
 }
 
 #[test]

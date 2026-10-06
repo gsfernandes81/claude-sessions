@@ -270,7 +270,7 @@ fn a_slot_running_background_work_is_kept_whatever_its_last_stop_says() {
     let body = std::fs::read_to_string(&path).unwrap();
     let with_work = body.replacen(
         "\"timers\":[]",
-        r#""timers":[],"background":[{"id":"a1","what":"subagent: council reviewer"},{"id":"w1","what":"workflow: review"}]"#,
+        "\"timers\":[],\"background\":[\"subagent: council reviewer\",\"workflow: review\"]",
         1,
     );
     assert_ne!(body, with_work, "calibration: the fixture took the field");
