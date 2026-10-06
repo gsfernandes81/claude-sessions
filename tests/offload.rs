@@ -259,6 +259,40 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     assert!(log.contains("claude-1: closed"), "logged: {log}");
 }
 
+/// 0.4.5: every pass says what the activity rule would do, measured from the kernel and
+/// acted on by nothing. The first pass has no window yet and keeps the slot; one straight
+/// after it is too short to count and leaves the state for the next. The state lives beside
+/// the registry under a name the registry does not read as a slot.
+#[test]
+fn every_pass_measures_and_a_short_window_waits_for_the_next() {
+    let s = idle_slot("activity", 0o600, false);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("claude-1: measured — ")
+            && out.contains("the activity rule would keep it: first reading"),
+        "got: {out}"
+    );
+    assert!(
+        out.contains("claude-1: would offload"),
+        "the offloader's own verdict is unchanged: {out}"
+    );
+    let state =
+        std::fs::read_to_string(s.root.join("registry/activity.state")).expect("state written");
+    assert!(state.contains("\"claude-1\""), "{state}");
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("too short; the next pass counts it"),
+        "got: {out}"
+    );
+    assert!(
+        !out.lines()
+            .any(|l| l.starts_with("activity: kept") || l.starts_with("activity: would")),
+        "no phantom slot named after the state file: {out}"
+    );
+}
+
 /// Issue #9: a slot whose claude finished its turn 11 minutes ago but is still running
 /// in-process background work — four council agents, in the report — reads as idle to every
 /// hook. Calibrated by `an_idle_detached_slot_is_stopped_and_marked_offloaded`: the same

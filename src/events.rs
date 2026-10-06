@@ -84,18 +84,17 @@ impl Event {
     /// `background_tasks`, Claude Code's own task registry filtered to what is not foreground
     /// and not finished (read in the 2.1.291 binary). One `type: description` per task; `type`
     /// arrives already in words (`subagent`, `workflow`, `shell`, `monitor`, `teammate`,
-    /// `cloud session`, …). Absent on a version that does not send it, which reads as none: no
-    /// evidence either way.
+    /// `cloud session`, …). `None` where the field is absent or not a list — a version that
+    /// does not send it — which `Stop` reads as none and `SubagentStop` as no news
+    /// (claude-sessions#12).
     ///
     /// Not [`AMBIENT`] tasks: Claude Code's own housekeeping ends without waking a turn, so no
     /// later list would ever drop one. The auto-dream fork's `SubagentStop` lists its own
     /// `dream` task as running, and taken in, it would hold an idle slot until the owner's
     /// next turn there.
-    pub fn background_tasks(&self) -> Vec<String> {
-        let Some(tasks) = self.0.get("background_tasks").and_then(Value::as_arr) else {
-            return Vec::new();
-        };
-        tasks
+    pub fn background_tasks(&self) -> Option<Vec<String>> {
+        let tasks = self.0.get("background_tasks")?.as_arr()?;
+        let list = tasks
             .iter()
             .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
@@ -112,7 +111,8 @@ impl Event {
                     _ => kind.to_string(),
                 })
             })
-            .collect()
+            .collect();
+        Some(list)
     }
     /// `SubagentStart`: the kind of agent it announces.
     pub fn agent_type(&self) -> Option<&str> {
@@ -264,7 +264,7 @@ pub fn apply(
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running, and a task finishing wakes
             // claude for a turn that ends in another `Stop`.
-            rec.background = ev.background_tasks();
+            rec.background = ev.background_tasks().unwrap_or_default();
             Outcome::Changed
         }
         // Agents between the parent's `Stop`s (issue #10), editing the list and nothing else:
@@ -285,16 +285,19 @@ pub fn apply(
         // Its payload carries the same list as `Stop`'s, so it is taken whole the same way. That
         // list never names a foreground agent, so one an Esc cut off — which sends no
         // `SubagentStop` of its own — leaves at the next one; and a background agent's own
-        // `SubagentStop` still names it, so it is held until the turn it wakes claude for.
-        "SubagentStop" => {
-            let now_running = ev.background_tasks();
-            if rec.background == now_running {
+        // `SubagentStop` still names it, so it is held until the turn it wakes claude for. One
+        // with no list at all says nothing about what runs (claude-sessions#12): a version that
+        // stopped sending it must not wipe what `Stop` recorded on every unannounced agent.
+        "SubagentStop" => match ev.background_tasks() {
+            None => Outcome::Ignored("no background_tasks in the payload"),
+            Some(now_running) if now_running == rec.background => {
                 Outcome::Ignored("the list is unchanged")
-            } else {
+            }
+            Some(now_running) => {
                 rec.background = now_running;
                 Outcome::Changed
             }
-        }
+        },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
                 rec.needs_you = true;
@@ -521,6 +524,31 @@ mod tests {
         assert_eq!(own(&mut rec, &none, 5_000), Outcome::Changed);
         assert!(rec.background.is_empty());
         assert_eq!(rec.last_activity_ms, 1_500, "still idle from the Stop");
+    }
+
+    #[test]
+    fn a_subagentstop_with_no_list_is_no_news() {
+        // claude-sessions#12: a version that stopped sending `background_tasks` on
+        // `SubagentStop` must not wipe what `Stop` recorded. Calibration: an empty list does.
+        let mut rec = slot();
+        own(&mut rec, &ev(STOP_WITH_WORK), 2_000);
+        for body in [
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":""}"#,
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a941","background_tasks":"not a list"}"#,
+        ] {
+            assert!(
+                matches!(own(&mut rec, &ev(body), 3_000), Outcome::Ignored(_)),
+                "{body}"
+            );
+            assert_eq!(rec.background.len(), 2, "{body}");
+        }
+        let empty = r#"{"hook_event_name":"SubagentStop","agent_id":"a941","background_tasks":[]}"#;
+        assert_eq!(own(&mut rec, &ev(empty), 4_000), Outcome::Changed);
+        assert!(rec.background.is_empty());
+        // `Stop` with no list still reads as none, as since issue #9.
+        own(&mut rec, &ev(STOP_WITH_WORK), 5_000);
+        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 6_000);
+        assert!(rec.background.is_empty());
     }
 
     #[test]

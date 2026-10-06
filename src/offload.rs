@@ -415,7 +415,13 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     // slot's lock is held has to wait for it — issue #1: a prompt dropped that way leaves a
     // busy claude reading as idle, and ten minutes later the offloader would stop it.
     let table = procinfo::table();
-    for listed in registry::all()? {
+    let records = registry::all()?;
+    // What the activity rule would do, beside what this pass does (0.4.5: measured, not
+    // acted on). Before any stop, so a slot this pass offloads is measured as it was.
+    for line in crate::activity::pass(&records, table.as_deref(), clock::now()) {
+        say!("{line}");
+    }
+    for listed in records {
         if !matches!(listed.state, State::Live | State::Offloading) {
             continue;
         }

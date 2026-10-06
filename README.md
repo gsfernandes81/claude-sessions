@@ -36,6 +36,7 @@ registry implementation and one set of tests:
 | `claude-sessions reconcile` | makes the registry agree with reality after a restart |
 | `claude-sessions close` | ends a session without opening it |
 | `claude-sessions doctor` | says what it can and cannot see, per slot |
+| `claude-sessions statusline` | RAM, load and host, for Claude Code's status line |
 
 ## Status
 

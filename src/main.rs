@@ -39,6 +39,7 @@ macro_rules! warn {
     }};
 }
 
+mod activity;
 mod archive;
 mod bind;
 mod clock;
@@ -57,6 +58,7 @@ mod registry;
 mod render;
 mod run;
 mod signal;
+mod statusline;
 mod store;
 mod term;
 mod transcript;
@@ -139,6 +141,10 @@ fn main() -> ExitCode {
             say!("{}", json::to_string_pretty(&hooks_config::settings(&exe)));
             ExitCode::SUCCESS
         }
+        "statusline" => {
+            statusline::run();
+            ExitCode::SUCCESS
+        }
         "offload" => match args.get(1).map(String::as_str) {
             None => report(offload::run(false)),
             Some("--dry-run") => report(offload::run(true)),
@@ -159,9 +165,12 @@ fn usage() -> String {
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
   claude-sessions offload      stop every slot idle 10 minutes past its Stop; run from a timer
-                  [--dry-run]  say what it would stop, and stop nothing
+                  [--dry-run]  say what it would stop, and stop nothing; either way, say
+                               what the activity rule (measured, not acted on) would do
+  claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
-                               the Claude Code settings that install the hooks, naming PATH
+                               the Claude Code settings that install the hooks and the status
+                               line, naming PATH
                                (default: this binary) — for /etc/claude-code/managed-settings.d/
 
 The registry is {} — override with CLAUDE_SESSIONS_DIR.

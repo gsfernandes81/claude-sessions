@@ -149,7 +149,7 @@ terminal.
 | `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
 | `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
-| `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`; **not** activity |
+| `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`, but one with no list is no news, not an empty list (#12); **not** activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
 | `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
@@ -366,6 +366,68 @@ is the choice and why:
 - **Logged to `offload.log`** beside the registry: every stop, every failed stop, and every
   sweep kill, kept-too-young tree and would-be kill. Slots kept are printed to stdout only, since a pass every few minutes
   would otherwise bury the lines that matter.
+
+## Activity, measured (0.4.5: reported, not acted on)
+
+**Why.** Every rule above reads Claude Code: hook payloads, its task list's filters, which
+agents announce themselves. Eight review rounds of #10 kept finding corners of that reading,
+and a self-update can move any of them without a word; when one moves, the cost is a working
+claude stopped. The owner's direction (2026-10-06): try a rule that asks the kernel instead —
+what a slot's processes *do* means the same on every Claude Code version and every machine —
+with **freezing** (`SIGSTOP`, a reversible pause that leaves a cold process for swap to take)
+in place of killing. 0.4.5 is the first step: every pass, live or dry, says what that rule
+would do beside what the offloader did, and nothing else changes. The freeze comes after the
+fleet's own numbers have been read. `src/activity.rs` has the details and the tests.
+
+- **Bytes, not CPU.** A model turn is a stream from the API and claude writes its transcript
+  as it goes, so work is bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`,
+  the same count on a Pi 4 as on x86. CPU time is not device-invariant: the same work costs a
+  slow CPU more of it. Wake-ups (voluntary context switches, summed over threads) are logged
+  beside the bytes as a second opinion. Measured on 2.1.291 with agent view off, here, under
+  a real `offload --dry-run`: idle 95–139 B/s and 21–25 wakeups/s; streaming a reply
+  9,342 B/s and 47 wakeups/s. Bytes part idle from work by about 70×, wake-ups by 2×.
+- **Which processes: the environment.** With agent view off, claude is one process: an
+  in-process subagent shows as claude's own bytes, and its tools as claude's children
+  (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
+  outside its tree). Every process a slot's claude starts inherits `CLAUDE_SESSIONS_SLOT`,
+  including one that double-forks away to init, so `/proc/*/environ` finds them however they
+  were reparented; the recorded claude and its descendants are added in case one cleared it.
+  Not `claude-sessions` itself — a hook, or a pass run from a slot's shell, carries the
+  variable too. A reaped child's counters are folded into its parent's by the kernel, so a
+  tool that ran and exited between passes is still counted. Agent view, which runs a service
+  outside any slot, stays off.
+- **The line: each slot's own floor.** A slot's floor is its quietest window in the last
+  24 hours, hour by hour; it counts as active above ten times that, held between 512 B/s and
+  4 KB/s. A Claude Code that idles noisier raises its own floor; the cap stops a slot only
+  ever seen busy from setting a line real work could fall under; the base stops a near-silent
+  floor from making a stray read look like a turn. All bytes, so no device enters.
+- **The verdict.** Quiet — under the line in every window — for the offloader's 10 minutes,
+  and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
+  first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
+  `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, 1 process(es), line 945 B/s from
+  floor 95, quiet 14m; the activity rule would freeze it`.
+- **What is unknown counts as active**: a slot's first reading, a process not seen last time
+  (its whole history falls in the window), a window under a minute (a pass run by hand right
+  after the timer's is left for the next, with a line saying so).
+- **State** is `activity.state` beside the registry — not `.json`, which the registry reads
+  as a slot — written whole and renamed into place. Two passes at once may each write it; the
+  later wins and the other's window is measured again.
+- **What it cannot see**: a claude waiting in process, silently, for ten minutes — a tool
+  blocked on a remote that sends nothing. That is rare, and it is why the action is to be a
+  freeze: attached, it thaws and carries on.
+
+**Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
+2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.
+
+## The status line
+
+`claude-sessions statusline` prints `RAM: 1.0G / 3.0G used, Load: 2.3, or3-dev` (owner,
+2026-10-06) for Claude Code's status line: the menu's working-set figure against the
+container's limit — or the host's total and available memory where there is no limit — the
+one-minute load, and the hostname, which names the dev container. Anything unreadable is a
+`?`. `hooks-config` installs it as `statusLine` in the same drop-in as the hooks; a managed
+setting outranks a user's own, so it replaces any status line set per user. It reads a few
+small files and nothing else, because Claude Code runs it often.
 
 ## The menu
 
@@ -654,8 +716,8 @@ claude-sessions hooks-config /usr/local/bin/claude-sessions \
 chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
 ```
 
-It installs the eight events of the table, `PostToolUse` matched to exactly the three timer
-tools, with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
+It installs the eight events of the table and the status line, `PostToolUse` matched to
+exactly the three timer tools, with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
 every `SessionEnd` hook on the box shares. `src/hooks_config.rs` has the reasons and the tests
 that hold it to the state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and

@@ -1,4 +1,5 @@
-//! The Claude Code settings that feed the registry, printed by the binary that consumes them.
+//! The Claude Code settings that feed the registry, printed by the binary that consumes them —
+//! the hooks, and the status line `statusline` draws.
 //!
 //! `infra` writes this to `/etc/claude-code/managed-settings.d/claude-sessions.json` at image
 //! build — see `docs/design.md` § *Where the hooks live* for why a managed drop-in. It is
@@ -61,6 +62,15 @@ pub fn settings(exe: &str) -> Value {
     }
     let mut doc = Value::obj();
     doc.set("hooks", hooks);
+    // The status line (owner, 2026-10-06): memory in view while working. Managed settings
+    // outrank a user's own, so installing this replaces any status line set per user.
+    let mut status = Value::obj();
+    status.set("type", Value::string("command"));
+    status.set(
+        "command",
+        Value::string(format!("{} statusline", shell_quote(exe))),
+    );
+    doc.set("statusLine", status);
     doc
 }
 
@@ -102,7 +112,7 @@ mod tests {
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"p"}"#,
             r#"{"hook_event_name":"Stop"}"#,
             r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-purpose"}"#,
-            r#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#,
+            r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[]}"#,
             r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#,
             r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
             r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#,
@@ -204,5 +214,16 @@ mod tests {
         );
         assert_eq!(shell_quote("/opt/my tools/cs"), "'/opt/my tools/cs'");
         assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
+    }
+
+    #[test]
+    fn the_status_line_names_this_binary() {
+        let doc = installed();
+        let status = doc.get("statusLine").expect("a statusLine");
+        assert_eq!(status.get("type").and_then(Value::as_str), Some("command"));
+        assert_eq!(
+            status.get("command").and_then(Value::as_str),
+            Some("/usr/local/bin/claude-sessions statusline")
+        );
     }
 }
