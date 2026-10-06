@@ -181,7 +181,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     if rec.session_id.is_none() || rec.cwd.is_none() {
         return Err(Hold::NotResumable);
     }
-    // An Esc after the last thing the hooks recorded ended that turn, whatever they say: a
+    // An Esc after the latest activity the hooks recorded ended that turn, whatever they say: a
     // prompt or a permission request it interrupted is gone, and claude is at its prompt.
     let esc = rec.esc_ended(seen.interrupted_at);
     if rec.needs_you && esc.is_none() {
@@ -824,7 +824,7 @@ mod tests {
                 left_ms: IDLE_AFTER_STOP_MS - 60_000
             })
         );
-        // A marker older than the last thing the hooks saw is an earlier turn's.
+        // A marker older than the latest activity the hooks saw is an earlier turn's.
         seen.interrupted_at = Some(prompt - 1);
         rec.last_activity_ms = prompt;
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::NotStopped));

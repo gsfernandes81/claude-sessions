@@ -241,7 +241,7 @@ under Working. What the interrupt does write is a `user` entry whose text begins
 `[Request interrupted by user` — `]` mid-reply, ` for tool use]` mid-tool — timestamped at the
 Esc, after the cut-off reply or the tool's rejected result, with only bookkeeping after it.
 So when the hooks left a slot busy or waiting and its transcript's last conversational entry is
-that marker, newer than the last thing the hooks recorded, **the turn ended at the marker**: the
+that marker, newer than the latest activity the hooks recorded, **the turn ended at the marker**: the
 offloader counts idleness from it as it would from a `Stop`, and the menu draws the row under
 Idle. The two read one rule (`SlotRecord::esc_ended`). The offloader still holds the slot for
 anything `background` lists, as it does for an agent the interrupted turn started; the menu

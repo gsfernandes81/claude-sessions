@@ -159,8 +159,9 @@ impl SlotRecord {
     }
 
     /// When an Esc ended the turn, given the transcript's trailing interrupt marker: the marker,
-    /// if it is no older than everything the hooks recorded (an Esc fires no hook). The one rule
-    /// the offloader and the menu both read, so they cannot disagree about a slot.
+    /// if it is no older than the latest activity the hooks recorded (an Esc fires no hook, and
+    /// `SubagentStart`/`SubagentStop` are not activity). The one rule the offloader and the menu
+    /// both read, so they cannot disagree about a slot.
     pub fn esc_ended(&self, interrupted_at: Option<Millis>) -> Option<Millis> {
         interrupted_at.filter(|&at| at >= self.last_activity_ms)
     }
