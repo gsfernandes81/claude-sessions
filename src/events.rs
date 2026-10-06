@@ -100,7 +100,9 @@ impl Event {
             .filter_map(|t| {
                 let kind = t.get("type").and_then(Value::as_str).unwrap_or("task");
                 let desc = t.get("description").and_then(Value::as_str);
-                if AMBIENT.contains(&kind) || desc.is_some_and(|d| d.starts_with(ARTIFACT_WATCH)) {
+                let watch = kind == "monitor"
+                    && desc.is_some_and(|d| ARTIFACT_WATCH.iter().any(|p| d.starts_with(p)));
+                if watch || AMBIENT.contains(&kind) {
                     return None;
                 }
                 Some(match desc {
@@ -131,11 +133,12 @@ impl Event {
 /// one still running is invisible, so a dream that outlasts the idle threshold can be stopped
 /// partway, and Claude Code's own lock and abort handling recover it.
 const AMBIENT: [&str; 3] = ["dream", "auto-mode scan", "memory import"];
-/// Claude Code's watch on an artifact it published, labelled `monitor` like the owner's own and
-/// told apart by its fixed description. A listener, not work (owner, 2026-10-06): an idle one
-/// is retired after hours, silently, and holding a slot for comments costs more than missing
-/// them — someone who wants the replies is attached, and an attached slot is never offloaded.
-const ARTIFACT_WATCH: &str = "live updates for artifact ";
+/// Claude Code's watch on an artifact it published — the live-updates socket and, where the
+/// server offers it, its presence companion — labelled `monitor` like the owner's own and told
+/// apart by their fixed descriptions. Listeners, not work (owner, 2026-10-06): an idle watch is
+/// retired after hours, silently, and holding a slot for comments costs more than missing them
+/// — someone who wants the replies is attached, and an attached slot is never offloaded.
+const ARTIFACT_WATCH: [&str; 2] = ["live updates for artifact ", "presence on artifact "];
 
 /// What `apply` did, so the caller knows whether to write and `doctor` can say why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,7 +540,7 @@ mod tests {
         ));
         assert!(rec.background.is_empty());
         // Nor is its watch on an artifact it published, though the owner's own monitor is.
-        let watch = r#",{"id":"m1","type":"monitor","status":"running","description":"live updates for artifact abc (Fleet board)"}"#;
+        let watch = r#",{"id":"m1","type":"monitor","status":"running","description":"live updates for artifact abc (Fleet board)"},{"id":"m3","type":"monitor","status":"running","description":"presence on artifact https://claude.ai/artifact/abc"}"#;
         assert!(matches!(
             own(&mut rec, &dream(watch), 2_500),
             Outcome::Ignored(_)

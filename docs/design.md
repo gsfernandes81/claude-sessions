@@ -196,8 +196,9 @@ working agents. Three things close it:
   auto-dream fork's `SubagentStop` lists its own task as running. The cost is that one still
   running is invisible: a dream that outlasts the idle threshold can be stopped partway, and
   Claude Code's lock and abort handling recover it. **So is its watch on an artifact it
-  published** (owner, 2026-10-06), labelled `monitor` but told apart by its fixed description
-  `live updates for artifact …`: a listener, not work. An idle one is retired after 3.5 hours,
+  published** (owner, 2026-10-06) — the live-updates socket and its presence companion,
+  labelled `monitor` but told apart by their fixed descriptions (`live updates for artifact …`,
+  `presence on artifact …`): listeners, not work, as Claude Code's own keep-alive test agrees. An idle one is retired after 3.5 hours,
   ambient again, so it would hold a slot for hours and then for good; and whoever wants the
   replies to a comment is attached, which already keeps the slot.
 - **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
