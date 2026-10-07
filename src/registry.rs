@@ -133,6 +133,19 @@ impl Written {
         }
     }
 
+    /// Takes `f` for an event fired at `tick`, unless a later one has.
+    pub fn claim(&mut self, f: Field, tick: u64) -> bool {
+        let newer = tick >= self[f];
+        if newer {
+            self.stamp(f, tick);
+        }
+        newer
+    }
+
+    pub fn stamp(&mut self, f: Field, tick: u64) {
+        self.ticks[f as usize] = tick;
+    }
+
     /// Stamps from before a reboot lie in this boot's future and would refuse every event.
     pub fn forget_after(&mut self, tick: u64) {
         if self
@@ -159,21 +172,19 @@ impl Written {
     }
 
     fn from_json(v: Option<&Value>) -> Written {
-        let mut w = Written::new(0);
-        for f in Field::ALL {
-            w[f] = v
-                .and_then(|v| v.get(f.name()))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-        }
+        let mut deleted = BTreeMap::new();
         if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
             for (id, t) in m {
                 if let Some(t) = t.as_u64() {
-                    w.deleted.insert(id.clone(), t);
+                    deleted.insert(id.clone(), t);
                 }
             }
         }
-        w
+        let tick = |f: Field| v.and_then(|v| v.get(f.name())).and_then(Value::as_u64);
+        Written {
+            ticks: Field::ALL.map(|f| tick(f).unwrap_or(0)),
+            deleted,
+        }
     }
 }
 
@@ -181,12 +192,6 @@ impl std::ops::Index<Field> for Written {
     type Output = u64;
     fn index(&self, f: Field) -> &u64 {
         &self.ticks[f as usize]
-    }
-}
-
-impl std::ops::IndexMut<Field> for Written {
-    fn index_mut(&mut self, f: Field) -> &mut u64 {
-        &mut self.ticks[f as usize]
     }
 }
 
@@ -553,7 +558,7 @@ mod tests {
     fn stamped() -> Written {
         let mut w = Written::new(0);
         for (i, f) in Field::ALL.into_iter().enumerate() {
-            w[f] = i as u64 + 1;
+            w.stamp(f, i as u64 + 1);
         }
         w.deleted.insert("cron:c1".into(), 8);
         w
@@ -567,7 +572,7 @@ mod tests {
         assert_eq!(kept, w, "calibration: this boot's stamps stay");
         for f in Field::ALL {
             let mut v = w.clone();
-            v[f] = 9;
+            v.stamp(f, 9);
             v.forget_after(8);
             assert_eq!(v, Written::new(0), "{f:?}");
         }

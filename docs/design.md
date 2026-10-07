@@ -177,9 +177,10 @@ tie; the times the record shows or compares with file times are its wall-clock r
 `busy`, `needs_you`, `background`, the wake-up — the record keeps the tick of the event that
 last wrote it (`written`), and only an event of the same tick or later writes it again; activity
 only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the conversation
-goes to the one on record, whose start was synchronous. A hook whose claude has gone (an
-async hook can outlive it) is stamped from its own start, which is no later than the fork it
-came from. A new record is stamped with the tick it
+goes to the one on record, whose start was synchronous. An async hook can outlive its claude:
+one that read its claude alive keeps the binding it read, and the stamps refuse what is older
+than the slot's last start or end, binding included; one that finds no claude above it is
+stamped from its own start, which is no later than the fork it came from. A new record is stamped with the tick it
 is made in, so nothing fired before it, such as the last hook of a claude whose slot name is
 being reused, can write it; stamps from before a reboot, larger than any tick of this boot, are
 forgotten when a hook next loads the record. A late event of the conversation before the
@@ -189,8 +190,8 @@ before its create lands is remembered, so the late create is not taken. Only a h
 read `/proc` is stamped when it lands. `prompt_id` cannot do this: a prompt typed mid-turn fires its
 `UserPromptSubmit` under the running turn's id, and the turn it later starts fires none.
 
-What stays uncorrected, each until the next event of its kind: a turn drained from that queue
-fires no hook, so it reads idle except through its transcript's writes, as it did before async;
+What stays uncorrected, each until the next event of its kind: a turn drained from Claude
+Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through its transcript's writes, as it did before async;
 events fired within one 10 ms clock tick apply in landing order; a hook whose `sh` forked rather
 than exec'd it, and whose claude has gone, is stamped from its own start, a stall after the
 fork; a nested `claude -p` under a tool call kills its last async hooks when it exits; and a

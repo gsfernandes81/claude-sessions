@@ -22,14 +22,13 @@ pub fn slot_from_env() -> Option<String> {
 }
 
 /// What a hook learns from its line of parents.
-#[derive(Debug, PartialEq, Eq)]
 pub struct Origin {
     pub binding: Binding,
     /// The nearest claude above the hook: the one that fired it.
     pub claude: Option<u32>,
     /// When it fired: the start of the process that claude forked to run the hook, which a
-    /// stall after the fork does not move.
-    pub fired: Option<Moment>,
+    /// stall after the fork does not move; when it landed only if /proc cannot be read.
+    pub fired: Moment,
 }
 
 /// Where the hook `hook_pid` came from.
@@ -43,7 +42,8 @@ pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Origin {
         fired: place
             .forked
             .and_then(procinfo::start_time)
-            .and_then(Moment::of_tick),
+            .and_then(Moment::of_tick)
+            .unwrap_or_else(Moment::now),
     }
 }
 
@@ -66,18 +66,18 @@ struct Place {
 /// (`Event::fired_in_subagent`). No claude at all is a hook whose claude has gone, or one run
 /// by hand, and neither may rebind a slot.
 fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
-    let Some(i) = line.iter().skip(1).position(|(_, comm)| comm == "claude") else {
+    let Some(c) = (1..line.len()).find(|&c| line[c].1 == "claude") else {
         return Place {
             binding: Binding::Nested,
             claude: None,
             forked: line.first().map(|(pid, _)| *pid),
         };
     };
-    let own = !fired_in_subagent && line.get(i + 2).is_some_and(|(_, comm)| comm == "zmx");
+    let own = !fired_in_subagent && line.get(c + 1).is_some_and(|(_, comm)| comm == "zmx");
     Place {
         binding: if own { Binding::Own } else { Binding::Nested },
-        claude: Some(line[i + 1].0),
-        forked: Some(line[i].0),
+        claude: Some(line[c].0),
+        forked: Some(line[c - 1].0),
     }
 }
 

@@ -229,8 +229,7 @@ fn cmd_hook() -> std::io::Result<()> {
 
     let origin = bind::origin(std::process::id(), ev.fired_in_subagent());
     let binding = origin.binding;
-    // Only an unreadable /proc leaves no start to read.
-    let fired = origin.fired.unwrap_or_else(Moment::now);
+    let fired = origin.fired;
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.
     let own_pid = origin.claude.filter(|_| binding == Binding::Own);

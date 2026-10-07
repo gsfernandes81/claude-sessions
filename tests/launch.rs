@@ -312,7 +312,11 @@ fn a_hook_landing_late_is_ordered_by_when_claude_fired_it() {
             landed.exists().then_some(())
         });
         let body = std::fs::read_to_string(root.0.join(format!("registry/{slot}.json"))).unwrap();
-        // Landing order alone would read the opposite in each.
+        // Both landed, and landing order alone would read the opposite in each.
+        assert!(
+            body.contains("\"first_prompt\": \"go\"") && body.contains("\"Stop\""),
+            "{slot}: {body}"
+        );
         assert!(
             body.contains(&format!("\"busy\": {busy}")),
             "{slot}: {body}"

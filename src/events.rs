@@ -184,15 +184,6 @@ pub fn lock_wait(ev: &Event, binding: Binding) -> Duration {
     }
 }
 
-/// Takes a field stamped `written` for an event fired at `tick`, unless a later one has.
-fn claim(written: &mut u64, tick: u64) -> bool {
-    let newer = tick >= *written;
-    if newer {
-        *written = tick;
-    }
-    newer
-}
-
 /// Activity only moves forward: an event landing late does not make the slot look newer.
 fn active(rec: &mut SlotRecord, at: Millis) {
     rec.last_activity_ms = rec.last_activity_ms.max(at);
@@ -207,7 +198,7 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written[Field::Conversation] = tick;
+    rec.written.stamp(Field::Conversation, tick);
     rec.written.deleted.clear();
 }
 
@@ -259,27 +250,28 @@ pub fn apply(
             if let Some(t) = ev.session_title() {
                 rec.title = Some(t.to_string());
             }
-            if pid.is_some() {
-                // A different process cannot be running the old one's background work.
-                if (pid != rec.pid || proc_start != rec.proc_start)
-                    && claim(&mut rec.written[Field::Background], tick)
-                {
-                    rec.background.clear();
-                }
-                rec.pid = pid;
-                rec.proc_start = proc_start;
-            }
-            // Live even mid-offload: the process in front of the owner is the truth.
-            if claim(&mut rec.written[Field::Life], tick) {
+            // Live even mid-offload: the process in front of the owner is the truth. A start
+            // older than the slot's last start or end binds nothing.
+            if rec.written.claim(Field::Life, tick) {
                 rec.state = State::Live;
+                if pid.is_some() {
+                    // A different process cannot be running the old one's background work.
+                    if (pid, proc_start) != (rec.pid, rec.proc_start)
+                        && rec.written.claim(Field::Background, tick)
+                    {
+                        rec.background.clear();
+                    }
+                    rec.pid = pid;
+                    rec.proc_start = proc_start;
+                }
             }
             active(rec, at);
             if ev.opens_at_prompt() {
-                if claim(&mut rec.written[Field::Busy], tick) {
+                if rec.written.claim(Field::Busy, tick) {
                     rec.busy = false;
                     rec.ready_ms = Some(at);
                 }
-                if claim(&mut rec.written[Field::NeedsYou], tick) {
+                if rec.written.claim(Field::NeedsYou, tick) {
                     rec.needs_you = false;
                 }
             }
@@ -291,26 +283,26 @@ pub fn apply(
             if first.is_some() && (rec.first_prompt.is_none() || tick < rec.written[Field::Prompt])
             {
                 rec.first_prompt = first;
-                rec.written[Field::Prompt] = tick;
+                rec.written.stamp(Field::Prompt, tick);
             }
             active(rec, at);
-            if claim(&mut rec.written[Field::Busy], tick) {
+            if rec.written.claim(Field::Busy, tick) {
                 rec.busy = true;
             }
-            if claim(&mut rec.written[Field::NeedsYou], tick) {
+            if rec.written.claim(Field::NeedsYou, tick) {
                 rec.needs_you = false;
             }
             Outcome::Changed
         }
         "Stop" => {
             active(rec, at);
-            if claim(&mut rec.written[Field::Busy], tick) {
+            if rec.written.claim(Field::Busy, tick) {
                 rec.busy = false;
                 rec.last_stop_ms = Some(at);
             }
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running.
-            if claim(&mut rec.written[Field::Background], tick) {
+            if rec.written.claim(Field::Background, tick) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
             Outcome::Changed
@@ -321,7 +313,7 @@ pub fn apply(
         "SubagentStart" => {
             let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
             let what = format!("subagent: {kind}");
-            if !claim(&mut rec.written[Field::Background], tick) {
+            if !rec.written.claim(Field::Background, tick) {
                 return Outcome::Ignored("a newer list has landed");
             }
             if !rec.background.contains(&what) {
@@ -335,7 +327,7 @@ pub fn apply(
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
             Some(running) => {
-                if claim(&mut rec.written[Field::Background], tick) {
+                if rec.written.claim(Field::Background, tick) {
                     rec.background = running;
                     Outcome::Changed
                 } else {
@@ -345,7 +337,7 @@ pub fn apply(
         },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
-                if claim(&mut rec.written[Field::NeedsYou], tick) {
+                if rec.written.claim(Field::NeedsYou, tick) {
                     rec.needs_you = true;
                     active(rec, at);
                     Outcome::Changed
@@ -365,7 +357,7 @@ pub fn apply(
                 Outcome::Ignored("clear and resume continue in the same process")
             }
             _ => {
-                if !claim(&mut rec.written[Field::Life], tick) {
+                if !rec.written.claim(Field::Life, tick) {
                     return Outcome::Ignored("a newer start has landed");
                 }
                 rec.state = if rec.state == State::Offloading {
@@ -373,7 +365,7 @@ pub fn apply(
                 } else {
                     State::Closed
                 };
-                if claim(&mut rec.written[Field::Busy], tick) {
+                if rec.written.claim(Field::Busy, tick) {
                     rec.busy = false;
                 }
                 Outcome::Changed
@@ -403,7 +395,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !claim(&mut rec.written[Field::Wakeup], tick) {
+            if !rec.written.claim(Field::Wakeup, tick) {
                 return Outcome::Ignored("a newer wake-up has landed");
             }
             let stop = input
@@ -688,14 +680,17 @@ mod tests {
     }
 
     #[test]
-    fn a_permission_prompt_landing_after_the_next_prompt_is_not_waiting() {
+    fn a_permission_prompt_and_the_prompt_before_it_land_in_either_order() {
         let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
         let mut rec = slot();
         land(&mut rec, &[(ask, 2_000)]);
         assert!(rec.needs_you, "calibration");
         let mut rec = slot();
         land(&mut rec, &[(PROMPT, 3_000), (ask, 2_000)]);
-        assert!(!rec.needs_you);
+        assert!(!rec.needs_you, "answered by the next prompt");
+        let mut rec = slot();
+        land(&mut rec, &[(ask, 3_000), (PROMPT, 2_000)]);
+        assert!(rec.needs_you && rec.busy, "asked within its turn");
     }
 
     #[test]
@@ -814,7 +809,7 @@ mod tests {
         assert!(rec.background.is_empty());
         assert!(!rec.needs_you && !rec.busy);
         assert_eq!(rec.state, State::Live);
-        // Landing after the process has gone, with no claude above them, they are nested.
+        // Read /proc after the process had gone: no claude above, so nested.
         for body in [stop, ask] {
             apply(
                 &mut rec,
@@ -827,6 +822,27 @@ mod tests {
         }
         assert_eq!(rec.last_activity_ms, 9_000, "idle since the resume, still");
         assert!(rec.ready_ms >= Some(rec.last_activity_ms));
+        // A late start of the old process binds nothing.
+        let compact =
+            r#"{"hook_event_name":"SessionStart","source":"compact","session_id":"first"}"#;
+        apply(
+            &mut rec,
+            &ev(compact),
+            Moment::ms(5_000),
+            Binding::Own,
+            Some(100),
+            Some(7),
+        );
+        assert_eq!((rec.pid, rec.proc_start), (Some(200), Some(8)));
+        apply(
+            &mut rec,
+            &ev(compact),
+            Moment::ms(9_500),
+            Binding::Own,
+            Some(300),
+            Some(9),
+        );
+        assert_eq!(rec.pid, Some(300), "calibration: a newer start binds");
         land(&mut rec, &[(stop, 10_000), (ask, 11_000)]);
         assert!(
             !rec.background.is_empty() && rec.needs_you,

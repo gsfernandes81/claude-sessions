@@ -85,10 +85,8 @@ pub fn lineage(pid: u32, limit: usize) -> Vec<(u32, String)> {
     while line.len() <= limit && cur > 1 {
         let Some(name) = comm(cur) else { break };
         line.push((cur, name));
-        match parent(cur) {
-            Some(p) => cur = p,
-            None => break,
-        }
+        let Some(p) = parent(cur) else { break };
+        cur = p;
     }
     line
 }

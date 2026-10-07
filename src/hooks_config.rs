@@ -14,8 +14,8 @@
 //!   matcher names exactly the timer tools and nothing that merely contains their names.
 //! - **Every event but `SessionStart` and `SessionEnd` is `async`**: an interactive Claude Code
 //!   neither waits for the hook nor times it out, so a stalled disk delays the event, not the
-//!   prompt; `claude -p` kills any still running when it exits. Async
-//!   hooks of one slot can land out of order, which `events` handles.
+//!   prompt; `claude -p` kills any still running when it exits. Async hooks of one slot can
+//!   land out of order, which `events` handles.
 //! - **`SessionStart` and `SessionEnd` are synchronous**: the first binds the slot's process
 //!   (claude's first reply, an in-session `/resume` and a compaction wait for it), and the
 //!   second must finish before claude exits.
