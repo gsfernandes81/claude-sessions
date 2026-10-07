@@ -146,7 +146,8 @@ done
     let claude_args = match depth {
         0 => "600",
         1 => "-c 'sleep 600; :'",
-        _ => r#"-c 'sh -c "sleep 600; :"; :'"#,
+        2 => r#"-c 'sh -c "sleep 600; :"; :'"#,
+        n => panic!("no fixture of depth {n}"),
     };
 
     // `; :` keeps the shell as the parent rather than letting it exec the command, which is
@@ -466,6 +467,20 @@ fn a_frozen_claude_is_thawed_by_what_still_runs_and_not_by_what_it_started() {
         "got: {out}"
     );
     assert!(!frozen_kept(&s), "the thaw is stored");
+
+    // A tool call: claude → sh → sleep, all new since the freeze. Claude's doing, named by
+    // what it started directly; the calibration is the thaw above, where the sh was there.
+    let s = idle_slot_deep("activity-own-deep", 2);
+    measured_frozen(&s, &[], -180_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "the activity rule would have claude frozen, 3m so far, and claude itself started sh, which the freeze would have stopped\n"
+        ),
+        "got: {out}"
+    );
+    assert!(frozen_kept(&s), "the freeze is stored");
 
     let s = idle_slot_deep("activity-own", 1);
     measured_frozen(&s, &[], -180_000);

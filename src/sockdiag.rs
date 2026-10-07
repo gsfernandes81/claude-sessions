@@ -27,6 +27,7 @@ const SOCK_DGRAM: c_int = 2;
 const SOCK_CLOEXEC: c_int = 0o2_000_000;
 const NETLINK_SOCK_DIAG: c_int = 4;
 const MSG_DONTWAIT: c_int = 0x40;
+const MSG_TRUNC: c_int = 0x20;
 
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
@@ -89,6 +90,9 @@ fn dump(fd: &OwnedFd, seq: u32, family: u8, out: &mut BTreeMap<u64, u64>) -> io:
     if sent < 0 {
         return Err(io::Error::last_os_error());
     }
+    // The kernel sends a dump in parts of at most 32 KiB less its own overhead, so one always
+    // fits; `MSG_TRUNC` makes `recv` say a part's true length, so one that did not would be an
+    // error rather than a message cut short.
     let mut buf = vec![0u8; 32 * 1024];
     loop {
         // Never blocks: the kernel queues a dump's first part while handling the request and
@@ -100,13 +104,19 @@ fn dump(fd: &OwnedFd, seq: u32, family: u8, out: &mut BTreeMap<u64, u64>) -> io:
                 fd.as_raw_fd(),
                 buf.as_mut_ptr().cast(),
                 buf.len(),
-                MSG_DONTWAIT,
+                MSG_DONTWAIT | MSG_TRUNC,
             )
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
         let n = n as usize;
+        if n > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a dump part was longer than the buffer",
+            ));
+        }
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
