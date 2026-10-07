@@ -53,8 +53,8 @@ jobs:
       # cannot prove — v0.3.8 passed every test against a stand-in while the real holder turned
       # every swipe into arrow keys. Pinned and checked, the same version infra installs; the
       # test fails under CI without it, so a broken download cannot pass for the wrong reason.
-      # From the GitHub release: zmx.sh does not serve every architecture, and the hash pins
-      # the bytes whichever host serves them.
+      # From the GitHub release: zmx.sh has answered a GitHub runner 404 for a tarball it serves
+      # elsewhere, and the hash pins the bytes whichever host serves them.
       - name: Fetch the pinned zmx
         run: |
           curl -fsSLo zmx.tgz https://github.com/neurosnap/zmx/releases/download/v0.8.1/zmx-0.8.1-linux-x86_64.tar.gz
@@ -86,8 +86,8 @@ jobs:
       # cannot prove — v0.3.8 passed every test against a stand-in while the real holder turned
       # every swipe into arrow keys. Pinned and checked, the same version infra installs; the
       # test fails under CI without it, so a broken download cannot pass for the wrong reason.
-      # From the GitHub release: zmx.sh does not serve every architecture, and the hash pins
-      # the bytes whichever host serves them.
+      # From the GitHub release: zmx.sh has answered a GitHub runner 404 for a tarball it serves
+      # elsewhere, and the hash pins the bytes whichever host serves them.
       - name: Fetch the pinned zmx
         run: |
           curl -fsSLo zmx.tgz https://github.com/neurosnap/zmx/releases/download/v0.8.1/zmx-0.8.1-linux-aarch64.tar.gz

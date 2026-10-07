@@ -111,27 +111,32 @@ impl Written {
 
     /// Stamps from before a reboot lie in this boot's future and would refuse every event.
     pub fn forget_after(&mut self, tick: u64) {
-        if self.clone().named().iter().any(|(_, t)| **t > tick) {
+        let stamps = self.stamps().map(|(_, t)| t);
+        if stamps
+            .iter()
+            .chain(self.deleted.values())
+            .any(|&t| t > tick)
+        {
             *self = Written::new(0);
         }
     }
 
-    fn named(&mut self) -> [(&'static str, &mut u64); 7] {
+    fn stamps(&self) -> [(&'static str, u64); 7] {
         [
-            ("conversation", &mut self.conversation),
-            ("life", &mut self.life),
-            ("busy", &mut self.busy),
-            ("needs_you", &mut self.needs_you),
-            ("background", &mut self.background),
-            ("wakeup", &mut self.wakeup),
-            ("prompt", &mut self.prompt),
+            ("conversation", self.conversation),
+            ("life", self.life),
+            ("busy", self.busy),
+            ("needs_you", self.needs_you),
+            ("background", self.background),
+            ("wakeup", self.wakeup),
+            ("prompt", self.prompt),
         ]
     }
 
     fn to_json(&self) -> Value {
         let mut o = Value::obj();
-        for (name, tick) in self.clone().named() {
-            o.set(name, Value::num(*tick as f64));
+        for (name, tick) in self.stamps() {
+            o.set(name, Value::num(tick as f64));
         }
         let mut deleted = Value::obj();
         for (id, tick) in &self.deleted {
@@ -142,21 +147,29 @@ impl Written {
     }
 
     fn from_json(v: Option<&Value>) -> Written {
-        let mut w = Written::new(0);
-        for (name, tick) in w.named() {
-            *tick = v
-                .and_then(|v| v.get(name))
+        let get = |name: &str| {
+            v.and_then(|v| v.get(name))
                 .and_then(Value::as_u64)
-                .unwrap_or(0);
-        }
+                .unwrap_or(0)
+        };
+        let mut deleted = BTreeMap::new();
         if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
             for (id, t) in m {
                 if let Some(t) = t.as_u64() {
-                    w.deleted.insert(id.clone(), t);
+                    deleted.insert(id.clone(), t);
                 }
             }
         }
-        w
+        Written {
+            conversation: get("conversation"),
+            life: get("life"),
+            busy: get("busy"),
+            needs_you: get("needs_you"),
+            background: get("background"),
+            wakeup: get("wakeup"),
+            prompt: get("prompt"),
+            deleted,
+        }
     }
 }
 
@@ -521,11 +534,37 @@ mod tests {
 
     #[test]
     fn stamps_from_before_a_reboot_are_forgotten() {
-        let mut w = Written::new(500);
-        w.forget_after(500);
-        assert_eq!(w, Written::new(500), "calibration: this boot's stamps stay");
-        w.forget_after(499);
-        assert_eq!(w, Written::new(0));
+        let w = Written {
+            conversation: 1,
+            life: 2,
+            busy: 3,
+            needs_you: 4,
+            background: 5,
+            wakeup: 6,
+            prompt: 7,
+            deleted: [("cron:c1".to_string(), 8)].into(),
+        };
+        let mut kept = w.clone();
+        kept.forget_after(8);
+        assert_eq!(kept, w, "calibration: this boot's stamps stay");
+        // Each field alone, past the tick, is a stamp from before a reboot.
+        for i in 0..8 {
+            let mut v = w.clone();
+            match i {
+                0 => v.conversation = 9,
+                1 => v.life = 9,
+                2 => v.busy = 9,
+                3 => v.needs_you = 9,
+                4 => v.background = 9,
+                5 => v.wakeup = 9,
+                6 => v.prompt = 9,
+                _ => {
+                    v.deleted.insert("cron:c2".into(), 9);
+                }
+            }
+            v.forget_after(8);
+            assert_eq!(v, Written::new(0), "field {i}");
+        }
     }
 
     #[test]

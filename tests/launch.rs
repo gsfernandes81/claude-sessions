@@ -16,6 +16,7 @@
 //! between the server and claude, and the same hook must then refuse to bind — or this test
 //! could be passing because the hook binds anything.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -102,11 +103,13 @@ exit 0"#,
         &root.join("bin/claude"),
         &format!(
             r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
-printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook
-printf '{{"hook_event_name":"SubagentStart","agent_id":"a-e2e","agent_type":"general-purpose","session_id":"conv-e2e"}}' | "{bin}" hook
+echo marker >> "{out}"
+printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook >> "{out}"
+printf '{{"hook_event_name":"SubagentStart","agent_id":"a-e2e","agent_type":"general-purpose","session_id":"conv-e2e"}}' | "{bin}" hook >> "{out}"
 echo "claude said this on stderr" >&2
 exec sleep 600"#,
             pids = root.join("pids").display(),
+            out = root.join("hook.out").display(),
             bin = BIN,
             transcript = root.join("transcript.jsonl").display(),
         ),
@@ -221,6 +224,25 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(body.contains("subagent: general-purpose"), "{body}");
+    // The marker proves the capture; its being alone, that the slot's own hooks said nothing.
+    let out = std::fs::read_to_string(root.0.join("hook.out")).unwrap();
+    assert_eq!(out, "marker\n");
+}
+
+#[test]
+fn a_record_stamped_before_a_reboot_is_still_bound() {
+    let root = setup("reboot");
+    let far = 1u64 << 40;
+    std::fs::write(
+        root.0.join("registry/claude-6.json"),
+        format!(
+            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"wakeup":{far},"prompt":{far}}}}}"#
+        ),
+    )
+    .unwrap();
+    start(&root.0, "claude-6", WRAP);
+    let body = record(&root.0, "claude-6");
+    assert!(number(&body, "pid").is_some(), "{body}");
 }
 
 #[test]
@@ -305,4 +327,63 @@ fn a_hook_landing_late_is_ordered_by_when_claude_fired_it() {
             "{slot}: {body}"
         );
     }
+}
+
+#[test]
+fn a_hook_that_outlives_its_claude_is_stamped_from_its_fork() {
+    let root = setup("orphan");
+    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e","background_tasks":[]}"#;
+    let fifo = root.0.join("late.fifo");
+    script(
+        &root.0.join("bin/claude"),
+        &format!(
+            r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
+printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e"}}' | "{bin}" hook
+mkfifo "{fifo}"
+"{bin}" hook < "{fifo}" &
+exit 0"#,
+            pids = root.0.join("pids").display(),
+            fifo = fifo.display(),
+            bin = BIN,
+        ),
+    );
+    start(&root.0, "claude-5", WRAP);
+    record(&root.0, "claude-5");
+    let claude = std::fs::read_to_string(root.0.join("pids")).unwrap();
+    let claude = claude.split_whitespace().next().unwrap().to_string();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Path::new(&format!("/proc/{claude}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the stand-in claude never exited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(1_200));
+    let fed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fifo)
+        .unwrap()
+        .write_all(stop.as_bytes())
+        .unwrap();
+    let path = root.0.join("registry/claude-5.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        if body.contains("\"Stop\"") {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the late Stop never landed: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Landing time would read as activity after claude had gone.
+    let active = number(&body, "last_activity_ms").unwrap();
+    assert!(active + 500 < fed, "active {active}, fed {fed}: {body}");
 }

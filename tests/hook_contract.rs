@@ -1,8 +1,9 @@
 //! The two promises the rest of the design leans on, tested against the real binary.
 //!
-//! **`hook` always exits 0 and says nothing.** Its stdout is fed to Claude, and a failing
-//! synchronous hook is shown to the person, so a registry bug must never wedge a session or
-//! talk to it. Every run of the hook below asserts both.
+//! **`hook` always exits 0 and says nothing.** Its stdout is fed to Claude, a failing
+//! synchronous hook is shown to the person, and a failing async one is handed to Claude, so a
+//! registry bug must never wedge a session or talk to it. Every run of the hook below asserts
+//! both.
 //!
 //! **A record is never caught half-written.** The registry is read on the ssh path, so a
 //! reader landing mid-write must still get valid JSON. That is what the temp-file-then-rename
@@ -334,4 +335,33 @@ fn a_clear_end_takes_no_lock_and_a_dropped_event_says_which_it_was() {
         log()
     );
     holder.wait().ok();
+}
+
+#[test]
+fn a_start_that_binds_nothing_gives_up_where_a_prompt_waits() {
+    // Run by hand the hook binds nothing, so its synchronous start holds up only claude.
+    let dir = tmpdir("startwait");
+    let slot = "claude-8";
+    let mut holder = Command::new("flock")
+        .arg(dir.join(format!("{slot}.lock")))
+        .args(["sleep", "3"])
+        .spawn()
+        .expect("flock(1) runs");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let started = std::time::Instant::now();
+    let start = r#"{"hook_event_name":"SessionStart","source":"compact"}"#;
+    assert_eq!(run_hook(&dir, Some(slot), start), 0);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2_600),
+        "{:?}",
+        started.elapsed()
+    );
+    let log = std::fs::read_to_string(dir.join("hook.log")).unwrap_or_default();
+    assert!(log.contains("claude-8: SessionStart dropped"), "{log}");
+    // Calibration: the same held lock is waited out by a prompt.
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#;
+    assert_eq!(run_hook(&dir, Some(slot), prompt), 0);
+    holder.wait().ok();
+    let body = std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
+    assert!(body.contains("\"UserPromptSubmit\""), "{body}");
 }

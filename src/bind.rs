@@ -36,32 +36,49 @@ pub struct Origin {
 pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Origin {
     // hook -> sh -> claude -> zmx is the usual shape; a deeper walk would start finding
     // unrelated claudes in a container that runs several.
-    let (binding, above) = place(&procinfo::lineage(hook_pid, 9), fired_in_subagent);
+    let place = place(&procinfo::lineage(hook_pid, 9), fired_in_subagent);
     Origin {
-        binding,
-        claude: above.map(|(_, claude)| claude),
-        fired: above
-            .and_then(|(forked, _)| procinfo::start_time(forked))
+        binding: place.binding,
+        claude: place.claude,
+        fired: place
+            .forked
+            .and_then(procinfo::start_time)
             .and_then(Moment::of_tick),
     }
 }
 
-/// How a hook's line of parents, nearest first, places it: its binding, and the claude above
-/// it with the process that claude forked to run it.
+/// How a hook sits on its line of parents.
+#[derive(Debug, PartialEq, Eq)]
+struct Place {
+    binding: Binding,
+    claude: Option<u32>,
+    /// The process whose start is when the event fired: what claude forked to run the hook,
+    /// or with no claude above, the hook itself. An async hook outlives its claude, and then
+    /// started no later than the fork it came from.
+    forked: Option<u32>,
+}
+
+/// How a hook's line of parents, nearest first, places it.
 ///
 /// The claude is the slot's own when its parent is a `zmx` daemon: the daemon forks the
 /// session's command directly (seen on zmx 0.8.1), so a nested claude has another claude or a
 /// shell in between. A hook fired in a subagent's own context is nested whatever the tree says
-/// (`Event::fired_in_subagent`). No claude at all is something running the hook by hand, which
-/// must not rebind a slot it may know nothing about.
-fn place(line: &[(u32, String)], fired_in_subagent: bool) -> (Binding, Option<(u32, u32)>) {
-    let Some(forked) = line.iter().skip(1).position(|(_, comm)| comm == "claude") else {
-        return (Binding::Nested, None);
+/// (`Event::fired_in_subagent`). No claude at all is a hook whose claude has gone, or one run
+/// by hand, and neither may rebind a slot.
+fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
+    let Some(i) = line.iter().skip(1).position(|(_, comm)| comm == "claude") else {
+        return Place {
+            binding: Binding::Nested,
+            claude: None,
+            forked: line.first().map(|(pid, _)| *pid),
+        };
     };
-    let claude = line[forked + 1].0;
-    let own = !fired_in_subagent && line.get(forked + 2).is_some_and(|(_, comm)| comm == "zmx");
-    let binding = if own { Binding::Own } else { Binding::Nested };
-    (binding, Some((line[forked].0, claude)))
+    let own = !fired_in_subagent && line.get(i + 2).is_some_and(|(_, comm)| comm == "zmx");
+    Place {
+        binding: if own { Binding::Own } else { Binding::Nested },
+        claude: Some(line[i + 1].0),
+        forked: Some(line[i].0),
+    }
 }
 
 #[cfg(test)]
@@ -76,32 +93,40 @@ mod tests {
             .collect()
     }
 
+    fn placed(binding: Binding, claude: Option<u32>, forked: u32) -> Place {
+        Place {
+            binding,
+            claude,
+            forked: Some(forked),
+        }
+    }
+
     #[test]
     fn a_hook_under_the_slots_own_claude_is_its_own() {
         let own = line(&["claude-sessions", "sh", "claude", "zmx"]);
-        assert_eq!(place(&own, false), (Binding::Own, Some((11, 12))));
+        assert_eq!(place(&own, false), placed(Binding::Own, Some(12), 11));
         assert_eq!(
-            place(&own, true).0,
+            place(&own, true).binding,
             Binding::Nested,
             "fired inside a subagent"
         );
         // `sh` exec'd the hook: the hook is what claude forked.
         let exec = line(&["claude-sessions", "claude", "zmx"]);
-        assert_eq!(place(&exec, false), (Binding::Own, Some((10, 11))));
+        assert_eq!(place(&exec, false), placed(Binding::Own, Some(11), 10));
     }
 
     #[test]
     fn a_hook_under_a_nested_claude_or_none_is_nested() {
         let nested = line(&["claude-sessions", "sh", "claude", "bash", "claude", "zmx"]);
-        assert_eq!(place(&nested, false), (Binding::Nested, Some((11, 12))));
+        assert_eq!(place(&nested, false), placed(Binding::Nested, Some(12), 11));
+        let mine = line(&["claude-sessions", "sh", "claude"]);
         assert_eq!(
-            place(&line(&["claude-sessions", "sh", "bash"]), false),
-            (Binding::Nested, None)
-        );
-        assert_eq!(
-            place(&line(&["claude-sessions", "sh", "claude"]), false).0,
+            place(&mine, false).binding,
             Binding::Nested,
-            "a claude with no zmx above it"
+            "a claude with no zmx above"
         );
+        // Its claude gone, the hook was reparented: its own start is when it fired.
+        let orphan = line(&["claude-sessions", "init"]);
+        assert_eq!(place(&orphan, false), placed(Binding::Nested, None, 10));
     }
 }

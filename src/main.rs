@@ -94,9 +94,9 @@ fn main() -> ExitCode {
             say_nl!("{}", usage());
             ExitCode::SUCCESS
         }
-        // THE ONE SUBCOMMAND THAT MUST NOT FAIL OR SPEAK: its stdout is fed to Claude, and a
-        // failing synchronous hook is shown to the person. Every failure is logged and
-        // swallowed, a panic included.
+        // THE ONE SUBCOMMAND THAT MUST NOT FAIL OR SPEAK: its stdout is fed to Claude, a failing
+        // synchronous hook is shown to the person, and a failing async one is handed to Claude.
+        // Every failure is logged and swallowed, a panic included.
         "hook" => {
             std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
             match std::panic::catch_unwind(cmd_hook) {
@@ -229,6 +229,7 @@ fn cmd_hook() -> std::io::Result<()> {
 
     let origin = bind::origin(std::process::id(), ev.fired_in_subagent());
     let binding = origin.binding;
+    // Only an unreadable /proc leaves no start to read.
     let fired = origin.fired.unwrap_or_else(Moment::now);
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.

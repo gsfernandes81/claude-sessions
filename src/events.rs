@@ -192,7 +192,6 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.transcript_path = None;
     rec.last_event_ms.clear();
     rec.written.conversation = tick;
-    rec.written.prompt = tick;
     rec.written.deleted.clear();
 }
 
@@ -740,6 +739,19 @@ mod tests {
         assert!(rec.background.is_empty());
         assert!(!rec.needs_you && !rec.busy);
         assert_eq!(rec.state, State::Live);
+        // Landing after the process has gone, with no claude above them, they are nested.
+        for body in [stop, ask] {
+            apply(
+                &mut rec,
+                &ev(body),
+                Moment::ms(5_000),
+                Binding::Nested,
+                None,
+                None,
+            );
+        }
+        assert_eq!(rec.last_activity_ms, 9_000, "idle since the resume, still");
+        assert!(rec.ready_ms >= Some(rec.last_activity_ms));
         land(&mut rec, &[(stop, 10_000), (ask, 11_000)]);
         assert!(
             !rec.background.is_empty() && rec.needs_you,
@@ -992,10 +1004,15 @@ mod tests {
             &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"x"}"#),
             1_500,
         );
+        rec.written.deleted.insert("cron:c1".into(), 150);
         own(
             &mut rec,
             &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
             2_000,
+        );
+        assert!(
+            rec.written.deleted.is_empty(),
+            "a cron of the last one is not this one's"
         );
         assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), None);
         assert_eq!(rec.last_event_ms.get("SessionStart"), Some(&2_000));
@@ -1380,6 +1397,12 @@ mod tests {
         );
         assert_eq!(rec.last_event_ms.get("Stop"), Some(&7_000));
         assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), Some(&8_000));
+        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 6_000);
+        assert_eq!(
+            rec.last_event_ms.get("Stop"),
+            Some(&7_000),
+            "a late one moves nothing back"
+        );
     }
 
     // ── titles: the first prompt, and a new conversation forgetting the old one ─
