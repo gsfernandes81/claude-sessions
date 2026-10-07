@@ -649,9 +649,14 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   deadline is in its own memory alone — and would be the nearest of its housekeeping
   intervals anyway. A freeze that thaws on a fixed cycle would fire an overdue timer late,
   page the process back in every cycle, and have to tell its own catch-up burst from a turn.
-  The hook-read hold stays; it fails the wrong way — a `Stop` payload that loses its timer
-  field drops the hold without a word — so infra's checks on Claude Code's binary should
-  cover that field as they cover `background_tasks`. **Then a message for claude alone** — a
+  The hook-read hold stays; it comes from `PostToolUse` on the timer tools, not from `Stop`,
+  and fails the wrong way in three places: a timer tool renamed (`ScheduleWakeup`,
+  `CronCreate`, `CronDelete`, named exactly in the hook's matcher), so its hook never fires;
+  `PostToolUse`'s `tool_name`; and `CronDelete`'s `tool_input.id`, whose loss reads as a
+  delete with no target and drops every cron. infra's checks on Claude Code's binary should
+  cover the three tool names as they cover `background_tasks`. The other fields err towards
+  keeping: no `delaySeconds` is a wake-up with no due time, no `stop` leaves a wake-up until
+  it is due, and no `tool_response.id` keeps a cron no delete can match. **Then a message for claude alone** — a
   remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
   process's socket, so a real freeze could see those bytes arrive and thaw on them; the
   measurement cannot, because claude is not stopped, and the bytes it receives are mostly
