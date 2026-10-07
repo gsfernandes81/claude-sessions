@@ -35,7 +35,7 @@ impl Drop for Slot {
         // pid, may be another test's process or anything on the machine running the tests.
         // From the leaf up, so nothing under claude is orphaned to outlive the test.
         if alive(self.claude, self.claude_start) {
-            let mut tree = work_of(self);
+            let mut tree = chain_under(self.claude);
             tree.insert(0, self.claude);
             for pid in tree.iter().rev() {
                 let _ = Command::new("kill")
@@ -69,10 +69,10 @@ fn alive(pid: u32, start: u64) -> bool {
     stat_fields(pid).is_some_and(|f| f[0] != "Z" && f[19].parse::<u64>().ok() == Some(start))
 }
 
-/// The chain of processes under the stand-in claude, nearest first.
-fn work_of(s: &Slot) -> Vec<u32> {
+/// The chain of processes under `pid`, nearest first.
+fn chain_under(pid: u32) -> Vec<u32> {
     let mut chain = Vec::new();
-    let mut at = s.claude;
+    let mut at = pid;
     while let Some(child) = child_of(at) {
         chain.push(child);
         at = child;
@@ -142,7 +142,9 @@ done
     std::fs::set_permissions(&list, std::fs::Permissions::from_mode(0o755)).unwrap();
     let claude_bin = if depth == 0 { "/bin/sleep" } else { "/bin/sh" };
     symlink(claude_bin, root.join("bin/claude")).unwrap();
-    // `; :` at each level keeps a shell from exec-ing its one command away.
+    // `; :` keeps each shell as its command's parent rather than letting it exec the command
+    // away — which is what zmx does too: its daemon outlives its command by a couple of
+    // seconds.
     let claude_args = match depth {
         0 => "600",
         1 => "-c 'sleep 600; :'",
@@ -150,8 +152,6 @@ done
         n => panic!("no fixture of depth {n}"),
     };
 
-    // `; :` keeps the shell as the parent rather than letting it exec the command, which is
-    // what zmx does too: its daemon outlives its command by a couple of seconds.
     let server = Command::new(root.join("bin/zmx"))
         .env_remove("ZMX_SESSION")
         .arg("-c")
@@ -181,6 +181,17 @@ done
         std::thread::sleep(Duration::from_millis(10));
     };
     let claude_start: u64 = stat_fields(claude).unwrap()[19].parse().unwrap();
+    // The work under claude forks after claude does. A test that read `/proc` before it was
+    // all there would see a shorter chain — and a pass that saw claude → sh alone would print
+    // what a rule stopping at claude's direct children also prints.
+    while chain_under(claude).len() < depth {
+        assert!(
+            Instant::now() < deadline,
+            "the chain under the stand-in claude never reached depth {depth}: {:?}",
+            chain_under(claude)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let attached = u8::from(socket_mode & 0o100 != 0);
     std::fs::write(root.join("zmx/claude-1"), format!("{claude} {attached}\n")).unwrap();
@@ -446,7 +457,7 @@ fn frozen_kept(s: &Slot) -> bool {
 #[test]
 fn a_frozen_claude_is_thawed_by_what_still_runs_and_not_by_what_it_started() {
     let s = idle_slot_deep("activity-frozen", 2);
-    let tree = work_of(&s);
+    let tree = chain_under(s.claude);
     assert_eq!(
         tree.len(),
         2,
@@ -641,14 +652,6 @@ fn a_dry_run_stops_nothing() {
 #[test]
 fn work_running_under_the_slot_keeps_it() {
     let s = idle_slot("busy", 0o600, true);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while child_of(s.claude).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the build stand-in never started"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
     assert!(

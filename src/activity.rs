@@ -10,14 +10,15 @@
 //! bytes it reads and writes, how often it wakes — means the same on every Claude Code
 //! version and every machine.
 //!
-//! **What is counted.** Bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`:
-//! the terminal claude repaints, the transcripts it writes, pipes to its tools. The same count
-//! on a Pi 4 and an x86 box, where CPU time is not. The kernel counts by call: `read`/`write`
-//! on a socket count, but `send`/`recv` do not, and claude's own network uses those — so to
-//! these the bytes of every TCP socket a slot's processes hold are added, from the kernel's
-//! own per-socket count (`src/sockdiag.rs`). File I/O through a mapping stays invisible. CPU
-//! time and wake-ups are logged beside the bytes for the data, not judged. The measured figures, the membership rule,
-//! the line and what the rule cannot see are in design.md, which is the one record of them.
+//! **What is counted.** Bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`: the
+//! terminal claude repaints, the transcripts it writes, pipes to its tools. The same count on a
+//! Pi 4 and an x86 box, where CPU time is not. The kernel counts by call: `read`/`write` on a
+//! socket count, but `send`/`recv` do not, and claude's own network uses those — so to these
+//! the bytes of every TCP socket a slot's processes hold are added, from the kernel's own
+//! per-socket count (`src/sockdiag.rs`). File I/O through a mapping stays invisible. CPU time
+//! and wake-ups are logged beside the bytes for the data, not judged. The measured figures, the
+//! membership rule, the line and what the rule cannot see are in design.md, which is the one
+//! record of them.
 //!
 //! **Which way it errs.** Anything not known counts as active: a slot's first reading, a
 //! member that left since the last reading, a process that is there but cannot be read, a
@@ -202,7 +203,8 @@ pub struct Snapshot {
 /// doing when it is `new` and its line of parents reaches claude through members that are all
 /// new too. The walk stops at a member that was there last reading — `gh` under the `bash` of
 /// `sleep N && gh run view`, started before the freeze, is the rest's — and at a parent that
-/// is no member, one that has left the slot: the rest's, erring towards a thaw.
+/// is no member, gone before the pass's snapshot so its child was reparented: the rest's,
+/// erring towards a thaw.
 fn claudes_doing(
     claude: Option<(u32, u64)>,
     tree: &[Member],
@@ -489,9 +491,9 @@ fn keep(why: &str) -> String {
 /// claude's move may have followed the thaw. So `which the freeze would have stopped` appears
 /// exactly when nothing would have thawed it, which is what makes it countable.
 ///
-/// `claude` is the recorded claude while it is alive and was read, and `parent` the name of its parent: a
-/// claude whose parent is not zmx was started from a shell, whose job control would take the
-/// terminal back from a stopped claude, so it is never frozen.
+/// `claude` is the recorded claude while it is alive and was read, and `parent` the name of its
+/// parent: a claude whose parent is not zmx was started from a shell, whose job control would
+/// take the terminal back from a stopped claude, so it is never frozen.
 pub fn shadow(
     prev: Option<&Frozen>,
     m: &Measure,
@@ -871,13 +873,14 @@ pub fn by_slot(table: &[Proc]) -> BTreeMap<String, Vec<u32>> {
     out
 }
 
-/// A slot's members: those carrying its variable — if the recorded claude is known, only
-/// those younger than it — and the recorded claude, only if it is still the process that was
+/// A slot's members: those carrying its variable — if the recorded claude is known, only those
+/// younger than it — and the recorded claude, only if it is still the process that was
 /// recorded, by start time, with its descendants. Not this process and not a running
 /// `claude-sessions`: a menu or a pass in the slot's shell would count its own reading of
 /// `/proc`. Not `zmx` either: a daemon a slot's tool started keeps the slot's `ZMX_SESSION`,
-/// and its reads are the other session's terminal, not this slot's work. (One that has exited is already in its parent's counters — the kernel folds a
-/// reaped child's bytes in — which is why the status line raises every floor a little.)
+/// and its reads are the other session's terminal, not this slot's work. (One that has exited
+/// is already in its parent's counters — the kernel folds a reaped child's bytes in — which is
+/// why the status line raises every floor a little.)
 pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)>) -> Vec<u32> {
     let mut pids: Vec<u32> = env.cloned().unwrap_or_default();
     let root =
@@ -1809,13 +1812,15 @@ mod tests {
             pass(vec![r(1, 7, 36_000)], vec![], Some(false)),
             "a process exited",
         );
-        // ... and gh starts, under the bash claude started before the freeze. (The same
-        // readings with gh as claude's own child are claude's doing, not a thaw: the
+        // ... and gh starts, under the bash (pid 2) claude started before the freeze. (The
+        // same readings with gh as claude's own child are claude's doing, not a thaw: the
         // calibration half of `a_process_claude_itself_started_is_claudes_not_a_thaw`.)
         thawed(
-            pass(
-                vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 9, 0)],
-                vec![],
+            after_freeze(
+                Snapshot {
+                    tree: vec![member(2, 1, "bash"), member(3, 2, "gh")],
+                    ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 9, 0)], Ok(vec![]))
+                },
                 Some(false),
             ),
             "a process started",
@@ -1892,7 +1897,8 @@ mod tests {
         );
         assert_eq!(m.split.rest_change, Some("a process started"));
         assert_eq!(m.split.rest, moved(1_500, 0));
-        // And one whose parent has left the slot is the rest's, erring towards a thaw.
+        // And one whose parent is no member — reparented — is the rest's, erring towards a
+        // thaw.
         let (_, said) = after_freeze(
             Snapshot {
                 tree: vec![member(4, 1234, "gh")],
@@ -1914,6 +1920,29 @@ mod tests {
             still.is_some() && said.contains("claude itself started bash"),
             "{said}"
         );
+        // Calibration of that: the bash was there at the freeze and exited as the pass read
+        // it — new by pid it is not, so the gh under it is the rest's, and the exit thaws.
+        let (s, f) = frozen_pair();
+        let seen = SlotState {
+            procs: vec![r(1, 7, 18_000), r(2, 8, 0), r(3, 9, 0)],
+            ..s
+        };
+        let (_, m) = step(
+            Some(&seen),
+            T0 + 360_000,
+            Snapshot {
+                left: vec![3],
+                tree: vec![member(3, 1, "bash"), member(4, 3, "gh")],
+                ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(4, 10, 500)], Ok(vec![]))
+            },
+        );
+        assert_eq!(
+            (m.split.rest_change, &m.split.claude_change, m.split.rest),
+            (Some("a process exited"), &None, moved(500, 0))
+        );
+        let (thawed, said) = shadow(Some(&f), &m, Some(false), CLAUDE, Some("zmx"), T0 + 360_000);
+        assert_eq!(thawed, None);
+        assert_eq!(said, "the activity rule would thaw it: a process exited");
     }
 
     #[test]
