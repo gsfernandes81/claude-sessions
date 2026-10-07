@@ -578,18 +578,20 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   minute — a pass run by hand right after the timer's — is left for the next, with a line
   saying so.
 - **State** is `activity.state` beside the registry — not `.json`, which the registry reads
-  as a slot — written whole and renamed into place. Two passes at once may each write it; the
-  later wins and the other's window is measured again. **The state belongs to the slot's
+  as a slot — written whole and renamed into place. Two passes at once may each write it;
+  the later wins and the other's window is measured again. **The state belongs to the slot's
   name** for as long as it has a record, and is carried as it was unless a reading replaces
   it — an offloaded slot, a crashed one with nothing left to read, a pass too soon after the
-  last — so a resume under the same name does not relearn its floor from busy windows. A
-  reading dated after the pass (a clock stepped back, or a pass that stored while this one
-  waited on zmx) starts over but keeps the floor. **Only a window known whole teaches the
-  floor**: one as long as the quiet period, or one a member left — the first after a resume
-  spans the whole offload — is active and teaches nothing, since its rate never happened. A name
-  closed and reused inherits it, which mostly carries the container's idle noise across.
-  A pass that cannot save it leaves the last saved state in place: counters are cumulative,
-  so the next window from it holds every byte, and floors survive a full disk.
+  last — so a resume under the same name does not relearn its floor from busy windows. The
+  one thing not carried past a crash with nothing left to read is a held freeze: the claude
+  it froze is gone for certain, so it ends there, said (the bullet above). A reading dated
+  after the pass (a clock stepped back, or a pass that stored while this one waited on zmx)
+  starts over but keeps the floor. **Only a window known whole teaches the floor**: one as
+  long as the quiet period, or one a member left — the first after a resume spans the whole
+  offload — is active and teaches nothing, since its rate never happened. A name closed and
+  reused inherits it, which mostly carries the container's idle noise across. A pass that
+  cannot save it leaves the last saved state in place: counters are cumulative, so the next
+  window from it holds every byte, and floors survive a full disk.
 - **What it cannot see**: a claude waiting in process, silently. **The common case is its
   own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
   the reason the offloader never stops a slot with one pending (owner, 2026-10-01). The

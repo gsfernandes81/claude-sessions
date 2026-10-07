@@ -139,7 +139,8 @@ pub struct Split {
     /// could not have done, so never a thaw.
     pub claude_change: Option<String>,
     /// A member claude did not start in the window started, or a member other than claude
-    /// that was seen at the last reading exited — whoever started it.
+    /// exited — one seen at the last reading, whoever started it, or one gone before it was
+    /// read that was not claude's doing.
     pub rest_change: Option<&'static str>,
     /// Members other than the recorded claude.
     pub others: usize,
