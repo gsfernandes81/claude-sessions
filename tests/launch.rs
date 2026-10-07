@@ -187,6 +187,11 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     );
     assert!(body.contains("\"conv-e2e\""), "{body}");
     assert!(number(&body, "proc_start").is_some(), "with its start time");
+    // Idle since its start, which is what lets a slot opened and never prompted close.
+    assert!(
+        number(&body, "ready_ms") >= number(&body, "last_activity_ms"),
+        "{body}"
+    );
     // The stand-in speaks on stderr after its hooks return, so the record can land first.
     let deadline = Instant::now() + Duration::from_secs(10);
     let stderr = loop {

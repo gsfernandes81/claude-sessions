@@ -51,7 +51,7 @@ impl SlotLock {
     ///
     /// Polls rather than blocking in `flock(2)`: a blocking call cannot be given a deadline
     /// without arming a signal to interrupt it, which is a great deal more machinery than
-    /// asking again in five milliseconds. Contention here is two processes, not two hundred.
+    /// asking again in five milliseconds. Contention here is a handful of processes, not hundreds.
     pub fn acquire(path: &Path, wait: Duration) -> io::Result<SlotLock> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;

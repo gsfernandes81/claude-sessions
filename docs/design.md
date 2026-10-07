@@ -168,10 +168,14 @@ slot never marked closed.
 **Events apply in the order Claude Code fired them, not the order they land.** Each hook is a
 process claude forks (`/bin/sh -c …`), and that process's start time in `/proc` is when the
 event fired, however long the hook then takes to arrive — seen on 2.1.292, the start ticks rise
-in event order. The hook stamps its event with that time. For each field two events can race on
-— the conversation, live or closed, `busy`, `needs_you`, `background`, the wake-up — the record
-keeps the stamp of the event that last wrote it (`written`), and only an event at least as new
-writes it again; activity only moves forward. A late event of the conversation before the
+in event order. The hook stamps its event with that tick as wall-clock time (`clock::at_tick`,
+from `CLOCK_BOOTTIME`, the clock the ticks count on), so events fired in one tick tie. For each
+field two events can race on — the conversation, live or closed, `busy`, `needs_you`,
+`background`, the wake-up — the record keeps the stamp of the event that last wrote it
+(`written`), and only an event at least as new writes it again; activity only moves forward,
+and `first_prompt` is the earliest prompt fired. A new record is stamped when it is made, so
+nothing fired before it, such as the last hook of a claude whose slot name is being reused, can
+write it. A late event of the conversation before the
 current one (a `Stop` of the one `/clear` left) is dropped, and a newer one from a conversation
 the record has not heard start adopts it, as the lost `SessionStart` would have. A cron deleted
 before its create lands is remembered, so the late create is not taken. A hook run outside any
@@ -180,7 +184,10 @@ claude is stamped when it lands. `prompt_id` cannot do this: a prompt typed mid-
 
 What stays uncorrected, each until the next event of its kind: a turn drained from that queue
 fires no hook, so it reads idle except through its transcript's writes, as it did before async;
-and events fired within one 10 ms clock tick apply in landing order.
+events fired within one 10 ms clock tick apply in landing order; and a `SessionEnd`, which waits
+only 400 ms for the slot's lock, gives up behind an async hook stalled while holding it, so the
+record stays live with a dead process, which the menu shows as offloaded and `reconcile`
+settles.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:

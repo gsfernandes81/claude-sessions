@@ -16,7 +16,7 @@
 
 use crate::clock::Millis;
 use crate::json::{self, Value};
-use crate::registry::{SlotRecord, State, Timer};
+use crate::registry::{SlotRecord, Stamp, State, Timer};
 
 /// Whether the claude that fired this event is the slot's own process, or one nested under it.
 /// Decided in `bind.rs` from `/proc`, never from the payload alone.
@@ -183,7 +183,8 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, at: Millis) {
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written.conversation = at;
+    rec.written[Stamp::Conversation] = at;
+    rec.written[Stamp::Prompt] = at;
     rec.written.deleted.clear();
 }
 
@@ -210,7 +211,7 @@ pub fn apply(
         .session_id()
         .filter(|id| rec.session_id.as_deref() != Some(id))
     {
-        if at < rec.written.conversation {
+        if at < rec.written[Stamp::Conversation] {
             return Outcome::Ignored("an event of an earlier conversation");
         }
         begin_conversation(rec, id, at);
@@ -234,7 +235,7 @@ pub fn apply(
             if pid.is_some() {
                 // A different process cannot be running the old one's background work.
                 if (pid != rec.pid || proc_start != rec.proc_start)
-                    && claim(&mut rec.written.background, at)
+                    && claim(&mut rec.written[Stamp::Background], at)
                 {
                     rec.background.clear();
                 }
@@ -242,7 +243,7 @@ pub fn apply(
                 rec.proc_start = proc_start;
             }
             // Live even mid-offload: the process in front of the owner is the truth.
-            if claim(&mut rec.written.life, at) {
+            if claim(&mut rec.written[Stamp::Life], at) {
                 rec.state = State::Live;
             }
             active(rec, at);
@@ -252,38 +253,41 @@ pub fn apply(
                 ev.source(),
                 Some("startup") | Some("resume") | Some("clear") | Some("fork")
             ) {
-                if claim(&mut rec.written.busy, at) {
+                if claim(&mut rec.written[Stamp::Busy], at) {
                     rec.busy = false;
                     rec.ready_ms = Some(at);
                 }
-                if claim(&mut rec.written.needs_you, at) {
+                if claim(&mut rec.written[Stamp::NeedsYou], at) {
                     rec.needs_you = false;
                 }
             }
             Outcome::Changed
         }
         "UserPromptSubmit" => {
-            if rec.first_prompt.is_none() {
-                rec.first_prompt = ev.prompt().and_then(one_line);
+            // The earliest prompt fired, whichever lands first.
+            let first = ev.prompt().and_then(one_line);
+            if first.is_some() && (rec.first_prompt.is_none() || at < rec.written[Stamp::Prompt]) {
+                rec.first_prompt = first;
+                rec.written[Stamp::Prompt] = at;
             }
             active(rec, at);
-            if claim(&mut rec.written.busy, at) {
+            if claim(&mut rec.written[Stamp::Busy], at) {
                 rec.busy = true;
             }
-            if claim(&mut rec.written.needs_you, at) {
+            if claim(&mut rec.written[Stamp::NeedsYou], at) {
                 rec.needs_you = false;
             }
             Outcome::Changed
         }
         "Stop" => {
             active(rec, at);
-            if claim(&mut rec.written.busy, at) {
+            if claim(&mut rec.written[Stamp::Busy], at) {
                 rec.busy = false;
                 rec.last_stop_ms = Some(at);
             }
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running.
-            if claim(&mut rec.written.background, at) {
+            if claim(&mut rec.written[Stamp::Background], at) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
             Outcome::Changed
@@ -296,7 +300,7 @@ pub fn apply(
             let what = format!("subagent: {kind}");
             if rec.background.contains(&what) {
                 Outcome::Ignored("an agent of that type is already listed")
-            } else if claim(&mut rec.written.background, at) {
+            } else if claim(&mut rec.written[Stamp::Background], at) {
                 rec.background.push(what);
                 Outcome::Changed
             } else {
@@ -309,7 +313,7 @@ pub fn apply(
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
             Some(running) => {
-                if claim(&mut rec.written.background, at) {
+                if claim(&mut rec.written[Stamp::Background], at) {
                     rec.background = running;
                     Outcome::Changed
                 } else {
@@ -319,7 +323,7 @@ pub fn apply(
         },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
-                if claim(&mut rec.written.needs_you, at) {
+                if claim(&mut rec.written[Stamp::NeedsYou], at) {
                     rec.needs_you = true;
                     active(rec, at);
                     Outcome::Changed
@@ -339,7 +343,7 @@ pub fn apply(
                 Outcome::Ignored("clear and resume continue in the same process")
             }
             _ => {
-                if !claim(&mut rec.written.life, at) {
+                if !claim(&mut rec.written[Stamp::Life], at) {
                     return Outcome::Ignored("a newer start has landed");
                 }
                 rec.state = if rec.state == State::Offloading {
@@ -347,7 +351,7 @@ pub fn apply(
                 } else {
                     State::Closed
                 };
-                if claim(&mut rec.written.busy, at) {
+                if claim(&mut rec.written[Stamp::Busy], at) {
                     rec.busy = false;
                 }
                 Outcome::Changed
@@ -376,7 +380,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, at: Millis) -> Outcome {
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !claim(&mut rec.written.wakeup, at) {
+            if !claim(&mut rec.written[Stamp::Wakeup], at) {
                 return Outcome::Ignored("a newer wake-up has landed");
             }
             let stop = input
@@ -677,6 +681,74 @@ mod tests {
         assert_eq!(rec.state, State::Live);
         land(&mut rec, &[(end, 6_000)]);
         assert_eq!(rec.state, State::Closed, "calibration");
+    }
+
+    #[test]
+    fn events_fired_in_the_same_tick_both_apply() {
+        let agent =
+            |kind: &str| format!(r#"{{"hook_event_name":"SubagentStart","agent_type":"{kind}"}}"#);
+        let (a, b) = (agent("a"), agent("b"));
+        let mut rec = slot();
+        land(&mut rec, &[(&a, 2_000), (&b, 2_000)]);
+        assert_eq!(rec.background, ["subagent: a", "subagent: b"]);
+    }
+
+    #[test]
+    fn a_killed_process_late_events_do_not_reach_its_resumed_slot() {
+        let resume = r#"{"hook_event_name":"SessionStart","source":"resume","session_id":"first"}"#;
+        let stop = r#"{"hook_event_name":"Stop","session_id":"first","background_tasks":[
+            {"id":"a1","type":"subagent","status":"running","description":"x"}]}"#;
+        let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt",
+            "session_id":"first"}"#;
+        let mut rec = slot();
+        apply(
+            &mut rec,
+            &ev(resume),
+            9_000,
+            Binding::Own,
+            Some(200),
+            Some(8),
+        );
+        land(&mut rec, &[(stop, 3_000), (ask, 4_000)]);
+        assert!(rec.background.is_empty());
+        assert!(!rec.needs_you && !rec.busy);
+        assert_eq!(rec.state, State::Live);
+        land(&mut rec, &[(stop, 10_000), (ask, 11_000)]);
+        assert!(
+            !rec.background.is_empty() && rec.needs_you,
+            "calibration: newer ones are taken"
+        );
+    }
+
+    #[test]
+    fn the_first_prompt_is_the_earliest_fired() {
+        let said =
+            |text: &str| format!(r#"{{"hook_event_name":"UserPromptSubmit","prompt":"{text}"}}"#);
+        let (one, two) = (said("one"), said("two"));
+        let mut rec = slot();
+        land(&mut rec, &[(&one, 2_000), (&two, 3_000)]);
+        assert_eq!(rec.first_prompt.as_deref(), Some("one"), "calibration");
+        let mut rec = slot();
+        land(&mut rec, &[(&two, 3_000), (&one, 2_000)]);
+        assert_eq!(rec.first_prompt.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn a_new_record_refuses_what_fired_before_it() {
+        // The menu reuses a closed slot's name with a fresh record; the old claude's last hook
+        // can land after it.
+        let mut rec = SlotRecord::new("claude-1", 5_000);
+        let old = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt",
+            "session_id":"before"}"#;
+        assert!(matches!(
+            land(&mut rec, &[(old, 3_000)])[0],
+            Outcome::Ignored(_)
+        ));
+        assert_eq!(rec.session_id, None);
+        assert!(!rec.needs_you);
+        let start = r#"{"hook_event_name":"SessionStart","source":"startup","session_id":"new"}"#;
+        land(&mut rec, &[(start, 6_000)]);
+        assert_eq!(rec.session_id.as_deref(), Some("new"), "calibration");
     }
 
     // ── background work (issue #9) ──────────────────────────────────────────

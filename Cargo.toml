@@ -26,8 +26,8 @@ license = "AGPL-3.0-or-later"
 #
 # The syscalls needed are declared directly, each with a note on why its layout is the same
 # on both targets: flock in src/lockfile.rs; kill and the pidfd calls in src/signal.rs;
-# socket, send and recv for the socket-diagnostics netlink in src/sockdiag.rs; termios,
-# ioctl, poll, signal and read in src/term.rs.
+# socket, send and recv for the socket-diagnostics netlink in src/sockdiag.rs; clock_gettime
+# in src/clock.rs; termios, ioctl, poll, signal and read in src/term.rs.
 [dependencies]
 
 [profile.release]
@@ -35,7 +35,6 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-# Panics unwind, as they do in the tests. Aborting made any panic a SIGABRT and a core dump
-# in the cwd — a git checkout, for the menu (issue #6) — let a panicking hook exit non-zero,
-# which blocks a prompt, and killed the whole menu where the tests had seen a worker thread's
-# panic caught and reported.
+# Panics unwind, as they do in the tests. Aborting would make any panic a SIGABRT and a core
+# dump in the cwd (a git checkout, for the menu; issue #6), show a panicking synchronous hook
+# to the person, and kill the whole menu where the tests see a worker thread's panic caught.

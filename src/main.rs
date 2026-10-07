@@ -226,19 +226,12 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     };
 
-    let me = std::process::id();
-    let binding = bind::binding_for(me, ev.fired_in_subagent());
-    let claude = procinfo::ancestor_named(me, "claude", 8);
-    // The process claude forked to run this hook started when the event fired, however long
-    // the hook then took to get here.
-    let at = claude
-        .and_then(|c| procinfo::started_by(me, c))
-        .and_then(procinfo::started_ms)
-        .unwrap_or_else(clock::now);
-
+    let origin = bind::origin(std::process::id(), ev.fired_in_subagent());
+    let binding = origin.binding;
+    let at = origin.fired_at.unwrap_or_else(clock::now);
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.
-    let own_pid = claude.filter(|_| binding == Binding::Own);
+    let own_pid = origin.claude.filter(|_| binding == Binding::Own);
     let own_start = own_pid.and_then(procinfo::start_time);
 
     // A SessionEnd for /clear or /resume changes nothing — the same process goes on, and its
@@ -249,8 +242,8 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // SessionEnd hooks share a 1.5 s budget. Nothing waits on the others, and a dropped
-    // UserPromptSubmit leaves a working claude reading as idle (issue #1).
+    // SessionEnd hooks share a 1.5 s budget; a dropped UserPromptSubmit leaves a working
+    // claude reading as idle (issue #1).
     let wait = if ev.name() == "SessionEnd" {
         lockfile::SESSION_END_WAIT
     } else {
@@ -273,9 +266,8 @@ fn cmd_hook() -> std::io::Result<()> {
         e
     })?;
 
-    let now = clock::now();
     let mut rec = registry::load(&slot)?.unwrap_or_else(|| {
-        let mut r = SlotRecord::new(&slot, now);
+        let mut r = SlotRecord::new(&slot, at);
         r.registered = registered;
         r
     });
@@ -284,7 +276,7 @@ fn cmd_hook() -> std::io::Result<()> {
             if let Some(titles) = &titles {
                 events::apply_titles(&mut rec, titles);
             }
-            rec.updated_ms = now;
+            rec.updated_ms = clock::now();
             registry::store(&rec)
         }
         Outcome::Ignored(_why) => Ok(()),

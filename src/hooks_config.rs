@@ -40,18 +40,12 @@ pub const EVENTS: [&str; 8] = [
     "SessionEnd",
 ];
 
-/// How Claude Code runs an event's hook; the module header says why.
-#[derive(Debug, PartialEq, Eq)]
-enum Run {
-    Async,
-    Sync { timeout_secs: u32 },
-}
-
-fn run(event: &str) -> Run {
+/// The timeout of a synchronous hook; `None` runs it async. The module header says why.
+fn timeout_secs(event: &str) -> Option<u32> {
     match event {
-        "SessionStart" => Run::Sync { timeout_secs: 30 },
-        "SessionEnd" => Run::Sync { timeout_secs: 1 },
-        _ => Run::Async,
+        "SessionStart" => Some(30),
+        "SessionEnd" => Some(1),
+        _ => None,
     }
 }
 
@@ -63,9 +57,9 @@ pub fn settings(exe: &str) -> Value {
         let mut handler = Value::obj();
         handler.set("type", Value::string("command"));
         handler.set("command", Value::string(command.as_str()));
-        match run(event) {
-            Run::Async => handler.set("async", Value::Bool(true)),
-            Run::Sync { timeout_secs } => handler.set("timeout", Value::num(timeout_secs)),
+        match timeout_secs(event) {
+            Some(secs) => handler.set("timeout", Value::num(secs)),
+            None => handler.set("async", Value::Bool(true)),
         }
         let mut group = Value::obj();
         if event == "PostToolUse" {

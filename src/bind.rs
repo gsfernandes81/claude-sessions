@@ -10,6 +10,7 @@
 //! A hook's claude is the slot's own only when it is the direct child of that slot's zmx
 //! daemon. Anything else is work running under the slot.
 
+use crate::clock::{self, Millis};
 use crate::events::Binding;
 use crate::procinfo;
 
@@ -20,30 +21,40 @@ pub fn slot_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Decide the binding for the claude that fired this hook.
+/// What a hook learns from its line of parents.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Origin {
+    pub binding: Binding,
+    /// The nearest claude above the hook: the one that fired it.
+    pub claude: Option<u32>,
+    /// When it fired: the start of the process that claude forked to run the hook, which a
+    /// stall after the fork does not move.
+    pub fired_at: Option<Millis>,
+}
+
+/// Where the hook `hook_pid` came from.
 ///
-/// `hook_pid` is the hook process itself; its claude is an ancestor. We look for the nearest
-/// `claude` above us, then ask whether ITS parent is a `zmx` daemon. One generation is the
-/// whole test: the daemon forks the session's command directly (seen on zmx 0.8.1), so the
-/// slot's own claude has zmx as its parent and a nested one has another claude (or a shell)
-/// in between.
-///
-/// A hook fired in a subagent's own context is a cheaper answer when the payload says so
-/// (`Event::fired_in_subagent`), so the caller passes it; a `claude -p` from a shell carries
-/// no such field and still needs this.
-pub fn binding_for(hook_pid: u32, fired_in_subagent: bool) -> Binding {
-    if fired_in_subagent {
-        return Binding::Nested;
-    }
-    // At most a few generations: hook -> sh -> claude is the usual shape, and a deep walk
-    // would start finding unrelated claudes in a container that runs several.
-    let Some(claude) = procinfo::ancestor_named(hook_pid, "claude", 8) else {
-        // No claude above us at all. Something ran the hook by hand; treat it as nested
-        // rather than letting it rebind a slot it may know nothing about.
-        return Binding::Nested;
+/// Its claude is the slot's own when that claude's parent is a `zmx` daemon: the daemon forks
+/// the session's command directly (seen on zmx 0.8.1), so a nested claude has another claude
+/// or a shell in between. A hook fired in a subagent's own context is nested whatever the
+/// tree says (`Event::fired_in_subagent`). No claude above at all is something running the
+/// hook by hand, which must not rebind a slot it may know nothing about.
+pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Origin {
+    // hook -> sh -> claude -> zmx is the usual shape; a deeper walk would start finding
+    // unrelated claudes in a container that runs several.
+    let line = procinfo::lineage(hook_pid, 9);
+    let Some(at) = line.iter().skip(1).position(|(_, comm)| comm == "claude") else {
+        return Origin {
+            binding: Binding::Nested,
+            claude: None,
+            fired_at: None,
+        };
     };
-    match procinfo::parent(claude).and_then(procinfo::comm) {
-        Some(parent) if parent == "zmx" => Binding::Own,
-        _ => Binding::Nested,
+    let (forked, claude) = (line[at].0, line[at + 1].0);
+    let own = !fired_in_subagent && line.get(at + 2).is_some_and(|(_, comm)| comm == "zmx");
+    Origin {
+        binding: if own { Binding::Own } else { Binding::Nested },
+        claude: Some(claude),
+        fired_at: procinfo::start_time(forked).and_then(clock::at_tick),
     }
 }

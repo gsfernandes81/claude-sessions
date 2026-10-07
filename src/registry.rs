@@ -76,26 +76,52 @@ pub struct Timer {
     pub recurring: bool,
 }
 
-/// When Claude Code fired the event that last wrote each field. Hooks run async and can land
-/// in any order, so a field takes a write only from an event at least as new as its stamp.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Written {
-    pub conversation: Millis,
+/// A field two hook events can race on.
+#[derive(Debug, Clone, Copy)]
+pub enum Stamp {
+    Conversation,
     /// `state`, between a start and an end.
-    pub life: Millis,
-    pub busy: Millis,
-    pub needs_you: Millis,
-    pub background: Millis,
-    pub wakeup: Millis,
+    Life,
+    Busy,
+    NeedsYou,
+    Background,
+    Wakeup,
+    /// `first_prompt`, which the earliest prompt takes rather than the latest.
+    Prompt,
+}
+
+const STAMPS: [&str; 7] = [
+    "conversation",
+    "life",
+    "busy",
+    "needs_you",
+    "background",
+    "wakeup",
+    "prompt",
+];
+
+/// When Claude Code fired the event that last wrote each raced field. Hooks run async and land
+/// in any order, so a field takes a write only from an event at least as new as its stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written {
+    at: [Millis; STAMPS.len()],
     /// Crons whose delete landed before their create, by timer id.
     pub deleted: BTreeMap<String, Millis>,
 }
 
 impl Written {
+    /// Nothing fired before `at` may write a record made then.
+    pub fn new(at: Millis) -> Written {
+        Written {
+            at: [at; STAMPS.len()],
+            deleted: BTreeMap::new(),
+        }
+    }
+
     fn to_json(&self) -> Value {
         let mut o = Value::obj();
-        for (k, at) in self.stamps() {
-            o.set(k, Value::num(at as f64));
+        for (name, at) in STAMPS.iter().zip(self.at) {
+            o.set(name, Value::num(at as f64));
         }
         let mut deleted = Value::obj();
         for (id, at) in &self.deleted {
@@ -106,39 +132,34 @@ impl Written {
     }
 
     fn from_json(v: Option<&Value>) -> Written {
-        let at = |k: &str| {
-            v.and_then(|v| v.get(k))
+        let mut w = Written::new(0);
+        for (name, at) in STAMPS.iter().zip(&mut w.at) {
+            *at = v
+                .and_then(|v| v.get(name))
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-        };
-        let mut deleted = BTreeMap::new();
+                .unwrap_or(0);
+        }
         if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
             for (id, t) in m {
                 if let Some(t) = t.as_u64() {
-                    deleted.insert(id.clone(), t);
+                    w.deleted.insert(id.clone(), t);
                 }
             }
         }
-        Written {
-            conversation: at("conversation"),
-            life: at("life"),
-            busy: at("busy"),
-            needs_you: at("needs_you"),
-            background: at("background"),
-            wakeup: at("wakeup"),
-            deleted,
-        }
+        w
     }
+}
 
-    fn stamps(&self) -> [(&'static str, Millis); 6] {
-        [
-            ("conversation", self.conversation),
-            ("life", self.life),
-            ("busy", self.busy),
-            ("needs_you", self.needs_you),
-            ("background", self.background),
-            ("wakeup", self.wakeup),
-        ]
+impl std::ops::Index<Stamp> for Written {
+    type Output = Millis;
+    fn index(&self, s: Stamp) -> &Millis {
+        &self.at[s as usize]
+    }
+}
+
+impl std::ops::IndexMut<Stamp> for Written {
+    fn index_mut(&mut self, s: Stamp) -> &mut Millis {
+        &mut self.at[s as usize]
     }
 }
 
@@ -222,7 +243,7 @@ impl SlotRecord {
             registered: true,
             updated_ms: now,
             last_event_ms: BTreeMap::new(),
-            written: Written::default(),
+            written: Written::new(now),
         }
     }
 
@@ -509,7 +530,7 @@ mod tests {
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
         rec.first_prompt = Some("move the tunnel to the new box".into());
-        rec.written.busy = 1_500;
+        rec.written[Stamp::Busy] = 1_500;
         rec.written.deleted.insert("cron:c1".into(), 1_600);
         rec.state = State::Offloaded;
         rec.needs_you = true;

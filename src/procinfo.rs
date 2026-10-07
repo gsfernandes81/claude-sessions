@@ -78,62 +78,34 @@ pub fn comm(pid: u32) -> Option<String> {
     Some(stat[open..close].to_string())
 }
 
-/// Walk up from `pid` looking for an ancestor whose `comm` is `name`, at most `limit` steps.
-///
-/// Used for the one question the hook has to answer before it writes anything: is the claude
-/// that fired this event the slot's own, or a nested one? A nested claude inherits
-/// `CLAUDE_SESSIONS_SLOT` from its parent and would otherwise rebind the slot to its own
-/// short-lived conversation.
+/// `pid` and up to `limit` of its ancestors, nearest first, with each one's `comm`.
+pub fn lineage(pid: u32, limit: usize) -> Vec<(u32, String)> {
+    let mut line = Vec::new();
+    let mut cur = pid;
+    while line.len() <= limit && cur > 1 {
+        let Some(name) = comm(cur) else { break };
+        line.push((cur, name));
+        match parent(cur) {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    line
+}
+
+/// The nearest ancestor of `pid` whose `comm` is `name`, at most `limit` steps up.
 pub fn ancestor_named(pid: u32, name: &str, limit: usize) -> Option<u32> {
-    let mut cur = pid;
-    for _ in 0..limit {
-        let p = parent(cur)?;
-        if p <= 1 {
-            return None;
-        }
-        if comm(p).as_deref() == Some(name) {
-            return Some(p);
-        }
-        cur = p;
-    }
-    None
-}
-
-/// The process on `pid`'s line of parents, `pid` included, that `ancestor` started itself.
-pub fn started_by(pid: u32, ancestor: u32) -> Option<u32> {
-    let mut cur = pid;
-    for _ in 0..16 {
-        match parent(cur)? {
-            p if p == ancestor => return Some(cur),
-            p if p <= 1 => return None,
-            p => cur = p,
-        }
-    }
-    None
-}
-
-/// When a process started, in wall-clock milliseconds.
-pub fn started_ms(pid: u32) -> Option<crate::clock::Millis> {
-    let age = age(start_time(pid)?)?;
-    Some(crate::clock::now().saturating_sub(age.as_millis() as crate::clock::Millis))
+    lineage(pid, limit)
+        .into_iter()
+        .skip(1)
+        .find(|(_, comm)| comm == name)
+        .map(|(p, _)| p)
 }
 
 /// How long ago a process started, from its start time in clock ticks.
-///
-/// `/proc/<pid>/stat` counts start time in `USER_HZ` ticks since boot, and `USER_HZ` is 100 on
-/// every Linux the binary ships for — it is part of the kernel's user ABI, fixed regardless of
-/// the kernel's internal `HZ`. `None` when the uptime cannot be read.
 pub fn age(start_ticks: u64) -> Option<std::time::Duration> {
-    let uptime: f64 = fs::read_to_string("/proc/uptime")
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    let started = start_ticks as f64 / 100.0;
-    Some(std::time::Duration::from_secs_f64(
-        (uptime - started).max(0.0),
-    ))
+    let ns = crate::clock::since_tick_ns(start_ticks)?.max(0);
+    Some(std::time::Duration::from_nanos(u64::try_from(ns).ok()?))
 }
 
 /// One row of a `/proc` snapshot.
@@ -294,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grandchild_was_started_by_way_of_our_child_and_at_its_start() {
+    fn a_lineage_runs_up_through_our_child_and_its_start_is_one_moment() {
         let before = crate::clock::now();
         let mut child = std::process::Command::new("sh")
             .args(["-c", "sleep 30 & wait"])
@@ -313,18 +285,30 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert_eq!(started_by(grandchild, me), Some(child.id()));
-        assert_eq!(started_by(child.id(), me), Some(child.id()));
+        let line: Vec<u32> = lineage(grandchild, 2).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(line, [grandchild, child.id(), me]);
+        assert_eq!(ancestor_named(grandchild, "sh", 4), Some(child.id()));
         assert_eq!(
-            started_by(grandchild, grandchild),
+            ancestor_named(grandchild, "sleep", 4),
             None,
-            "calibration: not an ancestor"
+            "calibration: not itself"
         );
-        let at = started_ms(child.id()).unwrap();
-        // Clock ticks are 10 ms, and uptime is read a moment after the clock.
+        let tick = start_time(child.id()).unwrap();
+        let at = crate::clock::at_tick(tick).unwrap();
         assert!(
-            at + 50 >= before && at <= crate::clock::now() + 50,
+            at + 10 >= before && at <= crate::clock::now(),
             "{before} {at}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(7));
+        assert_eq!(
+            crate::clock::at_tick(tick),
+            Some(at),
+            "one tick reads the same later"
+        );
+        assert_eq!(
+            crate::clock::at_tick(tick + 1),
+            Some(at + 10),
+            "calibration"
         );
         let _ = std::process::Command::new("kill")
             .args(["-9", &grandchild.to_string()])
