@@ -64,6 +64,12 @@ impl Event {
     pub fn prompt(&self) -> Option<&str> {
         self.s("prompt")
     }
+    /// The turn this event belongs to: a `UserPromptSubmit` opens every turn — one a finished
+    /// background task wakes included — with a new id, and every later event of the turn carries
+    /// it (seen on 2.1.292). Absent before the process's first prompt.
+    pub fn prompt_id(&self) -> Option<&str> {
+        self.s("prompt_id")
+    }
     /// `SessionEnd`: clear | resume | logout | prompt_input_exit | other.
     pub fn reason(&self) -> Option<&str> {
         self.s("reason")
@@ -248,19 +254,37 @@ pub fn apply(
             }
             Outcome::Changed
         }
+        // The hooks run in the background (`hooks_config`), so two of one slot can land in either
+        // order, and the turn ids put back the one order that matters: a turn's `Stop` after its
+        // `UserPromptSubmit`. Without an id on both, events apply in the order they land.
         "UserPromptSubmit" => {
             if rec.first_prompt.is_none() {
                 rec.first_prompt = ev.prompt().and_then(one_line);
             }
-            rec.busy = true;
-            rec.needs_you = false;
-            rec.last_activity_ms = now;
+            // This turn's `Stop` landed first: the turn it would mark busy is already over.
+            let over =
+                !rec.busy && ev.prompt_id().is_some() && ev.prompt_id() == rec.turn.as_deref();
+            if !over {
+                rec.busy = true;
+                rec.needs_you = false;
+                rec.last_activity_ms = now;
+                rec.turn = ev.prompt_id().map(str::to_string);
+            }
             Outcome::Changed
+        }
+        // The `Stop` of an earlier turn, landing after the next turn's `UserPromptSubmit`: the
+        // turn running now is not over, and the list it carries is that earlier turn's.
+        "Stop"
+            if rec.busy
+                && matches!((ev.prompt_id(), rec.turn.as_deref()), (Some(p), Some(t)) if p != t) =>
+        {
+            Outcome::Ignored("a Stop from an earlier turn")
         }
         "Stop" => {
             rec.busy = false;
             rec.last_activity_ms = now;
             rec.last_stop_ms = Some(now);
+            rec.turn = ev.prompt_id().map(str::to_string);
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running, and a task finishing wakes
             // claude for a turn that ends in another `Stop`.
@@ -473,6 +497,79 @@ mod tests {
     }
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
         apply(rec, e, now, Binding::Own, Some(100), Some(7))
+    }
+
+    // ── hooks landing out of order ──────────────────────────────────────────
+
+    fn prompt(id: &str) -> Event {
+        ev(&format!(
+            r#"{{"hook_event_name":"UserPromptSubmit","prompt":"go","prompt_id":"{id}"}}"#
+        ))
+    }
+    fn stop(id: &str) -> Event {
+        ev(&format!(
+            r#"{{"hook_event_name":"Stop","prompt_id":"{id}","background_tasks":[]}}"#
+        ))
+    }
+
+    #[test]
+    fn a_turns_prompt_landing_after_its_stop_leaves_the_slot_idle() {
+        // Calibration: in order, the turn is busy and then over.
+        let mut rec = slot();
+        own(&mut rec, &prompt("p1"), 2_000);
+        assert!(rec.busy);
+        own(&mut rec, &stop("p1"), 3_000);
+        assert!(!rec.busy);
+        // Swapped: the Stop lands first, and the prompt that follows is that same turn's.
+        let mut rec = slot();
+        own(&mut rec, &stop("p1"), 3_000);
+        assert_eq!(own(&mut rec, &prompt("p1"), 3_100), Outcome::Changed);
+        assert!(!rec.busy, "the turn is over");
+        assert_eq!(
+            rec.last_activity_ms, 3_000,
+            "and its prompt is not newer activity"
+        );
+        assert_eq!(
+            rec.first_prompt.as_deref(),
+            Some("go"),
+            "the title still learns it"
+        );
+        // The next turn is a new id, and busy as ever.
+        own(&mut rec, &prompt("p2"), 4_000);
+        assert!(rec.busy);
+    }
+
+    #[test]
+    fn an_earlier_turns_stop_landing_after_the_next_prompt_leaves_it_busy() {
+        let mut rec = slot();
+        own(&mut rec, &prompt("p1"), 2_000);
+        own(&mut rec, &prompt("p2"), 5_000);
+        let late = ev(
+            r#"{"hook_event_name":"Stop","prompt_id":"p1","background_tasks":[
+            {"id":"a1","type":"subagent","status":"running","description":"finished since"}]}"#,
+        );
+        assert!(matches!(own(&mut rec, &late, 5_100), Outcome::Ignored(_)));
+        assert!(rec.busy, "p2 is still running");
+        assert!(rec.background.is_empty(), "and the stale list is not taken");
+        // Calibration: p2's own Stop ends it.
+        own(&mut rec, &stop("p2"), 6_000);
+        assert!(!rec.busy);
+    }
+
+    #[test]
+    fn without_turn_ids_events_apply_in_the_order_they_land() {
+        // A version that sends no `prompt_id` gets exactly what it got before: the last word wins.
+        let mut rec = slot();
+        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 2_000);
+        own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#),
+            2_100,
+        );
+        assert!(rec.busy);
+        own(&mut rec, &prompt("p1"), 3_000);
+        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 4_000);
+        assert!(!rec.busy, "a Stop with no id ends whatever is running");
     }
 
     // ── background work (issue #9) ──────────────────────────────────────────

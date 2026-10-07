@@ -23,10 +23,12 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
 - **The approved mockups are binding.** [`docs/mockups.md`](docs/mockups.md) was approved by
   the owner on 2026-10-01. Phase 4 renders to those screens; a change to them needs the
   owner, not a judgement call. The colour assignment in that file is part of the approval.
-- **`claude-sessions hook` always exits 0.** `UserPromptSubmit`, `Stop` and `SubagentStop`
-  are *blocking* hooks: a non-zero exit on the first blocks the prompt, and on the others
-  makes Claude (or its subagent) carry on as though it had more to do. A registry bug must
-  never wedge a session. It logs its own failures to its own log and returns 0 — a panic
+- **`claude-sessions hook` always exits 0, and says nothing.** `UserPromptSubmit`, `Stop` and
+  `SubagentStop` are *blocking* events: a non-zero exit on the first blocks the prompt, and on
+  the others makes Claude (or its subagent) carry on as though it had more to do. Ours run
+  `async` since 0.4.6, so nothing waits on them, but an async hook's non-zero exit or stderr
+  is still handed to Claude on its next turn, and `SessionStart`/`SessionEnd` are synchronous.
+  A registry bug must never wedge a session or talk to it. It logs its own failures to its own log and returns 0 — a panic
   included, which is caught. A test pins this, naming those events. Nothing in the binary
   uses `print!`/`println!`/`eprintln!` (they panic on a closed terminal or pipe; issue #6),
   and a lint enforces it.

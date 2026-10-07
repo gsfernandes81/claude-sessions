@@ -99,6 +99,9 @@ pub struct SlotRecord {
     pub first_prompt: Option<String>,
     pub state: State,
     pub busy: bool,
+    /// The turn `busy` was last set or cleared for: the `prompt_id` of the `UserPromptSubmit`
+    /// or `Stop` that did it. What lets a late hook be told from a current one (`events`).
+    pub turn: Option<String>,
     pub needs_you: bool,
     pub last_activity_ms: Millis,
     /// When the owner last had this slot on their screen. Written by the menu, never by a
@@ -145,6 +148,7 @@ impl SlotRecord {
             first_prompt: None,
             state: State::Live,
             busy: false,
+            turn: None,
             needs_you: false,
             last_activity_ms: now,
             last_attach_ms: 0,
@@ -240,6 +244,7 @@ impl SlotRecord {
         set_opt_str(&mut o, "transcript_path", self.transcript_path.as_deref());
         set_opt_str(&mut o, "first_prompt", self.first_prompt.as_deref());
         o.set("busy", Value::Bool(self.busy));
+        set_opt_str(&mut o, "turn", self.turn.as_deref());
         o.set("needs_you", Value::Bool(self.needs_you));
         o.set("registered", Value::Bool(self.registered));
         o.set("last_activity_ms", Value::num(self.last_activity_ms as f64));
@@ -324,6 +329,7 @@ impl SlotRecord {
             first_prompt: str_of(v, "first_prompt"),
             state: State::parse(v.get("state").and_then(Value::as_str).unwrap_or("live")),
             busy: v.get("busy").and_then(Value::as_bool).unwrap_or(false),
+            turn: str_of(v, "turn"),
             needs_you: v.get("needs_you").and_then(Value::as_bool).unwrap_or(false),
             last_activity_ms: v
                 .get("last_activity_ms")
@@ -439,6 +445,7 @@ mod tests {
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
         rec.first_prompt = Some("move the tunnel to the new box".into());
+        rec.turn = Some("d5aa51d7-a1a1-4e1e-82de-27da64b69bd1".into());
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
@@ -455,6 +462,7 @@ mod tests {
         assert_eq!(back.proc_start, Some(99));
         assert_eq!(back.state, State::Offloaded);
         assert_eq!(back.first_prompt, rec.first_prompt);
+        assert_eq!(back.turn, rec.turn);
         assert!(back.needs_you);
         assert_eq!(back.timers, rec.timers);
         assert_eq!(back.last_event_ms.get("Stop"), Some(&2_000));

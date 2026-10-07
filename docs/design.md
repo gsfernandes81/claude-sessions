@@ -146,8 +146,8 @@ terminal.
 | event | registry effect |
 |---|---|
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms = now`; `compact` changes none of those |
-| `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
-| `Stop` | `last_activity = now`, idle since now; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
+| `UserPromptSubmit` | `last_activity = now`, busy, clear `needs_you`, `turn` = its `prompt_id`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort. **Not busy if its own turn's `Stop` landed first** (`turn` is already its id and the slot is idle) |
+| `Stop` | `last_activity = now`, idle since now, `turn` = its `prompt_id`; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9). **Nothing if it is an earlier turn's**, landing while the slot is busy with a different `turn` |
 | `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
 | `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`, but one with no list is no news, not an empty list (#12); **not** activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
@@ -155,6 +155,23 @@ terminal.
 | `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
+
+**Every hook but `SessionStart` and `SessionEnd` runs `async`** (0.4.6): Claude Code starts it
+and carries on, never waiting for it and never timing it out. On or3's containers a hook that
+takes milliseconds ran past its 5 s timeout under the box's own disk and memory load; the
+prompt waited all 5 s, then Claude Code killed the hook and the event was lost. Async, a
+stalled hook costs the prompt nothing and its event lands late instead of never. The cost is
+order: two hooks of one slot can now land either way round. `prompt_id` puts back the order the
+offloader depends on: every turn opens with a `UserPromptSubmit` carrying a new id, a turn woken
+by a finished background task included, and every later event of the turn carries the same id
+(seen on 2.1.292). So a prompt landing after its own turn's `Stop` does not mark the slot busy
+again, and an earlier turn's `Stop` landing after the next prompt does not mark it idle. Two
+orders stay uncorrected, both on the side of keeping a slot or showing too little: a
+`Notification` landing before its own turn's `UserPromptSubmit` has its `needs_you` cleared by
+it, and a turn ended by Esc (no `Stop`), whose next turn's `Stop` lands before that turn's
+prompt, reads busy until the turn after. `SessionStart` stays synchronous because Claude Code's
+first reply waits for it anyway, without blocking your typing; `SessionEnd`, because a hook
+still running when claude exits leaves the slot never marked closed.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
@@ -352,8 +369,8 @@ is the choice and why:
   that is kept — nearly every slot, nearly always — never touches its lock, and `--dry-run`
   takes none at all. A candidate then takes its lock, re-reads its record and `/proc`, and
   decides again before anything is signalled. Hook events other than `SessionEnd` wait up to
-  2 s for a slot's lock (inside their 5 s timeout) rather than `SessionEnd`'s 400 ms, because a
-  dropped `UserPromptSubmit` leaves a working claude reading as idle.
+  2 s for a slot's lock rather than `SessionEnd`'s 400 ms (they run async, so nothing waits on
+  them), because a dropped `UserPromptSubmit` leaves a working claude reading as idle.
 - **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
   offloader writes `offloaded` (or `closed`) itself. A `hook.log` line per offload is expected.
@@ -948,7 +965,8 @@ chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
 ```
 
 It installs the eight events of the table and the status line, `PostToolUse` matched to
-exactly the three timer tools, with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
+exactly the three timer tools, every event but `SessionStart` and `SessionEnd` `async` (see
+*The event table*), with a 5 s timeout and **1 s on `SessionEnd`** — a longer one would raise the budget
 every `SessionEnd` hook on the box shares. `src/hooks_config.rs` has the reasons and the tests
 that hold it to the state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
