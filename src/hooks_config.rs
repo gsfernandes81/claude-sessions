@@ -14,14 +14,13 @@
 //!   matcher names exactly the timer tools and nothing that merely contains their names.
 //! - **Every event but `SessionStart` and `SessionEnd` is `async`**: Claude Code neither waits
 //!   for the hook nor times it out, so a stalled disk delays the event, not the prompt. Async
-//!   hooks of one slot can land out of order, which `events` handles. An async hook's non-zero
-//!   exit or stderr is handed to Claude, so the hook stays silent.
+//!   hooks of one slot can land out of order, which `events` handles.
 //! - **`SessionStart` and `SessionEnd` are synchronous**: claude's first reply waits for the
 //!   first anyway, and the second must finish before claude exits.
-//! - **`timeout` is seconds.** A `SessionEnd` hook with a timeout above 1.5 s *raises* the
-//!   budget all `SessionEnd` hooks share, which would slow every `/exit` on the box if this hook
-//!   ever hung — so ours is 1, inside the default budget. The hook's own lock wait is 400 ms.
-//!   Everything else gets 5, which Claude Code ignores on an async hook.
+//! - **`timeout` is seconds, and only a synchronous hook has one.** `SessionEnd` hooks share a
+//!   1.5 s budget that a longer timeout *raises*, slowing every `/exit` on the box, so ours is 1
+//!   and its lock wait 400 ms. `SessionStart`'s is above the hook's own lock wait: a stalled
+//!   disk then costs the first reply seconds rather than the slot its binding.
 //! - **No matcher on the other events**: `SessionStart` must see every source, including
 //!   `clear` and `fork`, and the notification types are told apart in `events.rs`, where the
 //!   reason for each is written down.
@@ -41,11 +40,20 @@ pub const EVENTS: [&str; 8] = [
     "SessionEnd",
 ];
 
-const TIMEOUT_SECS: u32 = 5;
-const SESSION_END_TIMEOUT_SECS: u32 = 1;
+/// How Claude Code runs an event's hook; the module header says why.
+#[derive(Debug, PartialEq, Eq)]
+enum Run {
+    Async,
+    Sync { timeout_secs: u32 },
+}
 
-/// Events Claude Code waits for; the module header says why.
-const SYNC: [&str; 2] = ["SessionStart", "SessionEnd"];
+fn run(event: &str) -> Run {
+    match event {
+        "SessionStart" => Run::Sync { timeout_secs: 30 },
+        "SessionEnd" => Run::Sync { timeout_secs: 1 },
+        _ => Run::Async,
+    }
+}
 
 /// The settings document, with `exe` as the path to this binary.
 pub fn settings(exe: &str) -> Value {
@@ -55,14 +63,9 @@ pub fn settings(exe: &str) -> Value {
         let mut handler = Value::obj();
         handler.set("type", Value::string("command"));
         handler.set("command", Value::string(command.as_str()));
-        let timeout = if event == "SessionEnd" {
-            SESSION_END_TIMEOUT_SECS
-        } else {
-            TIMEOUT_SECS
-        };
-        handler.set("timeout", Value::num(timeout));
-        if !SYNC.contains(&event) {
-            handler.set("async", Value::Bool(true));
+        match run(event) {
+            Run::Async => handler.set("async", Value::Bool(true)),
+            Run::Sync { timeout_secs } => handler.set("timeout", Value::num(timeout_secs)),
         }
         let mut group = Value::obj();
         if event == "PostToolUse" {
@@ -191,57 +194,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_end_stays_inside_the_shared_budget() {
-        let doc = installed();
-        for event in EVENTS {
-            let timeout = doc
-                .get("hooks")
-                .and_then(|h| h.get(event))
-                .and_then(Value::as_arr)
-                .and_then(|a| a.first())
-                .and_then(|g| g.get("hooks"))
-                .and_then(Value::as_arr)
-                .and_then(|a| a.first())
-                .and_then(|h| h.get("timeout"))
-                .and_then(Value::as_f64)
-                .expect("every handler has a timeout");
-            if event == "SessionEnd" {
-                assert!(
-                    timeout <= 1.5,
-                    "a longer timeout raises every SessionEnd's budget"
-                );
-            } else {
-                assert!(
-                    timeout <= 10.0,
-                    "{event}: a hung hook should not cost minutes"
-                );
-            }
-        }
+    fn handler<'a>(doc: &'a Value, event: &str) -> &'a Value {
+        doc.get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(Value::as_arr)
+            .and_then(|a| a.first())
+            .and_then(|g| g.get("hooks"))
+            .and_then(Value::as_arr)
+            .and_then(|a| a.first())
+            .expect("a handler")
     }
 
     #[test]
-    fn only_the_two_events_that_bound_a_session_are_waited_on() {
+    fn only_session_start_and_end_are_waited_on_and_only_they_time_out() {
         let doc = installed();
+        let hook_wait = crate::lockfile::HOOK_WAIT.as_secs_f64();
         for event in EVENTS {
-            let handler = doc
-                .get("hooks")
-                .and_then(|h| h.get(event))
-                .and_then(Value::as_arr)
-                .and_then(|a| a.first())
-                .and_then(|g| g.get("hooks"))
-                .and_then(Value::as_arr)
-                .and_then(|a| a.first())
-                .expect("a handler");
-            let async_ = handler.get("async").and_then(Value::as_bool);
-            if event == "SessionStart" || event == "SessionEnd" {
-                assert_eq!(async_, None, "{event} must finish before claude moves on");
-            } else {
-                assert_eq!(
-                    async_,
-                    Some(true),
-                    "{event} would make a prompt wait on the disk"
-                );
+            let h = handler(&doc, event);
+            let is_async = h.get("async").and_then(Value::as_bool) == Some(true);
+            let timeout = h.get("timeout").and_then(Value::as_f64);
+            match event {
+                "SessionEnd" => {
+                    assert!(!is_async);
+                    assert!(
+                        timeout.is_some_and(|t| t <= 1.5),
+                        "inside the shared budget"
+                    );
+                }
+                "SessionStart" => {
+                    assert!(!is_async);
+                    assert!(
+                        timeout.is_some_and(|t| t > hook_wait),
+                        "outlasts the lock wait"
+                    );
+                }
+                _ => {
+                    assert!(is_async, "{event} would make claude wait on the disk");
+                    assert_eq!(timeout, None, "{event}: an async hook is never timed out");
+                }
             }
         }
     }

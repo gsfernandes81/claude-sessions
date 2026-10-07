@@ -64,11 +64,6 @@ impl Event {
     pub fn prompt(&self) -> Option<&str> {
         self.s("prompt")
     }
-    /// The turn this event belongs to. Each turn opens with a `UserPromptSubmit` carrying a new
-    /// id, and its later events repeat it.
-    pub fn prompt_id(&self) -> Option<&str> {
-        self.s("prompt_id")
-    }
     /// `SessionEnd`: clear | resume | logout | prompt_input_exit | other.
     pub fn reason(&self) -> Option<&str> {
         self.s("reason")
@@ -165,26 +160,62 @@ fn needs_you_type(t: &str) -> bool {
     )
 }
 
-/// Apply an event to a record. `pid`/`proc_start` describe the slot's own claude, and are
-/// `None` when this event did not come from it.
+/// Takes a field stamped `written` for an event fired at `at`, unless a newer event has.
+fn claim(written: &mut Millis, at: Millis) -> bool {
+    let newer = at >= *written;
+    if newer {
+        *written = at;
+    }
+    newer
+}
+
+/// Activity only moves forward: an event landing late does not make the slot look newer.
+fn active(rec: &mut SlotRecord, at: Millis) {
+    rec.last_activity_ms = rec.last_activity_ms.max(at);
+}
+
+/// A different conversation in the same slot (after /clear, a resume, a fork): what described
+/// the old one must not describe the new one.
+fn begin_conversation(rec: &mut SlotRecord, id: &str, at: Millis) {
+    rec.session_id = Some(id.to_string());
+    rec.title = None;
+    rec.ai_title = None;
+    rec.first_prompt = None;
+    rec.transcript_path = None;
+    rec.last_event_ms.clear();
+    rec.written.conversation = at;
+    rec.written.deleted.clear();
+}
+
+/// Apply an event Claude Code fired at `at` to a record. `pid`/`proc_start` describe the
+/// slot's own claude, and are `None` when this event did not come from it.
 pub fn apply(
     rec: &mut SlotRecord,
     ev: &Event,
-    now: Millis,
+    at: Millis,
     binding: Binding,
     pid: Option<u32>,
     proc_start: Option<u64>,
 ) -> Outcome {
-    rec.last_event_ms.insert(ev.name().to_string(), now);
-
     // A nested claude is work, not a new identity, and its events keep the slot's activity
     // fresh. In-process agents are not nested: the slot's own claude fires their
     // `SubagentStart`/`SubagentStop`, which keep `background` (issues #9, #10).
     if binding == Binding::Nested {
-        rec.last_activity_ms = now;
-        rec.updated_ms = now;
+        seen(rec, ev, at);
+        active(rec, at);
         return Outcome::Changed;
     }
+
+    if let Some(id) = ev
+        .session_id()
+        .filter(|id| rec.session_id.as_deref() != Some(id))
+    {
+        if at < rec.written.conversation {
+            return Outcome::Ignored("an event of an earlier conversation");
+        }
+        begin_conversation(rec, id, at);
+    }
+    seen(rec, ev, at);
 
     // Every event from the slot's own claude names its current transcript; recorded so
     // "is there a conversation to resume" can be answered by the file existing (issue #5).
@@ -192,29 +223,8 @@ pub fn apply(
         rec.transcript_path = Some(p.to_string());
     }
 
-    let out = match ev.name() {
+    match ev.name() {
         "SessionStart" => {
-            if let Some(id) = ev.session_id() {
-                // A different conversation in the same slot — after /clear, a resume, a fork.
-                // What described the old one must not describe the new one: the title and the
-                // first prompt start again, rather than the menu showing last task's name on
-                // this task's row.
-                if rec.session_id.as_deref() != Some(id) {
-                    rec.title = None;
-                    rec.ai_title = None;
-                    rec.first_prompt = None;
-                    // The per-event times too: a `UserPromptSubmit` left over from the last
-                    // conversation reads as this one having been prompted, which misled
-                    // infra's own check on 2026-10-03. This event is the first of the new one.
-                    rec.last_event_ms.clear();
-                    rec.last_event_ms.insert(ev.name().to_string(), now);
-                    // The new conversation's own path, if this event carried one, was set above.
-                    if ev.transcript_path().is_none() {
-                        rec.transcript_path = None;
-                    }
-                }
-                rec.session_id = Some(id.to_string());
-            }
             if let Some(cwd) = ev.cwd() {
                 rec.cwd = Some(cwd.to_string());
             }
@@ -222,137 +232,135 @@ pub fn apply(
                 rec.title = Some(t.to_string());
             }
             if pid.is_some() {
-                // A different process cannot be running the old one's background work: a
-                // list recorded before a crash or an offload would otherwise hold the resumed
-                // slot until its first `Stop`.
-                if pid != rec.pid || proc_start != rec.proc_start {
+                // A different process cannot be running the old one's background work.
+                if (pid != rec.pid || proc_start != rec.proc_start)
+                    && claim(&mut rec.written.background, at)
+                {
                     rec.background.clear();
                 }
                 rec.pid = pid;
                 rec.proc_start = proc_start;
             }
-            // A start always means live, including one arriving mid-offload: the owner opened
-            // it faster than the offloader could stop it, and the process in front of them is
-            // the truth.
-            rec.state = State::Live;
-            rec.last_activity_ms = now;
-            // A start that opens a conversation leaves claude at its prompt, waiting: "you can
-            // type right away" (vendor hook docs, read 2026-10-03). That is idle, as after a
-            // Stop, so a slot opened and then left is offloadable like any other. `compact` is
-            // NOT one of these: auto-compaction can happen in the middle of a turn, the docs
-            // do not say otherwise, and a compaction must not make a working claude read as
-            // done — so it leaves `busy`, `needs_you` and readiness exactly as they were. A
-            // start with no source at all is treated the same way: no evidence of idleness.
+            // Live even mid-offload: the process in front of the owner is the truth.
+            if claim(&mut rec.written.life, at) {
+                rec.state = State::Live;
+            }
+            active(rec, at);
+            // Opening a conversation leaves claude idle at its prompt. `compact` can fire
+            // mid-turn, and a start with no source is no evidence, so both leave these alone.
             if matches!(
                 ev.source(),
                 Some("startup") | Some("resume") | Some("clear") | Some("fork")
             ) {
-                rec.busy = false;
-                rec.needs_you = false;
-                rec.ready_ms = Some(now);
+                if claim(&mut rec.written.busy, at) {
+                    rec.busy = false;
+                    rec.ready_ms = Some(at);
+                }
+                if claim(&mut rec.written.needs_you, at) {
+                    rec.needs_you = false;
+                }
             }
             Outcome::Changed
         }
-        // Hooks are async, so they can land out of order; `turn` keeps a turn's `Stop` after its
-        // prompt. Events without a `prompt_id` apply in landing order.
         "UserPromptSubmit" => {
             if rec.first_prompt.is_none() {
                 rec.first_prompt = ev.prompt().and_then(one_line);
             }
-            // This turn's `Stop` has already landed.
-            let over =
-                !rec.busy && ev.prompt_id().is_some() && ev.prompt_id() == rec.turn.as_deref();
-            if !over {
+            active(rec, at);
+            if claim(&mut rec.written.busy, at) {
                 rec.busy = true;
+            }
+            if claim(&mut rec.written.needs_you, at) {
                 rec.needs_you = false;
-                rec.last_activity_ms = now;
-                rec.turn = ev.prompt_id().map(str::to_string);
             }
             Outcome::Changed
         }
-        // An earlier turn's `Stop`, landing after the next prompt.
-        "Stop"
-            if rec.busy
-                && matches!((ev.prompt_id(), rec.turn.as_deref()), (Some(p), Some(t)) if p != t) =>
-        {
-            Outcome::Ignored("a Stop from an earlier turn")
-        }
         "Stop" => {
-            rec.busy = false;
-            rec.last_activity_ms = now;
-            rec.last_stop_ms = Some(now);
-            rec.turn = ev.prompt_id().map(str::to_string);
+            active(rec, at);
+            if claim(&mut rec.written.busy, at) {
+                rec.busy = false;
+                rec.last_stop_ms = Some(at);
+            }
             // The turn is over but its background work may not be (issue #9). Replaced, not
-            // merged: each `Stop` lists everything still running, and a task finishing wakes
-            // claude for a turn that ends in another `Stop`.
-            rec.background = ev.background_tasks().unwrap_or_default();
+            // merged: each `Stop` lists everything still running.
+            if claim(&mut rec.written.background, at) {
+                rec.background = ev.background_tasks().unwrap_or_default();
+            }
             Outcome::Changed
         }
-        // Agents between the parent's `Stop`s (issue #10), editing the list and nothing else:
-        // neither event is activity. An agent's work reaches the offloader as writes to its own
-        // transcript, and Claude Code sends `SubagentStop` for internal agents it never
-        // announced, at any time — after a `Stop` or an Esc too, where counting it would make an
-        // idle slot read busy until the owner's next turn.
+        // Agents between the parent's `Stop`s (issue #10) edit the list and are not activity:
+        // an agent's work shows as writes to its own transcript, and Claude Code sends
+        // `SubagentStop` for internal agents it never announced, after a `Stop` or an Esc too.
         "SubagentStart" => {
             let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
             let what = format!("subagent: {kind}");
             if rec.background.contains(&what) {
                 Outcome::Ignored("an agent of that type is already listed")
-            } else {
+            } else if claim(&mut rec.written.background, at) {
                 rec.background.push(what);
                 Outcome::Changed
+            } else {
+                Outcome::Ignored("a newer list has landed")
             }
         }
-        // Its payload carries the same list as `Stop`'s, so it is taken whole the same way. That
-        // list never names a foreground agent, so one an Esc cut off — which sends no
-        // `SubagentStop` of its own — leaves at the next one; and a background agent's own
-        // `SubagentStop` still names it, so it is held until the turn it wakes claude for. One
-        // with no list at all says nothing about what runs (claude-sessions#12): a version that
-        // stopped sending it must not wipe what `Stop` recorded on every unannounced agent.
+        // Its list is `Stop`'s and is taken whole the same way; it never names a foreground
+        // agent, so one an Esc cut off leaves at the next. A payload with no list says nothing
+        // about what runs (claude-sessions#12).
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
-            Some(now_running) if now_running == rec.background => {
-                Outcome::Ignored("the list is unchanged")
-            }
-            Some(now_running) => {
-                rec.background = now_running;
-                Outcome::Changed
+            Some(running) => {
+                if claim(&mut rec.written.background, at) {
+                    rec.background = running;
+                    Outcome::Changed
+                } else {
+                    Outcome::Ignored("a newer list has landed")
+                }
             }
         },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
-                rec.needs_you = true;
-                rec.last_activity_ms = now;
-                Outcome::Changed
+                if claim(&mut rec.written.needs_you, at) {
+                    rec.needs_you = true;
+                    active(rec, at);
+                    Outcome::Changed
+                } else {
+                    Outcome::Ignored("a newer prompt has landed")
+                }
             }
             Some("idle_prompt") => {
                 Outcome::Ignored("idle_prompt fires after every unanswered Stop")
             }
             _ => Outcome::Ignored("notification type does not mean a person is needed"),
         },
-        "PostToolUse" => apply_timer(rec, ev, now),
+        "PostToolUse" => apply_timer(rec, ev, at),
         "SessionEnd" => match ev.reason() {
             // Both are followed by a SessionStart in the same process.
             Some("clear") | Some("resume") => {
                 Outcome::Ignored("clear and resume continue in the same process")
             }
             _ => {
+                if !claim(&mut rec.written.life, at) {
+                    return Outcome::Ignored("a newer start has landed");
+                }
                 rec.state = if rec.state == State::Offloading {
                     State::Offloaded
                 } else {
                     State::Closed
                 };
-                rec.busy = false;
+                if claim(&mut rec.written.busy, at) {
+                    rec.busy = false;
+                }
                 Outcome::Changed
             }
         },
         _ => Outcome::Ignored("event not in the table"),
-    };
-
-    if out == Outcome::Changed {
-        rec.updated_ms = now;
     }
-    out
+}
+
+/// When each event was last seen, for `doctor`.
+fn seen(rec: &mut SlotRecord, ev: &Event, at: Millis) {
+    let last = rec.last_event_ms.entry(ev.name().to_string()).or_insert(at);
+    *last = (*last).max(at);
 }
 
 /// The tools whose `PostToolUse` sets or clears a timer. `hooks_config` installs the
@@ -364,30 +372,27 @@ pub const TIMER_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "CronDelete"
 /// `CronList` is not here and must not be: it reads timers, it does not create one. Nor is
 /// `TaskStop`, which stops a background task rather than a timer. A slot pinned open by a
 /// listing would never be offloadable again.
-fn apply_timer(rec: &mut SlotRecord, ev: &Event, now: Millis) -> Outcome {
+fn apply_timer(rec: &mut SlotRecord, ev: &Event, at: Millis) -> Outcome {
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
+            if !claim(&mut rec.written.wakeup, at) {
+                return Outcome::Ignored("a newer wake-up has landed");
+            }
             let stop = input
                 .and_then(|v| v.get("stop"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if stop {
-                let before = rec.timers.len();
                 rec.timers.retain(|t| t.id != "wakeup");
-                return if rec.timers.len() == before {
-                    Outcome::Ignored("no wake-up to stop")
-                } else {
-                    Outcome::Changed
-                };
+                return Outcome::Changed;
             }
             let delay = input
                 .and_then(|v| v.get("delaySeconds"))
                 .and_then(Value::as_f64);
-            // No delay means a payload shape this version does not know. Record the timer with
-            // no due time rather than guessing one: an unknown due date counts as pending,
-            // which errs towards keeping the session alive.
-            let due = delay.map(|d| now + (d.max(0.0) * 1000.0) as Millis);
+            // An unknown payload shape records no due time, which counts as pending: it errs
+            // towards keeping the session alive.
+            let due = delay.map(|d| at + (d.max(0.0) * 1000.0) as Millis);
             upsert(
                 rec,
                 Timer {
@@ -404,12 +409,15 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, now: Millis) -> Outcome {
                 .and_then(|v| v.get("id"))
                 .and_then(Value::as_str)
                 .or_else(|| input.and_then(|v| v.get("name")).and_then(Value::as_str))
-                .unwrap_or("cron")
-                .to_string();
+                .unwrap_or("cron");
+            let key = format!("cron:{id}");
+            if rec.written.deleted.get(&key).is_some_and(|&del| del >= at) {
+                return Outcome::Ignored("deleted before its create landed");
+            }
             upsert(
                 rec,
                 Timer {
-                    id: format!("cron:{id}"),
+                    id: key,
                     due_ms: None,
                     recurring: true,
                 },
@@ -420,21 +428,28 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, now: Millis) -> Outcome {
             let id = input
                 .and_then(|v| v.get("id").or_else(|| v.get("name")))
                 .and_then(Value::as_str);
-            let before = rec.timers.len();
             match id {
                 Some(id) => {
                     let key = format!("cron:{id}");
+                    let before = rec.timers.len();
                     rec.timers.retain(|t| t.id != key);
+                    // Not created yet as far as the record knows: its create may land later.
+                    if rec.timers.len() == before {
+                        rec.written.deleted.insert(key, at);
+                    }
+                    Outcome::Changed
                 }
-                // A delete whose target we cannot read is still a delete, and dropping every
-                // cron is the safe direction: the alternative is a slot pinned open forever by
-                // a timer that no longer exists.
-                None => rec.timers.retain(|t| !t.recurring),
-            }
-            if rec.timers.len() == before {
-                Outcome::Ignored("no such timer")
-            } else {
-                Outcome::Changed
+                // A delete whose target cannot be read drops every cron: the alternative is a
+                // slot pinned open forever by a timer that no longer exists.
+                None => {
+                    let before = rec.timers.len();
+                    rec.timers.retain(|t| !t.recurring);
+                    if rec.timers.len() == before {
+                        Outcome::Ignored("no such timer")
+                    } else {
+                        Outcome::Changed
+                    }
+                }
             }
         }
         _ => Outcome::Ignored("tool does not set a timer"),
@@ -497,76 +512,171 @@ mod tests {
     }
 
     // ── hooks landing out of order ──────────────────────────────────────────
+    // Each event is applied in the order it lands, with the time Claude Code fired it.
 
-    fn prompt(id: &str) -> Event {
-        ev(&format!(
-            r#"{{"hook_event_name":"UserPromptSubmit","prompt":"go","prompt_id":"{id}"}}"#
-        ))
-    }
-    fn stop(id: &str) -> Event {
-        ev(&format!(
-            r#"{{"hook_event_name":"Stop","prompt_id":"{id}","background_tasks":[]}}"#
-        ))
+    const PROMPT: &str = r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#;
+    const STOP: &str = r#"{"hook_event_name":"Stop","background_tasks":[]}"#;
+
+    fn land(rec: &mut SlotRecord, events: &[(&str, Millis)]) -> Vec<Outcome> {
+        events
+            .iter()
+            .map(|&(body, at)| own(rec, &ev(body), at))
+            .collect()
     }
 
     #[test]
-    fn a_turns_prompt_landing_after_its_stop_leaves_the_slot_idle() {
-        // Calibration: in order, the turn is busy and then over.
+    fn a_prompt_landing_after_its_turns_stop_leaves_the_slot_idle() {
         let mut rec = slot();
-        own(&mut rec, &prompt("p1"), 2_000);
-        assert!(rec.busy);
-        own(&mut rec, &stop("p1"), 3_000);
+        land(&mut rec, &[(PROMPT, 2_000), (STOP, 3_000)]);
+        assert!(!rec.busy, "calibration: in order");
+        let mut rec = slot();
+        land(&mut rec, &[(STOP, 3_000), (PROMPT, 2_000)]);
         assert!(!rec.busy);
-        // Swapped: the Stop lands first, and the prompt that follows is that same turn's.
+        assert_eq!(rec.last_stop_ms, Some(3_000));
+        assert_eq!(rec.last_activity_ms, 3_000);
+        assert_eq!(rec.first_prompt.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn a_stop_landing_after_the_next_prompt_leaves_it_busy() {
         let mut rec = slot();
-        own(&mut rec, &stop("p1"), 3_000);
-        assert_eq!(own(&mut rec, &prompt("p1"), 3_100), Outcome::Changed);
-        assert!(!rec.busy, "the turn is over");
-        assert_eq!(
-            rec.last_activity_ms, 3_000,
-            "and its prompt is not newer activity"
-        );
-        assert_eq!(
-            rec.first_prompt.as_deref(),
-            Some("go"),
-            "the title still learns it"
-        );
-        // The next turn is a new id, and busy as ever.
-        own(&mut rec, &prompt("p2"), 4_000);
+        land(&mut rec, &[(PROMPT, 2_000), (PROMPT, 5_000), (STOP, 3_000)]);
         assert!(rec.busy);
+        assert_eq!(rec.last_stop_ms, None);
+        land(&mut rec, &[(STOP, 6_000)]);
+        assert!(!rec.busy, "calibration: the newer turn's own Stop ends it");
     }
 
     #[test]
-    fn an_earlier_turns_stop_landing_after_the_next_prompt_leaves_it_busy() {
+    fn a_prompt_typed_mid_turn_landing_after_both_stops_leaves_it_idle() {
+        // The second prompt fires while the first turn runs, and its own turn fires no prompt.
         let mut rec = slot();
-        own(&mut rec, &prompt("p1"), 2_000);
-        own(&mut rec, &prompt("p2"), 5_000);
-        let late = ev(
-            r#"{"hook_event_name":"Stop","prompt_id":"p1","background_tasks":[
-            {"id":"a1","type":"subagent","status":"running","description":"finished since"}]}"#,
-        );
-        assert!(matches!(own(&mut rec, &late, 5_100), Outcome::Ignored(_)));
-        assert!(rec.busy, "p2 is still running");
-        assert!(rec.background.is_empty(), "and the stale list is not taken");
-        // Calibration: p2's own Stop ends it.
-        own(&mut rec, &stop("p2"), 6_000);
-        assert!(!rec.busy);
-    }
-
-    #[test]
-    fn without_turn_ids_events_apply_in_the_order_they_land() {
-        // A version that sends no `prompt_id` gets exactly what it got before: the last word wins.
-        let mut rec = slot();
-        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 2_000);
-        own(
+        land(
             &mut rec,
-            &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#),
-            2_100,
+            &[
+                (PROMPT, 1_000),
+                (STOP, 3_000),
+                (STOP, 4_000),
+                (PROMPT, 2_000),
+            ],
         );
+        assert!(!rec.busy);
+        assert_eq!(rec.last_stop_ms, Some(4_000));
+    }
+
+    #[test]
+    fn a_start_landing_after_the_first_prompt_leaves_it_busy() {
+        let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 2_000), (start, 1_000)]);
         assert!(rec.busy);
-        own(&mut rec, &prompt("p1"), 3_000);
-        own(&mut rec, &ev(r#"{"hook_event_name":"Stop"}"#), 4_000);
-        assert!(!rec.busy, "a Stop with no id ends whatever is running");
+        assert_eq!(rec.ready_ms, None);
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 2_000), (start, 2_500)]);
+        assert!(!rec.busy, "calibration: a newer start is at its prompt");
+    }
+
+    #[test]
+    fn the_previous_conversations_late_events_are_dropped() {
+        let mut rec = slot();
+        let clear = r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second",
+            "transcript_path":"/t/second.jsonl"}"#;
+        let late = r#"{"hook_event_name":"Stop","session_id":"first","transcript_path":"/t/first.jsonl",
+            "background_tasks":[{"id":"a1","type":"subagent","status":"running","description":"x"}]}"#;
+        let out = land(&mut rec, &[(clear, 5_000), (late, 3_000)]);
+        assert!(matches!(out[1], Outcome::Ignored(_)));
+        assert_eq!(rec.session_id.as_deref(), Some("second"));
+        assert_eq!(rec.transcript_path.as_deref(), Some("/t/second.jsonl"));
+        assert!(rec.background.is_empty());
+        assert_eq!(rec.last_stop_ms, None);
+        // Calibration: the same Stop from the current conversation is taken.
+        let own_stop = late.replace(r#""session_id":"first""#, r#""session_id":"second""#);
+        assert_eq!(land(&mut rec, &[(&own_stop, 6_000)])[0], Outcome::Changed);
+        assert_eq!(rec.background.len(), 1);
+    }
+
+    #[test]
+    fn a_newer_event_of_an_unknown_conversation_adopts_it() {
+        // Its SessionStart was lost: the slot follows the conversation it hears.
+        let mut rec = slot();
+        rec.title = Some("old".into());
+        let other = r#"{"hook_event_name":"UserPromptSubmit","prompt":"new","session_id":"third"}"#;
+        land(&mut rec, &[(other, 2_000)]);
+        assert_eq!(rec.session_id.as_deref(), Some("third"));
+        assert_eq!(rec.title, None);
+        assert_eq!(rec.first_prompt.as_deref(), Some("new"));
+        assert!(rec.busy);
+    }
+
+    #[test]
+    fn an_older_list_never_replaces_a_newer_one() {
+        let start = r#"{"hook_event_name":"SubagentStart","agent_type":"general-purpose"}"#;
+        let sub_stop = r#"{"hook_event_name":"SubagentStop","background_tasks":[]}"#;
+        // An agent announced before its turn's Stop, landing after it: the Stop listed it if
+        // it still ran.
+        let mut rec = slot();
+        land(&mut rec, &[(STOP, 3_000), (start, 2_000)]);
+        assert!(rec.background.is_empty());
+        // A list taken before an agent started, landing after the start.
+        let mut rec = slot();
+        land(&mut rec, &[(start, 5_000), (sub_stop, 4_000)]);
+        assert_eq!(rec.background, ["subagent: general-purpose"]);
+        land(&mut rec, &[(sub_stop, 6_000)]);
+        assert!(
+            rec.background.is_empty(),
+            "calibration: a newer list is taken"
+        );
+    }
+
+    #[test]
+    fn a_permission_prompt_landing_after_the_next_prompt_is_not_waiting() {
+        let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(ask, 2_000)]);
+        assert!(rec.needs_you, "calibration");
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 3_000), (ask, 2_000)]);
+        assert!(!rec.needs_you);
+    }
+
+    #[test]
+    fn a_cron_deleted_before_its_create_lands_is_not_pending() {
+        let create = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1"}}"#;
+        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(create, 2_000), (delete, 3_000)]);
+        assert!(rec.timers.is_empty(), "calibration: in order");
+        let mut rec = slot();
+        land(&mut rec, &[(delete, 3_000), (create, 2_000)]);
+        assert!(rec.timers.is_empty());
+        land(&mut rec, &[(create, 9_000)]);
+        assert_eq!(
+            rec.timers.len(),
+            1,
+            "a create after the delete is a new cron"
+        );
+    }
+
+    #[test]
+    fn a_wake_up_stopped_before_its_setting_lands_is_not_pending() {
+        let set = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":600}}"#;
+        let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(set, 2_000)]);
+        assert_eq!(rec.timers.len(), 1, "calibration");
+        land(&mut rec, &[(stop, 4_000), (set, 3_000)]);
+        assert!(rec.timers.is_empty());
+    }
+
+    #[test]
+    fn an_end_landing_after_a_newer_start_leaves_it_live() {
+        let start = r#"{"hook_event_name":"SessionStart","source":"startup"}"#;
+        let end = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(start, 5_000), (end, 4_000)]);
+        assert_eq!(rec.state, State::Live);
+        land(&mut rec, &[(end, 6_000)]);
+        assert_eq!(rec.state, State::Closed, "calibration");
     }
 
     // ── background work (issue #9) ──────────────────────────────────────────
@@ -608,10 +718,8 @@ mod tests {
         );
         assert_eq!(own(&mut rec, &still, 4_000), Outcome::Changed);
         assert_eq!(rec.background, ["subagent: look"]);
-        assert!(
-            matches!(own(&mut rec, &still, 4_100), Outcome::Ignored(_)),
-            "unchanged"
-        );
+        own(&mut rec, &still, 4_100);
+        assert_eq!(rec.background, ["subagent: look"], "unchanged");
         let none = ev(
             r#"{"hook_event_name":"SubagentStop","agent_id":"a941","agent_type":"","background_tasks":[]}"#,
         );
@@ -656,17 +764,12 @@ mod tests {
                 r#"{{"hook_event_name":"SubagentStop","agent_id":"f1","agent_type":"","background_tasks":[{{"id":"d1","type":"dream","status":"running","description":"dreaming"}}{also}]}}"#
             ))
         };
-        assert!(matches!(
-            own(&mut rec, &dream(""), 2_000),
-            Outcome::Ignored(_)
-        ));
+        own(&mut rec, &dream(""), 2_000);
         assert!(rec.background.is_empty());
         // Nor is its watch on an artifact it published, though the owner's own monitor is.
         let watch = r#",{"id":"m1","type":"monitor","status":"running","description":"live updates for artifact abc (Fleet board)"},{"id":"m3","type":"monitor","status":"running","description":"presence on artifact https://claude.ai/artifact/abc"}"#;
-        assert!(matches!(
-            own(&mut rec, &dream(watch), 2_500),
-            Outcome::Ignored(_)
-        ));
+        own(&mut rec, &dream(watch), 2_500);
+        assert!(rec.background.is_empty());
         let shell = r#",{"id":"b1","type":"shell","status":"running","description":"sleep 45"}"#;
         let mine = r#",{"id":"m2","type":"monitor","status":"running","description":"tail the build log"}"#;
         own(&mut rec, &dream(&format!("{shell}{mine}")), 3_000);

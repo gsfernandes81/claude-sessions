@@ -868,6 +868,8 @@ mod tests {
             r#"[{"id":"a90c","type":"subagent","status":"running","description":"look"}]"#;
         for agent in [Agent::None, Agent::Background, Agent::Foreground] {
             let (mut rec, mut seen) = idle();
+            rec.last_stop_ms = Some(t0 - 1_000);
+            rec.last_activity_ms = t0 - 1_000;
             hook(
                 &mut rec,
                 r#"{"hook_event_name":"UserPromptSubmit","prompt":"go"}"#,

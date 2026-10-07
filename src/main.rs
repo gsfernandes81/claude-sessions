@@ -93,12 +93,9 @@ fn main() -> ExitCode {
             say_nl!("{}", usage());
             ExitCode::SUCCESS
         }
-        // THE ONE SUBCOMMAND THAT MUST NOT FAIL. UserPromptSubmit, Stop and SubagentStop are
-        // blocking hooks: a non-zero exit on the first blocks the prompt, and on the others
-        // tells Claude (or its subagent) it has more to do. A registry bug must never wedge a
-        // session, so every failure in here is logged and swallowed.
-        // A panic too: it is logged here rather than printed, and caught, so even a bug that
-        // panics exits 0.
+        // THE ONE SUBCOMMAND THAT MUST NOT FAIL OR SPEAK: its stdout is fed to Claude, and a
+        // failing synchronous hook is shown to the person. Every failure is logged and
+        // swallowed, a panic included.
         "hook" => {
             std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
             match std::panic::catch_unwind(cmd_hook) {
@@ -229,12 +226,19 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     };
 
-    let binding = bind::binding_for(std::process::id(), ev.fired_in_subagent());
+    let me = std::process::id();
+    let binding = bind::binding_for(me, ev.fired_in_subagent());
+    let claude = procinfo::ancestor_named(me, "claude", 8);
+    // The process claude forked to run this hook started when the event fired, however long
+    // the hook then took to get here.
+    let at = claude
+        .and_then(|c| procinfo::started_by(me, c))
+        .and_then(procinfo::started_ms)
+        .unwrap_or_else(clock::now);
 
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.
-    let own_pid = procinfo::ancestor_named(std::process::id(), "claude", 8)
-        .filter(|_| binding == Binding::Own);
+    let own_pid = claude.filter(|_| binding == Binding::Own);
     let own_start = own_pid.and_then(procinfo::start_time);
 
     // A SessionEnd for /clear or /resume changes nothing — the same process goes on, and its
@@ -245,14 +249,12 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // SessionEnd hooks share a 1.5 s budget, so that one event may only risk SESSION_END_WAIT.
-    // Every other event has a 5 s hook timeout (hooks_config.rs) and waits longer: dropping a
-    // UserPromptSubmit because the lock was busy leaves a working claude reading as idle,
-    // which is the one mistake the offloader cannot survive (issue #1).
+    // SessionEnd hooks share a 1.5 s budget. Nothing waits on the others, and a dropped
+    // UserPromptSubmit leaves a working claude reading as idle (issue #1).
     let wait = if ev.name() == "SessionEnd" {
         lockfile::SESSION_END_WAIT
     } else {
-        lockfile::INTERACTIVE_WAIT
+        lockfile::HOOK_WAIT
     };
     // The conversation's titles, read before the lock — a transcript's tail is the slow part
     // of this hook, and the lock is what other hooks wait on (issue #1). Only the slot's own
@@ -277,12 +279,14 @@ fn cmd_hook() -> std::io::Result<()> {
         r.registered = registered;
         r
     });
-    let outcome = events::apply(&mut rec, &ev, now, binding, own_pid, own_start);
-    if let Some(titles) = &titles {
-        events::apply_titles(&mut rec, titles);
-    }
-    match outcome {
-        Outcome::Changed => registry::store(&rec),
+    match events::apply(&mut rec, &ev, at, binding, own_pid, own_start) {
+        Outcome::Changed => {
+            if let Some(titles) = &titles {
+                events::apply_titles(&mut rec, titles);
+            }
+            rec.updated_ms = now;
+            registry::store(&rec)
+        }
         Outcome::Ignored(_why) => Ok(()),
     }
 }

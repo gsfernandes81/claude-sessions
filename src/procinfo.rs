@@ -99,6 +99,25 @@ pub fn ancestor_named(pid: u32, name: &str, limit: usize) -> Option<u32> {
     None
 }
 
+/// The process on `pid`'s line of parents, `pid` included, that `ancestor` started itself.
+pub fn started_by(pid: u32, ancestor: u32) -> Option<u32> {
+    let mut cur = pid;
+    for _ in 0..16 {
+        match parent(cur)? {
+            p if p == ancestor => return Some(cur),
+            p if p <= 1 => return None,
+            p => cur = p,
+        }
+    }
+    None
+}
+
+/// When a process started, in wall-clock milliseconds.
+pub fn started_ms(pid: u32) -> Option<crate::clock::Millis> {
+    let age = age(start_time(pid)?)?;
+    Some(crate::clock::now().saturating_sub(age.as_millis() as crate::clock::Millis))
+}
+
 /// How long ago a process started, from its start time in clock ticks.
 ///
 /// `/proc/<pid>/stat` counts start time in `USER_HZ` ticks since boot, and `USER_HZ` is 100 on
@@ -270,6 +289,46 @@ mod tests {
                 .any(|p| p.pid == child.id() && p.comm == "sleep"),
             "the sleep we started should be under us"
         );
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn a_grandchild_was_started_by_way_of_our_child_and_at_its_start() {
+        let before = crate::clock::now();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .spawn()
+            .expect("spawn");
+        let me = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let grandchild = loop {
+            let t = table().expect("/proc lists");
+            if let Some(p) = descendants(&t, child.id()).first() {
+                break p.pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sleep never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(started_by(grandchild, me), Some(child.id()));
+        assert_eq!(started_by(child.id(), me), Some(child.id()));
+        assert_eq!(
+            started_by(grandchild, grandchild),
+            None,
+            "calibration: not an ancestor"
+        );
+        let at = started_ms(child.id()).unwrap();
+        // Clock ticks are 10 ms, and uptime is read a moment after the clock.
+        assert!(
+            at + 50 >= before && at <= crate::clock::now() + 50,
+            "{before} {at}"
+        );
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &grandchild.to_string()])
+            .status();
         child.kill().ok();
         child.wait().ok();
     }

@@ -76,6 +76,72 @@ pub struct Timer {
     pub recurring: bool,
 }
 
+/// When Claude Code fired the event that last wrote each field. Hooks run async and can land
+/// in any order, so a field takes a write only from an event at least as new as its stamp.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Written {
+    pub conversation: Millis,
+    /// `state`, between a start and an end.
+    pub life: Millis,
+    pub busy: Millis,
+    pub needs_you: Millis,
+    pub background: Millis,
+    pub wakeup: Millis,
+    /// Crons whose delete landed before their create, by timer id.
+    pub deleted: BTreeMap<String, Millis>,
+}
+
+impl Written {
+    fn to_json(&self) -> Value {
+        let mut o = Value::obj();
+        for (k, at) in self.stamps() {
+            o.set(k, Value::num(at as f64));
+        }
+        let mut deleted = Value::obj();
+        for (id, at) in &self.deleted {
+            deleted.set(id, Value::num(*at as f64));
+        }
+        o.set("deleted", deleted);
+        o
+    }
+
+    fn from_json(v: Option<&Value>) -> Written {
+        let at = |k: &str| {
+            v.and_then(|v| v.get(k))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let mut deleted = BTreeMap::new();
+        if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
+            for (id, t) in m {
+                if let Some(t) = t.as_u64() {
+                    deleted.insert(id.clone(), t);
+                }
+            }
+        }
+        Written {
+            conversation: at("conversation"),
+            life: at("life"),
+            busy: at("busy"),
+            needs_you: at("needs_you"),
+            background: at("background"),
+            wakeup: at("wakeup"),
+            deleted,
+        }
+    }
+
+    fn stamps(&self) -> [(&'static str, Millis); 6] {
+        [
+            ("conversation", self.conversation),
+            ("life", self.life),
+            ("busy", self.busy),
+            ("needs_you", self.needs_you),
+            ("background", self.background),
+            ("wakeup", self.wakeup),
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SlotRecord {
     pub slot: String,
@@ -99,8 +165,6 @@ pub struct SlotRecord {
     pub first_prompt: Option<String>,
     pub state: State,
     pub busy: bool,
-    /// The `prompt_id` of the `UserPromptSubmit` or `Stop` that last set `busy`.
-    pub turn: Option<String>,
     pub needs_you: bool,
     pub last_activity_ms: Millis,
     /// When the owner last had this slot on their screen. Written by the menu, never by a
@@ -131,6 +195,7 @@ pub struct SlotRecord {
     /// while `UserPromptSubmit` is recent means a hook stopped being delivered, and that is
     /// invisible without this.
     pub last_event_ms: BTreeMap<String, Millis>,
+    pub written: Written,
 }
 
 impl SlotRecord {
@@ -147,7 +212,6 @@ impl SlotRecord {
             first_prompt: None,
             state: State::Live,
             busy: false,
-            turn: None,
             needs_you: false,
             last_activity_ms: now,
             last_attach_ms: 0,
@@ -158,6 +222,7 @@ impl SlotRecord {
             registered: true,
             updated_ms: now,
             last_event_ms: BTreeMap::new(),
+            written: Written::default(),
         }
     }
 
@@ -243,7 +308,6 @@ impl SlotRecord {
         set_opt_str(&mut o, "transcript_path", self.transcript_path.as_deref());
         set_opt_str(&mut o, "first_prompt", self.first_prompt.as_deref());
         o.set("busy", Value::Bool(self.busy));
-        set_opt_str(&mut o, "turn", self.turn.as_deref());
         o.set("needs_you", Value::Bool(self.needs_you));
         o.set("registered", Value::Bool(self.registered));
         o.set("last_activity_ms", Value::num(self.last_activity_ms as f64));
@@ -277,6 +341,7 @@ impl SlotRecord {
             ev.set(k, Value::num(*at as f64));
         }
         o.set("last_event_ms", ev);
+        o.set("written", self.written.to_json());
         o
     }
 
@@ -328,7 +393,6 @@ impl SlotRecord {
             first_prompt: str_of(v, "first_prompt"),
             state: State::parse(v.get("state").and_then(Value::as_str).unwrap_or("live")),
             busy: v.get("busy").and_then(Value::as_bool).unwrap_or(false),
-            turn: str_of(v, "turn"),
             needs_you: v.get("needs_you").and_then(Value::as_bool).unwrap_or(false),
             last_activity_ms: v
                 .get("last_activity_ms")
@@ -351,6 +415,7 @@ impl SlotRecord {
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,
+            written: Written::from_json(v.get("written")),
         })
     }
 }
@@ -444,7 +509,8 @@ mod tests {
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
         rec.first_prompt = Some("move the tunnel to the new box".into());
-        rec.turn = Some("d5aa51d7-a1a1-4e1e-82de-27da64b69bd1".into());
+        rec.written.busy = 1_500;
+        rec.written.deleted.insert("cron:c1".into(), 1_600);
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
@@ -461,7 +527,7 @@ mod tests {
         assert_eq!(back.proc_start, Some(99));
         assert_eq!(back.state, State::Offloaded);
         assert_eq!(back.first_prompt, rec.first_prompt);
-        assert_eq!(back.turn, rec.turn);
+        assert_eq!(back.written, rec.written);
         assert!(back.needs_you);
         assert_eq!(back.timers, rec.timers);
         assert_eq!(back.last_event_ms.get("Stop"), Some(&2_000));

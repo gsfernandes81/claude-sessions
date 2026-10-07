@@ -250,3 +250,54 @@ fn the_same_line_without_exec_is_not_bound() {
         "and not listed: {body}"
     );
 }
+
+/// A stand-in claude whose second hook lands before its first: the first is forked, then held
+/// on a fifo until the second has landed. `claude-3` fires a prompt and then its Stop;
+/// `claude-4` the reverse.
+fn claude_out_of_order(root: &Path) {
+    let prompt = r#"{"hook_event_name":"UserPromptSubmit","prompt":"go","session_id":"conv-e2e"}"#;
+    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e","background_tasks":[]}"#;
+    script(
+        &root.join("bin/claude"),
+        &format!(
+            r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
+case "$CLAUDE_SESSIONS_SLOT" in
+  claude-3) first='{prompt}'; second='{stop}' ;;
+  *) first='{stop}'; second='{prompt}' ;;
+esac
+late="{root}/$CLAUDE_SESSIONS_SLOT.fifo"
+mkfifo "$late"
+"{bin}" hook < "$late" &
+sleep 0.3
+printf '%s' "$second" | "{bin}" hook
+printf '%s' "$first" > "$late"
+wait
+: > "{root}/$CLAUDE_SESSIONS_SLOT.landed"
+exec sleep 600"#,
+            pids = root.join("pids").display(),
+            root = root.display(),
+            bin = BIN,
+        ),
+    );
+}
+
+#[test]
+fn a_hook_landing_late_is_ordered_by_when_claude_fired_it() {
+    let root = setup("order");
+    claude_out_of_order(&root.0);
+    for (slot, busy) in [("claude-3", false), ("claude-4", true)] {
+        start(&root.0, slot, WRAP);
+        let landed = root.0.join(format!("{slot}.landed"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !landed.exists() {
+            assert!(Instant::now() < deadline, "{slot}'s hooks never landed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let body = std::fs::read_to_string(root.0.join(format!("registry/{slot}.json"))).unwrap();
+        // Landing order alone would read the opposite in each.
+        assert!(
+            body.contains(&format!("\"busy\": {busy}")),
+            "{slot}: {body}"
+        );
+    }
+}

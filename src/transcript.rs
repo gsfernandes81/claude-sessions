@@ -14,9 +14,9 @@
 //! sessions file instead, and on the boxes that showed a long reply of Claude's in place of a
 //! title; that file is undocumented, and is no longer read for titles at all.
 //!
-//! Only the tail is read: transcripts run to megabytes, the hook that reads this runs on
-//! `Stop` — a blocking hook — and the titles are re-appended often enough that the latest of
-//! each is near the end.
+//! Only the tail is read: transcripts run to megabytes, the hook reads this on the
+//! synchronous `SessionStart` as well as on `Stop`, and the titles are re-appended often
+//! enough that the latest of each is near the end.
 
 use crate::json::{self, Value};
 use std::fs::File;

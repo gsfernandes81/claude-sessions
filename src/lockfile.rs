@@ -30,9 +30,12 @@ unsafe extern "C" {
 }
 
 /// What a `SessionEnd` hook may spend waiting. `SessionEnd` hooks share 1.5 s across all of
-/// them, so a quarter of that is the most one write may risk. Every other hook event waits
-/// `INTERACTIVE_WAIT`, inside its 5 s timeout.
+/// them, so a quarter of that is the most one write may risk.
 pub const SESSION_END_WAIT: Duration = Duration::from_millis(400);
+
+/// What every other hook may spend: long enough to outlast a write stalled on a busy disk.
+/// Nothing waits on an async hook, and `SessionStart`'s timeout is set above this.
+pub const HOOK_WAIT: Duration = Duration::from_secs(15);
 
 /// What an interactive command may spend. Long enough to outlast a competing write, short
 /// enough that a person does not think the menu has hung.

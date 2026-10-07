@@ -1,9 +1,8 @@
 //! The two promises the rest of the design leans on, tested against the real binary.
 //!
-//! **`hook` always exits 0.** `UserPromptSubmit`, `Stop` and `SubagentStop` are *blocking*
-//! hooks: a non-zero exit on the first blocks the owner's prompt, and on the others tells Claude
-//! (or its subagent) it has more to do. A bug in the registry must never wedge a session, so
-//! those three are asserted by name as well as in the general sweep.
+//! **`hook` always exits 0 and says nothing.** Its stdout is fed to Claude, and a failing
+//! synchronous hook is shown to the person, so a registry bug must never wedge a session or
+//! talk to it. Every run of the hook below asserts both.
 //!
 //! **A record is never caught half-written.** The registry is read on the ssh path, so a
 //! reader landing mid-write must still get valid JSON. That is what the temp-file-then-rename
@@ -11,7 +10,7 @@
 //! that is the only way the failure would ever show up.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
@@ -22,14 +21,14 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-/// Run `claude-sessions hook` with `body` on stdin, in `dir`, and return its exit code.
-fn run_hook(dir: &std::path::Path, slot: Option<&str>, body: &str) -> i32 {
+/// Run the binary with `args` and `stdin`, capturing what it says.
+fn run(args: &[&str], dir: &std::path::Path, slot: Option<&str>, stdin: &str) -> Output {
     let mut cmd = Command::new(BIN);
-    cmd.arg("hook")
+    cmd.args(args)
         .env("CLAUDE_SESSIONS_DIR", dir)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     match slot {
         Some(s) => cmd.env("CLAUDE_SESSIONS_SLOT", s),
         None => cmd.env_remove("CLAUDE_SESSIONS_SLOT"),
@@ -37,15 +36,27 @@ fn run_hook(dir: &std::path::Path, slot: Option<&str>, body: &str) -> i32 {
     let mut child = cmd.spawn().expect("spawn");
     child
         .stdin
-        .as_mut()
+        .take()
         .expect("stdin")
-        .write_all(body.as_bytes())
-        .expect("write payload");
-    child.wait().expect("wait").code().unwrap_or(-1)
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait")
+}
+
+/// `hook` with `body` on stdin, asserting it said nothing; its exit code.
+fn run_hook(dir: &std::path::Path, slot: Option<&str>, body: &str) -> i32 {
+    let out = run(&["hook"], dir, slot, body);
+    assert!(
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        "the hook spoke for {body:?}: {:?} {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.status.code().unwrap_or(-1)
 }
 
 #[test]
-fn hook_exits_zero_on_the_blocking_events_whatever_the_payload() {
+fn hook_exits_zero_and_says_nothing_whatever_the_payload() {
     let dir = tmpdir("blocking");
     // Each of these is a payload the hook could actually be handed: well-formed, malformed,
     // truncated, and well-formed-but-wrong-shape.
@@ -55,13 +66,12 @@ fn hook_exits_zero_on_the_blocking_events_whatever_the_payload() {
         r#"{"hook_event_name":"UserPromptSubmit","session_id":null}"#,
         r#"{"hook_event_name":"Stop""#,
         r#"{"hook_event_name":"Stop","tool_input":"not an object"}"#,
-        // A subagent's Stop, installed since issue #10: exit 2 would keep the agent running.
         r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":"not an array"}"#,
         r#"{"hook_event_name":"SubagentStop","background_tasks":[{"type":"#,
     ];
     for body in payloads {
         let code = run_hook(&dir, Some("claude-1"), body);
-        assert_eq!(code, 0, "a blocking hook must exit 0; payload was {body}");
+        assert_eq!(code, 0, "the hook must exit 0; payload was {body}");
     }
 }
 
@@ -205,9 +215,11 @@ fn an_unknown_subcommand_fails_loudly() {
     // The door falls through to a shell on a NON-ZERO exit, so a typo must not look like
     // success — and neither may a flag `offload` does not know, which on a timer's command
     // line would otherwise be a stop nobody asked for.
+    // Through the hook's own capture, so a silent hook is known to be silent for the right reason.
+    let dir = tmpdir("unknown");
     for args in [&["frobnicate"][..], &["offload", "--force"][..]] {
         let arg = args.join(" ");
-        let out = Command::new(BIN).args(args).output().expect("runs");
+        let out = run(args, &dir, None, "");
         assert!(!out.status.success(), "{arg} should have failed");
         assert!(
             !String::from_utf8_lossy(&out.stderr).is_empty(),
