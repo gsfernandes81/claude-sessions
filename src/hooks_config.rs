@@ -42,11 +42,15 @@ pub const EVENTS: [&str; 8] = [
     "SessionEnd",
 ];
 
+const START_TIMEOUT_SECS: u32 = 30;
+const END_TIMEOUT_SECS: u32 = 1;
+const _: () = assert!(START_TIMEOUT_SECS as u64 > crate::lockfile::HOOK_WAIT.as_secs());
+
 /// The timeout of a synchronous hook; `None` runs it async. The module header says why.
 fn timeout_secs(event: &str) -> Option<u32> {
     match event {
-        "SessionStart" => Some(30),
-        "SessionEnd" => Some(1),
+        "SessionStart" => Some(START_TIMEOUT_SECS),
+        "SessionEnd" => Some(END_TIMEOUT_SECS),
         _ => None,
     }
 }

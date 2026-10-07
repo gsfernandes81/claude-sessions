@@ -158,15 +158,15 @@ terminal.
 
 **Every hook but `SessionStart` and `SessionEnd` runs `async`** (0.4.6): Claude Code starts it
 and carries on, never waiting for it and never timing it out (`claude -p` kills any still
-running when it exits). On or3's containers a hook that
-takes milliseconds ran past its 5 s timeout under the box's own disk and memory load; the
-prompt waited all 5 s, then Claude Code killed the hook and the event was lost. Async, a
-stalled hook costs the prompt nothing and its event lands late instead of never.
-`SessionStart` stays synchronous because it binds the slot's process: Claude Code's first reply
-waits for it, and so do an in-session `/resume` and a compaction mid-turn. Only a start that can
-bind (the slot's own claude, at its prompt) waits the full 15 s for the slot's lock; any other
-waits 2 s, all under its 30 s timeout. `SessionEnd` stays synchronous because a hook still
-running when claude exits leaves the slot never marked closed.
+running when it exits). On or3's containers a hook that takes milliseconds ran past its 5 s
+timeout under the box's own disk and memory load; the prompt waited all 5 s, then Claude Code
+killed the hook and the event was lost. Async, a stalled hook costs the prompt nothing and its
+event lands late instead of never. `SessionStart` stays synchronous because it binds the slot's
+process: Claude Code's first reply waits for it, and so do an in-session `/resume` and a
+compaction mid-turn. Only a start that can bind (the slot's own claude, at its prompt) waits
+the full 15 s for the slot's lock; any other waits 2 s, all under its 30 s timeout.
+`SessionEnd` stays synchronous because a hook still running when claude exits leaves the slot
+never marked closed.
 
 **Events apply in the order Claude Code fired them, not the order they land.** Each hook is a
 process claude forks (`/bin/sh -c …`), and that process's start time in `/proc` is when the
@@ -175,30 +175,31 @@ in event order. Events are ordered by that tick, which is exact, so events fired
 tie; the times the record shows or compares with file times are its wall-clock reading
 (`clock::Moment`). For each field two events can race on — the conversation, live or closed,
 `busy`, `needs_you`, `background`, the wake-up — the record keeps the tick of the event that
-last wrote it (`written`), and only an event of the same tick or later writes it again; activity
-only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the conversation
-goes to the one on record, whose start was synchronous. An async hook can outlive its claude:
-one that read its claude alive keeps the binding it read, and the stamps refuse what is older
-than the slot's last start or end, binding included; one that finds no claude above it is
-stamped from its own start, which is no later than the fork it came from. A new record is stamped with the tick it
-is made in, so nothing fired before it, such as the last hook of a claude whose slot name is
-being reused, can write it; stamps from before a reboot, larger than any tick of this boot, are
-forgotten when a hook next loads the record. A late event of the conversation before the
-current one (a `Stop` of the one `/clear` left) is dropped, and a newer one from a conversation
-the record has not heard start adopts it, as the lost `SessionStart` would have. A cron deleted
-before its create lands is remembered, so the late create is not taken. Only a hook that cannot
-read `/proc` is stamped when it lands. `prompt_id` cannot do this: a prompt typed mid-turn fires its
-`UserPromptSubmit` under the running turn's id, and the turn it later starts fires none.
+last wrote it (`written`), and only an event of the same tick or later writes it again;
+activity only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the
+conversation goes to the one on record, whose start was synchronous; and since claude forks the
+first prompt's hook only after the start's has finished, a start is never behind its own first
+prompt. An async hook can outlive its claude: one that read its claude alive keeps the binding
+it read, and the stamps refuse what is older than the slot's last start or end, binding
+included; one that finds no claude above it is stamped from its own start, which is no later
+than the fork it came from. A new record is stamped with the tick it is made in, so nothing
+fired before it, such as the last hook of a claude whose slot name is being reused, can write
+it; stamps from before a reboot, larger than any tick of this boot, are forgotten when a hook
+next loads the record. A late event of the conversation before the current one (a `Stop` of the
+one `/clear` left) is dropped, and a newer one from a conversation the record has not heard
+start adopts it, as the lost `SessionStart` would have. A cron deleted before its create lands
+is remembered, so the late create is not taken. Only a hook that cannot read `/proc` is stamped
+when it lands. `prompt_id` cannot do this: a prompt typed mid-turn fires its `UserPromptSubmit`
+under the running turn's id, and the turn it later starts fires none.
 
 What stays uncorrected, each until the next event of its kind: a turn drained from Claude
-Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through its transcript's writes, as it did before async;
-events fired within one 10 ms clock tick apply in landing order; a hook whose `sh` forked rather
-than exec'd it, and whose claude has gone, is stamped from its own start, a stall after the
-fork; a nested `claude -p` under a tool call kills its last async hooks when it exits; and a
-`SessionEnd`, which waits
-only 400 ms for the slot's lock, gives up behind an async hook stalled while holding it, so the
-record stays live with a dead process, which the menu shows as offloaded and `reconcile`
-settles.
+Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through
+its transcript's writes, as it did before async; events fired within one 10 ms clock tick apply
+in landing order; a hook whose `sh` forked rather than exec'd it, and whose claude has gone, is
+stamped from its own start, a stall after the fork; a nested `claude -p` under a tool call
+kills its last async hooks when it exits; and a `SessionEnd`, which waits only 400 ms for the
+slot's lock, gives up behind an async hook stalled while holding it, so the record stays live
+with a dead process, which the menu shows as offloaded and `reconcile` settles.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:

@@ -228,11 +228,7 @@ fn cmd_hook() -> std::io::Result<()> {
     };
 
     let origin = bind::origin(std::process::id(), ev.fired_in_subagent());
-    let binding = origin.binding;
-    let fired = origin.fired;
-    // The claude whose pid belongs in the record is the slot's own, which is the one directly
-    // under its zmx daemon — not this hook, and not a nested claude.
-    let own_pid = origin.claude.filter(|_| binding == Binding::Own);
+    let (binding, own_pid, fired) = (origin.binding, origin.own_pid, origin.fired());
     let own_start = own_pid.and_then(procinfo::start_time);
 
     // A SessionEnd for /clear or /resume changes nothing — the same process goes on, and its
@@ -306,30 +302,36 @@ fn slot_for_hook() -> Option<(String, bool)> {
 /// the same pids again: without this, every slot still reads `live` and points at a pid that
 /// now belongs to something else.
 fn cmd_reconcile() -> std::io::Result<()> {
-    let now = clock::now();
     let mut moved = 0usize;
-    for mut rec in registry::all()? {
-        if matches!(rec.state, State::Closed | State::Offloaded) {
+    for listed in registry::all()? {
+        if !process_gone(&listed) {
             continue;
         }
-        let gone = match (rec.pid, rec.proc_start) {
-            (Some(pid), Some(start)) => !procinfo::is_alive(pid, start),
-            // A record with no pid cannot be checked. Leave it: `doctor` reports it, and
-            // guessing would mean marking a live session offloaded.
-            _ => false,
+        let slot = listed.slot;
+        let _lock = match lockfile::SlotLock::acquire(
+            &registry::lock_path(&slot),
+            lockfile::INTERACTIVE_WAIT,
+        ) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                say!("{slot}: kept — its lock is busy");
+                continue;
+            }
+            Err(e) => return Err(e),
         };
-        if gone {
-            let _lock = lockfile::SlotLock::acquire(
-                &registry::lock_path(&rec.slot),
-                lockfile::INTERACTIVE_WAIT,
-            )?;
-            rec.state = State::Offloaded;
-            rec.busy = false;
-            rec.updated_ms = now;
-            registry::store(&rec)?;
-            say!("{}: process gone -> offloaded", rec.slot);
-            moved += 1;
+        // Decided again on the record as it is under the lock, not as it was listed.
+        let Some(mut rec) = registry::load(&slot)? else {
+            continue;
+        };
+        if !process_gone(&rec) {
+            continue;
         }
+        rec.state = State::Offloaded;
+        rec.busy = false;
+        rec.updated_ms = clock::now();
+        registry::store(&rec)?;
+        say!("{slot}: process gone -> offloaded");
+        moved += 1;
     }
 
     // Dead sessions: `zmx list` removes a dead daemon's socket itself when its connection is
@@ -349,6 +351,18 @@ fn cmd_reconcile() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A slot still open whose recorded process has gone. A record with no pid cannot be checked
+/// and is left: `doctor` reports it, and guessing would mark a live session offloaded.
+fn process_gone(rec: &SlotRecord) -> bool {
+    if matches!(rec.state, State::Closed | State::Offloaded) {
+        return false;
+    }
+    match (rec.pid, rec.proc_start) {
+        (Some(pid), Some(start)) => !procinfo::is_alive(pid, start),
+        _ => false,
+    }
 }
 
 // ── list and doctor ─────────────────────────────────────────────────────────

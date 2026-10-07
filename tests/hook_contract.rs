@@ -364,3 +364,54 @@ fn a_start_that_binds_nothing_gives_up_where_a_prompt_waits() {
     let body = std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
     assert!(body.contains("\"UserPromptSubmit\""), "{body}");
 }
+
+#[test]
+fn reconcile_offloads_a_slot_whose_pid_was_reused_and_skips_a_locked_one() {
+    let dir = tmpdir("reconcile");
+    let me = std::process::id();
+    let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
+    let start: u64 = stat[stat.rfind(')').unwrap() + 2..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let live = |slot: &str, start: u64| {
+        std::fs::write(
+            dir.join(format!("{slot}.json")),
+            format!(r#"{{"slot":"{slot}","state":"live","pid":{me},"proc_start":{start}}}"#),
+        )
+        .unwrap();
+    };
+    // This process's pid, as a container restart hands old pids out again.
+    live("claude-1", start + 1);
+    live("claude-2", start);
+    live("claude-3", start + 1);
+    let mut holder = Command::new("flock")
+        .arg(dir.join("claude-3.lock"))
+        .args(["sleep", "4"])
+        .spawn()
+        .expect("flock(1) runs");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let out = run(&["reconcile"], &dir, None, "");
+    holder.kill().ok();
+    holder.wait().ok();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state = |slot: &str| {
+        let body = std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
+        body.contains(r#""state": "offloaded""#)
+    };
+    assert!(state("claude-1"), "a reused pid is not the slot's process");
+    assert!(
+        !state("claude-2"),
+        "calibration: the process itself is alive"
+    );
+    assert!(
+        !state("claude-3"),
+        "its lock was busy: left for the next pass"
+    );
+}

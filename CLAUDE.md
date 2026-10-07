@@ -26,10 +26,12 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
 - **`claude-sessions hook` always exits 0, and says nothing.** Its stdout reaches Claude (as
   context from the synchronous `SessionStart`, and as `systemMessage`/`additionalContext` from
   a JSON line of an async event), and a failing synchronous hook is shown to the person; an
-  async one's exit status and stderr reach only Claude Code's debug log. A registry bug must
-  never wedge a session or talk to it. It logs its own failures to its own log and returns 0
-  — a panic included, which is caught. A test pins both. Nothing in the binary uses `print!`/`println!`/`eprintln!` (they
-  panic on a closed terminal or pipe; issue #6), and a lint enforces it.
+  async one's exit status and stderr are never shown to the model: they land as an attachment
+  on its next turn, in the transcript view and in the debug log. A registry bug must never
+  wedge a session or talk to it. It logs its own failures to its own log and returns 0 — a
+  panic included, which is caught. A test pins both. Nothing in the binary uses
+  `print!`/`println!`/`eprintln!` (they panic on a closed terminal or pipe; issue #6), and a
+  lint enforces it.
 - **Every lock has a timeout.** The menu is what an ssh login lands on, so a stuck lock would
   hold the door shut. `SessionEnd` hooks additionally share a **1.5-second** budget across
   all of them — a lock wait on that path must be well inside it, or the write that marks a
@@ -70,12 +72,11 @@ product.
 release is a static musl build, so the thing under test is the thing published. CI names the
 target explicitly per job because the runner is x86_64.
 
-The syscalls are declared directly rather than taken from `libc`: `flock` in
-`src/lockfile.rs`, `kill` plus the two pidfd calls in `src/signal.rs`, `socket`, `send` and
-`recv` for the socket-diagnostics netlink in `src/sockdiag.rs`, `clock_gettime` in
-`src/clock.rs`, and the terminal's
-termios, `ioctl`, `poll`, `signal` and `read` in `src/term.rs`, each with a note on why its
-layout or constant is the same on both targets.
+The syscalls are declared directly rather than taken from `libc`: `flock` in `src/lockfile.rs`,
+`kill` plus the two pidfd calls in `src/signal.rs`, `socket`, `send` and `recv` for the
+socket-diagnostics netlink in `src/sockdiag.rs`, `clock_gettime` in `src/clock.rs`, and the
+terminal's termios, `ioctl`, `poll`, `signal` and `read` in `src/term.rs`, each with a note on
+why its layout or constant is the same on both targets.
 `src/json.rs` is a small reader and writer, which the hook path wants anyway: payloads must be
 read *tolerantly*, and a `Value` tree does that more honestly than a struct of twelve
 `Option`s pretending to know the shape of an interface that updates itself.

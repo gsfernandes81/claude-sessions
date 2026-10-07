@@ -21,41 +21,34 @@ pub fn slot_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// What a hook learns from its line of parents.
-pub struct Origin {
-    pub binding: Binding,
-    /// The nearest claude above the hook: the one that fired it.
-    pub claude: Option<u32>,
-    /// When it fired: the start of the process that claude forked to run the hook, which a
-    /// stall after the fork does not move; when it landed only if /proc cannot be read.
-    pub fired: Moment,
-}
-
-/// Where the hook `hook_pid` came from.
-pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Origin {
-    // hook -> sh -> claude -> zmx is the usual shape; a deeper walk would start finding
-    // unrelated claudes in a container that runs several.
-    let place = place(&procinfo::lineage(hook_pid, 9), fired_in_subagent);
-    Origin {
-        binding: place.binding,
-        claude: place.claude,
-        fired: place
-            .forked
-            .and_then(procinfo::start_time)
-            .and_then(Moment::of_tick)
-            .unwrap_or_else(Moment::now),
-    }
-}
-
 /// How a hook sits on its line of parents.
 #[derive(Debug, PartialEq, Eq)]
-struct Place {
-    binding: Binding,
-    claude: Option<u32>,
+pub struct Place {
+    pub binding: Binding,
+    /// The slot's own claude, when it is the one that fired the hook.
+    pub own_pid: Option<u32>,
     /// The process whose start is when the event fired: what claude forked to run the hook,
     /// or with no claude above, the hook itself. An async hook outlives its claude, and then
     /// started no later than the fork it came from.
     forked: Option<u32>,
+}
+
+impl Place {
+    /// When the event fired, which a stall after the fork does not move; when it landed only
+    /// if /proc cannot be read.
+    pub fn fired(&self) -> Moment {
+        self.forked
+            .and_then(procinfo::start_time)
+            .and_then(Moment::of_tick)
+            .unwrap_or_else(Moment::now)
+    }
+}
+
+/// Where the hook `hook_pid` sits.
+pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Place {
+    // hook -> sh -> claude -> zmx is the usual shape; a deeper walk would start finding
+    // unrelated claudes in a container that runs several.
+    place(&procinfo::lineage(hook_pid, 9), fired_in_subagent)
 }
 
 /// How a hook's line of parents, nearest first, places it.
@@ -69,14 +62,14 @@ fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
     let Some(c) = (1..line.len()).find(|&c| line[c].1 == "claude") else {
         return Place {
             binding: Binding::Nested,
-            claude: None,
+            own_pid: None,
             forked: line.first().map(|(pid, _)| *pid),
         };
     };
     let own = !fired_in_subagent && line.get(c + 1).is_some_and(|(_, comm)| comm == "zmx");
     Place {
         binding: if own { Binding::Own } else { Binding::Nested },
-        claude: Some(line[c].0),
+        own_pid: own.then_some(line[c].0),
         forked: Some(line[c - 1].0),
     }
 }
@@ -93,10 +86,10 @@ mod tests {
             .collect()
     }
 
-    fn placed(binding: Binding, claude: Option<u32>, forked: u32) -> Place {
+    fn placed(binding: Binding, own_pid: Option<u32>, forked: u32) -> Place {
         Place {
             binding,
-            claude,
+            own_pid,
             forked: Some(forked),
         }
     }
@@ -118,7 +111,7 @@ mod tests {
     #[test]
     fn a_hook_under_a_nested_claude_or_none_is_nested() {
         let nested = line(&["claude-sessions", "sh", "claude", "bash", "claude", "zmx"]);
-        assert_eq!(place(&nested, false), placed(Binding::Nested, Some(12), 11));
+        assert_eq!(place(&nested, false), placed(Binding::Nested, None, 11));
         let mine = line(&["claude-sessions", "sh", "claude"]);
         assert_eq!(
             place(&mine, false).binding,
