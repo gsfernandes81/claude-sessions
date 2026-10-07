@@ -761,13 +761,14 @@ fn log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Moment;
     use crate::registry::Timer;
 
     const NOW: Millis = 100 * 60 * 1000;
 
     /// A slot that SHOULD be offloaded — the calibration case every hold is a change from.
     fn idle() -> (SlotRecord, Seen) {
-        let mut r = SlotRecord::new("claude-1", 0);
+        let mut r = SlotRecord::new("claude-1", Moment::ms(0));
         r.pid = Some(100);
         r.proc_start = Some(7);
         r.session_id = Some("conv".into());
@@ -858,7 +859,7 @@ mod tests {
             apply(
                 rec,
                 &Event::parse(body).unwrap(),
-                at,
+                Moment::ms(at),
                 Binding::Own,
                 Some(100),
                 Some(7),

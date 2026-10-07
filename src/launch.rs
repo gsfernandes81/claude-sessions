@@ -23,7 +23,7 @@
 //! `CLAUDE_SESSIONS_ZMX` names the zmx to run (default `zmx`) and
 //! `CLAUDE_SESSIONS_CLAUDE` the claude (default `claude`). An empty value is the default.
 
-use crate::clock::{self, Millis};
+use crate::clock::{self, Millis, Moment};
 use crate::fmt;
 use crate::live;
 use crate::lockfile::{INTERACTIVE_WAIT, SlotLock};
@@ -810,8 +810,7 @@ fn allocate_for(
             // A record that cannot be read is not ours to overwrite; doctor reports it.
             Err(_) => continue,
         }
-        let now = clock::now();
-        let mut rec = SlotRecord::new(&slot, now);
+        let mut rec = SlotRecord::new(&slot, Moment::now());
         rec.cwd = Some(cwd.to_string());
         if let Some((id, title)) = resuming {
             rec.session_id = Some(id.to_string());
@@ -1489,7 +1488,7 @@ exit 1"#,
     }
 
     fn live(slot: &str, pid: u32, start: u64) -> SlotRecord {
-        let mut r = SlotRecord::new(slot, clock::now());
+        let mut r = SlotRecord::new(slot, Moment::now());
         r.pid = Some(pid);
         r.proc_start = Some(start);
         r.session_id = Some(format!("conv-of-{slot}"));
@@ -1499,7 +1498,14 @@ exit 1"#,
 
     /// An offloaded slot with its conversation on disk.
     fn offloaded(slot: &str, session: &str, cwd: &str) -> SlotRecord {
-        let mut r = SlotRecord::new(slot, clock::now() - 3_600_000);
+        let made = Moment::now();
+        let mut r = SlotRecord::new(
+            slot,
+            Moment {
+                at: made.at - 3_600_000,
+                ..made
+            },
+        );
         r.state = State::Offloaded;
         r.session_id = Some(session.into());
         r.cwd = Some(cwd.into());

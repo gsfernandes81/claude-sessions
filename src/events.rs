@@ -14,9 +14,9 @@
 //! subagent, inherits `CLAUDE_SESSIONS_SLOT` and fires the same hooks. Its events count as
 //! *work running under* the slot — enough to keep the offloader off it — and nothing more.
 
-use crate::clock::Millis;
+use crate::clock::{Millis, Moment};
 use crate::json::{self, Value};
-use crate::registry::{SlotRecord, Stamp, State, Timer};
+use crate::registry::{SlotRecord, State, Timer};
 
 /// Whether the claude that fired this event is the slot's own process, or one nested under it.
 /// Decided in `bind.rs` from `/proc`, never from the payload alone.
@@ -53,6 +53,14 @@ impl Event {
     /// `SessionStart`: startup | resume | clear | compact | fork.
     pub fn source(&self) -> Option<&str> {
         self.s("source")
+    }
+    /// A `SessionStart` that leaves claude idle at its prompt. `compact` can fire mid-turn, and
+    /// a start with no source is no evidence.
+    pub fn opens_at_prompt(&self) -> bool {
+        matches!(
+            self.source(),
+            Some("startup") | Some("resume") | Some("clear") | Some("fork")
+        )
     }
     pub fn session_title(&self) -> Option<&str> {
         self.s("session_title")
@@ -160,11 +168,11 @@ fn needs_you_type(t: &str) -> bool {
     )
 }
 
-/// Takes a field stamped `written` for an event fired at `at`, unless a newer event has.
-fn claim(written: &mut Millis, at: Millis) -> bool {
-    let newer = at >= *written;
+/// Takes a field stamped `written` for an event fired at `tick`, unless a later one has.
+fn claim(written: &mut u64, tick: u64) -> bool {
+    let newer = tick >= *written;
     if newer {
-        *written = at;
+        *written = tick;
     }
     newer
 }
@@ -176,28 +184,29 @@ fn active(rec: &mut SlotRecord, at: Millis) {
 
 /// A different conversation in the same slot (after /clear, a resume, a fork): what described
 /// the old one must not describe the new one.
-fn begin_conversation(rec: &mut SlotRecord, id: &str, at: Millis) {
+fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.session_id = Some(id.to_string());
     rec.title = None;
     rec.ai_title = None;
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written[Stamp::Conversation] = at;
-    rec.written[Stamp::Prompt] = at;
+    rec.written.conversation = tick;
+    rec.written.prompt = tick;
     rec.written.deleted.clear();
 }
 
-/// Apply an event Claude Code fired at `at` to a record. `pid`/`proc_start` describe the
+/// Apply an event Claude Code fired at `fired` to a record. `pid`/`proc_start` describe the
 /// slot's own claude, and are `None` when this event did not come from it.
 pub fn apply(
     rec: &mut SlotRecord,
     ev: &Event,
-    at: Millis,
+    fired: Moment,
     binding: Binding,
     pid: Option<u32>,
     proc_start: Option<u64>,
 ) -> Outcome {
+    let Moment { tick, at } = fired;
     // A nested claude is work, not a new identity, and its events keep the slot's activity
     // fresh. In-process agents are not nested: the slot's own claude fires their
     // `SubagentStart`/`SubagentStop`, which keep `background` (issues #9, #10).
@@ -211,10 +220,13 @@ pub fn apply(
         .session_id()
         .filter(|id| rec.session_id.as_deref() != Some(id))
     {
-        if at < rec.written[Stamp::Conversation] {
+        // A tie goes to the conversation on record: its start was synchronous, so nothing of
+        // a newer one can have forked in the same tick.
+        let started = rec.written.conversation;
+        if tick < started || (tick == started && rec.session_id.is_some()) {
             return Outcome::Ignored("an event of an earlier conversation");
         }
-        begin_conversation(rec, id, at);
+        begin_conversation(rec, id, tick);
     }
     seen(rec, ev, at);
 
@@ -235,7 +247,7 @@ pub fn apply(
             if pid.is_some() {
                 // A different process cannot be running the old one's background work.
                 if (pid != rec.pid || proc_start != rec.proc_start)
-                    && claim(&mut rec.written[Stamp::Background], at)
+                    && claim(&mut rec.written.background, tick)
                 {
                     rec.background.clear();
                 }
@@ -243,21 +255,16 @@ pub fn apply(
                 rec.proc_start = proc_start;
             }
             // Live even mid-offload: the process in front of the owner is the truth.
-            if claim(&mut rec.written[Stamp::Life], at) {
+            if claim(&mut rec.written.life, tick) {
                 rec.state = State::Live;
             }
             active(rec, at);
-            // Opening a conversation leaves claude idle at its prompt. `compact` can fire
-            // mid-turn, and a start with no source is no evidence, so both leave these alone.
-            if matches!(
-                ev.source(),
-                Some("startup") | Some("resume") | Some("clear") | Some("fork")
-            ) {
-                if claim(&mut rec.written[Stamp::Busy], at) {
+            if ev.opens_at_prompt() {
+                if claim(&mut rec.written.busy, tick) {
                     rec.busy = false;
                     rec.ready_ms = Some(at);
                 }
-                if claim(&mut rec.written[Stamp::NeedsYou], at) {
+                if claim(&mut rec.written.needs_you, tick) {
                     rec.needs_you = false;
                 }
             }
@@ -266,28 +273,28 @@ pub fn apply(
         "UserPromptSubmit" => {
             // The earliest prompt fired, whichever lands first.
             let first = ev.prompt().and_then(one_line);
-            if first.is_some() && (rec.first_prompt.is_none() || at < rec.written[Stamp::Prompt]) {
+            if first.is_some() && (rec.first_prompt.is_none() || tick < rec.written.prompt) {
                 rec.first_prompt = first;
-                rec.written[Stamp::Prompt] = at;
+                rec.written.prompt = tick;
             }
             active(rec, at);
-            if claim(&mut rec.written[Stamp::Busy], at) {
+            if claim(&mut rec.written.busy, tick) {
                 rec.busy = true;
             }
-            if claim(&mut rec.written[Stamp::NeedsYou], at) {
+            if claim(&mut rec.written.needs_you, tick) {
                 rec.needs_you = false;
             }
             Outcome::Changed
         }
         "Stop" => {
             active(rec, at);
-            if claim(&mut rec.written[Stamp::Busy], at) {
+            if claim(&mut rec.written.busy, tick) {
                 rec.busy = false;
                 rec.last_stop_ms = Some(at);
             }
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running.
-            if claim(&mut rec.written[Stamp::Background], at) {
+            if claim(&mut rec.written.background, tick) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
             Outcome::Changed
@@ -300,7 +307,7 @@ pub fn apply(
             let what = format!("subagent: {kind}");
             if rec.background.contains(&what) {
                 Outcome::Ignored("an agent of that type is already listed")
-            } else if claim(&mut rec.written[Stamp::Background], at) {
+            } else if claim(&mut rec.written.background, tick) {
                 rec.background.push(what);
                 Outcome::Changed
             } else {
@@ -313,7 +320,7 @@ pub fn apply(
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
             Some(running) => {
-                if claim(&mut rec.written[Stamp::Background], at) {
+                if claim(&mut rec.written.background, tick) {
                     rec.background = running;
                     Outcome::Changed
                 } else {
@@ -323,7 +330,7 @@ pub fn apply(
         },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
-                if claim(&mut rec.written[Stamp::NeedsYou], at) {
+                if claim(&mut rec.written.needs_you, tick) {
                     rec.needs_you = true;
                     active(rec, at);
                     Outcome::Changed
@@ -336,14 +343,14 @@ pub fn apply(
             }
             _ => Outcome::Ignored("notification type does not mean a person is needed"),
         },
-        "PostToolUse" => apply_timer(rec, ev, at),
+        "PostToolUse" => apply_timer(rec, ev, fired),
         "SessionEnd" => match ev.reason() {
             // Both are followed by a SessionStart in the same process.
             Some("clear") | Some("resume") => {
                 Outcome::Ignored("clear and resume continue in the same process")
             }
             _ => {
-                if !claim(&mut rec.written[Stamp::Life], at) {
+                if !claim(&mut rec.written.life, tick) {
                     return Outcome::Ignored("a newer start has landed");
                 }
                 rec.state = if rec.state == State::Offloading {
@@ -351,7 +358,7 @@ pub fn apply(
                 } else {
                     State::Closed
                 };
-                if claim(&mut rec.written[Stamp::Busy], at) {
+                if claim(&mut rec.written.busy, tick) {
                     rec.busy = false;
                 }
                 Outcome::Changed
@@ -376,11 +383,12 @@ pub const TIMER_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "CronDelete"
 /// `CronList` is not here and must not be: it reads timers, it does not create one. Nor is
 /// `TaskStop`, which stops a background task rather than a timer. A slot pinned open by a
 /// listing would never be offloadable again.
-fn apply_timer(rec: &mut SlotRecord, ev: &Event, at: Millis) -> Outcome {
+fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
+    let Moment { tick, at } = fired;
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !claim(&mut rec.written[Stamp::Wakeup], at) {
+            if !claim(&mut rec.written.wakeup, tick) {
                 return Outcome::Ignored("a newer wake-up has landed");
             }
             let stop = input
@@ -415,7 +423,12 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, at: Millis) -> Outcome {
                 .or_else(|| input.and_then(|v| v.get("name")).and_then(Value::as_str))
                 .unwrap_or("cron");
             let key = format!("cron:{id}");
-            if rec.written.deleted.get(&key).is_some_and(|&del| del >= at) {
+            if rec
+                .written
+                .deleted
+                .get(&key)
+                .is_some_and(|&del| del >= tick)
+            {
                 return Outcome::Ignored("deleted before its create landed");
             }
             upsert(
@@ -439,7 +452,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, at: Millis) -> Outcome {
                     rec.timers.retain(|t| t.id != key);
                     // Not created yet as far as the record knows: its create may land later.
                     if rec.timers.len() == before {
-                        rec.written.deleted.insert(key, at);
+                        rec.written.deleted.insert(key, tick);
                     }
                     Outcome::Changed
                 }
@@ -505,14 +518,14 @@ mod tests {
     }
     /// A slot mid-session: bound, idle, nothing waiting.
     fn slot() -> SlotRecord {
-        let mut r = SlotRecord::new("claude-1", 1_000);
+        let mut r = SlotRecord::new("claude-1", Moment::ms(1_000));
         r.session_id = Some("first".into());
         r.pid = Some(100);
         r.proc_start = Some(7);
         r
     }
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
-        apply(rec, e, now, Binding::Own, Some(100), Some(7))
+        apply(rec, e, Moment::ms(now), Binding::Own, Some(100), Some(7))
     }
 
     // ── hooks landing out of order ──────────────────────────────────────────
@@ -593,6 +606,20 @@ mod tests {
         assert_eq!(rec.transcript_path.as_deref(), Some("/t/second.jsonl"));
         assert!(rec.background.is_empty());
         assert_eq!(rec.last_stop_ms, None);
+        // Fired in the tick the new one started in: still the old conversation's.
+        let mut tied = slot();
+        assert!(matches!(
+            land(&mut tied, &[(clear, 5_000), (late, 5_000)])[1],
+            Outcome::Ignored(_)
+        ));
+        assert_eq!(tied.session_id.as_deref(), Some("second"));
+        let mut fresh = SlotRecord::new("claude-1", Moment::ms(5_000));
+        land(&mut fresh, &[(clear, 5_000)]);
+        assert_eq!(
+            fresh.session_id.as_deref(),
+            Some("second"),
+            "calibration: a new record adopts"
+        );
         // Calibration: the same Stop from the current conversation is taken.
         let own_stop = late.replace(r#""session_id":"first""#, r#""session_id":"second""#);
         assert_eq!(land(&mut rec, &[(&own_stop, 6_000)])[0], Outcome::Changed);
@@ -704,7 +731,7 @@ mod tests {
         apply(
             &mut rec,
             &ev(resume),
-            9_000,
+            Moment::ms(9_000),
             Binding::Own,
             Some(200),
             Some(8),
@@ -737,7 +764,7 @@ mod tests {
     fn a_new_record_refuses_what_fired_before_it() {
         // The menu reuses a closed slot's name with a fresh record; the old claude's last hook
         // can land after it.
-        let mut rec = SlotRecord::new("claude-1", 5_000);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(5_000));
         let old = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt",
             "session_id":"before"}"#;
         assert!(matches!(
@@ -891,7 +918,7 @@ mod tests {
         apply(
             &mut rec,
             &ev(r#"{"hook_event_name":"SubagentStop","agent_id":"n1","background_tasks":[]}"#),
-            3_000,
+            Moment::ms(3_000),
             Binding::Nested,
             None,
             None,
@@ -909,7 +936,7 @@ mod tests {
         apply(
             &mut rec,
             &ev(r#"{"hook_event_name":"SessionStart","source":"resume","session_id":"second"}"#),
-            5_000,
+            Moment::ms(5_000),
             Binding::Own,
             Some(200),
             Some(9),
@@ -1085,7 +1112,7 @@ mod tests {
         let out = apply(
             &mut rec,
             &ev(r#"{"hook_event_name":"SessionStart","session_id":"subagent","agent_id":"a1"}"#),
-            5_000,
+            Moment::ms(5_000),
             Binding::Nested,
             None,
             None,
@@ -1109,7 +1136,7 @@ mod tests {
         apply(
             &mut rec,
             &ev(r#"{"hook_event_name":"SessionEnd","reason":"other"}"#),
-            5_000,
+            Moment::ms(5_000),
             Binding::Nested,
             None,
             None,
@@ -1463,7 +1490,7 @@ mod tests {
         apply(
             &mut rec,
             &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"subagent work"}"#),
-            2_000,
+            Moment::ms(2_000),
             Binding::Nested,
             None,
             None,

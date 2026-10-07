@@ -67,6 +67,7 @@ mod ui;
 mod work;
 mod zmx;
 
+use clock::Moment;
 use events::{Binding, Outcome};
 use fmt::{age, human};
 use registry::{SlotRecord, State};
@@ -228,7 +229,7 @@ fn cmd_hook() -> std::io::Result<()> {
 
     let origin = bind::origin(std::process::id(), ev.fired_in_subagent());
     let binding = origin.binding;
-    let at = origin.fired_at.unwrap_or_else(clock::now);
+    let fired = origin.fired.unwrap_or_else(Moment::now);
     // The claude whose pid belongs in the record is the slot's own, which is the one directly
     // under its zmx daemon — not this hook, and not a nested claude.
     let own_pid = origin.claude.filter(|_| binding == Binding::Own);
@@ -242,12 +243,15 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // SessionEnd hooks share a 1.5 s budget; a dropped UserPromptSubmit leaves a working
-    // claude reading as idle (issue #1).
-    let wait = if ev.name() == "SessionEnd" {
-        lockfile::SESSION_END_WAIT
-    } else {
-        lockfile::HOOK_WAIT
+    // SessionEnd hooks share a 1.5 s budget, and a synchronous start that binds nothing holds
+    // up only claude. A dropped UserPromptSubmit leaves a working claude reading as idle
+    // (issue #1), and a dropped binding start loses the slot's process.
+    let wait = match ev.name() {
+        "SessionEnd" => lockfile::SESSION_END_WAIT,
+        "SessionStart" if binding != Binding::Own || !ev.opens_at_prompt() => {
+            lockfile::INTERACTIVE_WAIT
+        }
+        _ => lockfile::HOOK_WAIT,
     };
     // The conversation's titles, read before the lock — a transcript's tail is the slow part
     // of this hook, and the lock is what other hooks wait on (issue #1). Only the slot's own
@@ -267,11 +271,13 @@ fn cmd_hook() -> std::io::Result<()> {
     })?;
 
     let mut rec = registry::load(&slot)?.unwrap_or_else(|| {
-        let mut r = SlotRecord::new(&slot, at);
+        let mut r = SlotRecord::new(&slot, fired);
         r.registered = registered;
         r
     });
-    match events::apply(&mut rec, &ev, at, binding, own_pid, own_start) {
+    // Stamps from before a reboot would otherwise refuse every event of this boot.
+    rec.written.forget_after(Moment::now().tick);
+    match events::apply(&mut rec, &ev, fired, binding, own_pid, own_start) {
         Outcome::Changed => {
             if let Some(titles) = &titles {
                 events::apply_titles(&mut rec, titles);

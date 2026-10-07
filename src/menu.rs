@@ -618,6 +618,7 @@ pub fn workspace() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Moment;
 
     #[test]
     fn a_turn_interrupted_with_esc_is_not_drawn_as_working_or_waiting() {
@@ -627,7 +628,7 @@ mod tests {
         let transcript = dir.join("conv.jsonl");
         let prompted = r#"{"type":"user","message":{"role":"user","content":"go"},"timestamp":"2026-10-06T09:23:28.476Z"}"#;
         std::fs::write(&transcript, format!("{prompted}\n")).unwrap();
-        let mut r = SlotRecord::new("claude-1", 0);
+        let mut r = SlotRecord::new("claude-1", Moment::ms(0));
         r.transcript_path = Some(transcript.display().to_string());
         r.busy = true;
         r.needs_you = true;

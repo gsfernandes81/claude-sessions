@@ -266,8 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lineage_runs_up_through_our_child_and_its_start_is_one_moment() {
-        let before = crate::clock::now();
+    fn a_lineage_runs_up_through_our_child() {
         let mut child = std::process::Command::new("sh")
             .args(["-c", "sleep 30 & wait"])
             .spawn()
@@ -292,23 +291,6 @@ mod tests {
             ancestor_named(grandchild, "sleep", 4),
             None,
             "calibration: not itself"
-        );
-        let tick = start_time(child.id()).unwrap();
-        let at = crate::clock::at_tick(tick).unwrap();
-        assert!(
-            at + 10 >= before && at <= crate::clock::now(),
-            "{before} {at}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(7));
-        assert_eq!(
-            crate::clock::at_tick(tick),
-            Some(at),
-            "one tick reads the same later"
-        );
-        assert_eq!(
-            crate::clock::at_tick(tick + 1),
-            Some(at + 10),
-            "calibration"
         );
         let _ = std::process::Command::new("kill")
             .args(["-9", &grandchild.to_string()])

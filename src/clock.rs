@@ -41,8 +41,7 @@ fn read_ns(clock: i32) -> Option<i128> {
     ok.then(|| i128::from(ts.sec) * 1_000_000_000 + i128::from(ts.nsec))
 }
 
-/// Nanoseconds since boot.
-pub fn since_boot_ns() -> Option<i128> {
+fn since_boot_ns() -> Option<i128> {
     read_ns(CLOCK_BOOTTIME)
 }
 
@@ -51,9 +50,53 @@ pub fn since_tick_ns(ticks: u64) -> Option<i128> {
     Some(since_boot_ns()? - i128::from(ticks) * NS_PER_TICK)
 }
 
-/// The wall-clock time of a moment `ticks` after boot. Every reading of one tick agrees, to
-/// within the two clock reads, so events stamped from the same tick tie.
-pub fn at_tick(ticks: u64) -> Option<Millis> {
+/// The wall-clock time of a moment `ticks` after boot, to within a millisecond.
+fn at_tick(ticks: u64) -> Option<Millis> {
     let boot = read_ns(CLOCK_REALTIME)? - since_boot_ns()?;
     Millis::try_from((boot + i128::from(ticks) * NS_PER_TICK) / 1_000_000).ok()
+}
+
+/// A moment twice over: the clock tick since boot the kernel stamps a process's start with,
+/// exact and so what events are ordered by, and its wall-clock time, for everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Moment {
+    pub tick: u64,
+    pub at: Millis,
+}
+
+impl Moment {
+    pub fn now() -> Moment {
+        let tick = since_boot_ns().map_or(0, |ns| (ns / NS_PER_TICK) as u64);
+        Moment { tick, at: now() }
+    }
+
+    pub fn of_tick(tick: u64) -> Option<Moment> {
+        Some(Moment {
+            tick,
+            at: at_tick(tick)?,
+        })
+    }
+
+    /// A moment at `at` milliseconds, ticking with it, for tests.
+    #[cfg(test)]
+    pub fn ms(at: Millis) -> Moment {
+        Moment { tick: at / 10, at }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tick_reads_as_one_wall_clock_moment() {
+        let now = Moment::now();
+        let then = Moment::of_tick(now.tick).unwrap();
+        assert!(then.at.abs_diff(now.at) <= 11, "{then:?} {now:?}");
+        let later = Moment::of_tick(now.tick + 100).unwrap();
+        assert!(
+            later.at.abs_diff(then.at + 1_000) <= 1,
+            "calibration: 100 ticks is 1 s"
+        );
+    }
 }

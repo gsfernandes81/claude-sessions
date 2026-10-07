@@ -15,8 +15,9 @@
 //! - **Every event but `SessionStart` and `SessionEnd` is `async`**: Claude Code neither waits
 //!   for the hook nor times it out, so a stalled disk delays the event, not the prompt. Async
 //!   hooks of one slot can land out of order, which `events` handles.
-//! - **`SessionStart` and `SessionEnd` are synchronous**: claude's first reply waits for the
-//!   first anyway, and the second must finish before claude exits.
+//! - **`SessionStart` and `SessionEnd` are synchronous**: the first binds the slot's process
+//!   (claude's first reply, an in-session `/resume` and a compaction wait for it), and the
+//!   second must finish before claude exits.
 //! - **`timeout` is seconds, and only a synchronous hook has one.** `SessionEnd` hooks share a
 //!   1.5 s budget that a longer timeout *raises*, slowing every `/exit` on the box, so ours is 1
 //!   and its lock wait 400 ms. `SessionStart`'s is above the hook's own lock wait: a stalled
@@ -101,6 +102,7 @@ fn shell_quote(exe: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Moment;
     use crate::events::{self, Binding, Event, Outcome};
     use crate::registry::SlotRecord;
 
@@ -128,23 +130,23 @@ mod tests {
             r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
             r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#,
         ];
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         for (event, body) in EVENTS.iter().zip(payloads) {
             assert!(hooks.get(event).is_some(), "{event} is not installed");
             let ev = Event::parse(body).unwrap();
             assert_eq!(ev.name(), *event, "payload table out of step");
-            let out = events::apply(&mut rec, &ev, 1_000, Binding::Own, None, None);
+            let out = events::apply(&mut rec, &ev, Moment::ms(1_000), Binding::Own, None, None);
             assert_eq!(
                 out,
                 Outcome::Changed,
                 "{event} is installed but does nothing"
             );
         }
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         let ev = Event::parse(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#).unwrap();
         assert!(
             matches!(
-                events::apply(&mut rec, &ev, 1_000, Binding::Own, None, None),
+                events::apply(&mut rec, &ev, Moment::ms(1_000), Binding::Own, None, None),
                 Outcome::Ignored(_)
             ),
             "an event apply ignores is right to be left uninstalled"
@@ -166,20 +168,20 @@ mod tests {
         // Plain letters and `|` only, so Claude Code reads it as an exact list, not a regex.
         assert!(matcher.chars().all(|c| c.is_ascii_alphabetic() || c == '|'));
         for tool in matcher.split('|') {
-            let mut rec = SlotRecord::new("claude-1", 0);
+            let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
             // Seed a cron so a delete has something to delete.
             let seed = Event::parse(
                 r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1"}}"#,
             )
             .unwrap();
-            events::apply(&mut rec, &seed, 1, Binding::Own, None, None);
+            events::apply(&mut rec, &seed, Moment::ms(1), Binding::Own, None, None);
             let body = format!(
                 r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}","tool_input":{{"delaySeconds":60,"id":"c1"}},"tool_response":{{"id":"c2"}}}}"#
             );
             let out = events::apply(
                 &mut rec,
                 &Event::parse(&body).unwrap(),
-                1_000,
+                Moment::ms(1_000),
                 Binding::Own,
                 None,
                 None,

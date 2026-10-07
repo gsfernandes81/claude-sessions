@@ -161,21 +161,25 @@ and carries on, never waiting for it and never timing it out. On or3's container
 takes milliseconds ran past its 5 s timeout under the box's own disk and memory load; the
 prompt waited all 5 s, then Claude Code killed the hook and the event was lost. Async, a
 stalled hook costs the prompt nothing and its event lands late instead of never.
-`SessionStart` stays synchronous because Claude Code's first reply waits for it anyway, without
-blocking your typing; `SessionEnd`, because a hook still running when claude exits leaves the
-slot never marked closed.
+`SessionStart` stays synchronous because it binds the slot's process: Claude Code's first reply
+waits for it, and so do an in-session `/resume` and a compaction mid-turn. Only a start that can
+bind (the slot's own claude, at its prompt) waits the full 15 s for the slot's lock; any other
+waits 2 s, all under its 30 s timeout. `SessionEnd` stays synchronous because a hook still
+running when claude exits leaves the slot never marked closed.
 
 **Events apply in the order Claude Code fired them, not the order they land.** Each hook is a
 process claude forks (`/bin/sh -c …`), and that process's start time in `/proc` is when the
 event fired, however long the hook then takes to arrive — seen on 2.1.292, the start ticks rise
-in event order. The hook stamps its event with that tick as wall-clock time (`clock::at_tick`,
-from `CLOCK_BOOTTIME`, the clock the ticks count on), so events fired in one tick tie. For each
-field two events can race on — the conversation, live or closed, `busy`, `needs_you`,
-`background`, the wake-up — the record keeps the stamp of the event that last wrote it
-(`written`), and only an event at least as new writes it again; activity only moves forward,
-and `first_prompt` is the earliest prompt fired. A new record is stamped when it is made, so
-nothing fired before it, such as the last hook of a claude whose slot name is being reused, can
-write it. A late event of the conversation before the
+in event order. Events are ordered by that tick, which is exact, so events fired in one tick
+tie; the times the record shows or compares with file times are its wall-clock reading
+(`clock::Moment`). For each field two events can race on — the conversation, live or closed,
+`busy`, `needs_you`, `background`, the wake-up — the record keeps the tick of the event that
+last wrote it (`written`), and only an event of the same tick or later writes it again; activity
+only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the conversation
+goes to the one on record, whose start was synchronous. A new record is stamped with the tick it
+is made in, so nothing fired before it, such as the last hook of a claude whose slot name is
+being reused, can write it; stamps from before a reboot, larger than any tick of this boot, are
+forgotten when a hook next loads the record. A late event of the conversation before the
 current one (a `Stop` of the one `/clear` left) is dropped, and a newer one from a conversation
 the record has not heard start adopts it, as the lost `SessionStart` would have. A cron deleted
 before its create lands is remembered, so the late create is not taken. A hook run outside any

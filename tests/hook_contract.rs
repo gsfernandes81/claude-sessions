@@ -21,7 +21,8 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-/// Run the binary with `args` and `stdin`, capturing what it says.
+/// Run the binary with `args` and `stdin`, capturing what it says. `--version` and an unknown
+/// subcommand are run through it too, so an empty capture is known to mean silence.
 fn run(args: &[&str], dir: &std::path::Path, slot: Option<&str>, stdin: &str) -> Output {
     let mut cmd = Command::new(BIN);
     cmd.args(args)
@@ -68,6 +69,10 @@ fn hook_exits_zero_and_says_nothing_whatever_the_payload() {
         r#"{"hook_event_name":"Stop","tool_input":"not an object"}"#,
         r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":"not an array"}"#,
         r#"{"hook_event_name":"SubagentStop","background_tasks":[{"type":"#,
+        r#"{"hook_event_name":"SessionStart","source":"startup","session_id":"s1","transcript_path":"/nonexistent/t.jsonl"}"#,
+        r#"{"hook_event_name":"SessionStart","source":"compact","session_id":"s1"}"#,
+        r#"{"hook_event_name":"SessionStart","source":"resume","transcript_path":7}"#,
+        r#"{"hook_event_name":"SessionEnd","reason":"not one of the six"}"#,
     ];
     for body in payloads {
         let code = run_hook(&dir, Some("claude-1"), body);
@@ -215,8 +220,8 @@ fn an_unknown_subcommand_fails_loudly() {
     // The door falls through to a shell on a NON-ZERO exit, so a typo must not look like
     // success — and neither may a flag `offload` does not know, which on a timer's command
     // line would otherwise be a stop nobody asked for.
-    // Through the hook's own capture, so a silent hook is known to be silent for the right reason.
     let dir = tmpdir("unknown");
+    assert!(!run(&["--version"], &dir, None, "").stdout.is_empty());
     for args in [&["frobnicate"][..], &["offload", "--force"][..]] {
         let arg = args.join(" ");
         let out = run(args, &dir, None, "");
@@ -230,8 +235,8 @@ fn an_unknown_subcommand_fails_loudly() {
 
 #[test]
 fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
-    // Issue #1: every event waited only SessionEnd's 400 ms. A UserPromptSubmit dropped that
-    // way leaves a working claude reading as idle. Hold the slot's lock for a second.
+    // Issue #1: a UserPromptSubmit dropped on a busy lock leaves a working claude reading as
+    // idle. The hold outlasts the interactive wait, so the hook's own wait is what is measured.
     let dir = tmpdir("lockwait");
     let slot = "claude-4";
     let hold = |secs: &str| {
@@ -243,7 +248,7 @@ fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         child
     };
-    let mut holder = hold("1");
+    let mut holder = hold("3");
     assert_eq!(
         run_hook(
             &dir,

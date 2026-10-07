@@ -14,7 +14,7 @@
 //! its missing fields defaulted, because the alternative is a menu that refuses to draw. A
 //! record this version cannot parse at all is reported, not guessed at.
 
-use crate::clock::Millis;
+use crate::clock::{Millis, Moment};
 use crate::json::{self, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -76,56 +76,66 @@ pub struct Timer {
     pub recurring: bool,
 }
 
-/// A field two hook events can race on.
-#[derive(Debug, Clone, Copy)]
-pub enum Stamp {
-    Conversation,
-    /// `state`, between a start and an end.
-    Life,
-    Busy,
-    NeedsYou,
-    Background,
-    Wakeup,
-    /// `first_prompt`, which the earliest prompt takes rather than the latest.
-    Prompt,
-}
-
-const STAMPS: [&str; 7] = [
-    "conversation",
-    "life",
-    "busy",
-    "needs_you",
-    "background",
-    "wakeup",
-    "prompt",
-];
-
-/// When Claude Code fired the event that last wrote each raced field. Hooks run async and land
-/// in any order, so a field takes a write only from an event at least as new as its stamp.
+/// The clock tick of the event that last wrote each field two hook events can race on. Hooks
+/// run async and land in any order, so a field takes a write only from an event fired in the
+/// same tick or later (`events`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {
-    at: [Millis; STAMPS.len()],
+    pub conversation: u64,
+    /// `state`, between a start and an end.
+    pub life: u64,
+    pub busy: u64,
+    pub needs_you: u64,
+    pub background: u64,
+    pub wakeup: u64,
+    /// `first_prompt`, which the earliest prompt takes rather than the latest.
+    pub prompt: u64,
     /// Crons whose delete landed before their create, by timer id.
-    pub deleted: BTreeMap<String, Millis>,
+    pub deleted: BTreeMap<String, u64>,
 }
 
 impl Written {
-    /// Nothing fired before `at` may write a record made then.
-    pub fn new(at: Millis) -> Written {
+    /// Nothing fired before `tick` may write a record made then.
+    pub fn new(tick: u64) -> Written {
         Written {
-            at: [at; STAMPS.len()],
+            conversation: tick,
+            life: tick,
+            busy: tick,
+            needs_you: tick,
+            background: tick,
+            wakeup: tick,
+            prompt: tick,
             deleted: BTreeMap::new(),
         }
     }
 
+    /// Stamps from before a reboot lie in this boot's future and would refuse every event.
+    pub fn forget_after(&mut self, tick: u64) {
+        if self.clone().named().iter().any(|(_, t)| **t > tick) {
+            *self = Written::new(0);
+        }
+    }
+
+    fn named(&mut self) -> [(&'static str, &mut u64); 7] {
+        [
+            ("conversation", &mut self.conversation),
+            ("life", &mut self.life),
+            ("busy", &mut self.busy),
+            ("needs_you", &mut self.needs_you),
+            ("background", &mut self.background),
+            ("wakeup", &mut self.wakeup),
+            ("prompt", &mut self.prompt),
+        ]
+    }
+
     fn to_json(&self) -> Value {
         let mut o = Value::obj();
-        for (name, at) in STAMPS.iter().zip(self.at) {
-            o.set(name, Value::num(at as f64));
+        for (name, tick) in self.clone().named() {
+            o.set(name, Value::num(*tick as f64));
         }
         let mut deleted = Value::obj();
-        for (id, at) in &self.deleted {
-            deleted.set(id, Value::num(*at as f64));
+        for (id, tick) in &self.deleted {
+            deleted.set(id, Value::num(*tick as f64));
         }
         o.set("deleted", deleted);
         o
@@ -133,8 +143,8 @@ impl Written {
 
     fn from_json(v: Option<&Value>) -> Written {
         let mut w = Written::new(0);
-        for (name, at) in STAMPS.iter().zip(&mut w.at) {
-            *at = v
+        for (name, tick) in w.named() {
+            *tick = v
                 .and_then(|v| v.get(name))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
@@ -147,19 +157,6 @@ impl Written {
             }
         }
         w
-    }
-}
-
-impl std::ops::Index<Stamp> for Written {
-    type Output = Millis;
-    fn index(&self, s: Stamp) -> &Millis {
-        &self.at[s as usize]
-    }
-}
-
-impl std::ops::IndexMut<Stamp> for Written {
-    fn index_mut(&mut self, s: Stamp) -> &mut Millis {
-        &mut self.at[s as usize]
     }
 }
 
@@ -220,7 +217,7 @@ pub struct SlotRecord {
 }
 
 impl SlotRecord {
-    pub fn new(slot: &str, now: Millis) -> Self {
+    pub fn new(slot: &str, made: Moment) -> Self {
         SlotRecord {
             slot: slot.to_string(),
             pid: None,
@@ -234,16 +231,16 @@ impl SlotRecord {
             state: State::Live,
             busy: false,
             needs_you: false,
-            last_activity_ms: now,
+            last_activity_ms: made.at,
             last_attach_ms: 0,
             last_stop_ms: None,
             ready_ms: None,
             timers: Vec::new(),
             background: Vec::new(),
             registered: true,
-            updated_ms: now,
+            updated_ms: made.at,
             last_event_ms: BTreeMap::new(),
-            written: Written::new(now),
+            written: Written::new(made.tick),
         }
     }
 
@@ -523,15 +520,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stamps_from_before_a_reboot_are_forgotten() {
+        let mut w = Written::new(500);
+        w.forget_after(500);
+        assert_eq!(w, Written::new(500), "calibration: this boot's stamps stay");
+        w.forget_after(499);
+        assert_eq!(w, Written::new(0));
+    }
+
+    #[test]
     fn a_record_survives_a_round_trip() {
-        let mut rec = SlotRecord::new("claude-3", 1_000);
+        let mut rec = SlotRecord::new("claude-3", Moment::ms(1_000));
         rec.pid = Some(42);
         rec.proc_start = Some(99);
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
         rec.first_prompt = Some("move the tunnel to the new box".into());
-        rec.written[Stamp::Busy] = 1_500;
-        rec.written.deleted.insert("cron:c1".into(), 1_600);
+        rec.written = Written {
+            conversation: 1,
+            life: 2,
+            busy: 3,
+            needs_you: 4,
+            background: 5,
+            wakeup: 6,
+            prompt: 7,
+            deleted: [("cron:c1".to_string(), 8)].into(),
+        };
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
@@ -578,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_row_shows_the_title_claude_codes_own_selector_would() {
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         assert_eq!(rec.display_title(), "(no title yet)");
         rec.first_prompt = Some("fix the tunnel please".into());
         assert_eq!(
@@ -605,7 +619,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cs-conv-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("abc.jsonl");
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         rec.session_id = Some("abc".into());
         rec.cwd = Some("/workspace".into());
         rec.transcript_path = Some(path.display().to_string());
@@ -622,7 +636,7 @@ mod tests {
 
     #[test]
     fn an_older_record_finds_its_transcript_where_claude_code_keeps_it() {
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         rec.session_id = Some("abc".into());
         rec.cwd = Some("/home/user/claude-sessions".into());
         let p = rec.conversation_path().unwrap();
@@ -637,7 +651,7 @@ mod tests {
 
     #[test]
     fn unread_is_a_stop_later_than_the_last_look() {
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         assert!(!rec.unread(), "nothing has finished yet");
         rec.last_stop_ms = Some(100);
         rec.last_attach_ms = 50;
@@ -648,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_timer_with_no_due_time_counts_as_pending() {
-        let mut rec = SlotRecord::new("claude-1", 0);
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
         rec.timers.push(Timer {
             id: "wakeup".into(),
             due_ms: None,
