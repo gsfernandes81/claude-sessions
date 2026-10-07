@@ -33,19 +33,17 @@ impl Drop for Slot {
     fn drop(&mut self) {
         // Only the claude this slot recorded: once it has gone, its pid, and any child of that
         // pid, may be another test's process or anything on the machine running the tests.
+        // From the leaf up, so nothing under claude is orphaned to outlive the test.
         if alive(self.claude, self.claude_start) {
-            if let Some(grandchild) = child_of(self.claude) {
+            let mut tree = work_of(self);
+            tree.insert(0, self.claude);
+            for pid in tree.iter().rev() {
                 let _ = Command::new("kill")
                     .env_remove("ZMX_SESSION")
-                    .args(["-9", &grandchild.to_string()])
+                    .args(["-9", &pid.to_string()])
                     .stderr(Stdio::null())
                     .status();
             }
-            let _ = Command::new("kill")
-                .env_remove("ZMX_SESSION")
-                .args(["-9", &self.claude.to_string()])
-                .stderr(Stdio::null())
-                .status();
         }
         let _ = self.server.kill();
         let _ = self.server.wait();
@@ -69,6 +67,17 @@ fn stat_fields(pid: u32) -> Option<Vec<String>> {
 /// Alive and not a zombie, with this start time.
 fn alive(pid: u32, start: u64) -> bool {
     stat_fields(pid).is_some_and(|f| f[0] != "Z" && f[19].parse::<u64>().ok() == Some(start))
+}
+
+/// The chain of processes under the stand-in claude, nearest first.
+fn work_of(s: &Slot) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut at = s.claude;
+    while let Some(child) = child_of(at) {
+        chain.push(child);
+        at = child;
+    }
+    chain
 }
 
 fn child_of(ppid: u32) -> Option<u32> {
@@ -97,6 +106,16 @@ fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
 /// As [`idle_slot`], with the transcript there or not. A slot opened and never prompted has
 /// none: Claude Code writes it at the first prompt (issue #5).
 fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) -> Slot {
+    slot_with(tag, socket_mode, usize::from(child), transcript)
+}
+
+/// An idle, detached slot whose stand-in claude has `depth` processes in a chain under it: a
+/// `sleep` alone at 1, a shell running the `sleep` at 2.
+fn idle_slot_deep(tag: &str, depth: usize) -> Slot {
+    slot_with(tag, 0o600, depth, true)
+}
+
+fn slot_with(tag: &str, socket_mode: u32, depth: usize, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["bin", "registry", "zmx"] {
@@ -121,9 +140,14 @@ done
     )
     .unwrap();
     std::fs::set_permissions(&list, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let claude_bin = if child { "/bin/sh" } else { "/bin/sleep" };
+    let claude_bin = if depth == 0 { "/bin/sleep" } else { "/bin/sh" };
     symlink(claude_bin, root.join("bin/claude")).unwrap();
-    let claude_args = if child { "-c 'sleep 600; :'" } else { "600" };
+    // `; :` at each level keeps a shell from exec-ing its one command away.
+    let claude_args = match depth {
+        0 => "600",
+        1 => "-c 'sleep 600; :'",
+        _ => r#"-c 'sh -c "sleep 600; :"; :'"#,
+    };
 
     // `; :` keeps the shell as the parent rather than letting it exec the command, which is
     // what zmx does too: its daemon outlives its command by a couple of seconds.
@@ -368,27 +392,35 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
         floor_kept(&s),
         "a future reading starts over but keeps the slot's floor"
     );
+    // ... and a freeze, as it keeps the floor: the slot's until something thaws it.
+    // Calibration: the case above, with no freeze, said "first reading".
+    let s = idle_slot("activity-future-frozen", 0o600, false);
+    measured_frozen(&s, &[], 60 * 60_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the activity rule would have claude frozen"),
+        "got: {out}"
+    );
+    assert!(frozen_kept(&s), "{out}");
 }
 
-/// A slot the rule would have frozen at its last reading — claude alone, the `sleep` under it
-/// left running — with that `sleep` in the reading or not.
-fn measured_frozen(s: &Slot, child_seen: bool) {
-    let now = now_ms();
-    let child = child_of(s.claude).expect("the stand-in claude's sleep");
-    let child_start = &stat_fields(child).unwrap()[19];
-    let procs = if child_seen {
-        format!(
-            "[{},{},0,0,0],[{child},{child_start},0,0,0]",
-            s.claude, s.claude_start
-        )
-    } else {
-        format!("[{},{},0,0,0]", s.claude, s.claude_start)
-    };
+/// A slot the rule would have frozen at its last reading, `at_offset_ms` from now, with
+/// these of the processes under claude read then beside it.
+fn measured_frozen(s: &Slot, seen: &[u32], at_offset_ms: i64) {
+    let now = now_ms() as i64;
+    let mut procs = format!("[{},{},0,0,0]", s.claude, s.claude_start);
+    for pid in seen {
+        procs.push_str(&format!(
+            ",[{pid},{},0,0,0]",
+            stat_fields(*pid).unwrap()[19]
+        ));
+    }
     std::fs::write(
         s.root.join("registry/activity.state"),
         format!(
             r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[{procs}],"minima":[[{},87.5]],"sockets":[],"frozen":[{},{},{}]}}}}"#,
-            now - 180_000,
+            now + at_offset_ms,
             now - 11 * 60_000,
             now / 3_600_000,
             now - 180_000,
@@ -399,31 +431,53 @@ fn measured_frozen(s: &Slot, child_seen: bool) {
     .unwrap();
 }
 
-/// Claude frozen alone, through the real pass: with nothing new under it, it stays frozen;
-/// a process that was not there at the freeze — `gh` after `sleep N &&` — thaws it.
+fn frozen_kept(s: &Slot) -> bool {
+    std::fs::read_to_string(s.root.join("registry/activity.state"))
+        .unwrap()
+        .contains("\"frozen\"")
+}
+
+/// Claude frozen alone, through the real pass. A process that was not there at the freeze
+/// and that claude did not start — `gh` under the `bash` of `sleep N && gh run view` — thaws
+/// it. One claude started itself is claude's doing, which a frozen claude could not have
+/// done: the line says the freeze would have stopped it, and the freeze holds. Calibration:
+/// with nothing new under claude, it stays frozen and says nothing more.
 #[test]
-fn a_frozen_claude_is_thawed_by_what_still_runs() {
-    let s = idle_slot("activity-frozen", 0o600, true);
-    measured_frozen(&s, true);
+fn a_frozen_claude_is_thawed_by_what_still_runs_and_not_by_what_it_started() {
+    let s = idle_slot_deep("activity-frozen", 2);
+    let tree = work_of(&s);
+    assert_eq!(
+        tree.len(),
+        2,
+        "calibration: claude, a shell, a sleep: {tree:?}"
+    );
+    measured_frozen(&s, &tree, -180_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("the activity rule would have claude frozen, 3m so far"),
+        out.contains("the activity rule would have claude frozen, 3m so far\n"),
         "calibration, nothing changed: {out}"
     );
-    measured_frozen(&s, false);
+    measured_frozen(&s, &tree[..1], -180_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("the activity rule would thaw it: a process started"),
+        out.contains("the activity rule would thaw it: a process started\n"),
         "got: {out}"
     );
+    assert!(!frozen_kept(&s), "the thaw is stored");
+
+    let s = idle_slot_deep("activity-own", 1);
+    measured_frozen(&s, &[], -180_000);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
     assert!(
-        !std::fs::read_to_string(s.root.join("registry/activity.state"))
-            .unwrap()
-            .contains("frozen"),
-        "the thaw is stored"
+        out.contains(
+            "the activity rule would have claude frozen, 3m so far, and claude itself started sleep, which the freeze would have stopped"
+        ),
+        "got: {out}"
     );
+    assert!(frozen_kept(&s), "the freeze is stored");
 }
 
 /// A live record whose claude died without a word — an OOM kill — has no processes to read;

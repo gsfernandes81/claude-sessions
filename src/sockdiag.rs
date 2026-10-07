@@ -113,44 +113,59 @@ fn dump(fd: &OwnedFd, seq: u32, family: u8, out: &mut BTreeMap<u64, u64>) -> io:
                 "the dump ended without its last message",
             ));
         }
-        let mut off = 0;
-        while off + NLMSG_HDR <= n {
-            let len = u32_at(&buf, off) as usize;
-            let kind = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
-            if len < NLMSG_HDR || off + len > n {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "a malformed netlink message",
-                ));
-            }
-            match kind {
-                NLMSG_DONE => return Ok(()),
-                NLMSG_ERROR => {
-                    let errno = i32::from_ne_bytes(
-                        buf[off + NLMSG_HDR..off + NLMSG_HDR + 4]
-                            .try_into()
-                            .unwrap_or([0; 4]),
-                    );
-                    return Err(io::Error::from_raw_os_error(-errno));
-                }
-                _ => {
-                    if let Some((inode, bytes)) = socket_bytes(&buf[off + NLMSG_HDR..off + len]) {
-                        out.insert(inode, bytes);
-                    }
-                }
-            }
-            off += align(len);
+        if messages(&buf[..n], out)? {
+            return Ok(());
         }
     }
 }
 
+/// One datagram of a dump: each socket in it into `out`. `Ok(true)` once the dump's last
+/// message has come; an error the kernel reports — on an `NLMSG_ERROR`, or on the
+/// `NLMSG_DONE` of a dump that failed partway, which carries its errno too — is an error.
+fn messages(buf: &[u8], out: &mut BTreeMap<u64, u64>) -> io::Result<bool> {
+    let errno = |off: usize| {
+        buf.get(off + NLMSG_HDR..off + NLMSG_HDR + 4)
+            .map_or(0, |b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut off = 0;
+    while off + NLMSG_HDR <= buf.len() {
+        let len = u32_at(buf, off) as usize;
+        let kind = u16::from_ne_bytes([buf[off + 4], buf[off + 5]]);
+        if len < NLMSG_HDR || off + len > buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a malformed netlink message",
+            ));
+        }
+        match kind {
+            NLMSG_DONE | NLMSG_ERROR if errno(off) < 0 => {
+                return Err(io::Error::from_raw_os_error(-errno(off)));
+            }
+            NLMSG_DONE => return Ok(true),
+            // An acknowledgement, errno 0: nothing a dump sends, and nothing to count.
+            NLMSG_ERROR => {}
+            _ => {
+                if let Some((inode, bytes)) = socket_bytes(&buf[off + NLMSG_HDR..off + len]) {
+                    out.insert(inode, bytes);
+                }
+            }
+        }
+        off += align(len);
+    }
+    Ok(false)
+}
+
 /// One `inet_diag_msg` and its attributes: the socket's inode and its bytes both ways, or
-/// `None` without a `tcp_info` long enough to hold them.
+/// `None` without a `tcp_info` long enough to hold them — or without an inode: a socket its
+/// owner has closed, still finishing in the kernel, which nobody holds.
 fn socket_bytes(msg: &[u8]) -> Option<(u64, u64)> {
     if msg.len() < DIAG_MSG {
         return None;
     }
     let inode = u64::from(u32_at(msg, DIAG_INODE));
+    if inode == 0 {
+        return None;
+    }
     let mut off = DIAG_MSG;
     while off + 4 <= msg.len() {
         let len = u16::from_ne_bytes([msg[off], msg[off + 1]]) as usize;
@@ -249,25 +264,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_short_or_infoless_message_reads_as_nothing() {
-        assert_eq!(socket_bytes(&[0u8; 10]), None);
+    /// An `inet_diag_msg` for `inode` with a `tcp_info` of `info_len` bytes, acked 5 and
+    /// received 7 when it is long enough to hold them; no attribute at all for `None`.
+    fn diag(inode: u32, info_len: Option<usize>) -> Vec<u8> {
         let mut msg = vec![0u8; DIAG_MSG];
-        msg[DIAG_INODE..DIAG_INODE + 4].copy_from_slice(&42u32.to_ne_bytes());
-        assert_eq!(socket_bytes(&msg), None, "no attribute");
-        // A tcp_info too short for the byte counts: an old kernel's.
-        let mut short = msg.clone();
-        short.extend_from_slice(&(4u16 + 100).to_ne_bytes());
-        short.extend_from_slice(&INET_DIAG_INFO.to_ne_bytes());
-        short.extend_from_slice(&[0u8; 100]);
-        assert_eq!(socket_bytes(&short), None);
-        // Calibration: one long enough reads both counts, summed.
-        let mut info = vec![0u8; 136];
-        info[TCPI_BYTES_ACKED..TCPI_BYTES_ACKED + 8].copy_from_slice(&5u64.to_ne_bytes());
-        info[TCPI_BYTES_RECEIVED..TCPI_BYTES_RECEIVED + 8].copy_from_slice(&7u64.to_ne_bytes());
-        msg.extend_from_slice(&(4u16 + 136).to_ne_bytes());
-        msg.extend_from_slice(&INET_DIAG_INFO.to_ne_bytes());
-        msg.extend_from_slice(&info);
-        assert_eq!(socket_bytes(&msg), Some((42, 12)));
+        msg[DIAG_INODE..DIAG_INODE + 4].copy_from_slice(&inode.to_ne_bytes());
+        if let Some(n) = info_len {
+            let mut info = vec![0u8; n];
+            if n >= 136 {
+                info[TCPI_BYTES_ACKED..TCPI_BYTES_ACKED + 8].copy_from_slice(&5u64.to_ne_bytes());
+                info[TCPI_BYTES_RECEIVED..TCPI_BYTES_RECEIVED + 8]
+                    .copy_from_slice(&7u64.to_ne_bytes());
+            }
+            msg.extend_from_slice(&(4 + n as u16).to_ne_bytes());
+            msg.extend_from_slice(&INET_DIAG_INFO.to_ne_bytes());
+            msg.extend_from_slice(&info);
+        }
+        msg
+    }
+
+    /// `payload` wrapped in a netlink header of `kind`, padded as the kernel pads it.
+    fn nlmsg(kind: u16, payload: &[u8]) -> Vec<u8> {
+        let mut m = Vec::new();
+        m.extend_from_slice(&((NLMSG_HDR + payload.len()) as u32).to_ne_bytes());
+        m.extend_from_slice(&kind.to_ne_bytes());
+        m.extend_from_slice(&[0u8; 10]);
+        m.extend_from_slice(payload);
+        m.resize(align(m.len()), 0);
+        m
+    }
+
+    #[test]
+    fn a_short_ownerless_or_infoless_message_reads_as_nothing() {
+        assert_eq!(socket_bytes(&[0u8; 10]), None);
+        assert_eq!(socket_bytes(&diag(42, None)), None, "no attribute");
+        assert_eq!(
+            socket_bytes(&diag(42, Some(100))),
+            None,
+            "an old kernel's tcp_info"
+        );
+        assert_eq!(
+            socket_bytes(&diag(0, Some(136))),
+            None,
+            "closed, held by nobody"
+        );
+        // Calibration: an owned socket with a whole tcp_info reads both counts, summed.
+        assert_eq!(socket_bytes(&diag(42, Some(136))), Some((42, 12)));
+    }
+
+    #[test]
+    fn a_dumps_end_and_its_errors_are_read() {
+        let sock = nlmsg(SOCK_DIAG_BY_FAMILY, &diag(42, Some(136)));
+        let done = |errno: i32| nlmsg(NLMSG_DONE, &errno.to_ne_bytes());
+        let mut out = BTreeMap::new();
+        assert!(!messages(&sock, &mut out).unwrap(), "more to come");
+        assert_eq!(out.get(&42), Some(&12));
+        let mut whole = sock.clone();
+        whole.extend(done(0));
+        assert!(messages(&whole, &mut BTreeMap::new()).unwrap(), "done");
+        // A dump that failed partway says so on its last message, and a refusal on its first.
+        let mut broken = sock;
+        broken.extend(done(-2));
+        let e = messages(&broken, &mut BTreeMap::new()).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(2));
+        let e = messages(
+            &nlmsg(NLMSG_ERROR, &(-13i32).to_ne_bytes()),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(13));
+        // A length shorter than its own header is no message.
+        let mut bad = nlmsg(NLMSG_DONE, &0i32.to_ne_bytes());
+        bad[0] = 4;
+        assert!(messages(&bad, &mut BTreeMap::new()).is_err());
     }
 }
