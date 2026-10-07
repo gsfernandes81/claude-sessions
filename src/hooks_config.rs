@@ -12,25 +12,16 @@
 //!
 //! - **A matcher of letters and `|` is an exact list**, not a regex, so the `PostToolUse`
 //!   matcher names exactly the timer tools and nothing that merely contains their names.
-//! - **Every event but the two that bound a session runs `async`**: Claude Code starts the hook
-//!   and carries on without waiting for it. The registry is bookkeeping, never a gate, and a
-//!   prompt that waits on it waits on whatever the box's disk and memory are doing: on or3's
-//!   containers a hook that takes milliseconds ran past its 5 s timeout, the prompt waited the
-//!   whole 5 s, and the event was lost, because a timed-out hook is killed. An async hook is
-//!   neither waited on nor timed out, so the event lands late instead. Measured on 2.1.292: the
-//!   same 8 s hook held a `-p` prompt for its 5 s timeout and then was killed, and run async
-//!   held it for nothing. Async hooks of one slot can then land out of order; `events` puts a
-//!   turn's `Stop` back after its `UserPromptSubmit` by their turn ids. An async hook that
-//!   exits non-zero or writes to stderr has that delivered to Claude on its next turn, so the
-//!   hook's exit 0 and its silence still matter.
-//! - **`SessionStart` and `SessionEnd` stay synchronous.** Claude Code's first reply waits for
-//!   `SessionStart` hooks anyway, and runs them without blocking your typing; a `SessionEnd`
-//!   left running when claude exits is a slot never marked closed.
+//! - **Every event but `SessionStart` and `SessionEnd` is `async`**: Claude Code neither waits
+//!   for the hook nor times it out, so a stalled disk delays the event, not the prompt. Async
+//!   hooks of one slot can land out of order, which `events` handles. An async hook's non-zero
+//!   exit or stderr is handed to Claude, so the hook stays silent.
+//! - **`SessionStart` and `SessionEnd` are synchronous**: claude's first reply waits for the
+//!   first anyway, and the second must finish before claude exits.
 //! - **`timeout` is seconds.** A `SessionEnd` hook with a timeout above 1.5 s *raises* the
 //!   budget all `SessionEnd` hooks share, which would slow every `/exit` on the box if this hook
 //!   ever hung — so ours is 1, inside the default budget. The hook's own lock wait is 400 ms.
-//!   Everything else gets 5: Claude Code ignores it on an async hook, and it is there so that
-//!   one which ever ran synchronously again would cost a prompt seconds, not the default.
+//!   Everything else gets 5, which Claude Code ignores on an async hook.
 //! - **No matcher on the other events**: `SessionStart` must see every source, including
 //!   `clear` and `fork`, and the notification types are told apart in `events.rs`, where the
 //!   reason for each is written down.
@@ -53,7 +44,7 @@ pub const EVENTS: [&str; 8] = [
 const TIMEOUT_SECS: u32 = 5;
 const SESSION_END_TIMEOUT_SECS: u32 = 1;
 
-/// The events whose hooks Claude Code waits for, as the module header says why.
+/// Events Claude Code waits for; the module header says why.
 const SYNC: [&str; 2] = ["SessionStart", "SessionEnd"];
 
 /// The settings document, with `exe` as the path to this binary.

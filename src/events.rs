@@ -64,9 +64,8 @@ impl Event {
     pub fn prompt(&self) -> Option<&str> {
         self.s("prompt")
     }
-    /// The turn this event belongs to: a `UserPromptSubmit` opens every turn — one a finished
-    /// background task wakes included — with a new id, and every later event of the turn carries
-    /// it (seen on 2.1.292). Absent before the process's first prompt.
+    /// The turn this event belongs to. Each turn opens with a `UserPromptSubmit` carrying a new
+    /// id, and its later events repeat it.
     pub fn prompt_id(&self) -> Option<&str> {
         self.s("prompt_id")
     }
@@ -254,14 +253,13 @@ pub fn apply(
             }
             Outcome::Changed
         }
-        // The hooks run in the background (`hooks_config`), so two of one slot can land in either
-        // order, and the turn ids put back the one order that matters: a turn's `Stop` after its
-        // `UserPromptSubmit`. Without an id on both, events apply in the order they land.
+        // Hooks are async, so they can land out of order; `turn` keeps a turn's `Stop` after its
+        // prompt. Events without a `prompt_id` apply in landing order.
         "UserPromptSubmit" => {
             if rec.first_prompt.is_none() {
                 rec.first_prompt = ev.prompt().and_then(one_line);
             }
-            // This turn's `Stop` landed first: the turn it would mark busy is already over.
+            // This turn's `Stop` has already landed.
             let over =
                 !rec.busy && ev.prompt_id().is_some() && ev.prompt_id() == rec.turn.as_deref();
             if !over {
@@ -272,8 +270,7 @@ pub fn apply(
             }
             Outcome::Changed
         }
-        // The `Stop` of an earlier turn, landing after the next turn's `UserPromptSubmit`: the
-        // turn running now is not over, and the list it carries is that earlier turn's.
+        // An earlier turn's `Stop`, landing after the next prompt.
         "Stop"
             if rec.busy
                 && matches!((ev.prompt_id(), rec.turn.as_deref()), (Some(p), Some(t)) if p != t) =>

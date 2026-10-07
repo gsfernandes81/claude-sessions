@@ -99,8 +99,7 @@ pub struct SlotRecord {
     pub first_prompt: Option<String>,
     pub state: State,
     pub busy: bool,
-    /// The turn `busy` was last set or cleared for: the `prompt_id` of the `UserPromptSubmit`
-    /// or `Stop` that did it. What lets a late hook be told from a current one (`events`).
+    /// The `prompt_id` of the `UserPromptSubmit` or `Stop` that last set `busy`.
     pub turn: Option<String>,
     pub needs_you: bool,
     pub last_activity_ms: Millis,
