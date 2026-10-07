@@ -366,7 +366,7 @@ fn a_start_that_binds_nothing_gives_up_where_a_prompt_waits() {
 }
 
 #[test]
-fn reconcile_offloads_a_slot_whose_pid_was_reused_and_skips_a_locked_one() {
+fn reconcile_offloads_a_reused_pid_on_the_record_under_its_lock_and_skips_a_busy_one() {
     let dir = tmpdir("reconcile");
     let me = std::process::id();
     let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
@@ -376,26 +376,42 @@ fn reconcile_offloads_a_slot_whose_pid_was_reused_and_skips_a_locked_one() {
         .unwrap()
         .parse()
         .unwrap();
-    let live = |slot: &str, start: u64| {
+    let live = move |dir: &std::path::Path, slot: &str, start: u64| {
         std::fs::write(
             dir.join(format!("{slot}.json")),
             format!(r#"{{"slot":"{slot}","state":"live","pid":{me},"proc_start":{start}}}"#),
         )
         .unwrap();
     };
+    let hold = |slot: &str, secs: &str| {
+        Command::new("flock")
+            .arg(dir.join(format!("{slot}.lock")))
+            .args(["sleep", secs])
+            .spawn()
+            .expect("flock(1) runs")
+    };
     // This process's pid, as a container restart hands old pids out again.
-    live("claude-1", start + 1);
-    live("claude-2", start);
-    live("claude-3", start + 1);
-    let mut holder = Command::new("flock")
-        .arg(dir.join("claude-3.lock"))
-        .args(["sleep", "4"])
-        .spawn()
-        .expect("flock(1) runs");
+    live(&dir, "claude-1", start + 1);
+    live(&dir, "claude-2", start);
+    live(&dir, "claude-3", start + 1);
+    live(&dir, "claude-4", start + 1);
+    let mut busy = hold("claude-3", "4");
+    let mut brief = hold("claude-4", "1");
     std::thread::sleep(std::time::Duration::from_millis(150));
+    // While reconcile waits for claude-4's lock, its holder rebinds it to a live process.
+    let rebind = {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            live(&dir, "claude-4", start);
+        })
+    };
     let out = run(&["reconcile"], &dir, None, "");
-    holder.kill().ok();
-    holder.wait().ok();
+    rebind.join().unwrap();
+    for h in [&mut busy, &mut brief] {
+        h.kill().ok();
+        h.wait().ok();
+    }
     assert!(
         out.status.success(),
         "{}",
@@ -409,6 +425,10 @@ fn reconcile_offloads_a_slot_whose_pid_was_reused_and_skips_a_locked_one() {
     assert!(
         !state("claude-2"),
         "calibration: the process itself is alive"
+    );
+    assert!(
+        !state("claude-4"),
+        "decided on the record under the lock, not the listing"
     );
     assert!(
         !state("claude-3"),

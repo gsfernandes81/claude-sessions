@@ -231,13 +231,13 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
 }
 
 #[test]
-fn a_record_stamped_before_a_reboot_is_still_bound() {
+fn a_record_stamped_in_another_boot_is_still_bound() {
     let root = setup("reboot");
     let far = 1u64 << 40;
     std::fs::write(
         root.0.join("registry/claude-6.json"),
         format!(
-            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"wakeup":{far},"prompt":{far}}}}}"#
+            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"wakeup":{far},"prompt":{far},"boot":"an earlier boot"}}}}"#
         ),
     )
     .unwrap();

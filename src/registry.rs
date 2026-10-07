@@ -16,6 +16,7 @@
 
 use crate::clock::{Millis, Moment};
 use crate::json::{self, Value};
+use crate::procinfo;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -122,6 +123,8 @@ pub struct Written {
     ticks: [u64; Field::ALL.len()],
     /// Crons whose delete landed before their create, by timer id.
     pub deleted: BTreeMap<String, u64>,
+    /// The kernel's boot id: ticks count from boot, so another boot's mean nothing.
+    boot: String,
 }
 
 impl Written {
@@ -130,6 +133,7 @@ impl Written {
         Written {
             ticks: [tick; Field::ALL.len()],
             deleted: BTreeMap::new(),
+            boot: procinfo::boot_id(),
         }
     }
 
@@ -146,14 +150,9 @@ impl Written {
         self.ticks[f as usize] = tick;
     }
 
-    /// Stamps from before a reboot lie in this boot's future and would refuse every event.
-    pub fn forget_after(&mut self, tick: u64) {
-        if self
-            .ticks
-            .iter()
-            .chain(self.deleted.values())
-            .any(|&t| t > tick)
-        {
+    /// Stamps made in another boot are forgotten.
+    pub fn forget_other_boot(&mut self) {
+        if self.boot != procinfo::boot_id() {
             *self = Written::new(0);
         }
     }
@@ -168,6 +167,7 @@ impl Written {
             deleted.set(id, Value::num(*tick as f64));
         }
         o.set("deleted", deleted);
+        o.set("boot", Value::string(&self.boot));
         o
     }
 
@@ -184,6 +184,11 @@ impl Written {
         Written {
             ticks: Field::ALL.map(|f| tick(f).unwrap_or(0)),
             deleted,
+            boot: v
+                .and_then(|v| v.get("boot"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 }
@@ -512,15 +517,12 @@ pub fn load(slot: &str) -> std::io::Result<Option<SlotRecord>> {
     }
 }
 
-/// Write a record, atomically.
-///
-/// Temp file then rename, because a reader that catches a half-written file gets invalid JSON
-/// and this is read on the ssh path. The temp name carries the pid so two writers cannot
-/// collide on it even if the lock were ever bypassed.
+/// Write a record, atomically: temp then rename, under the slot's lock, so a reader never sees
+/// a half-written file and a killed writer's temp is reused by the next.
 pub fn store(rec: &SlotRecord) -> std::io::Result<()> {
     let dir = dir();
     std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!(".{}.{}.tmp", rec.slot, std::process::id()));
+    let tmp = dir.join(format!(".{}.tmp", rec.slot));
     std::fs::write(&tmp, json::to_string_pretty(&rec.to_json()))?;
     std::fs::rename(&tmp, rec.path())
 }
@@ -565,21 +567,14 @@ mod tests {
     }
 
     #[test]
-    fn stamps_from_before_a_reboot_are_forgotten() {
-        let w = stamped();
-        let mut kept = w.clone();
-        kept.forget_after(8);
-        assert_eq!(kept, w, "calibration: this boot's stamps stay");
-        for f in Field::ALL {
-            let mut v = w.clone();
-            v.stamp(f, 9);
-            v.forget_after(8);
-            assert_eq!(v, Written::new(0), "{f:?}");
-        }
-        let mut v = w.clone();
-        v.deleted.insert("cron:c2".into(), 9);
-        v.forget_after(8);
-        assert_eq!(v, Written::new(0), "a tombstone");
+    fn stamps_from_another_boot_are_forgotten() {
+        let mut kept = stamped();
+        kept.forget_other_boot();
+        assert_eq!(kept, stamped(), "calibration: this boot's stamps stay");
+        let mut other = stamped();
+        other.boot = "another".into();
+        other.forget_other_boot();
+        assert_eq!(other, Written::new(0));
     }
 
     #[test]

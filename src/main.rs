@@ -67,7 +67,6 @@ mod ui;
 mod work;
 mod zmx;
 
-use clock::Moment;
 use events::{Binding, Outcome};
 use fmt::{age, human};
 use registry::{SlotRecord, State};
@@ -262,8 +261,7 @@ fn cmd_hook() -> std::io::Result<()> {
         r.registered = registered;
         r
     });
-    // Stamps from before a reboot would otherwise refuse every event of this boot.
-    rec.written.forget_after(Moment::now().tick);
+    rec.written.forget_other_boot();
     match events::apply(&mut rec, &ev, fired, binding, own_pid, own_start) {
         Outcome::Changed => {
             if let Some(titles) = &titles {

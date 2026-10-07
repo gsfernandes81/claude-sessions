@@ -78,6 +78,13 @@ pub fn comm(pid: u32) -> Option<String> {
     Some(stat[open..close].to_string())
 }
 
+/// The kernel's id for this boot; empty if it cannot be read.
+pub fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// `pid` and up to `limit` of its ancestors, nearest first, with each one's `comm`.
 pub fn lineage(pid: u32, limit: usize) -> Vec<(u32, String)> {
     let mut line = Vec::new();
