@@ -369,7 +369,7 @@ is the choice and why:
   sweep kill, kept-too-young tree and would-be kill. Slots kept are printed to stdout only, since a pass every few minutes
   would otherwise bury the lines that matter.
 
-## Activity, measured (0.4.5: reported, not acted on)
+## Activity, measured (0.4.5 on: reported, not acted on)
 
 **Why.** Every rule above reads Claude Code: hook payloads, its task list's filters, which
 agents announce themselves. Eight review rounds of #10 kept finding corners of that reading,
@@ -378,8 +378,11 @@ claude stopped. The owner's direction (2026-10-06): try a rule that asks the ker
 what a slot's processes *do* means the same on every Claude Code version and every machine —
 with **freezing** (`SIGSTOP`, a reversible pause that leaves a cold process for swap to take)
 in place of killing. 0.4.5 is the first step: every pass, live or dry, says what that rule
-would do beside what the offloader did, and nothing else changes. The freeze comes after the
-fleet's own numbers have been read. `src/activity.rs` has the details and the tests.
+would do beside what the offloader did, and nothing else changes. 0.4.6 adds the TCP bytes
+the process counters miss, and carries the freeze the rule would make from pass to pass — of
+claude alone, thawed by what still runs — so the logs say when it would have thawed, and when
+claude moved while it would have been frozen. The freeze comes after the fleet's own numbers
+have been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the tests.
 
 - **Bytes through `read`/`write`, which is not all of the network.** `rchar + wchar` in
   `/proc/<pid>/io` counts the terminal claude repaints (zmx reads it whether or not anyone is
@@ -387,15 +390,35 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   on x86, where CPU time is not. The kernel counts by call, not by file: `read`/`write` on a
   socket are counted, **`send`/`recv` are not** — and claude's native build uses `send`/`recv`
   for the API (checked: a megabyte through a socketpair by `send`/`recv` moved `rchar` by
-  under a hundred bytes). So claude's own network is invisible here, and a model turn shows
-  as the screen it redraws and the transcript it appends, not as the stream itself. A child's
-  network shows or not by how it does I/O, not by its language: `read`/`write` is counted
-  (Node, Go, ssh, and blocking TLS through OpenSSL — Python's `ssl` module, `requests`);
-  `send`/`recv` is not (Bun, Rust's std sockets, Python's plain sockets and asyncio). Measured on 2.1.291 with agent view off,
+  under a hundred bytes). A child's network is in these counters or not by how it does I/O,
+  not by its language: `read`/`write` is counted (Node, Go, ssh, and blocking TLS through
+  OpenSSL — Python's `ssl` module, `requests`); `send`/`recv` is not (Bun, Rust's std
+  sockets, Python's plain sockets and asyncio). Measured on 2.1.291 with agent view off,
   here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
   reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. Wake-ups (voluntary
   context switches over live threads) and CPU time (`utime + stime` with reaped children's)
   are logged beside the bytes for the data and judged by nothing; CPU scales with the device.
+- **Plus every TCP socket's own count (0.4.6).** The kernel keeps bytes per TCP socket
+  whichever call moved them — `tcpi_bytes_received` and `tcpi_bytes_acked` — and hands them
+  to anyone who asks its socket-diagnostics netlink (`NETLINK_SOCK_DIAG`, what `ss -ti`
+  reads), for every socket in the asker's network namespace. A slot's sockets are the
+  inodes its members hold in `/proc/<pid>/fd`, each counted once however many share it, and
+  their bytes are added to the window's. So claude's own network — the API, a websocket
+  monitor, an HTTP MCP server — counts now, and so does a child's whatever calls it uses;
+  traffic through `read`/`write` on a socket counts twice, which errs active. **Checked
+  unprivileged** (2026-10-07): as `nobody` with every capability dropped, 1,000,000 bytes
+  moved by `send`/`recv` over loopback read back exactly. infra's dev containers run rootful
+  Docker with the default seccomp profile and capabilities, as `dev`, on 6.18, and nothing
+  there stands in the way; a kernel without the diag module, or anything else that refuses
+  the dump, is one line in the pass — `tcp sockets could not be read` — and every slot's
+  window reads `(tcp ?)` and is judged on its process bytes alone, exactly as 0.4.5 judged
+  it, with the last socket reading kept so the next window that can read them holds the
+  bytes. **Only TCP**: UDP and Unix sockets carry no count here. **A socket closed since the
+  last reading is not counted**, and does not make the window active as a member that left
+  does: its last bytes are lost with it, but claude's connection pool closes idle sockets as
+  a matter of course, so that rule would keep every slot, and a turn shows anyway in the
+  screen it redraws and the transcript it appends. The line says how many closed uncounted.
+  A new socket counts whole, and so does one whose inode a newer socket reused.
 - **Which processes: the environment.** With agent view off, claude is one process: an
   in-process subagent shows as claude's own bytes, and its tools as claude's children
   (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
@@ -447,9 +470,31 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
 - **The verdict.** Quiet — no window over its budget, a minute's worth of bytes at the line —
   for the offloader's 10 minutes, and detached by zmx's count: *would freeze*. Otherwise *would keep*, with the reason:
   first reading, attached, attachment unknown, or quiet under 10m. Each pass prints
-  `claude-1: measured — 95 B/s over 180s, 25.2 wakeups/s, cpu 6.1 ms/s, 1 process(es), line
-  950 B/s (57000 B a window) from floor 95, quiet 14m; the activity rule would freeze it` —
-  the bracket is the budget actually applied. These lines go to the pass's stdout only, not
+  `claude-1: measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), 25.2 wakeups/s, cpu 6.1
+  ms/s, 1 process(es), line 950 B/s (57000 B a window) from floor 95, quiet 14m; the activity
+  rule would freeze it` — the second bracket is the budget actually applied.
+- **The freeze is of claude alone (0.4.6).** What the rule would freeze is the recorded
+  claude, and nothing else in the slot: a tool waiting locally — `sleep N && gh run view`,
+  `tail -f` on a quiet log, `inotifywait`, a build — goes on waiting and then does what it
+  waits to do, and that is the thaw. While frozen, the slot is thawed by **a member other
+  than claude starting or exiting, or the others moving more than a window's budget** (their
+  process bytes and the sockets claude does not hold alone), or by an attach — and, erring
+  running, by an attachment zmx could not report. All of those are kernel facts; none reads
+  Claude Code. The freeze is carried in the state from pass to pass with the claude it froze,
+  by pid and start time, so an offload and resume, or a crash, ends it. Nothing is frozen
+  yet; the lines say what would have been: `would freeze it — claude alone, leaving 2 other
+  process(es) running` when the rule would make it, `would have claude frozen, 12m so far`
+  while it would hold, `would thaw it: a process exited` (or `a process started`, `its
+  other processes moved 70000 B`, `attached`) when it would end. **And when claude itself
+  moves while it would have been frozen**, the line adds `and claude itself moved 540000 B,
+  which the freeze would have stopped`: the case the rule cannot thaw for — a timer of
+  claude's own, a message reaching it over its own socket — counted in the logs before
+  anything depends on it. **A claude whose parent is not zmx is never frozen** — `would keep
+  it: claude's parent is fish, not zmx`: one typed into a shell in a zmx session is that
+  shell's job, and a stopped job hands its terminal back to the shell. The menu's slots run
+  claude as zmx's own child (`exec` through `env` and `sh`), so this is the hand-started case.
+  The thaw latency is a pass, three minutes; the thaw's own budget is the slot's, so a
+  child that idles noisily — an MCP server polling — shows in the floor first. These lines go to the pass's stdout only, not
   to `offload.log`. **The days of reading depend on infra keeping that stdout**: its live
   loop writes each pass, timestamped, to `~/.local/share/claude-sessions-passes.log` (infra#9,
   2026-10-06), and it must go on doing so until the owner has read the numbers. Wake-ups read `?` in a window where their sum fell — a thread that exited takes
@@ -479,22 +524,32 @@ fleet's own numbers have been read. `src/activity.rs` has the details and the te
   activity verdict has no input for timers, so such a slot will read *would freeze* beside
   the offloader's *kept — a timer is pending*; a freeze would stop the timer firing, and
   thawing on attach is no substitute for a wake-up nobody is there to see. The freeze
-  decision has to keep that rule. **Then claude's own network**: a cloud session, a
-  websocket monitor, an HTTP MCP server, a wait on the API that redraws nothing — all
-  claude's own sockets, none in the bytes; a child's monitor or server may or may not show,
-  by what it is written in. The freeze decision must keep the background-task hold for
-  these, or find a signal that sees them. **And a tool that computes without reading or
+  decision has to keep that rule. **No kernel signal stands in for it** (checked 2026-10-07):
+  the native build blocks in `epoll_pwait2` and holds no timerfd, so its next deadline is in
+  its own memory alone — and would be the nearest of its housekeeping intervals anyway. A
+  freeze that thaws on a fixed cycle would fire an overdue timer late, page the process back
+  in every cycle, and have to tell its own catch-up burst from a turn. The hook-read hold stays;
+  it fails the wrong way — a `Stop` payload that loses its timer field drops the hold without a
+  word — so infra's checks on Claude Code's binary should cover that field as they cover
+  `background_tasks`. **Then a message for claude alone** — a remote session's,
+  a websocket monitor's. The kernel goes on receiving into a stopped process's socket, so a
+  real freeze could see those bytes arrive and thaw on them; the measurement cannot, because
+  claude is not stopped, and the bytes it receives are mostly replies to what it sent. So
+  0.4.6 counts them under *claude itself moved*, and a thaw on claude's own sockets is for
+  the freeze's design, once the logs say how often that line appears. One for a child thaws
+  it now. **And a tool that computes without reading or
   writing** — a background build's link step, a script crunching numbers — adds no bytes
-  while claude sits at its prompt; the CPU figure on the same line will show it, and the hold
-  has to cover it too. So does file I/O through a mapping — a linker (lld, mold, gold),
-  sqlite with `mmap_size`, LMDB — which never passes through `read`/`write`. **And a server
+  while claude sits at its prompt; the CPU figure on the same line will show it, and with
+  claude frozen alone it runs on and its exit is the thaw. So does file I/O through a mapping —
+  a linker (lld, mold, gold), sqlite with `mmap_size`, LMDB — which never passes through
+  `read`/`write`. **And a server
   that writes its title over its environment** (postgres, nginx, `setproctitle` users such as
   gunicorn and celery) is in no slot once it has left claude's tree, nor is anything it
   forks. And a job that double-forked away and ran wholly
-  between two passes, reaped by init: nobody's counters ever hold it. **And a tool waiting
+  between two passes, reaped by init: nobody's counters ever hold it. **A tool waiting
   locally** — a background `sleep N && gh run view`, `tail -f` on a quiet log,
-  `inotifywait` — adds no bytes either, and the hold has to cover it too. Rarer: a tool
-  blocked on a remote that sends nothing, which a freeze pauses and an attach resumes.
+  `inotifywait` — adds no bytes either, which is why the freeze is of claude alone: the tool
+  is not frozen, and what it does when the wait ends thaws claude.
 
 **Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
 2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.

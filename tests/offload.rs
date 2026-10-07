@@ -370,6 +370,62 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
     );
 }
 
+/// A slot the rule would have frozen at its last reading — claude alone, the `sleep` under it
+/// left running — with that `sleep` in the reading or not.
+fn measured_frozen(s: &Slot, child_seen: bool) {
+    let now = now_ms();
+    let child = child_of(s.claude).expect("the stand-in claude's sleep");
+    let child_start = &stat_fields(child).unwrap()[19];
+    let procs = if child_seen {
+        format!(
+            "[{},{},0,0,0],[{child},{child_start},0,0,0]",
+            s.claude, s.claude_start
+        )
+    } else {
+        format!("[{},{},0,0,0]", s.claude, s.claude_start)
+    };
+    std::fs::write(
+        s.root.join("registry/activity.state"),
+        format!(
+            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[{procs}],"minima":[[{},87.5]],"sockets":[],"frozen":[{},{},{}]}}}}"#,
+            now - 180_000,
+            now - 11 * 60_000,
+            now / 3_600_000,
+            now - 180_000,
+            s.claude,
+            s.claude_start
+        ),
+    )
+    .unwrap();
+}
+
+/// Claude frozen alone, through the real pass: with nothing new under it, it stays frozen;
+/// a process that was not there at the freeze — `gh` after `sleep N &&` — thaws it.
+#[test]
+fn a_frozen_claude_is_thawed_by_what_still_runs() {
+    let s = idle_slot("activity-frozen", 0o600, true);
+    measured_frozen(&s, true);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the activity rule would have claude frozen, 3m so far"),
+        "calibration, nothing changed: {out}"
+    );
+    measured_frozen(&s, false);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("the activity rule would thaw it: a process started"),
+        "got: {out}"
+    );
+    assert!(
+        !std::fs::read_to_string(s.root.join("registry/activity.state"))
+            .unwrap()
+            .contains("frozen"),
+        "the thaw is stored"
+    );
+}
+
 /// A live record whose claude died without a word — an OOM kill — has no processes to read;
 /// its floor is carried until the slot is resumed, not dropped.
 #[test]

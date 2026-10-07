@@ -58,6 +58,7 @@ mod registry;
 mod render;
 mod run;
 mod signal;
+mod sockdiag;
 mod statusline;
 mod store;
 mod term;

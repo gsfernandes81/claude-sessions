@@ -416,7 +416,7 @@ pub fn run(dry_run: bool) -> io::Result<()> {
     // busy claude reading as idle, and ten minutes later the offloader would stop it.
     let table = procinfo::table();
     let records = registry::all()?;
-    // What the activity rule would do, beside what this pass does (0.4.5: measured, not
+    // What the activity rule would do, beside what this pass does (measured since 0.4.5, not
     // acted on). Before any stop, so a slot this pass offloads is measured as it was.
     for line in crate::activity::pass(&records, table.as_deref(), clock::now()) {
         say!("{line}");

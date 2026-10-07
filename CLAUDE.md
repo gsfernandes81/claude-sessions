@@ -71,7 +71,8 @@ release is a static musl build, so the thing under test is the thing published. 
 target explicitly per job because the runner is x86_64.
 
 The syscalls are declared directly rather than taken from `libc`: `flock` in
-`src/lockfile.rs`, `kill` plus the two pidfd calls in `src/signal.rs`, and the terminal's
+`src/lockfile.rs`, `kill` plus the two pidfd calls in `src/signal.rs`, `socket`, `send` and
+`recv` for the socket-diagnostics netlink in `src/sockdiag.rs`, and the terminal's
 termios, `ioctl`, `poll`, `signal` and `read` in `src/term.rs`, each with a note on why its
 layout or constant is the same on both targets.
 `src/json.rs` is a small reader and writer, which the hook path wants anyway: payloads must be
