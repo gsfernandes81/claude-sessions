@@ -139,7 +139,7 @@ pub struct Split {
     /// could not have done, so never a thaw.
     pub claude_change: Option<String>,
     /// A member claude did not start in the window started, or a member other than claude
-    /// exited — whoever started it.
+    /// that was seen at the last reading exited — whoever started it.
     pub rest_change: Option<&'static str>,
     /// Members other than the recorded claude.
     pub others: usize,
@@ -285,8 +285,8 @@ fn split_sockets(
 /// **Whose a change is.** A member claude started in the window ([`claudes_doing`]) is
 /// claude's: its bytes and sockets are claude's, and it is [`Split::claude_change`], never a
 /// thaw — a stopped process starts nothing. A new member anything else started is the rest's.
-/// A member that exited is the rest's whoever started it: `sleep N && gh run view` ends with
-/// claude's own `bash` exiting, and that is the thaw working.
+/// A member seen at the last reading that exited is the rest's whoever started it: `sleep N &&
+/// gh run view` ends with claude's own `bash` exiting, and that is the thaw working.
 pub fn step(prev: Option<&SlotState>, now: Millis, snap: Snapshot) -> (SlotState, Measure) {
     let Snapshot {
         readings,
@@ -732,6 +732,21 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
             }
         };
         if snap.readings.is_empty() {
+            // Nothing of the slot is left to read, so the claude a freeze held is gone for
+            // certain: said here, or it would end unsaid with the record.
+            if let Some(o) = stored.filter(|o| o.frozen.is_some()) {
+                lines.push(format!(
+                    "{}: measured — nothing to read; the claude it would have frozen has gone, and that freeze with it",
+                    rec.slot
+                ));
+                next.insert(
+                    rec.slot.clone(),
+                    SlotState {
+                        frozen: None,
+                        ..o.clone()
+                    },
+                );
+            }
             continue;
         }
         // Not the claude looked up above if it was gone before it could be read.
@@ -1943,6 +1958,28 @@ mod tests {
         let (thawed, said) = shadow(Some(&f), &m, Some(false), CLAUDE, Some("zmx"), T0 + 360_000);
         assert_eq!(thawed, None);
         assert_eq!(said, "the activity rule would thaw it: a process exited");
+        // A pid reused inside the window is a new process, by its start: the old one exited
+        // — a thaw — and the new one, under claude, is claude's start.
+        let (s, _) = frozen_pair();
+        let seen = SlotState {
+            procs: vec![r(1, 7, 18_000), r(2, 8, 0), r(3, 9, 0)],
+            ..s
+        };
+        let (_, m) = step(
+            Some(&seen),
+            T0 + 360_000,
+            Snapshot {
+                tree: vec![member(3, 1, "bash")],
+                ..with_claude(
+                    vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 11, 1_000)],
+                    Ok(vec![]),
+                )
+            },
+        );
+        assert_eq!(
+            (m.split.rest_change, m.split.claude_change.as_deref()),
+            (Some("a process exited"), Some("bash"))
+        );
     }
 
     #[test]
@@ -2059,6 +2096,13 @@ mod tests {
         assert_eq!(
             said,
             "the activity rule would keep it: attached; the claude it would have frozen has gone, and that freeze with it"
+        );
+        // A resumed claude that landed on the same pid is another process, by its start.
+        let (gone, said) = shadow(Some(&f), &m, Some(false), Some((1, 70)), Some("zmx"), at);
+        assert_eq!(gone, None);
+        assert!(
+            said.ends_with("; the claude it would have frozen has gone, and that freeze with it"),
+            "{said}"
         );
         // Gone before it was read: no claude at all, and said the same.
         let (gone, said) = shadow(Some(&f), &m, Some(false), None, None, at);

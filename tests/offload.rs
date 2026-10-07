@@ -507,7 +507,8 @@ fn a_frozen_claude_is_thawed_by_what_still_runs_and_not_by_what_it_started() {
 }
 
 /// A live record whose claude died without a word — an OOM kill — has no processes to read;
-/// its floor is carried until the slot is resumed, not dropped.
+/// its floor is carried until the slot is resumed, not dropped, and a freeze held on that
+/// claude is said to end.
 #[test]
 fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
     let s = idle_slot("activity-dead", 0o600, false);
@@ -519,6 +520,31 @@ fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
     std::fs::write(&path, dead).unwrap();
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
+    assert!(floor_kept(&s), "{out}");
+    assert!(
+        !out.contains("claude-1: measured"),
+        "nothing to read and nothing held, so nothing to say: {out}"
+    );
+    // The same with a freeze held: the claude it froze is gone for certain, and the line
+    // says so rather than letting the freeze end unsaid with the record.
+    let s = idle_slot("activity-dead-frozen", 0o600, false);
+    measured_frozen(&s, &[], -180_000);
+    let path = s.root.join("registry/claude-1.json");
+    let body = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        body.replacen(&format!("\"pid\":{}", s.claude), "\"pid\":4000000", 1),
+    )
+    .unwrap();
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(
+            "claude-1: measured — nothing to read; the claude it would have frozen has gone, and that freeze with it"
+        ),
+        "{out}"
+    );
+    assert!(!frozen_kept(&s), "{out}");
     assert!(floor_kept(&s), "{out}");
 }
 

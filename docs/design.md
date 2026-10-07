@@ -482,16 +482,18 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   The logs show the floor beside every rate, which is how to spot it.
 - **The verdict.** Quiet — no window over its budget, a minute's worth of bytes at the line
   — for the offloader's 10 minutes, and detached by zmx's count: *would freeze*. Otherwise
-  *would keep*, with the reason: first reading, attached, attachment unknown, or quiet under
-  10m. Each pass prints `claude-1: measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)),
-  25.2 wakeups/s, cpu 6.1 ms/s, 1 process(es), line 950 B/s (57000 B a window) from floor
-  95, quiet 14m; the activity rule would freeze it` — the second bracket is the budget
-  actually applied. These lines go to the pass's stdout only, not to `offload.log`. **The
-  days of reading depend on infra keeping that stdout**: its live loop writes each pass,
-  timestamped, to `~/.local/share/claude-sessions-passes.log` (infra#9, 2026-10-06), and it
-  must go on doing so until the owner has read the numbers. Wake-ups read `?` in a window
-  where their sum fell — a thread that exited takes its count with it — and are low,
-  unmarked, where newer threads outweighed it.
+  *would keep*, with the reason: first reading, attached, attachment unknown, quiet under
+  10m, or no recorded claude to freeze — the slot's members read but the recorded claude not
+  among them, its pid reused or gone before it was read. Each pass prints `claude-1:
+  measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), 25.2 wakeups/s, cpu 6.1 ms/s, 1
+  process(es), line 950 B/s (57000 B a window) from floor 95, quiet 14m; the activity rule
+  would freeze it` — the second bracket is the budget actually applied. These lines go to
+  the pass's stdout only, not to `offload.log`. **The days of reading depend on infra
+  keeping that stdout**: its live loop writes each pass, timestamped, to
+  `~/.local/share/claude-sessions-passes.log` (infra#9, 2026-10-06), and it must go on doing
+  so until the owner has read the numbers. Wake-ups read `?` in a window where their sum
+  fell — a thread that exited takes its count with it — and are low, unmarked, where newer
+  threads outweighed it.
 - **The freeze is of claude alone.** What the rule would freeze is the recorded
   claude, and nothing else in the slot: a tool waiting locally — `sleep N && gh run view`,
   `tail -f` on a quiet log, `inotifywait`, a build — goes on waiting and then does what it
@@ -509,16 +511,18 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   exited` (or `a process started`, `its other processes moved 70000 B`, `attached`,
   `attachment unknown`, `unknown`) when it would end.
 - **Read every freeze line beside the offloader's own line for the slot in the same pass.**
-  Both clocks run ten minutes: the offloader's from the `Stop`, the rule's from the pass that
-  closed the last active window, up to a pass later — and a pass measures before it stops
-  anything. So an ordinary idle, detached slot is offloaded at or before the pass where the
-  rule would first freeze it: at most one `would freeze it` beside `offloaded`, often none,
-  and never a carried freeze. **A freeze is carried only in a slot the offloader keeps** — a
-  timer pending, background work, waiting for you, a process running under claude — and
-  `which the freeze would have stopped` counts there, where claude moving is expected, the
-  timer above all (the hook-read hold stays for it). Whether a freeze would break an ordinary
-  idle slot, these logs cannot say while the kill runs; holding it off for a slot is the
-  owner's call.
+  Both clocks run ten minutes: the offloader's from the `Stop`, the rule's from the pass
+  that closed the last active window, up to a pass later — and a pass measures before it
+  stops anything. So an ordinary idle, detached slot is offloaded at or before the pass
+  where the rule would first freeze it: at most one `would freeze it` beside `offloaded`,
+  often none, and never a carried freeze — short of a turn under the budget, which restarts
+  the offloader's clock and not the rule's, so a carried freeze can show beside the
+  offloader's hold for up to ten minutes in an ordinary slot. **A freeze is carried only in
+  a slot the offloader keeps** — a timer pending, background work, waiting for you, a
+  process running under claude — and `which the freeze would have stopped` counts there,
+  where claude moving is expected, the timer above all (the hook-read hold stays for it).
+  Whether a freeze would break an ordinary idle slot, these logs cannot say while the kill
+  runs; holding it off for a slot is the owner's call.
 - **What claude itself does while it would have been frozen** is what a freeze would have
   stopped — a timer of claude's own, a message reaching it over its own socket — and is
   counted in the logs before anything depends on it. Claude's own is its bytes and those of
@@ -530,28 +534,32 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   and so is one whose parent is no member of the slot — gone before the pass's snapshot,
   leaving it reparented to init, a subreaper or a zmx — erring towards a thaw; a parent in
   the snapshot that was gone before it was read is walked through like any other new member.
-  Its **exit** stays a thaw like any other's, whoever started it — `sleep N && gh run view`
-  ends with claude's own `bash` exiting, and that is the thaw working — so a process claude
-  started while it would have been frozen thaws the measurement a pass later when it exits;
-  read the two lines together (a real freeze never meets this). When nothing would have
-  thawed it, the line adds `, and claude itself started bash` — named by what claude started
-  directly — or `moved 540000 B (40000 B of it tcp)`, or both, `which the freeze would have
-  stopped` — **that phrase is the count to read**, in the slots the bullet above says it can
-  come from. When something did thaw it in the same window, the line says both and claims no
-  order, since within a window it is unknowable: `would thaw it: a process exited; in the
-  same window claude itself moved 540000 B (0 B of it tcp), which may have followed the
-  thaw`. The count has slack both ways. Over: claude's own housekeeping — a re-read of the
-  shared `~/.claude.json` after another slot rewrote it, the status line's shell — can cross
-  a quiet slot's budget. Under: a socket that opened and closed inside one window is counted
-  nowhere and shown nowhere, not even as `closed uncounted` (that bracket is sockets held at
-  the last reading and gone now), so a turn whose API connection the pool closed before the
-  pass reads `0 B of it tcp`, or stays under budget and prints no line; and a turn routed
-  through a child that was there at the freeze — an MCP stdio server — thaws on the child's
-  bytes and reads `would thaw it: its other processes moved …; in the same window claude
-  itself moved …, which may have followed the thaw`, with no count. So tcp bytes on a line
-  mean a turn or a tool for certain; none does not mean housekeeping. Read `may have
-  followed the thaw` lines whose thaw is `its other processes moved` and whose claude part
-  has tcp bytes as probable turns, and count them by hand if there are many.
+  Its **exit** in a later window stays a thaw like any other's, whoever started it — `sleep
+  N && gh run view` ends with claude's own `bash` exiting, and that is the thaw working — so
+  a process claude started while it would have been frozen thaws the measurement a pass
+  later when it exits; read the two lines together (a real freeze never meets this). One
+  that came and went inside a window — in the pass's snapshot, gone before it was read — is
+  claude's start alone and no thaw, since nothing it did could have happened under a freeze.
+  When nothing would have thawed it, the line adds `, and claude itself started bash` —
+  named by what claude started directly — or `moved 540000 B (40000 B of it tcp)`, or both,
+  `which the freeze would have stopped` — **that phrase is the count to read**, in the slots
+  the bullet above says it can come from. When something did thaw it in the same window, the
+  line says both and claims no order, since within a window it is unknowable: `would thaw
+  it: a process exited; in the same window claude itself moved 540000 B (0 B of it tcp),
+  which may have followed the thaw`. The count has slack both ways. Over: claude's own
+  housekeeping — a re-read of the shared `~/.claude.json` after another slot rewrote it, the
+  status line's shell — can cross a quiet slot's budget. Under: a socket that opened and
+  closed inside one window is counted nowhere and shown nowhere, not even as `closed
+  uncounted` (that bracket is sockets held at the last reading and gone now), so a turn
+  whose API connection the pool closed before the pass reads `0 B of it tcp`, or stays under
+  budget and prints no line; and a turn routed through a child that was there at the freeze
+  — an MCP stdio server — thaws on the child's bytes and reads `would thaw it: its other
+  processes moved …; in the same window claude itself moved …, which may have followed the
+  thaw`, with no count. So tcp bytes of a turn's size on a line mean a turn or a tool; a
+  slot's own feature-flag refresh or an HTTP MCP keep-alive is tcp too, and small; none does
+  not mean housekeeping. Read `may have followed the thaw` lines whose thaw is `its other
+  processes moved` and whose claude part has tcp bytes as probable turns, and count them by
+  hand if there are many.
 - **A claude whose parent is not zmx is never frozen** — `would keep it: claude's parent is
   fish, not zmx`: one typed into a shell in a zmx session is that shell's job, and a stopped
   job hands its terminal back to the shell. The menu's slots run claude as zmx's own child
