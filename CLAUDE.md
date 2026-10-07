@@ -24,9 +24,9 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   the owner on 2026-10-01. Phase 4 renders to those screens; a change to them needs the
   owner, not a judgement call. The colour assignment in that file is part of the approval.
 - **`claude-sessions hook` always exits 0, and says nothing.** Its stdout reaches Claude (as
-  context from the synchronous `SessionStart`, as JSON from the async events), a failing
-  synchronous hook is shown to the person, and an async one's non-zero exit or stderr is handed
-  to Claude on its next turn. A registry bug must never wedge a session or talk
+  context from the synchronous `SessionStart`, and as `systemMessage`/`additionalContext` from
+  a JSON line of an async event), and a failing synchronous hook is shown to the person; an
+  async one's exit status and stderr reach only Claude Code's debug log. A registry bug must never wedge a session or talk
   to it. It logs its own failures to its own log and returns 0 — a panic included, which is
   caught. A test pins both. Nothing in the binary uses `print!`/`println!`/`eprintln!` (they
   panic on a closed terminal or pipe; issue #6), and a lint enforces it.

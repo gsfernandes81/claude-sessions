@@ -16,7 +16,9 @@
 
 use crate::clock::{Millis, Moment};
 use crate::json::{self, Value};
-use crate::registry::{SlotRecord, State, Timer};
+use crate::lockfile;
+use crate::registry::{Field, SlotRecord, State, Timer};
+use std::time::Duration;
 
 /// Whether the claude that fired this event is the slot's own process, or one nested under it.
 /// Decided in `bind.rs` from `/proc`, never from the payload alone.
@@ -168,6 +170,20 @@ fn needs_you_type(t: &str) -> bool {
     )
 }
 
+/// How long the hook waits for the slot's lock. `SessionEnd` hooks share a 1.5 s budget. A
+/// start at the slot's own prompt binds its process and waits out a stalled writer; any other
+/// start holds up only claude's turn. A dropped `UserPromptSubmit` leaves a working claude
+/// reading as idle (issue #1).
+pub fn lock_wait(ev: &Event, binding: Binding) -> Duration {
+    match ev.name() {
+        "SessionEnd" => lockfile::SESSION_END_WAIT,
+        "SessionStart" if binding != Binding::Own || !ev.opens_at_prompt() => {
+            lockfile::INTERACTIVE_WAIT
+        }
+        _ => lockfile::HOOK_WAIT,
+    }
+}
+
 /// Takes a field stamped `written` for an event fired at `tick`, unless a later one has.
 fn claim(written: &mut u64, tick: u64) -> bool {
     let newer = tick >= *written;
@@ -191,7 +207,7 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written.conversation = tick;
+    rec.written[Field::Conversation] = tick;
     rec.written.deleted.clear();
 }
 
@@ -221,7 +237,7 @@ pub fn apply(
     {
         // A tie goes to the conversation on record: its start was synchronous, so nothing of
         // a newer one can have forked in the same tick.
-        let started = rec.written.conversation;
+        let started = rec.written[Field::Conversation];
         if tick < started || (tick == started && rec.session_id.is_some()) {
             return Outcome::Ignored("an event of an earlier conversation");
         }
@@ -246,7 +262,7 @@ pub fn apply(
             if pid.is_some() {
                 // A different process cannot be running the old one's background work.
                 if (pid != rec.pid || proc_start != rec.proc_start)
-                    && claim(&mut rec.written.background, tick)
+                    && claim(&mut rec.written[Field::Background], tick)
                 {
                     rec.background.clear();
                 }
@@ -254,16 +270,16 @@ pub fn apply(
                 rec.proc_start = proc_start;
             }
             // Live even mid-offload: the process in front of the owner is the truth.
-            if claim(&mut rec.written.life, tick) {
+            if claim(&mut rec.written[Field::Life], tick) {
                 rec.state = State::Live;
             }
             active(rec, at);
             if ev.opens_at_prompt() {
-                if claim(&mut rec.written.busy, tick) {
+                if claim(&mut rec.written[Field::Busy], tick) {
                     rec.busy = false;
                     rec.ready_ms = Some(at);
                 }
-                if claim(&mut rec.written.needs_you, tick) {
+                if claim(&mut rec.written[Field::NeedsYou], tick) {
                     rec.needs_you = false;
                 }
             }
@@ -272,28 +288,29 @@ pub fn apply(
         "UserPromptSubmit" => {
             // The earliest prompt fired, whichever lands first.
             let first = ev.prompt().and_then(one_line);
-            if first.is_some() && (rec.first_prompt.is_none() || tick < rec.written.prompt) {
+            if first.is_some() && (rec.first_prompt.is_none() || tick < rec.written[Field::Prompt])
+            {
                 rec.first_prompt = first;
-                rec.written.prompt = tick;
+                rec.written[Field::Prompt] = tick;
             }
             active(rec, at);
-            if claim(&mut rec.written.busy, tick) {
+            if claim(&mut rec.written[Field::Busy], tick) {
                 rec.busy = true;
             }
-            if claim(&mut rec.written.needs_you, tick) {
+            if claim(&mut rec.written[Field::NeedsYou], tick) {
                 rec.needs_you = false;
             }
             Outcome::Changed
         }
         "Stop" => {
             active(rec, at);
-            if claim(&mut rec.written.busy, tick) {
+            if claim(&mut rec.written[Field::Busy], tick) {
                 rec.busy = false;
                 rec.last_stop_ms = Some(at);
             }
             // The turn is over but its background work may not be (issue #9). Replaced, not
             // merged: each `Stop` lists everything still running.
-            if claim(&mut rec.written.background, tick) {
+            if claim(&mut rec.written[Field::Background], tick) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
             Outcome::Changed
@@ -304,14 +321,13 @@ pub fn apply(
         "SubagentStart" => {
             let kind = ev.agent_type().filter(|t| !t.is_empty()).unwrap_or("agent");
             let what = format!("subagent: {kind}");
-            if rec.background.contains(&what) {
-                Outcome::Ignored("an agent of that type is already listed")
-            } else if claim(&mut rec.written.background, tick) {
-                rec.background.push(what);
-                Outcome::Changed
-            } else {
-                Outcome::Ignored("a newer list has landed")
+            if !claim(&mut rec.written[Field::Background], tick) {
+                return Outcome::Ignored("a newer list has landed");
             }
+            if !rec.background.contains(&what) {
+                rec.background.push(what);
+            }
+            Outcome::Changed
         }
         // Its list is `Stop`'s and is taken whole the same way; it never names a foreground
         // agent, so one an Esc cut off leaves at the next. A payload with no list says nothing
@@ -319,7 +335,7 @@ pub fn apply(
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
             Some(running) => {
-                if claim(&mut rec.written.background, tick) {
+                if claim(&mut rec.written[Field::Background], tick) {
                     rec.background = running;
                     Outcome::Changed
                 } else {
@@ -329,7 +345,7 @@ pub fn apply(
         },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
-                if claim(&mut rec.written.needs_you, tick) {
+                if claim(&mut rec.written[Field::NeedsYou], tick) {
                     rec.needs_you = true;
                     active(rec, at);
                     Outcome::Changed
@@ -349,7 +365,7 @@ pub fn apply(
                 Outcome::Ignored("clear and resume continue in the same process")
             }
             _ => {
-                if !claim(&mut rec.written.life, tick) {
+                if !claim(&mut rec.written[Field::Life], tick) {
                     return Outcome::Ignored("a newer start has landed");
                 }
                 rec.state = if rec.state == State::Offloading {
@@ -357,7 +373,7 @@ pub fn apply(
                 } else {
                     State::Closed
                 };
-                if claim(&mut rec.written.busy, tick) {
+                if claim(&mut rec.written[Field::Busy], tick) {
                     rec.busy = false;
                 }
                 Outcome::Changed
@@ -387,7 +403,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !claim(&mut rec.written.wakeup, tick) {
+            if !claim(&mut rec.written[Field::Wakeup], tick) {
                 return Outcome::Ignored("a newer wake-up has landed");
             }
             let stop = input
@@ -656,6 +672,19 @@ mod tests {
             rec.background.is_empty(),
             "calibration: a newer list is taken"
         );
+        // A second agent of the same type, landing before the first one's own SubagentStop.
+        let fired = [
+            (STOP, 1_500),
+            (start, 2_000),
+            (sub_stop, 3_000),
+            (start, 4_000),
+        ];
+        let mut rec = slot();
+        land(&mut rec, &fired);
+        assert_eq!(rec.background.len(), 1, "calibration: in order");
+        let mut rec = slot();
+        land(&mut rec, &[fired[0], fired[1], fired[3], fired[2]]);
+        assert_eq!(rec.background, ["subagent: general-purpose"]);
     }
 
     #[test]
@@ -696,6 +725,52 @@ mod tests {
         assert_eq!(rec.timers.len(), 1, "calibration");
         land(&mut rec, &[(stop, 4_000), (set, 3_000)]);
         assert!(rec.timers.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_landing_after_the_end_leaves_it_idle() {
+        let end = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;
+        for order in [
+            [(PROMPT, 2_000), (end, 3_000)],
+            [(end, 3_000), (PROMPT, 2_000)],
+        ] {
+            let mut rec = slot();
+            land(&mut rec, &order);
+            assert!(!rec.busy, "{order:?}");
+            assert_eq!(rec.state, State::Closed);
+        }
+    }
+
+    #[test]
+    fn only_a_start_that_binds_the_slot_waits_out_a_stalled_writer() {
+        let wait = |body: &str, binding| lock_wait(&ev(body), binding);
+        let start =
+            |source: &str| format!(r#"{{"hook_event_name":"SessionStart","source":"{source}"}}"#);
+        assert_eq!(
+            wait(r#"{"hook_event_name":"SessionEnd"}"#, Binding::Own),
+            lockfile::SESSION_END_WAIT
+        );
+        for source in ["startup", "resume", "clear", "fork"] {
+            assert_eq!(
+                wait(&start(source), Binding::Own),
+                lockfile::HOOK_WAIT,
+                "{source}"
+            );
+            assert_eq!(
+                wait(&start(source), Binding::Nested),
+                lockfile::INTERACTIVE_WAIT
+            );
+        }
+        assert_eq!(
+            wait(&start("compact"), Binding::Own),
+            lockfile::INTERACTIVE_WAIT
+        );
+        assert_eq!(
+            wait(r#"{"hook_event_name":"SessionStart"}"#, Binding::Own),
+            lockfile::INTERACTIVE_WAIT
+        );
+        assert_eq!(wait(PROMPT, Binding::Nested), lockfile::HOOK_WAIT);
+        assert_eq!(wait(STOP, Binding::Own), lockfile::HOOK_WAIT);
     }
 
     #[test]
@@ -819,10 +894,8 @@ mod tests {
             ["subagent: general-purpose"],
             "no Stop needed to hear of it"
         );
-        assert!(
-            matches!(own(&mut rec, &start, 3_100), Outcome::Ignored(_)),
-            "listed once"
-        );
+        own(&mut rec, &start, 3_100);
+        assert_eq!(rec.background, ["subagent: general-purpose"], "listed once");
         // A `SubagentStop` says what is running, as `Stop` does — its own agent included.
         let still = ev(
             r#"{"hook_event_name":"SubagentStop","agent_id":"a90c","background_tasks":[{"id":"a90c","type":"subagent","status":"running","description":"look"}]}"#,

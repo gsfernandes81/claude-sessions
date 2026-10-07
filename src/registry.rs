@@ -76,20 +76,50 @@ pub struct Timer {
     pub recurring: bool,
 }
 
-/// The clock tick of the event that last wrote each field two hook events can race on. Hooks
-/// run async and land in any order, so a field takes a write only from an event fired in the
-/// same tick or later (`events`).
+/// A field two hook events can race on.
+#[derive(Debug, Clone, Copy)]
+pub enum Field {
+    Conversation,
+    /// `state`, between a start and an end.
+    Life,
+    Busy,
+    NeedsYou,
+    Background,
+    Wakeup,
+    /// `first_prompt`, which the earliest prompt takes rather than the latest.
+    Prompt,
+}
+
+impl Field {
+    pub const ALL: [Field; 7] = [
+        Field::Conversation,
+        Field::Life,
+        Field::Busy,
+        Field::NeedsYou,
+        Field::Background,
+        Field::Wakeup,
+        Field::Prompt,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Field::Conversation => "conversation",
+            Field::Life => "life",
+            Field::Busy => "busy",
+            Field::NeedsYou => "needs_you",
+            Field::Background => "background",
+            Field::Wakeup => "wakeup",
+            Field::Prompt => "prompt",
+        }
+    }
+}
+
+/// The clock tick of the event that last wrote each `Field`. Hooks run async and land in any
+/// order, so a field takes a write only from an event fired in the same tick or later
+/// (`events`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {
-    pub conversation: u64,
-    /// `state`, between a start and an end.
-    pub life: u64,
-    pub busy: u64,
-    pub needs_you: u64,
-    pub background: u64,
-    pub wakeup: u64,
-    /// `first_prompt`, which the earliest prompt takes rather than the latest.
-    pub prompt: u64,
+    ticks: [u64; Field::ALL.len()],
     /// Crons whose delete landed before their create, by timer id.
     pub deleted: BTreeMap<String, u64>,
 }
@@ -98,21 +128,15 @@ impl Written {
     /// Nothing fired before `tick` may write a record made then.
     pub fn new(tick: u64) -> Written {
         Written {
-            conversation: tick,
-            life: tick,
-            busy: tick,
-            needs_you: tick,
-            background: tick,
-            wakeup: tick,
-            prompt: tick,
+            ticks: [tick; Field::ALL.len()],
             deleted: BTreeMap::new(),
         }
     }
 
     /// Stamps from before a reboot lie in this boot's future and would refuse every event.
     pub fn forget_after(&mut self, tick: u64) {
-        let stamps = self.stamps().map(|(_, t)| t);
-        if stamps
+        if self
+            .ticks
             .iter()
             .chain(self.deleted.values())
             .any(|&t| t > tick)
@@ -121,22 +145,10 @@ impl Written {
         }
     }
 
-    fn stamps(&self) -> [(&'static str, u64); 7] {
-        [
-            ("conversation", self.conversation),
-            ("life", self.life),
-            ("busy", self.busy),
-            ("needs_you", self.needs_you),
-            ("background", self.background),
-            ("wakeup", self.wakeup),
-            ("prompt", self.prompt),
-        ]
-    }
-
     fn to_json(&self) -> Value {
         let mut o = Value::obj();
-        for (name, tick) in self.stamps() {
-            o.set(name, Value::num(tick as f64));
+        for f in Field::ALL {
+            o.set(f.name(), Value::num(self[f] as f64));
         }
         let mut deleted = Value::obj();
         for (id, tick) in &self.deleted {
@@ -147,29 +159,34 @@ impl Written {
     }
 
     fn from_json(v: Option<&Value>) -> Written {
-        let get = |name: &str| {
-            v.and_then(|v| v.get(name))
+        let mut w = Written::new(0);
+        for f in Field::ALL {
+            w[f] = v
+                .and_then(|v| v.get(f.name()))
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
-        };
-        let mut deleted = BTreeMap::new();
+                .unwrap_or(0);
+        }
         if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
             for (id, t) in m {
                 if let Some(t) = t.as_u64() {
-                    deleted.insert(id.clone(), t);
+                    w.deleted.insert(id.clone(), t);
                 }
             }
         }
-        Written {
-            conversation: get("conversation"),
-            life: get("life"),
-            busy: get("busy"),
-            needs_you: get("needs_you"),
-            background: get("background"),
-            wakeup: get("wakeup"),
-            prompt: get("prompt"),
-            deleted,
-        }
+        w
+    }
+}
+
+impl std::ops::Index<Field> for Written {
+    type Output = u64;
+    fn index(&self, f: Field) -> &u64 {
+        &self.ticks[f as usize]
+    }
+}
+
+impl std::ops::IndexMut<Field> for Written {
+    fn index_mut(&mut self, f: Field) -> &mut u64 {
+        &mut self.ticks[f as usize]
     }
 }
 
@@ -532,39 +549,32 @@ pub fn all() -> std::io::Result<Vec<SlotRecord>> {
 mod tests {
     use super::*;
 
+    /// Every stamp distinct, and a tombstone.
+    fn stamped() -> Written {
+        let mut w = Written::new(0);
+        for (i, f) in Field::ALL.into_iter().enumerate() {
+            w[f] = i as u64 + 1;
+        }
+        w.deleted.insert("cron:c1".into(), 8);
+        w
+    }
+
     #[test]
     fn stamps_from_before_a_reboot_are_forgotten() {
-        let w = Written {
-            conversation: 1,
-            life: 2,
-            busy: 3,
-            needs_you: 4,
-            background: 5,
-            wakeup: 6,
-            prompt: 7,
-            deleted: [("cron:c1".to_string(), 8)].into(),
-        };
+        let w = stamped();
         let mut kept = w.clone();
         kept.forget_after(8);
         assert_eq!(kept, w, "calibration: this boot's stamps stay");
-        // Each field alone, past the tick, is a stamp from before a reboot.
-        for i in 0..8 {
+        for f in Field::ALL {
             let mut v = w.clone();
-            match i {
-                0 => v.conversation = 9,
-                1 => v.life = 9,
-                2 => v.busy = 9,
-                3 => v.needs_you = 9,
-                4 => v.background = 9,
-                5 => v.wakeup = 9,
-                6 => v.prompt = 9,
-                _ => {
-                    v.deleted.insert("cron:c2".into(), 9);
-                }
-            }
+            v[f] = 9;
             v.forget_after(8);
-            assert_eq!(v, Written::new(0), "field {i}");
+            assert_eq!(v, Written::new(0), "{f:?}");
         }
+        let mut v = w.clone();
+        v.deleted.insert("cron:c2".into(), 9);
+        v.forget_after(8);
+        assert_eq!(v, Written::new(0), "a tombstone");
     }
 
     #[test]
@@ -575,16 +585,7 @@ mod tests {
         rec.session_id = Some("abc".into());
         rec.title = Some("retire the old tunnel".into());
         rec.first_prompt = Some("move the tunnel to the new box".into());
-        rec.written = Written {
-            conversation: 1,
-            life: 2,
-            busy: 3,
-            needs_you: 4,
-            background: 5,
-            wakeup: 6,
-            prompt: 7,
-            deleted: [("cron:c1".to_string(), 8)].into(),
-        };
+        rec.written = stamped();
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);

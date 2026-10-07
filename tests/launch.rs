@@ -141,23 +141,36 @@ fn start(root: &Path, slot: &str, wrap: &str) {
     assert!(status.success());
 }
 
-/// The slot's record once the hook has written it, as text.
-fn record(root: &Path, slot: &str) -> String {
-    let path = root.join(format!("registry/{slot}.json"));
+/// What `ready` returns once it returns something, within 10 s; else a failure naming `what`
+/// with the hook's own log.
+fn wait_for<T>(root: &Path, what: &str, mut ready: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(body) = std::fs::read_to_string(&path) {
-            if body.contains("SessionStart") {
-                return body;
-            }
+        if let Some(t) = ready() {
+            return t;
         }
         assert!(
             Instant::now() < deadline,
-            "the hook never wrote {slot}; hook.log: {}",
+            "{what}; hook.log: {}",
             std::fs::read_to_string(root.join("registry/hook.log")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A file's text once `ready` holds for it.
+fn file_when(root: &Path, path: &Path, what: &str, ready: impl Fn(&str) -> bool) -> String {
+    wait_for(root, what, || {
+        std::fs::read_to_string(path).ok().filter(|s| ready(s))
+    })
+}
+
+/// The slot's record once the hook has written it, as text.
+fn record(root: &Path, slot: &str) -> String {
+    let path = root.join(format!("registry/{slot}.json"));
+    file_when(root, &path, &format!("the hook never wrote {slot}"), |b| {
+        b.contains("SessionStart")
+    })
 }
 
 fn number(body: &str, key: &str) -> Option<u64> {
@@ -196,15 +209,8 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
         "{body}"
     );
     // The stand-in speaks on stderr after its hooks return, so the record can land first.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let stderr = loop {
-        let s =
-            std::fs::read_to_string(root.0.join("registry/claude-1.stderr")).unwrap_or_default();
-        if !s.is_empty() || Instant::now() > deadline {
-            break s;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let stderr = root.0.join("registry/claude-1.stderr");
+    let stderr = file_when(&root.0, &stderr, "nothing on stderr", |s| !s.is_empty());
     assert_eq!(stderr, "claude said this on stderr\n", "stderr is captured");
     // The row's title is the transcript's title — what Claude Code's own selector shows —
     // and never a reply (0.3.1).
@@ -215,15 +221,10 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     assert!(!body.contains("very long reply"), "{body}");
     // The slot's own claude announcing an agent: bound by the process tree although the
     // payload names an `agent_id`, so the agent holds the slot (issue #10).
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let body = loop {
-        let body = std::fs::read_to_string(root.0.join("registry/claude-1.json")).unwrap();
-        if body.contains("subagent: general-purpose") || Instant::now() > deadline {
-            break body;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(body.contains("subagent: general-purpose"), "{body}");
+    let path = root.0.join("registry/claude-1.json");
+    file_when(&root.0, &path, "the agent was never listed", |b| {
+        b.contains("subagent: general-purpose")
+    });
     // The marker proves the capture; its being alone, that the slot's own hooks said nothing.
     let out = std::fs::read_to_string(root.0.join("hook.out")).unwrap();
     assert_eq!(out, "marker\n");
@@ -260,18 +261,10 @@ fn the_same_line_without_exec_is_not_bound() {
     assert!(!body.contains("ai_title"), "{body}");
     // And for the agent: once its SubagentStart has demonstrably been handled — the event is
     // in the record's times — a nested claude's agent is activity, not the slot's work.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let body = loop {
-        let body = std::fs::read_to_string(root.0.join("registry/claude-2.json")).unwrap();
-        if body.contains("\"SubagentStart\"") || Instant::now() > deadline {
-            break body;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(
-        body.contains("\"SubagentStart\""),
-        "the event was seen: {body}"
-    );
+    let path = root.0.join("registry/claude-2.json");
+    let body = file_when(&root.0, &path, "the event was never seen", |b| {
+        b.contains("\"SubagentStart\"")
+    });
     assert!(
         !body.contains("subagent: general-purpose"),
         "and not listed: {body}"
@@ -315,11 +308,9 @@ fn a_hook_landing_late_is_ordered_by_when_claude_fired_it() {
     for (slot, busy) in [("claude-3", false), ("claude-4", true)] {
         start(&root.0, slot, WRAP);
         let landed = root.0.join(format!("{slot}.landed"));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !landed.exists() {
-            assert!(Instant::now() < deadline, "{slot}'s hooks never landed");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for(&root.0, &format!("{slot}'s hooks never landed"), || {
+            landed.exists().then_some(())
+        });
         let body = std::fs::read_to_string(root.0.join(format!("registry/{slot}.json"))).unwrap();
         // Landing order alone would read the opposite in each.
         assert!(
@@ -351,14 +342,9 @@ exit 0"#,
     record(&root.0, "claude-5");
     let claude = std::fs::read_to_string(root.0.join("pids")).unwrap();
     let claude = claude.split_whitespace().next().unwrap().to_string();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Path::new(&format!("/proc/{claude}")).exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the stand-in claude never exited"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&root.0, "the stand-in claude never exited", || {
+        (!Path::new(&format!("/proc/{claude}")).exists()).then_some(())
+    });
     std::thread::sleep(Duration::from_millis(1_200));
     let fed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -371,18 +357,9 @@ exit 0"#,
         .write_all(stop.as_bytes())
         .unwrap();
     let path = root.0.join("registry/claude-5.json");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let body = loop {
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
-        if body.contains("\"Stop\"") {
-            break body;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the late Stop never landed: {body}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let body = file_when(&root.0, &path, "the late Stop never landed", |b| {
+        b.contains("\"Stop\"")
+    });
     // Landing time would read as activity after claude had gone.
     let active = number(&body, "last_activity_ms").unwrap();
     assert!(active + 500 < fed, "active {active}, fed {fed}: {body}");

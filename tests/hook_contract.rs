@@ -1,9 +1,8 @@
 //! The two promises the rest of the design leans on, tested against the real binary.
 //!
-//! **`hook` always exits 0 and says nothing.** Its stdout is fed to Claude, a failing
-//! synchronous hook is shown to the person, and a failing async one is handed to Claude, so a
-//! registry bug must never wedge a session or talk to it. Every run of the hook below asserts
-//! both.
+//! **`hook` always exits 0 and says nothing.** Its stdout is fed to Claude and a failing
+//! synchronous hook is shown to the person, so a registry bug must never wedge a session or
+//! talk to it. Every run of the hook below asserts both.
 //!
 //! **A record is never caught half-written.** The registry is read on the ssh path, so a
 //! reader landing mid-write must still get valid JSON. That is what the temp-file-then-rename

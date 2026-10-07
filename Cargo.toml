@@ -37,5 +37,4 @@ codegen-units = 1
 strip = true
 # Panics unwind, as they do in the tests. Aborting would make any panic a SIGABRT and a core
 # dump in the cwd (a git checkout, for the menu; issue #6), show a panicking synchronous hook
-# to the person and hand an async one to Claude, and kill the whole menu where the tests see a
-# worker thread's panic caught.
+# to the person, and kill the whole menu where the tests see a worker thread's panic caught.

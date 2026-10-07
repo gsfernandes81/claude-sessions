@@ -94,9 +94,9 @@ fn main() -> ExitCode {
             say_nl!("{}", usage());
             ExitCode::SUCCESS
         }
-        // THE ONE SUBCOMMAND THAT MUST NOT FAIL OR SPEAK: its stdout is fed to Claude, a failing
-        // synchronous hook is shown to the person, and a failing async one is handed to Claude.
-        // Every failure is logged and swallowed, a panic included.
+        // THE ONE SUBCOMMAND THAT MUST NOT FAIL OR SPEAK: its stdout is fed to Claude and a
+        // failing synchronous hook is shown to the person. Every failure is logged and
+        // swallowed, a panic included.
         "hook" => {
             std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
             match std::panic::catch_unwind(cmd_hook) {
@@ -244,16 +244,7 @@ fn cmd_hook() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // SessionEnd hooks share a 1.5 s budget, and a synchronous start that binds nothing holds
-    // up only claude. A dropped UserPromptSubmit leaves a working claude reading as idle
-    // (issue #1), and a dropped binding start loses the slot's process.
-    let wait = match ev.name() {
-        "SessionEnd" => lockfile::SESSION_END_WAIT,
-        "SessionStart" if binding != Binding::Own || !ev.opens_at_prompt() => {
-            lockfile::INTERACTIVE_WAIT
-        }
-        _ => lockfile::HOOK_WAIT,
-    };
+    let wait = events::lock_wait(&ev, binding);
     // The conversation's titles, read before the lock — a transcript's tail is the slow part
     // of this hook, and the lock is what other hooks wait on (issue #1). Only the slot's own
     // claude names the slot, and only when a title can have changed: a conversation opening,
