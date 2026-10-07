@@ -181,16 +181,17 @@ conversation goes to the one on record, whose start was synchronous; and since c
 first prompt's hook only after the start's has finished, a start is never behind its own first
 prompt. An async hook can outlive its claude: one that read its claude alive keeps the binding
 it read, and the stamps refuse what is older than the slot's last start or end, binding
-included; one that finds no claude above it is stamped from its own start, which is no later
-than the fork it came from. A new record is stamped with the tick it is made in, so nothing
-fired before it, such as the last hook of a claude whose slot name is being reused, can write
-it; stamps from another boot, told by the kernel's boot id, are forgotten when a hook next
-loads the record. A late event of the conversation before the current one (a `Stop` of the one
-`/clear` left) is dropped, and a newer one from a conversation the record has not heard start
-adopts it, as the lost `SessionStart` would have. A cron deleted before its create lands is
-remembered, so the late create is not taken. Only a hook that cannot read `/proc` is stamped
-when it lands. `prompt_id` cannot do this: a prompt typed mid-turn fires its `UserPromptSubmit`
-under the running turn's id, and the turn it later starts fires none.
+included; one that finds no claude above it is stamped from its own start, which is the fork
+itself when `sh` exec'd it and later only by the shell's start-up otherwise. A new record is
+stamped with the tick it is made in, so nothing fired before it, such as the last hook of a
+claude whose slot name is being reused, can write it; stamps from another boot, told by the
+kernel's boot id, are forgotten when a hook next loads the record. A late event of the
+conversation before the current one (a `Stop` of the one `/clear` left) is dropped, and a newer
+one from a conversation the record has not heard start adopts it, as the lost `SessionStart`
+would have. A cron deleted before its create lands is remembered, so the late create is not
+taken. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id` cannot do
+this: a prompt typed mid-turn fires its `UserPromptSubmit` under the running turn's id, and the
+turn it later starts fires none.
 
 What stays uncorrected, each until the next event of its kind: a turn drained from Claude
 Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through

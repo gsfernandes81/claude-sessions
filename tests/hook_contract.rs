@@ -44,6 +44,17 @@ fn run(args: &[&str], dir: &std::path::Path, slot: Option<&str>, stdin: &str) ->
     child.wait_with_output().expect("wait")
 }
 
+/// Holds `slot`'s lock in `dir` for `secs`, once it is taken.
+fn hold_lock(dir: &std::path::Path, slot: &str, secs: &str) -> std::process::Child {
+    let child = Command::new("flock")
+        .arg(dir.join(format!("{slot}.lock")))
+        .args(["sleep", secs])
+        .spawn()
+        .expect("flock(1) runs");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    child
+}
+
 /// `hook` with `body` on stdin, asserting it said nothing; its exit code.
 fn run_hook(dir: &std::path::Path, slot: Option<&str>, body: &str) -> i32 {
     let out = run(&["hook"], dir, slot, body);
@@ -239,16 +250,7 @@ fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
     // idle. The hold outlasts the interactive wait, so the hook's own wait is what is measured.
     let dir = tmpdir("lockwait");
     let slot = "claude-4";
-    let hold = |secs: &str| {
-        let child = Command::new("flock")
-            .arg(dir.join(format!("{slot}.lock")))
-            .args(["sleep", secs])
-            .spawn()
-            .expect("flock(1) runs");
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        child
-    };
-    let mut holder = hold("3");
+    let mut holder = hold_lock(&dir, slot, "3");
     assert_eq!(
         run_hook(
             &dir,
@@ -266,7 +268,7 @@ fn a_prompt_outlasts_a_busy_lock_that_session_end_gives_up_on() {
 
     // Calibration: SessionEnd keeps its short wait, inside the 1.5 s budget all SessionEnd
     // hooks share — so the same held lock makes it give up, and nothing is written.
-    let mut holder = hold("1");
+    let mut holder = hold_lock(&dir, slot, "1");
     assert_eq!(
         run_hook(
             &dir,
@@ -291,18 +293,9 @@ fn a_clear_end_takes_no_lock_and_a_dropped_event_says_which_it_was() {
     // end takes no lock at all, and a drop names the event and reason.
     let dir = tmpdir("namedrop");
     let slot = "claude-6";
-    let hold = || {
-        let child = Command::new("flock")
-            .arg(dir.join(format!("{slot}.lock")))
-            .args(["sleep", "2"])
-            .spawn()
-            .expect("flock(1) runs");
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        child
-    };
     let log = || std::fs::read_to_string(dir.join("hook.log")).unwrap_or_default();
 
-    let mut holder = hold();
+    let mut holder = hold_lock(&dir, slot, "2");
     let started = std::time::Instant::now();
     assert_eq!(
         run_hook(
@@ -341,12 +334,7 @@ fn a_start_that_binds_nothing_gives_up_where_a_prompt_waits() {
     // Run by hand the hook binds nothing, so its synchronous start holds up only claude.
     let dir = tmpdir("startwait");
     let slot = "claude-8";
-    let mut holder = Command::new("flock")
-        .arg(dir.join(format!("{slot}.lock")))
-        .args(["sleep", "3"])
-        .spawn()
-        .expect("flock(1) runs");
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut holder = hold_lock(&dir, slot, "3");
     let started = std::time::Instant::now();
     let start = r#"{"hook_event_name":"SessionStart","source":"compact"}"#;
     assert_eq!(run_hook(&dir, Some(slot), start), 0);
@@ -383,21 +371,13 @@ fn reconcile_offloads_a_reused_pid_on_the_record_under_its_lock_and_skips_a_busy
         )
         .unwrap();
     };
-    let hold = |slot: &str, secs: &str| {
-        Command::new("flock")
-            .arg(dir.join(format!("{slot}.lock")))
-            .args(["sleep", secs])
-            .spawn()
-            .expect("flock(1) runs")
-    };
     // This process's pid, as a container restart hands old pids out again.
     live(&dir, "claude-1", start + 1);
     live(&dir, "claude-2", start);
     live(&dir, "claude-3", start + 1);
     live(&dir, "claude-4", start + 1);
-    let mut busy = hold("claude-3", "4");
-    let mut brief = hold("claude-4", "1");
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut busy = hold_lock(&dir, "claude-3", "4");
+    let mut brief = hold_lock(&dir, "claude-4", "1");
     // While reconcile waits for claude-4's lock, its holder rebinds it to a live process.
     let rebind = {
         let dir = dir.clone();

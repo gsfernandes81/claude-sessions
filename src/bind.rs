@@ -28,8 +28,8 @@ pub struct Place {
     /// The slot's own claude, when it is the one that fired the hook.
     pub own_pid: Option<u32>,
     /// The process whose start is when the event fired: what claude forked to run the hook,
-    /// or with no claude above, the hook itself. An async hook outlives its claude, and then
-    /// started no later than the fork it came from.
+    /// or with no claude above, the hook itself: an async hook outlives its claude, and its own
+    /// start is that fork when `sh` exec'd it, later only by the shell's start-up otherwise.
     forked: Option<u32>,
 }
 
