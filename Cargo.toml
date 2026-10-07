@@ -1,6 +1,6 @@
 [package]
 name = "claude-sessions"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 rust-version = "1.85"
 description = "Several Claude Code sessions per box, cheap when idle, findable after a disconnect"
@@ -24,7 +24,10 @@ license = "AGPL-3.0-or-later"
 #      .cargo/config.toml. A dependency on serde would mean the tests could only ever be
 #      run in CI, and the tests are the product.
 #
-# The two syscalls needed (flock) are declared in src/lockfile.rs directly.
+# The syscalls needed are declared directly, each with a note on why its layout is the same
+# on both targets: flock in src/lockfile.rs; kill and the pidfd calls in src/signal.rs;
+# socket, send and recv for the socket-diagnostics netlink in src/sockdiag.rs; termios,
+# ioctl, poll, signal and read in src/term.rs.
 [dependencies]
 
 [profile.release]
