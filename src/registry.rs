@@ -70,8 +70,8 @@ impl State {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timer {
-    /// Stable within a slot: a wake-up replaces the previous wake-up, a cron is keyed by its
-    /// own id.
+    /// Stable within a slot: a cron is keyed by its own id, and a wake-up is `wakeup` until a
+    /// `Stop` lists it under one.
     pub id: String,
     pub due_ms: Option<Millis>,
     pub recurring: bool,
@@ -344,9 +344,8 @@ impl SlotRecord {
     /// A timer that has not fired yet, by our clock. A slot with one is never offloaded,
     /// whoever set it.
     ///
-    /// A timer with no due time counts as pending. That is the deliberate direction: an
-    /// unreadable payload shape should keep a session alive rather than let it be stopped
-    /// while something is still waiting to fire.
+    /// A timer with no due time counts as pending: a listed cron until a later list lacks it,
+    /// and a wake-up whose payload could not be read, erring towards keeping the session alive.
     pub fn has_pending_timer(&self, now: Millis) -> bool {
         self.timers
             .iter()
