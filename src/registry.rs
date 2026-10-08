@@ -3,8 +3,8 @@
 //!
 //! **It is written by `claude-sessions hook` and nobody else.** Every other subcommand reads
 //! it, or changes a field the hooks cannot know about — `last_attach_ms`, `keep_until_ms`
-//! (`claude-sessions keepalive`), and the `offloading` state. That split is what keeps "what happened" and "what we did about it"
-//! from racing.
+//! (`claude-sessions keepalive`), and the `offloading` state. That split is what keeps "what
+//! happened" and "what we did about it" from racing.
 //!
 //! **Attached is not stored.** Whether a client is on a slot right now is a fact zmx
 //! reports (`zmx list`'s `clients`), and a stored copy would be stale every time a

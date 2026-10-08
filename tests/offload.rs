@@ -148,7 +148,7 @@ done
         Load::Busy => "-c 'while :; do read l < /etc/services; done'",
     };
 
-    let server = Command::new(root.join("bin/zmx"))
+    let mut server = Command::new(root.join("bin/zmx"))
         .env_remove("ZMX_SESSION")
         .arg("-c")
         .arg(format!(
@@ -170,13 +170,22 @@ done
                 break pid;
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "the stand-in claude never started"
-        );
+        if Instant::now() >= deadline {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("the stand-in claude never started");
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
     let claude_start: u64 = stat_fields(claude).unwrap()[19].parse().unwrap();
+    // From here a panic drops the slot, which kills everything it started.
+    let s = Slot {
+        root,
+        server,
+        claude,
+        claude_start,
+    };
+    let root = &s.root;
     // The sleep under claude forks after claude does; wait for it, so a pass measures it.
     while load == Load::Child && child_of(claude).is_none() {
         assert!(Instant::now() < deadline, "the child never started");
@@ -209,18 +218,10 @@ done
     }
     let record = format!(
         r#"{{"slot":"claude-1","state":"live","pid":{claude},"proc_start":{claude_start},
-            "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}",
-            "busy":false,"needs_you":false,"last_activity_ms":{}}}"#,
-        transcript_path.display(),
-        now_ms() - 11 * 60 * 1000
+            "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}"}}"#,
+        transcript_path.display()
     );
     std::fs::write(root.join("registry/claude-1.json"), record).unwrap();
-    let s = Slot {
-        root,
-        server,
-        claude,
-        claude_start,
-    };
     measured_before(&s, -180_000);
     s
 }
@@ -581,7 +582,7 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
 #[test]
 fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
     let s = idle_slot("keepalive-by-hand", false);
-    let ask = |via_zmx: bool| {
+    let ask = |session: Option<&str>, via_zmx: bool| {
         let line = format!("{BIN} keepalive 25m; :");
         let mut cmd = if via_zmx {
             let mut c = Command::new(s.root.join("bin/zmx"));
@@ -592,17 +593,24 @@ fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
             c.args(["keepalive", "25m"]);
             c
         };
-        let out = cmd
-            .env_remove("CLAUDE_SESSIONS_SLOT")
-            .env("ZMX_SESSION", "claude-1")
-            .env("CLAUDE_SESSIONS_DIR", s.root.join("registry"))
-            .output()
-            .expect("keepalive runs");
+        cmd.env_remove("CLAUDE_SESSIONS_SLOT")
+            .env_remove("ZMX_SESSION")
+            .env("CLAUDE_SESSIONS_DIR", s.root.join("registry"));
+        if let Some(name) = session {
+            cmd.env("ZMX_SESSION", name);
+        }
+        let out = cmd.output().expect("keepalive runs");
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
     };
-    let out = ask(false);
+    let out = ask(None, true);
     assert!(out.contains("not inside a claude-sessions slot"), "{out}");
-    let out = ask(true);
+    // The variable alone is not a session. Not checkable from inside a real one, whose daemon
+    // is above this test too.
+    if std::env::var_os("ZMX_SESSION").is_none() {
+        let out = ask(Some("claude-1"), false);
+        assert!(out.contains("not inside a claude-sessions slot"), "{out}");
+    }
+    let out = ask(Some("claude-1"), true);
     assert!(out.contains("claude-1: kept alive for 25m"), "{out}");
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(

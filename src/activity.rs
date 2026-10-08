@@ -41,8 +41,9 @@ pub const MIN_WINDOW_MS: Millis = 60_000;
 /// (owner, 2026-10-01).
 pub const QUIET_FOR_MS: Millis = 10 * 60 * 1000;
 
-/// CPU milliseconds per second a slot may use and still be quiet: about eight times an idle
-/// claude's on the fleet (6 ms/s on a Pi, design.md), and well under any turn.
+/// CPU milliseconds per second whose minute's worth, 3000 ms, a window may use and still be
+/// quiet: at a 3-minute cadence about twice an idle slot's on the fleet (design.md), and well
+/// under any turn.
 pub const CPU_LINE: f64 = 50.0;
 
 const FLOOR_FACTOR: f64 = 10.0;

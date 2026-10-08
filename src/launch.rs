@@ -855,8 +855,9 @@ pub(crate) fn offload_then_open_with(
         // may have taken a while to answer. The offloader's own rule, asked again under the
         // lock, is the only thing that may stop a slot.
         let table = procinfo::table();
-        let seen = offload::look(&rec, &activity::load(), clock::now());
-        let verdict = match offload::judge(&rec, clock::now(), &seen) {
+        let now = clock::now();
+        let seen = offload::look(&rec, &activity::load(), now);
+        let verdict = match offload::judge(&rec, now, &seen) {
             Ok(verdict) => verdict,
             Err(hold) => {
                 return Outcome::Refused(format!("{n} can no longer be offloaded: {hold}"));

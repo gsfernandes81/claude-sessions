@@ -278,10 +278,12 @@ reports without signalling. Where the rules above left a choice, this is the cho
   reading**, never as of now, and only if the reading measured the slot's current claude, by
   pid and start time: a slot's state outlives its process, and a reading of the claude before
   a resume says nothing of this one.
-- **Run it every few minutes; 3 is assumed.** A window of 10 minutes or more counts as active
-  (it cannot say when in it anything fell), so a timer that slow never offloads anything. The
-  menu's make-room offer decides on the last stored reading, and only on one at most 5 minutes
-  old, so a timer slower than that leaves the offer nothing to make.
+- **Run it every 3 minutes.** Both budgets are a minute's worth whatever the window's length,
+  so a slower timer reads more active: at 3 minutes the CPU budget (3000 ms) is 16.7 ms/s,
+  about twice an idle slot's 7–13 ms/s on zero (claude-sessions#14), and much past 4 minutes
+  an idle claude reads active on CPU alone. A window of 10 minutes or more counts as active
+  whatever it measured, and the menu's make-room offer decides only on a reading at most 5
+  minutes old.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
@@ -344,11 +346,12 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   sockets, Python's plain sockets and asyncio). Measured on 2.1.291 with agent view off,
   here, under a real `offload --dry-run`: idle 95–139 B/s, a streaming reply 9,342 B/s —
   about 70×. These figures are `read`/`write` alone; the TCP count below sits on top of them.
-- **CPU, against a fixed line.** CPU time (`utime + stime` with reaped children's) over a
-  window is active above a minute's worth at 50 ms/s — about eight times an idle claude's 6
-  ms/s measured on the fleet, and well under any turn. It scales with the device, which is why
-  it has a fixed line rather than a floor: it catches work that computes without moving bytes
-  (a link step, a script crunching numbers), and a slower box only makes it read more active.
+- **CPU, against a fixed line.** CPU time (`utime + stime` with reaped children's) over a window
+  is active above a minute's worth at 50 ms/s, 3000 ms — at the 3-minute cadence about twice an
+  idle slot's 7–13 ms/s on zero (claude-sessions#14), and well under any turn. It scales with
+  the device, which is why it has a fixed line rather than a floor: it catches work that
+  computes without moving bytes (a link step, a script crunching numbers), and a slower box only
+  makes it read more active.
 - **Plus every TCP socket's own count.** The kernel keeps bytes per TCP socket whichever
   call moved them — `tcpi_bytes_received` and `tcpi_bytes_acked` — and hands them to anyone
   who asks its socket-diagnostics netlink (`NETLINK_SOCK_DIAG`, what `ss -ti` reads), for

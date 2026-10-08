@@ -44,7 +44,7 @@ registry implementation and one set of tests:
 
 ## Status
 
-Released as GitHub releases; nothing is deployed yet. Where the work stands is
+Released as GitHub releases, which infra's dev base pins. Where the work stands is
 [`docs/handoff/2026-10-02-menu.md`](docs/handoff/2026-10-02-menu.md).
 
 - [`docs/design.md`](docs/design.md) — what it does and why, in enough detail to build from
