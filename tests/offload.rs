@@ -124,11 +124,11 @@ done
     // `; :` keeps each shell as its command's parent rather than letting it exec the command
     // away — which is what zmx does too: its daemon outlives its command by a couple of
     // seconds.
-    // The stand-ins are in a group of their own, which an interrupt of the test run does not
-    // reach, so the busy loop ends with the test rather than spinning on.
     let claude_args = match load {
         Load::Sleep => "600".to_string(),
         Load::Child => "-c 'sleep 600; :'".to_string(),
+        // An interrupt of the test run does not reach the stand-ins' own process group, so the
+        // loop ends with the test rather than spinning on.
         Load::Busy => format!(
             "-c 'while [ -e /proc/{} ]; do read l < /etc/services; done'",
             std::process::id()
@@ -143,10 +143,10 @@ done
             root.join("bin/claude").display()
         ))
         .stdin(Stdio::null())
-        // The shell reports its child's signal ("Terminated", "Killed"), which is the test
-        // working, not failing; it would only be noise in the CI log. And a stand-in left
-        // behind by an interrupted run holds nothing of the harness's.
+        // A stand-in left behind by an interrupted run must not hold the harness's stdout.
         .stdout(Stdio::null())
+        // The shell reports its child's signal ("Terminated", "Killed"), which is the test
+        // working, not failing; it would only be noise in the CI log.
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()
