@@ -238,15 +238,16 @@ then arm its `/loop` keepalive, 1200 s from when the turn's `Stop` hooks have re
 up to the minute and so not in that `Stop`'s list, so the record holds a `keepalive` timer for
 22 minutes from the `Stop`, and no later list ends it sooner, a second `Stop` of a turn a hook
 blocked included; a `Stop` before it fires lists it as a one-shot the record has not seen, held
-until a list lacks it and then for a keepalive hold of its own; a cron one-shot firing looks
-the same and is held too. The keepalive follows only a turn a wake-up fired, never one it fired
-itself, since Claude Code allows one in a row, so a turn the keepalive fired arms no hold. The
-22 minutes assume no synchronous `Stop` hook holds the turn for more than about a minute:
-claude-sessions' own are async. `ScheduleWakeup` with `stop`, or with a `scheduledFor` of 0,
-ends the loop's wake-ups — `wakeup`, the keepalive hold and a listed one-shot carrying a due —
-as Claude Code's stop does, and a cron one-shot stays, as it does there. Durable crons
-(`CronCreate` with `durable`, kept in the project's `.claude/scheduled_tasks.json`) are never
-listed: they come only from `PostToolUse` and leave only with their own `CronDelete`.
+until a list lacks it; a cron one-shot firing looks the same and is held too. The keepalive
+follows only a turn a wake-up fired, never one it fired itself (Claude Code allows one in a
+row), so a turn an unlisted keepalive fired arms no hold; one a `Stop` listed first reads as
+any cron one-shot and gets a hold that covers nothing. The 22 minutes assume no synchronous
+`Stop` hook holds the turn for more than about a minute: claude-sessions' own are async.
+`ScheduleWakeup` with `stop`, or with a `scheduledFor` of 0, ends the loop's wake-ups —
+`wakeup`, the keepalive hold and a listed one-shot carrying a due — as Claude Code's stop does,
+and a cron one-shot stays, as it does there. Durable crons (`CronCreate` with `durable`, kept
+in the project's `.claude/scheduled_tasks.json`) are never listed: they come only from
+`PostToolUse` and leave only with their own `CronDelete`.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
