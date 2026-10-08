@@ -203,15 +203,16 @@ slot's lock, gives up behind an async hook stalled while holding it, so the reco
 with a dead process, which the menu shows as offloaded and `reconcile` settles; a resumed
 conversation carries the session crons Claude Code resurrects from its transcript unseen until
 its first `Stop`; a session cron an in-process teammate set is removed without a turn of the
-slot's own when it fires, so it is held until the next `Stop`; and an Esc cancels a loop's
-wake-up without a hook, so the record holds it until its due, at most an hour after it was set,
-or, when its due went unread, until the next `Stop`. A loop's turn that ends in an API error
-fires `StopFailure`, which is not installed, and Claude Code arms the keepalive after it, so no
-hold covers that keepalive. One is never corrected, and is not worth correcting (owner,
-2026-10-08): a durable cron Claude Code retires itself — a one-shot once it fires or is found
-missed at startup, a recurring one after its last fire past seven days' age unless it is
-permanent — is held for the slot's life, since it leaves its file without a hook and no list
-names it.
+slot's own when it fires, so it is held until the next `Stop`; an Esc cancels a loop's wake-up
+without a hook, so the record holds it until its due, at most an hour after it was set, or,
+when its due went unread, until the next `Stop`; and after a turn that reached no `Stop`, a
+turn no hook announces can list its wake-up before that wake-up's own hook lands, with the old
+wake-up's due until it does. A loop's turn that ends in an API error fires `StopFailure`, which
+is not installed, and Claude Code arms the keepalive after it, so no hold covers that
+keepalive. One is never corrected, and is not worth correcting (owner, 2026-10-08): a durable
+cron Claude Code retires itself — a one-shot once it fires or is found missed at startup, a
+recurring one after its last fire past seven days' age unless it is permanent — is held for the
+slot's life, since it leaves its file without a hook and no list names it.
 
 **Timers** (#13). Each `Stop` carries `session_crons`, Claude Code's in-memory crons with a
 `/loop` wake-up among them as a one-shot (seen on 2.1.292, read in 2.1.293), and the record
@@ -220,18 +221,21 @@ takes it as the session's timers, so a cron whose delete went unread leaves at t
 A `SubagentStop` carries the same list but is not read: from mid-turn it lacks a one-shot that
 has fired and the keepalive not yet armed, and one landing after the `Stop` is older than the
 keepalive too. The list has no due times: an entry keeps the one on record, and the one
-one-shot the record has not seen is the wake-up set in this turn, due when the `ScheduleWakeup`
-response's `scheduledFor` says, if that is still ahead; a wake-up left by a turn that reached
-no `Stop` lends its due to none. A one-shot without a due, two unseen included, is held until a
-later list lacks it. A one-shot gone from a list with none in its place has fired a turn that
-set none, and Claude Code may then arm its `/loop` keepalive, 1200 s from when the turn's
-`Stop` hooks have returned, rounded up to the minute and in no list, so the record holds a
-`keepalive` timer for 22 minutes from the `Stop`; a cron one-shot firing looks the same and is
-held too. The 22 minutes assume no synchronous `Stop` hook holds the turn for more than about a
-minute: claude-sessions' own are async. `ScheduleWakeup` with `stop`, or with a `scheduledFor`
-of 0, ends every one-shot, as Claude Code's stop does. Durable crons (`CronCreate` with
-`durable`, kept in the project's `.claude/scheduled_tasks.json`) are never listed: they come
-only from `PostToolUse` and leave only with their own `CronDelete`.
+one-shot the record has not seen is the wake-up set since the turn's prompt or the last `Stop`,
+due when the `ScheduleWakeup` response's `scheduledFor` says, if that is still ahead. A wake-up
+whose hook lands after the list raises the due it lent, never lowers it. A one-shot without a
+due, two unseen included, is held until a later list lacks it. A one-shot gone from a list with
+none in its place has fired a turn that set none, and Claude Code may then arm its `/loop`
+keepalive, 1200 s from when the turn's `Stop` hooks have returned, rounded up to the minute and
+in no list, so the record holds a `keepalive` timer for 22 minutes from the `Stop`; a cron
+one-shot firing looks the same and is held too. The 22 minutes assume no synchronous `Stop`
+hook holds the turn for more than about a minute: claude-sessions' own are async.
+`ScheduleWakeup` with `stop`, or with a `scheduledFor` of 0, ends the loop's wake-ups —
+`wakeup`, the keepalive hold and a listed one-shot carrying a due — as Claude Code's stop does,
+and a cron one-shot stays, as it does there. Durable crons (`CronCreate` with `durable`, kept
+in the project's `.claude/scheduled_tasks.json`) are never listed: they come only from
+`PostToolUse` and leave only with their own `CronDelete`; a cron in a record written before
+`durable` was is read as durable, as it was then held.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
@@ -680,21 +684,27 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   deadline is in its own memory alone — and would be the nearest of its housekeeping
   intervals anyway. A freeze that thaws on a fixed cycle would fire an overdue timer late,
   page the process back in every cycle, and have to tell its own catch-up burst from a turn.
-  The hook-read hold stays (§ The event table, *Timers*). What fails the wrong way is a durable
-  cron's: `CronCreate` renamed (it is named exactly in the hook's matcher) or `PostToolUse`'s
-  `tool_name` renamed, and its hook does nothing; or `durable` gone from both the call's
-  response and its input, and the next list drops it as a session cron. infra's checks on
-  Claude Code's binary should cover `session_crons`, `ScheduleWakeup`, `CronCreate` and
-  `CronDelete` as words, as they cover `background_tasks`; `durable` is too common a word for a
-  word grep (207 matches in 2.1.293), so its check is the extended regex
-  `humanSchedule:[$\w]+\([$\w]+\),recurring:[$\w]+,durable:[$\w]+\}`, `CronCreate`'s result
-  (minified names can carry `$`), counted with `grep -aoE … | wc -l` (`-c` counts lines of a
-  minified binary), calibrated to read exactly 1 on 2.1.293, where a 0 or a 2 both
-  fail. The rest err towards keeping: no readable `session_crons` is no news, an entry without
-  `recurring` is a one-shot as Claude Code reads it, no `scheduledFor` falls back to the asked
-  delay and no `delaySeconds` either is a wake-up with no due time, a delete with no readable
-  id leaves a session cron to the next list and holds a durable one for the slot's life, and no
-  `tool_response.id` keeps a durable cron no delete can match. **Then a message for claude alone** — a
+  The hook-read hold stays (§ The event table, *Timers*). Two things fail the wrong way. A
+  durable cron's: `CronCreate` renamed (it is named exactly in the hook's matcher) or
+  `PostToolUse`'s `tool_name` renamed, and its hook does nothing; or `durable` gone from both
+  the call's response and its input, and the next list drops it as a session cron. And a
+  `session_crons` that cannot be read (renamed, or its entries' `id`): the list is no news, so
+  the keepalive hold is lost and a fired wake-up's slot is let go ten minutes after its turn's
+  `Stop`, as before 0.4.7. infra's checks on Claude Code's binary should cover `session_crons`,
+  `ScheduleWakeup`, `CronCreate` and `CronDelete` as words, as they cover `background_tasks`.
+  `durable` is too common a word for a word grep (207 matches in 2.1.293), so its check is the
+  extended regex
+  `humanSchedule:[$[:alnum:]_]+\([$[:alnum:]_]+\),recurring:[$[:alnum:]_]+,durable:[$[:alnum:]_]+\}`,
+  `CronCreate`'s result; and the keepalive's 1200 s, which `KEEPALIVE_MS` assumes, is
+  `[$[:alnum:]_]+=60,[$[:alnum:]_]+=3600,[$[:alnum:]_]+=1200,`, the loop module's clamp bounds
+  and keepalive. Each is counted with `grep -aoE … | wc -l` (`-c` counts lines of a minified
+  binary; `\w` inside brackets is two literals to POSIX grep, and minified names can carry
+  `$`), and each reads exactly 1 on 2.1.293, where a 0 or a 2 both fail. The rest err towards
+  keeping: an entry without `recurring` is a one-shot as Claude Code reads it, no
+  `scheduledFor` falls back to the asked delay and no `delaySeconds` either is a wake-up with
+  no due time, a delete with no readable id leaves a session cron to the next list and holds a
+  durable one for the slot's life, and no `tool_response.id` keeps a durable cron no delete can
+  match. **Then a message for claude alone** — a
   remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
   process's socket, so a real freeze could see those bytes arrive and thaw on them; the
   measurement cannot, because claude is not stopped, and the bytes it receives are mostly

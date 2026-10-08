@@ -80,6 +80,18 @@ pub struct Timer {
     pub durable: bool,
 }
 
+impl Timer {
+    /// A timer with no due time.
+    pub fn new(id: impl Into<String>, recurring: bool, durable: bool) -> Timer {
+        Timer {
+            id: id.into(),
+            due_ms: None,
+            recurring,
+            durable,
+        }
+    }
+}
+
 /// A field two hook events can race on.
 #[derive(Debug, Clone, Copy)]
 pub enum Field {
@@ -426,11 +438,17 @@ impl SlotRecord {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
+                        let id = t.get("id").and_then(Value::as_str)?;
                         Some(Timer {
-                            id: t.get("id").and_then(Value::as_str)?.to_string(),
+                            id: id.to_string(),
                             due_ms: t.get("due_ms").and_then(Value::as_u64),
                             recurring: t.get("recurring").and_then(Value::as_bool).unwrap_or(false),
-                            durable: t.get("durable").and_then(Value::as_bool).unwrap_or(false),
+                            // Absent only before `durable` was written, when a cron was held
+                            // until its delete.
+                            durable: t
+                                .get("durable")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(id.starts_with("cron:")),
                         })
                     })
                     .collect()
@@ -630,13 +648,14 @@ mod tests {
     }
 
     #[test]
-    fn a_timer_without_durable_reads_as_a_session_timer() {
+    fn a_cron_from_before_durable_is_held_until_its_delete() {
         let v = crate::json::parse(
-            r#"{"slot":"claude-1","timers":[{"id":"cron:a","recurring":true}]}"#,
+            r#"{"slot":"claude-1","timers":[{"id":"cron:a","recurring":true},{"id":"wakeup"}]}"#,
         )
         .unwrap();
         let rec = SlotRecord::from_json(&v, "claude-1").expect("parses");
-        assert!(!rec.timers[0].durable);
+        assert!(rec.timers[0].durable);
+        assert!(!rec.timers[1].durable);
     }
 
     #[test]

@@ -134,12 +134,12 @@ impl Event {
             .as_arr()?
             .iter()
             .map(|c| {
-                Some(Timer {
-                    id: cron_key(c.get("id")?.as_str()?),
-                    due_ms: None,
-                    recurring: c.get("recurring").and_then(Value::as_bool).unwrap_or(false),
-                    durable: false,
-                })
+                let recurring = c.get("recurring").and_then(Value::as_bool);
+                Some(Timer::new(
+                    cron_key(c.get("id")?.as_str()?),
+                    recurring.unwrap_or(false),
+                    false,
+                ))
             })
             .collect()
     }
@@ -273,8 +273,8 @@ pub fn apply(
             // older than the slot's last start or end binds nothing.
             if rec.written.claim(Field::Life, tick) {
                 rec.state = State::Live;
-                // A different process cannot be running the old one's background work or its
-                // session crons, and a resume empties those before restoring its own.
+                // A different process runs none of the old one's background work or session
+                // crons, and a resume empties its session crons.
                 let new_process = pid.is_some() && (pid, proc_start) != (rec.pid, rec.proc_start);
                 if new_process && rec.written.claim(Field::Background, tick) {
                     rec.background.clear();
@@ -425,9 +425,6 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let response = ev.tool_response();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !rec.written.claim(Field::Timers, tick) {
-                return Outcome::Ignored("a newer timer has landed");
-            }
             let stop = input
                 .and_then(|v| v.get("stop"))
                 .and_then(Value::as_bool)
@@ -437,19 +434,34 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
             let target = response
                 .and_then(|v| v.get("scheduledFor"))
                 .and_then(Value::as_u64);
-            // Claude Code's stop cancels every one-shot of the loop; a cron one-shot it takes
-            // with them is back in the turn's own list.
-            if stop || target == Some(0) {
-                rec.timers.retain(|t| t.durable || t.recurring);
-                return Outcome::Changed;
-            }
+            let ended = stop || target == Some(0);
             // An unknown payload shape records no due time, which counts as pending: it errs
             // towards keeping the session alive.
             let asked = input
                 .and_then(|v| v.get("delaySeconds"))
                 .and_then(Value::as_f64)
                 .map(|d| at + (d.max(0.0) * 1000.0) as Millis);
-            upsert(rec, one_shot(WAKE_UP, target.or(asked)));
+            let due = target.or(asked);
+            if !rec.written.claim(Field::Timers, tick) {
+                // A newer list holds this wake-up under its own id, perhaps with an older one's
+                // due; a later due is never wrong to hold.
+                let listed = rec
+                    .timers
+                    .iter_mut()
+                    .find(|t| t.due_ms.is_some() && t.id != KEEPALIVE);
+                return match (listed, due) {
+                    (Some(t), Some(due)) if !ended && t.due_ms < Some(due) => {
+                        t.due_ms = Some(due);
+                        Outcome::Changed
+                    }
+                    _ => Outcome::Ignored("a newer timer has landed"),
+                };
+            }
+            if ended {
+                rec.timers.retain(|t| !loop_wake_up(t));
+            } else {
+                upsert(rec, one_shot(WAKE_UP, due));
+            }
             Outcome::Changed
         }
         "CronCreate" => {
@@ -472,15 +484,8 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
             if !durable && !rec.written.claim(Field::Timers, tick) {
                 return Outcome::Ignored("a newer timer has landed");
             }
-            upsert(
-                rec,
-                Timer {
-                    id: key,
-                    due_ms: None,
-                    recurring: said("recurring").and_then(Value::as_bool).unwrap_or(true),
-                    durable,
-                },
-            );
+            let recurring = said("recurring").and_then(Value::as_bool).unwrap_or(true);
+            upsert(rec, Timer::new(key, recurring, durable));
             Outcome::Changed
         }
         "CronDelete" => {
@@ -511,11 +516,14 @@ const KEEPALIVE_MS: Millis = (1_200 + 2 * 60) * 1_000;
 
 fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
     Timer {
-        id: id.into(),
         due_ms,
-        recurring: false,
-        durable: false,
+        ..Timer::new(id, false, false)
     }
+}
+
+/// What Claude Code's stop cancels: the loop's wake-ups, which alone carry a due.
+fn loop_wake_up(t: &Timer) -> bool {
+    t.id == WAKE_UP || t.id == KEEPALIVE || (!t.recurring && t.due_ms.is_some())
 }
 
 /// Takes a `Stop`'s `session_crons` as the whole of the session's timers, unless the list is
@@ -538,19 +546,20 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     if !rec.written.claim(Field::Timers, tick) {
         return;
     }
-    let due_of = |id: &str| rec.timers.iter().find(|t| t.id == id).map(|t| t.due_ms);
+    let mut unseen = Vec::new();
     for t in &mut listed {
-        if let Some(due) = due_of(&t.id) {
-            t.due_ms = due;
+        match rec.timers.iter().find(|r| r.id == t.id) {
+            Some(r) => t.due_ms = r.due_ms,
+            None if !t.recurring => unseen.push(t),
+            None => {}
         }
     }
-    let mut unseen: Vec<&mut Timer> = listed
-        .iter_mut()
-        .filter(|t| !t.recurring && due_of(&t.id).is_none())
-        .collect();
     if let [wake_up] = &mut unseen[..] {
-        wake_up.due_ms = due_of(WAKE_UP)
-            .flatten()
+        wake_up.due_ms = rec
+            .timers
+            .iter()
+            .find(|t| t.id == WAKE_UP)
+            .and_then(|t| t.due_ms)
             .filter(|&due| this_turn && due > at);
     }
     let woke = unseen.is_empty()
@@ -1429,13 +1438,11 @@ mod tests {
         "tool_input":{"cron":"0 9 * * *","prompt":"p","durable":true},
         "tool_response":{"id":"c1","recurring":true,"durable":true}}"#;
 
+    const DURABLE_DELETE: &str =
+        r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
+
     fn timer(id: &str, durable: bool) -> Timer {
-        Timer {
-            id: id.into(),
-            due_ms: None,
-            recurring: true,
-            durable,
-        }
+        Timer::new(id, true, durable)
     }
     fn ids(rec: &SlotRecord) -> Vec<&str> {
         let mut ids: Vec<&str> = rec.timers.iter().map(|t| t.id.as_str()).collect();
@@ -1505,8 +1512,16 @@ mod tests {
         assert!(rec.timers[0].durable);
         land(&mut rec, &[(NO_CRONS, 4_000)]);
         assert_eq!(ids(&rec), ["cron:c1"]);
-        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
-        land(&mut rec, &[(delete, 5_000)]);
+        let mut early = slot();
+        land(
+            &mut early,
+            &[(DURABLE_DELETE, 3_000), (DURABLE_CREATE, 2_000)],
+        );
+        assert!(
+            early.timers.is_empty(),
+            "a durable cron's delete outranks its late create"
+        );
+        land(&mut rec, &[(DURABLE_DELETE, 5_000)]);
         assert!(rec.timers.is_empty(), "its delete is what removes it");
     }
 
@@ -1526,6 +1541,7 @@ mod tests {
         let mut rec = slot();
         land(&mut rec, &[(bare, 2_000)]);
         assert!(rec.timers[0].recurring, "CronCreate's own default");
+        assert!(!rec.timers[0].durable);
     }
 
     #[test]
@@ -1712,12 +1728,26 @@ mod tests {
             ["keepalive"],
             "a one-shot without a due goes the same way"
         );
+    }
 
+    #[test]
+    fn a_stop_ends_the_loops_wake_ups_and_nothing_else() {
         let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
         let mut rec = listed_wake_up();
-        land(&mut rec, &[(stop, 50_000), (&listing(&[]), 51_000)]);
-        assert!(rec.timers.is_empty(), "a stopped loop arms no keepalive");
+        rec.timers.push(timer("cron:r", false));
+        rec.timers.push(Timer::new("cron:d", false, true));
+        rec.timers.push(Timer::new("cron:o", false, false));
+        land(&mut rec, &[(stop, 50_000)]);
+        assert_eq!(ids(&rec), ["cron:d", "cron:o", "cron:r"]);
+        land(&mut rec, &[(&listing(&["r", "o"]), 51_000)]);
+        assert_eq!(
+            ids(&rec),
+            ["cron:d", "cron:o", "cron:r"],
+            "a stopped loop arms no keepalive"
+        );
 
+        // A wake-up whose due went unread is not told from a cron one-shot, so it is held
+        // for the keepalive.
         let mut rec = slot();
         land(
             &mut rec,
@@ -1728,7 +1758,30 @@ mod tests {
                 (&listing(&[]), 51_000),
             ],
         );
-        assert!(rec.timers.is_empty(), "nor one whose due went unread");
+        assert_eq!(ids(&rec), ["keepalive"]);
+    }
+
+    #[test]
+    fn a_wake_up_landing_after_its_list_raises_the_due_it_lent() {
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[
+                (STOP, 1_000),
+                (&wake_up(1_801_000), 2_000),
+                (&listing(&["wb"]), 50_000),
+            ],
+        );
+        assert_eq!(
+            rec.timers[0].due_ms,
+            Some(1_801_000),
+            "calibration: a stale due"
+        );
+        let out = own(&mut rec, &ev(&wake_up(3_650_000)), 40_000);
+        assert_eq!(out, Outcome::Changed);
+        assert_eq!(rec.timers[0].due_ms, Some(3_650_000));
+        own(&mut rec, &ev(&wake_up(60_000)), 39_000);
+        assert_eq!(rec.timers[0].due_ms, Some(3_650_000), "never lowered");
     }
 
     #[test]
