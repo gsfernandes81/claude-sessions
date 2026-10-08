@@ -10,8 +10,6 @@
 //!
 //! Shapes and limits from `code.claude.com/docs/en/hooks`, read 2026-10-02:
 //!
-//! - **A matcher of letters and `|` is an exact list**, not a regex, so the `PostToolUse`
-//!   matcher names exactly the timer tools and nothing that merely contains their names.
 //! - **Every event but `SessionStart` and `SessionEnd` is `async`**: an interactive Claude Code
 //!   neither waits for the hook nor times it out, so a stalled disk delays the event, not the
 //!   prompt; `claude -p` kills any still running when it exits. Async hooks of one slot can
@@ -27,18 +25,14 @@
 //!   `clear` and `fork`, and the notification types are told apart in `events.rs`, where the
 //!   reason for each is written down.
 
-use crate::events::TIMER_TOOLS;
 use crate::json::Value;
 
 /// Every event `events::apply` acts on, in the order of the table in `docs/design.md`.
-pub const EVENTS: [&str; 8] = [
+pub const EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
-    "SubagentStart",
-    "SubagentStop",
     "Notification",
-    "PostToolUse",
     "SessionEnd",
 ];
 
@@ -68,9 +62,6 @@ pub fn settings(exe: &str) -> Value {
             None => handler.set("async", Value::Bool(true)),
         }
         let mut group = Value::obj();
-        if event == "PostToolUse" {
-            group.set("matcher", Value::string(TIMER_TOOLS.join("|")));
-        }
         group.set("hooks", Value::Arr(vec![handler]));
         hooks.set(event, Value::Arr(vec![group]));
     }
@@ -121,18 +112,14 @@ mod tests {
     #[test]
     fn every_event_the_state_machine_handles_is_installed() {
         // Calibration in both directions: each installed event changes a record when given a
-        // payload that should change it, and an event NOT installed is one apply ignores. One
-        // record through the table, in order: a `SubagentStop` changes one that lists its agent.
+        // payload that should change it, and an event NOT installed is one apply ignores.
         let doc = installed();
         let hooks = doc.get("hooks").expect("a hooks key");
         let payloads = [
             r#"{"hook_event_name":"SessionStart","session_id":"s"}"#,
             r#"{"hook_event_name":"UserPromptSubmit","prompt":"p"}"#,
             r#"{"hook_event_name":"Stop"}"#,
-            r#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"general-purpose"}"#,
-            r#"{"hook_event_name":"SubagentStop","agent_id":"a1","background_tasks":[]}"#,
             r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#,
-            r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
             r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#,
         ];
         let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
@@ -148,7 +135,8 @@ mod tests {
             );
         }
         let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
-        let ev = Event::parse(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#).unwrap();
+        let ev =
+            Event::parse(r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate"}"#).unwrap();
         assert!(
             matches!(
                 events::apply(&mut rec, &ev, Moment::ms(1_000), Binding::Own, None, None),
@@ -156,43 +144,6 @@ mod tests {
             ),
             "an event apply ignores is right to be left uninstalled"
         );
-    }
-
-    #[test]
-    fn the_timer_matcher_names_exactly_the_tools_that_set_timers() {
-        let doc = installed();
-        let matcher = doc
-            .get("hooks")
-            .and_then(|h| h.get("PostToolUse"))
-            .and_then(Value::as_arr)
-            .and_then(|a| a.first())
-            .and_then(|g| g.get("matcher"))
-            .and_then(Value::as_str)
-            .expect("a PostToolUse matcher");
-        assert_eq!(matcher, "ScheduleWakeup|CronCreate|CronDelete");
-        // Plain letters and `|` only, so Claude Code reads it as an exact list, not a regex.
-        assert!(matcher.chars().all(|c| c.is_ascii_alphabetic() || c == '|'));
-        for tool in matcher.split('|') {
-            let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
-            // Seed a cron so a delete has something to delete.
-            let seed = Event::parse(
-                r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1"}}"#,
-            )
-            .unwrap();
-            events::apply(&mut rec, &seed, Moment::ms(1), Binding::Own, None, None);
-            let body = format!(
-                r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}","tool_input":{{"delaySeconds":60,"id":"c1"}},"tool_response":{{"id":"c2"}}}}"#
-            );
-            let out = events::apply(
-                &mut rec,
-                &Event::parse(&body).unwrap(),
-                Moment::ms(1_000),
-                Binding::Own,
-                None,
-                None,
-            );
-            assert_eq!(out, Outcome::Changed, "{tool} is matched but sets no timer");
-        }
     }
 
     fn handler<'a>(doc: &'a Value, event: &str) -> &'a Value {

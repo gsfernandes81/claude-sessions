@@ -162,9 +162,9 @@ fn usage() -> String {
   claude-sessions reconcile    make the registry agree with reality after a restart
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
-  claude-sessions offload      stop every slot idle 10 minutes past its Stop; run from a timer
-                  [--dry-run]  say what it would stop, and stop nothing; either way, say
-                               what the activity rule (measured, not acted on) would do
+  claude-sessions offload      measure every slot, and stop each one quiet for 10 minutes
+                               and detached; run from a timer
+                  [--dry-run]  say what it would stop, and stop nothing
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status
@@ -399,10 +399,9 @@ fn cmd_list() -> std::io::Result<()> {
         let sess = sessions.iter().find(|s| s.name == r.slot);
         let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
         let marks = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}",
             if r.needs_you { "!" } else { "" },
             if r.unread() { "*" } else { "" },
-            if r.has_pending_timer(now) { "t" } else { "" },
             // Attached is only meaningful for a session we know to be alive.
             if alive && sess.is_some_and(|s| s.attached) {
                 "@"
@@ -528,11 +527,10 @@ fn cmd_doctor() -> std::io::Result<()> {
         );
         say!("  session   : {}", or_none(rec.session_id.clone()));
         say!(
-            "  flags     : busy={} needs_you={} unread={} timers={}",
+            "  flags     : busy={} needs_you={} unread={}",
             rec.busy,
             rec.needs_you,
-            rec.unread(),
-            rec.timers.len()
+            rec.unread()
         );
         if rec.last_event_ms.is_empty() {
             say!("  events    : none seen — the hooks are not installed, or not firing");

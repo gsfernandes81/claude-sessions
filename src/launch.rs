@@ -23,6 +23,7 @@
 //! `CLAUDE_SESSIONS_ZMX` names the zmx to run (default `zmx`) and
 //! `CLAUDE_SESSIONS_CLAUDE` the claude (default `claude`). An empty value is the default.
 
+use crate::activity;
 use crate::clock::{self, Millis, Moment};
 use crate::fmt;
 use crate::live;
@@ -854,7 +855,7 @@ pub(crate) fn offload_then_open_with(
         // may have taken a while to answer. The offloader's own rule, asked again under the
         // lock, is the only thing that may stop a slot.
         let table = procinfo::table();
-        let seen = offload::look(&rec, table.as_deref());
+        let seen = offload::look(&rec, &activity::load());
         let verdict = match offload::judge(&rec, clock::now(), &seen) {
             Ok(verdict) => verdict,
             Err(hold) => {
@@ -902,13 +903,13 @@ fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
 /// the dialog promises the offered session is resumable from disk.
 fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
     let now = clock::now();
-    let table = procinfo::table();
+    let measured = activity::load();
     registry::all()
         .ok()?
         .iter()
         .filter(|r| matches!(r.state, State::Live | State::Offloading))
         .filter_map(|r| {
-            let verdict = offload::judge(r, now, &offload::look(r, table.as_deref())).ok()?;
+            let verdict = offload::judge(r, now, &offload::look(r, &measured)).ok()?;
             let offload::Verdict::Offload { idle } = verdict else {
                 return None;
             };
@@ -1518,25 +1519,25 @@ exit 1"#,
         r
     }
 
-    /// An idle, detached slot the offloader would stop: stopped eleven minutes ago.
-    /// A live slot idle past the threshold, detached, with its conversation on disk.
+    /// A live slot the offloader would stop: measured quiet for eleven minutes, detached, with
+    /// its conversation on disk.
     fn idle(f: &mut Fixture, slot: &str) -> (u32, u64) {
         let (pid, start) = f.process();
         let mut r = live(slot, pid, start);
         let transcript = Path::new(&f.work()).join(format!("conv-of-{slot}.jsonl"));
-        let stop = clock::now() - 11 * 60 * 1000;
         std::fs::write(&transcript, PROMPTED).unwrap();
-        // Last written when its turn ended: a later write is activity (issue #9).
-        std::fs::File::options()
-            .write(true)
-            .open(&transcript)
-            .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(stop))
-            .unwrap();
         r.transcript_path = Some(transcript.display().to_string());
-        r.last_stop_ms = Some(stop);
-        r.last_activity_ms = stop;
         registry::store(&r).unwrap();
+        let mut measured = activity::load();
+        measured.insert(
+            slot.to_string(),
+            activity::SlotState {
+                at: clock::now(),
+                last_active: clock::now() - 11 * 60 * 1000,
+                ..Default::default()
+            },
+        );
+        activity::store(&measured).unwrap();
         f.session(slot, false);
         (pid, start)
     }

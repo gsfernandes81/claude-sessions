@@ -22,7 +22,7 @@ Code already lists past conversations and reopens one, and
    and its file is gone — and an offloaded slot is precisely when you need to know which
    conversation belonged to it, in which directory, to bring it back.
 3. **Nothing anywhere records attention or absence.** That a permission prompt is waiting.
-   That a timer is pending, so the slot must not be stopped. And **when you last looked** —
+   And **when you last looked** —
    which is the whole of `unread`, and cannot be derived from anything Claude Code keeps,
    because it is a fact about the owner rather than about the session.
 
@@ -44,7 +44,7 @@ The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
 `session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
-`needs_you` · `timers` (each with its due time, and whether it recurs)
+`needs_you`
 
 **States:** `attached` / `detached` — read from `zmx list`, never stored — plus `offloaded` and
 `closed`. **Unread is derived, not stored:** a `Stop` later than `last_attach` means the
@@ -81,9 +81,7 @@ direct child of that slot's `zmx` daemon**, checked in `/proc`. A nested claude 
 `claude -p` from a Bash tool call, or a subagent — inherits the variable too and must count
 as *work running under* the slot, never rebind its `session_id`. A hook fired in a subagent's
 own context — a tool call it makes — carries `agent_id`, which is a cheaper test than the
-`/proc` walk for that case; a `claude -p` spawned from a shell still needs the walk. **Except
-`SubagentStart` and `SubagentStop`:** the slot's own claude fires them, and there `agent_id`
-names the agent the event is about, so they are bound by the walk like any other (issue #10).
+`/proc` walk for that case; a `claude -p` spawned from a shell still needs the walk.
 
 **The three `CLAUDE_CODE_DISABLE_*` give claude the terminal's own scrollback** (owner,
 2026-10-04, issue #8), for a new slot and a resume alike. Every slot is reached over ssh,
@@ -145,14 +143,11 @@ terminal.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms` = when it fired; `compact` changes none of those |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared; `compact` changes neither |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
-| `Stop` | activity, idle since it fired; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
-| `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
-| `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`, but one with no list is no news, not an empty list (#12); **not** activity |
-| `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
+| `Stop` | activity, idle since it fired |
+| `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
-| `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
 
@@ -174,7 +169,7 @@ event fired, however long the hook then takes to arrive — seen on 2.1.292, the
 in event order. Events are ordered by that tick, which is exact, so events fired in one tick
 tie; the times the record shows or compares with file times are its wall-clock reading
 (`clock::Moment`). For each field two events can race on — the conversation, live or closed,
-`busy`, `needs_you`, `background`, the wake-up — the record keeps the tick of the event that
+`busy`, `needs_you` — the record keeps the tick of the event that
 last wrote it (`written`), and only an event of the same tick or later writes it again;
 activity only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the
 conversation goes to the one on record, whose start was synchronous; and since claude forks the
@@ -188,8 +183,7 @@ claude whose slot name is being reused, can write it; stamps from another boot, 
 kernel's boot id, are forgotten when a hook next loads the record. A late event of the
 conversation before the current one (a `Stop` of the one `/clear` left) is dropped, and a newer
 one from a conversation the record has not heard start adopts it, as the lost `SessionStart`
-would have. A cron deleted before its create lands is remembered, so the late create is not
-taken. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id` cannot do
+would have. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id` cannot do
 this: a prompt typed mid-turn fires its `UserPromptSubmit` under the running turn's id, and the
 turn it later starts fires none.
 
@@ -202,114 +196,33 @@ kills its last async hooks when it exits; and a `SessionEnd`, which waits only 4
 slot's lock, gives up behind an async hook stalled while holding it, so the record stays live
 with a dead process, which the menu shows as offloaded and `reconcile` settles.
 
-Three details that cost something if missed, read from the vendor hook documentation on
+Two details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
 
 - `SessionStart.source` has five values including **`fork`**, and carries
   `seconds_since_last_response` on a resume — a better idle clock than anything computed here.
 - `SessionEnd.reason` has six including **`resume`**. Treating `resume` as an end marks a slot
   closed every time a conversation is resumed.
-- `CronList` and `TaskStop` are **not** timers and must not pin a slot.
 
 ## The offloader
 
-Offloadable when: detached · `Stop`, or a start at the prompt, is the latest activity
-(`SubagentStart`/`SubagentStop` are not activity) · no
-`needs_you` · **no pending timer** (owner, 2026-10-01: never, whoever set it) · **no
-background work listed** (`Stop`'s list, kept between `Stop`s by `SubagentStart`/`SubagentStop`) · no non-`claude` descendants · idle past the threshold,
-counted from the later of that event and **the last write to the conversation's transcript or
-any of its subagents'**.
+**Offloadable when: detached · measured quiet for 10 minutes** (§ *Activity,
+measured*). Nothing the hooks say enters it: a slot is stopped when its processes have moved
+no bytes and used no CPU worth counting for ten minutes, whatever its last `Stop`, its
+`needs_you` or its claude's own timers say. The hooks feed the menu, not the offloader.
 
-**In-process background work is invisible to the process table** (issue #9, found by infra's
-reviewers and reproduced on v0.4.0). A background subagent, a Workflow run, a teammate or a
-cloud session runs inside claude's own process, so there is no descendant to see, and after the
-parent's `Stop` nothing moved the record: ten minutes later a live pass would have killed four
-working agents. Three things close it:
-
-- **`Stop` says what is still running.** Its payload carries `background_tasks` — Claude Code's
-  task registry filtered to backgrounded work that is running or pending, each with a `type`
-  in words (`subagent`, `workflow`, `shell`, `monitor`, `teammate`, `cloud session`, …) and a
-  description. Read in the 2.1.291 binary and then seen on the wire: a turn that left
-  `sleep 45` running in the background sent `{"type":"shell","status":"running",
-  "description":"Sleep for 45 seconds",…}`, and a quiet turn sent `[]`. Recorded as
-  `background`, it keeps the slot for as long as it is not empty. A task finishing wakes claude
-  to handle its notification, and that turn ends in a `Stop` with the list as it now is — so
-  the hold releases itself, and the ten minutes start from that `Stop`. A `SessionStart` from a
-  different process clears the list, since a new process cannot be running the old one's work.
-  **Claude Code's own housekeeping is left out** — `dream` (auto-dream, which tidies its memory
-  files after a turn), `auto-mode scan` and `memory import`: each ends "ambient", waking no turn
-  and writing no transcript (read in the binary), so no later list would ever drop one, and the
-  auto-dream fork's `SubagentStop` lists its own task as running. The cost is that one still
-  running is invisible: a dream that outlasts the idle threshold can be stopped partway, and
-  Claude Code's lock and abort handling recover it. **So is its watch on an artifact it
-  published** (owner, 2026-10-06) — the live-updates socket and its presence companion,
-  labelled `monitor` but told apart by their fixed descriptions (`live updates for artifact …`,
-  `presence on artifact …`): listeners, not work, as Claude Code's own keep-alive test agrees. An idle one is retired after 3.5 hours,
-  ambient again, so it would hold a slot for hours and then for good; and whoever wants the
-  replies to a comment is attached, which already keeps the slot.
-- **Between `Stop`s, agents announce themselves.** `SubagentStart` adds the agent it announces
-  to the list, and **`SubagentStop` takes its payload's `background_tasks` whole, as `Stop`
-  does** — except that one with no list is no news, where `Stop` reads none (#12): Claude
-  Code builds both from the same task registry. This is what holds work started in a turn
-  the owner ended with Esc (issue
-  #10): an Esc fires no `Stop`, so the list would otherwise be the previous turn's, and an agent
-  launched in the interrupted turn would hold the slot only while it kept writing. Seen on
-  2.1.291 under a pty on 2026-10-06: a background agent launched, the owner pressed Esc, and
-  the agent ran on for forty seconds, sent its `SubagentStop` — whose list still named it — and
-  woke claude for a turn that fired `UserPromptSubmit` and ended in `Stop` with an empty list.
-  So a background agent is held until the turn its end wakes, which is also what keeps one
-  that another installed hook sends back to work after its `SubagentStop`. The registry's list
-  never names a foreground agent (read in the binary: only backgrounded tasks pass its filter),
-  and a foreground agent the Esc cut off sends no `SubagentStop` of its own (issue #11) — so
-  it is listed from its `SubagentStart` until the next `SubagentStop` or `Stop` says otherwise:
-  the keep direction, and a turn still running holds the slot regardless. The other side of
-  the same rule: a foreground agent whose entry an earlier `SubagentStop` already replaced, then
-  sent to the background with no hook (Ctrl+B, or Claude Code's auto-background), then left by
-  an Esc, is held only by its writes until a later `SubagentStop` lists it — as in 0.4.3. Both events come
-  from the slot's own claude, so they are bound by the `/proc` walk, not by their `agent_id`
-  (which there names the agent, not the context the hook fired in); a nested `claude -p`'s
-  agents stay activity only. **Neither event is activity**: they edit the list and nothing
-  else. Claude Code also sends `SubagentStop`, with an empty `agent_type`, for internal agents
-  it never announced — seen about thirty seconds into both runs, after a `Stop` once and after
-  the Esc once, carrying the list — and as activity one would make an idle slot read busy until
-  the owner's next turn. An agent's work is seen as its transcript's writes (below).
-- **Writes are activity.** A turn writes its transcript as it goes, and a background subagent
-  writes its own under `<conversation>/subagents/` (Workflow runs a level or two deeper). The
-  offloader takes the newest of those modification times as one more "last thing that
-  happened". That covers a turn no hook announces, should there be one — a finished task's
-  notification was seen to fire `UserPromptSubmit`, a fired `ScheduleWakeup` has not been
-  watched — and a subagent that is working between the parent's `Stop`s. It errs one way only: a write for some other reason
-  delays an offload, never causes one.
-
-**An Esc fires no hook at all, and the transcript says so instead.** Seen on 2.1.291 under a
-pty with every hook logging (2026-10-06): Esc mid-reply and Esc mid-tool each left
-`UserPromptSubmit` as the last event — no `Stop`, no `StopFailure`, no `PostToolUse` for the
-interrupted tool — so the record read `busy` (and, if the Esc dismissed a permission prompt,
-waiting for you) until the next turn ended: the slot was never offloaded and the menu drew it
-under Working. What the interrupt does write is a `user` entry whose text begins
-`[Request interrupted by user` — `]` mid-reply, ` for tool use]` mid-tool — timestamped at the
-Esc, after the cut-off reply or the tool's rejected result, with only bookkeeping after it.
-So when the hooks left a slot busy or waiting and its transcript's last conversational entry is
-that marker, newer than the latest activity the hooks recorded, **the turn ended at the marker**: the
-offloader counts idleness from it as it would from a `Stop`, and the menu draws the row under
-Idle. The two read one rule (`SlotRecord::esc_ended`). The offloader still holds the slot for
-anything `background` lists, as it does for an agent the interrupted turn started; the menu
-does not read the list, so that row is Idle either way.
-Only the tail is read, and only for such a slot; a last line that cannot be read whole — a
-reply longer than the tail — is no answer, never an older marker's. **Only the marker itself
-counts** (issue #10): a list of exactly one text part that says exactly
-`[Request interrupted by user]` or `[Request interrupted by user for tool use]`, as Claude Code
-writes it and as its own checks read it. A prompt the owner types arrives as a string, so one that begins with the phrase is
-a prompt; subagent (`isSidechain`) lines are skipped. An Esc also clears waiting-for-you
-without knowing whose question it was: the prompt on screen is the likely one, and a question
-from a background agent would be the cost — infra's reviewers and this tool agree on clearing.
-
-**Still open:** a turn started by something that neither writes nor hooks has not been found,
-and would not be seen.
-
-**The threshold is 10 minutes** after `Stop` (owner, 2026-10-01). The hour floor the old
-shell script used existed only because self-scheduled wake-ups were invisible; the timer
-records make them visible, so the floor goes.
+**Still the menu's: an Esc fires no hook at all, and the transcript says so instead.** Seen
+on 2.1.291 under a pty with every hook logging (2026-10-06): Esc mid-reply and Esc mid-tool
+each left `UserPromptSubmit` as the last event — no `Stop` — so the record reads `busy` (and,
+if the Esc dismissed a permission prompt, waiting for you) until the next turn ends. What
+the interrupt does write is a `user` entry whose text begins `[Request interrupted by user`,
+timestamped at the Esc. So when the hooks left a slot busy or waiting and its transcript's
+last conversational entry is that marker, newer than the latest activity the hooks recorded,
+the menu draws the row under Idle (`SlotRecord::esc_ended`). Only the tail is read; a last
+line that cannot be read whole is no answer. **Only the marker itself counts** (issue #10): a
+list of exactly one text part that says exactly `[Request interrupted by user]` or
+`[Request interrupted by user for tool use]`; a prompt the owner types arrives as a string,
+and subagent (`isSidechain`) lines are skipped.
 
 It holds the slot lock from decision through kill, marks the slot `offloading` before
 signalling and `offloaded` after, and keeps `TERM` → grace → `KILL` → zmx teardown with
@@ -344,90 +257,62 @@ only logs what it would kill.
 
 ### How `claude-sessions offload` reads those rules
 
-Built 2026-10-01 in `src/offload.rs`. One pass per invocation, run from the box's timer;
-`--dry-run` decides and reports without signalling. Where the rules above left a choice, this
-is the choice and why:
+Built 2026-10-01 in `src/offload.rs`, reduced to the measurement on 2026-10-08. One pass per
+invocation, run from the box's timer; `--dry-run` decides and reports without signalling.
+Where the rules above left a choice, this is the choice and why:
 
-- **"`Stop` is the latest activity"** is the later of `last_stop_ms` and `ready_ms` being at or
-  after `last_activity_ms`, and not `busy`. `ready_ms` is the last `SessionStart` that opened a
-  conversation at its prompt — `startup`, `resume`, `clear` or `fork`, which the vendor docs
-  describe as "you can type right away" — so a slot resumed or started and then left is
-  offloadable ten minutes later like any other (owner, 2026-10-03, after asking for this to be
-  checked). A `compact` start is never readiness, and leaves `busy` and `needs_you` alone:
-  auto-compaction can come in the middle of a turn, and the docs do not say it cannot.
+- **Measured first.** Every pass measures every live slot (`activity::pass`) before it decides
+  anything, and decides on what that stored: the time each slot was last measured active. A
+  slot not measured yet — its first reading, or the state file lost — is kept.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
-  would be a close with extra steps. Registered and unregistered slots get the same rules, so
-  an unregistered slot whose hooks did record those is offloadable and comes back as a
-  registered one.
+  would be a close with extra steps. Registered and unregistered slots get the same rules.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
-  stopped; `judge` then makes it a close when the record's transcript — `transcript_path`, or
-  for an older record the path derived under `CLAUDE_CONFIG_DIR` — holds no exchange, or is
-  not there at all. Every
-  reason to keep holds a close exactly as it holds an offload. A slot with no `session_id`
-  is still kept rather than closed: there the hooks never bound and nothing is known, while
-  a recorded id with no transcript is evidence there is nothing to lose. `--dry-run` prints
-  `would close` for it, in the shape of `would offload`.
+  stopped; `judge` then makes it a close when the record's transcript holds no exchange, or
+  is not there at all. Every reason to keep holds a close exactly as it holds an offload.
+  `--dry-run` prints `would close` for it, in the shape of `would offload`.
 - **A close writes nothing before the signal.** The `SessionEnd` it provokes already reads as
   a close, and a stop that fails leaves the slot `live` for the next pass, where an offload
-  leaves it `offloading`. Afterwards the record is `closed`, the line in `offload.log` says
-  `closed … no conversation on disk to resume`, and the pass's summary counts it apart.
+  leaves it `offloading`.
 - **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
-  offload, because the dialog promises it is resumable from disk; accepted, the stop is
-  `judge`'s again under the lock, so a transcript that went in between makes it a close.
-- **Not being able to look keeps it.** A zmx that does not answer for the slot (attached cannot
-  be ruled out), a
-  `/proc` that cannot be listed (descendants cannot be ruled out), a record with no pid — each
-  is a reason to keep, because the offloader needs evidence to act, never to hold off.
-- **"No non-`claude` descendants"** walks the whole tree under the slot's claude, through any
-  nested claude, and ignores zombies. `claude.exe` counts as claude too — Claude Code's helper
-  processes have carried that name, and infra's old offloader measured and exempted them;
-  counted as work they would hold every slot forever. `node` is work (issue #2). A stdio MCP server would be such a descendant and would
-  pin its slot for good; the owner runs none (2026-10-01), so the rule stands as written. If
-  one is ever added, this is the line that has to learn about it — `offload --dry-run` names
-  what is holding each slot.
-- **Memory is reported, not a gate** (owner, 2026-10-01: no need to gate on it). The pass
-  prints the cgroup headroom and stops whatever is idle regardless.
+  offload, from the measurements the last pass stored; accepted, the stop is `judge`'s again
+  under the lock, so a transcript that went in between makes it a close.
+- **Not being able to look keeps it.** A zmx that does not answer for the slot (attached
+  cannot be ruled out), a slot not yet measured, a record with no pid — each is a reason to
+  keep.
+- **Memory is reported, not a gate** (owner, 2026-10-01). The pass prints the cgroup headroom
+  and stops whatever is quiet regardless.
 - **Signals go through a pidfd**, opened before the start-time check, so a pid reused between
   the check and the signal cannot be hit. `TERM`, 5 s, `KILL`, 3 s; a process still there is
   reported and the slot left `offloading` for the next pass to decide again. Then, if the
   claude's parent really was a `zmx` daemon, zmx is given up to 2 s to drop the session —
-  it does so the moment its program exits; its daemon lingers about 2.4 s more and exits by
-  itself, which nothing waits for.
-- **The lock is taken only by a slot about to be stopped** (issue #1). The pass reads `/proc`
-  once, holding no lock, and decides every slot from that and its record as listed; a slot
-  that is kept — nearly every slot, nearly always — never touches its lock, and `--dry-run`
-  takes none at all. A candidate then takes its lock, re-reads its record and `/proc`, and
-  decides again before anything is signalled. Hook events other than `SessionEnd` wait up to
-  15 s for a slot's lock rather than `SessionEnd`'s 400 ms (nothing waits on an async hook),
-  because a dropped `UserPromptSubmit` leaves a working claude reading as idle.
+  which hangs up its terminal, ending whatever ran under claude.
+- **The lock is taken only by a slot about to be stopped** (issue #1). A slot that is kept
+  never touches its lock, and `--dry-run` takes none at all. A candidate takes its lock,
+  re-reads its record, and decides again before anything is signalled.
 - **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
   offloader writes `offloaded` (or `closed`) itself. A `hook.log` line per offload is expected.
 - **The sweep infers "spawner gone" from the parent**: a transient daemon whose parent is no
   longer a `claude` has been reparented away from the session that started it — sound only
   with agent view disabled, as above. **A daemon under 10 minutes old is left alone**, as is
-  one whose age cannot be read: a tree caught between its spawner exiting and its own exit is
-  not a leak yet. The kill is `TERM` to the whole tree, deepest first, the offloader's grace,
-  then `KILL` to what is left, every signal checked against pid and start time. **A dry run
-  applies the same age check**, printing `would keep, too young` where the live sweep keeps
-  and `WOULD KILL` only where it would kill, so the dry run reads as the live sweep would act.
+  one whose age cannot be read. The kill is `TERM` to the whole tree, deepest first, the
+  offloader's grace, then `KILL` to what is left, every signal checked against pid and start
+  time. A dry run applies the same age check.
 - **Logged to `offload.log`** beside the registry: every stop, every failed stop, and every
-  sweep kill, kept-too-young tree and would-be kill. Slots kept are printed to stdout only, since a pass every few minutes
-  would otherwise bury the lines that matter.
+  sweep kill, kept-too-young tree and would-be kill. Slots kept and each slot's measurement
+  are printed to stdout only.
 
-## Activity, measured (reported, not acted on)
+## Activity, measured (what the offloader acts on)
 
-**Why.** Every rule above reads Claude Code: hook payloads, its task list's filters, which
-agents announce themselves. Eight review rounds of #10 kept finding corners of that reading,
-and a self-update can move any of them without a word; when one moves, the cost is a working
-claude stopped. The owner's direction (2026-10-06): try a rule that asks the kernel instead —
-what a slot's processes *do* means the same on every Claude Code version and every machine —
-with **freezing** (`SIGSTOP`, a reversible pause that leaves a cold process for swap to take)
-in place of killing. For now the rule is measured, not acted on: every pass, live or dry,
-says what it would do beside what the offloader did — the bytes of a slot's processes and
-TCP sockets, and the freeze it would hold from pass to pass, of claude alone, thawed by what
-still runs — and nothing else changes. The freeze comes after the fleet's own numbers have
-been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the tests.
+**Why.** Every rule the offloader once had read Claude Code: hook payloads, its task list's
+filters, which agents announce themselves, its timer tools. Eleven review rounds of the
+`session_crons` work kept finding corners of that reading (the branch
+`session-crons-0.4.7-wip` keeps it), and a self-update can move any of them without a word.
+What a slot's processes *do* means the same on every Claude Code version and every machine,
+so that is the whole rule now (owner, 2026-10-08): **a window is active when its bytes exceed
+a minute's worth at the slot's line, or its CPU a minute's worth at 50 ms/s**, and a slot
+quiet for ten minutes and detached is offloaded. `src/activity.rs` and
+`src/sockdiag.rs` have the details and the tests.
 
 - **Bytes through `read`/`write`, which is not all of the network.** `rchar + wchar` in
   `/proc/<pid>/io` counts the terminal claude repaints (zmx reads it whether or not anyone is
@@ -442,8 +327,11 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
   reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. These figures are
   `read`/`write` alone; the TCP count below sits on top of them. Wake-ups (voluntary
-  context switches over live threads) and CPU time (`utime + stime` with reaped children's)
-  are logged beside the bytes for the data and judged by nothing; CPU scales with the device.
+  context switches over live threads) are logged beside the bytes for the data.- **CPU, against a fixed line.** CPU time (`utime + stime` with reaped children's) over a
+  window is active above a minute's worth at 50 ms/s — about eight times an idle claude's 6
+  ms/s measured on the fleet, and well under any turn. It scales with the device, which is why
+  it has a fixed line rather than a floor: it catches work that computes without moving bytes
+  (a link step, a script crunching numbers), and a slower box only makes it read more active.
 - **Plus every TCP socket's own count.** The kernel keeps bytes per TCP socket whichever
   call moved them — `tcpi_bytes_received` and `tcpi_bytes_acked` — and hands them to anyone
   who asks its socket-diagnostics netlink (`NETLINK_SOCK_DIAG`, what `ss -ti` reads), for
@@ -475,10 +363,7 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   many closed uncounted — of those held at the last reading; one that opened and closed
   inside the window shows nowhere. A new socket counts whole; one whose inode a newer socket
   reused counts whole when its count is below the old one's and as a continuation otherwise
-  — inode numbers come from a counter, so reuse inside a window is not expected. Which part
-  of the slot a socket's bytes belong to is by its holders: claude's when every member
-  holding it is claude or a process claude started in the window, the others' otherwise.
-- **Which processes: the environment.** With agent view off, claude is one process: an
+  — inode numbers come from a counter, so reuse inside a window is not expected.- **Which processes: the environment.** With agent view off, claude is one process: an
   in-process subagent shows as claude's own bytes, and its tools as claude's children
   (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
   outside its tree). zmx sets `ZMX_SESSION` to the session's name for the program it runs,
@@ -510,8 +395,7 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   time it is read. An earlier claude's orphan is left out, but children it forks after the
   new claude started are younger and carry the name, so they count — and their turnover
   keeps the window active: the safe direction, and visible as a slot that never goes quiet.
-  Agent view, which runs a service outside any slot, stays off.
-- **The line: each slot's own floor.** A slot's floor is its quietest window in the last 24
+  Agent view, which runs a service outside any slot, stays off.- **The line: each slot's own floor.** A slot's floor is its quietest window in the last 24
   hours, hour by hour; the line is ten times the floor learned *before* the window, held
   between 512 B/s and 4 KB/s, and 512 for a slot with no floor yet. **A window is active
   when its bytes exceed a minute's worth at the line** — not when its average does, which
@@ -525,170 +409,44 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   enters. **Its blind spot:** a slot only ever seen busy learns that work as its floor, and
   then the 4 KB/s cap is its only protection — measured streaming is 9,342 B/s, about 2.3×
   the cap, so work that averages under 4 KB/s from a slot's first windows can read as quiet.
-  The logs show the floor beside every rate, which is how to spot it.
-- **The verdict.** Quiet — no window over its budget, a minute's worth of bytes at the line
-  — for the offloader's 10 minutes, and detached by zmx's count: *would freeze*. Otherwise
-  *would keep*, with the reason: first reading, attached, attachment unknown, quiet under
-  10m, or no recorded claude to freeze — the slot's members read but the recorded claude not
-  among them, its pid reused or gone before it was read. Each pass prints `claude-1:
-  measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), 25.2 wakeups/s, cpu 6.1 ms/s, 1
-  process(es), line 950 B/s (57000 B a window) from floor 95, quiet 14m; the activity rule
-  would freeze it` — the second bracket is the budget actually applied. These lines go to
-  the pass's stdout only, not to `offload.log`. **The days of reading depend on infra
-  keeping that stdout**: its live loop writes each pass, timestamped, to
-  `~/.local/share/claude-sessions-passes.log` (infra#9, 2026-10-06), and it must go on doing
-  so until the owner has read the numbers. Wake-ups read `?` in a window where their sum
-  fell — a thread that exited takes its count with it — and are low, unmarked, where newer
-  threads outweighed it.
-- **The freeze is of claude alone.** What the rule would freeze is the recorded
-  claude, and nothing else in the slot: a tool waiting locally — `sleep N && gh run view`,
-  `tail -f` on a quiet log, `inotifywait`, a build — goes on waiting and then does what it
-  waits to do, and that is the thaw. While frozen, the slot is thawed by **a member claude
-  did not start starting, any member but claude exiting, or the others moving more than a
-  window's budget** (their process bytes and every socket any of them holds), or by an
-  attach — and, erring running, by an attachment zmx could not report, or a member there but
-  unreadable. All of those are kernel facts; none reads Claude Code. The freeze is carried in
-  the state from pass to pass with the claude it froze, by pid and start time, and ends with
-  that claude — an offload and resume, a crash — said as `; the claude it would have frozen
-  has gone, and that freeze with it` on the slot's line; a reading from the future keeps it,
-  as it keeps the floor. Nothing is frozen yet; the lines say what would have been: `would
-  freeze it — claude alone, leaving 2 other process(es) running` when the rule would make
-  it, `would have claude frozen, 12m so far` while it would hold, `would thaw it: a process
-  exited` (or `a process started`, `its other processes moved 70000 B`, `attached`,
-  `attachment unknown`, `unknown`) when it would end.
-- **Read every freeze line beside the offloader's own line for the slot in the same pass.**
-  Both clocks run ten minutes: the offloader's from the `Stop`, the rule's from the pass
-  that closed the last active window, up to a pass later — and a pass measures before it
-  stops anything. So an ordinary idle, detached slot is offloaded at or before the pass
-  where the rule would first freeze it: at most one `would freeze it` beside `offloaded`,
-  often none, and never a carried freeze — short of a turn under the budget, which restarts
-  the offloader's clock and not the rule's, so a carried freeze can show beside the
-  offloader's hold for up to ten minutes in an ordinary slot. **A freeze is carried only in
-  a slot the offloader keeps** — a timer pending, background work, waiting for you, a
-  process running under claude — and `which the freeze would have stopped` counts there,
-  where claude moving is expected, the timer above all (the hook-read hold stays for it).
-  Whether a freeze would break an ordinary idle slot, these logs cannot say while the kill
-  runs; holding it off for a slot is the owner's call.
-- **What claude itself does while it would have been frozen** is what a freeze would have
-  stopped — a timer of claude's own, a message reaching it over its own socket — and is
-  counted in the logs before anything depends on it. Claude's own is its bytes and those of
-  any member new since the last reading whose line of parents, every one of them new,
-  reaches claude — the `gh` under the `bash` a tool call runs is claude's as much as the
-  `bash` — and the sockets only such processes hold. A stopped process starts nothing, so
-  such a process is claude's doing, never a thaw. A new member under one that was there last
-  reading is the rest's — the `gh` of `sleep N && gh run view` started before the freeze —
-  and so is one whose parent is no member of the slot — gone before the pass's snapshot,
-  leaving it reparented to init, a subreaper or a zmx — erring towards a thaw; a parent in
-  the snapshot that was gone before it was read is walked through like any other new member.
-  Its **exit** in a later window stays a thaw like any other's, whoever started it — `sleep
-  N && gh run view` ends with claude's own `bash` exiting, and that is the thaw working — so
-  a process claude started while it would have been frozen thaws the measurement a pass
-  later when it exits; read the two lines together (a real freeze never meets this). One
-  that came and went inside a window — in the pass's snapshot, gone before it was read — is
-  claude's start alone and no thaw, since nothing it did could have happened under a freeze.
-  When nothing would have thawed it, the line adds `, and claude itself started bash` —
-  named by what claude started directly — or `moved 540000 B (40000 B of it tcp)`, or both,
-  `which the freeze would have stopped` — **that phrase is the count to read**, in the slots
-  the bullet above says it can come from. When something did thaw it in the same window, the
-  line says both and claims no order, since within a window it is unknowable: `would thaw
-  it: a process exited; in the same window claude itself moved 540000 B (0 B of it tcp),
-  which may have followed the thaw`. The count has slack both ways. Over: claude's own
-  housekeeping — a re-read of the shared `~/.claude.json` after another slot rewrote it, the
-  status line's shell — can cross a quiet slot's budget. Under: a socket that opened and
-  closed inside one window is counted nowhere and shown nowhere, not even as `closed
-  uncounted` (that bracket is sockets held at the last reading and gone now), so a turn
-  whose API connection the pool closed before the pass reads `0 B of it tcp`, or stays under
-  budget and prints no line; and a turn routed through a child that was there at the freeze
-  — an MCP stdio server — thaws on the child's bytes and reads `would thaw it: its other
-  processes moved …; in the same window claude itself moved …, which may have followed the
-  thaw`, with no count. So tcp bytes of a turn's size on a line mean a turn or a tool; a
-  slot's own feature-flag refresh or an HTTP MCP keep-alive is tcp too, and small; none does
-  not mean housekeeping. Read `may have followed the thaw` lines whose thaw is `its other
-  processes moved` and whose claude part has tcp bytes as probable turns, and count them by
-  hand if there are many.
-- **A claude whose parent is not zmx is never frozen** — `would keep it: claude's parent is
-  fish, not zmx`: one typed into a shell in a zmx session is that shell's job, and a stopped
-  job hands its terminal back to the shell. The menu's slots run claude as zmx's own child
-  (`exec` through `env` and `sh`), so this is the hand-started case. The thaw latency is a
-  pass, three minutes; the thaw's own budget is the slot's, so a child that idles noisily —
-  an MCP server polling — shows in the floor first. A thaw is not activity: a process that
-  started and moved little leaves the slot quiet, and the next pass would freeze it again.
+  The logs show the floor beside every rate, which is how to spot it.- **Each pass prints** `claude-1: measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), 25.2
+  wakeups/s, cpu 6.1 ms/s (line 50), 1 process(es), line 950 B/s (57000 B a window) from floor
+  95, quiet 14m`, then the offloader's own line for the slot. These lines go to the pass's
+  stdout only, not to `offload.log`. Wake-ups read `?` in a window where their sum fell — a
+  thread that exited takes its count with it.
 - **What is unknown counts as active**: a slot's first reading, a member that left since the
-  last one, a process that is there but cannot be read (the slot is reported as unknown —
-  kept, or thawed if the rule held a freeze) — a setuid or otherwise non-dumpable member,
+  last one, a process that is there but cannot be read (the slot is reported as unknown and
+  kept) — a setuid or otherwise non-dumpable member,
   `sudo`, `su`, a mount helper, whose `/proc/<pid>/io` the kernel hides from its own user:
   the slot reads `N of its processes could not be read … unknown` every pass such a member
   lives, and never quiet — and a window as long as the quiet period, which cannot say when
   in it the bytes fell. A process not seen last time is counted whole — all it ever did
   falls in the window — which errs towards active without forcing it. A window under a
   minute — a pass run by hand right after the timer's — is left for the next, with a line
-  saying so.
-- **State** is `activity.state` beside the registry — not `.json`, which the registry reads
+  saying so.- **State** is `activity.state` beside the registry — not `.json`, which the registry reads
   as a slot — written whole and renamed into place. Two passes at once may each write it;
   the later wins and the other's window is measured again. **The state belongs to the slot's
   name** for as long as it has a record, and is carried as it was unless a reading replaces
   it — an offloaded slot, a crashed one with nothing left to read, a pass too soon after the
-  last — so a resume under the same name does not relearn its floor from busy windows. The
-  one thing not carried past a crash with nothing left to read is a held freeze: the claude
-  it froze is gone for certain, so it ends there, said (the bullet above). A reading dated
+  last — so a resume under the same name does not relearn its floor from busy windows. A reading dated
   after the pass (a clock stepped back, or a pass that stored while this one waited on zmx)
   starts over but keeps the floor. **Only a window known whole teaches the floor**: one as
   long as the quiet period, or one a member left — the first after a resume spans the whole
   offload — is active and teaches nothing, since its rate never happened. A name closed and
   reused inherits it, which mostly carries the container's idle noise across. A pass that
   cannot save it leaves the last saved state in place: counters are cumulative, so the next
-  window from it holds every byte, and floors survive a full disk.
-- **What it cannot see**: a claude waiting in process, silently. **The common case is its
-  own timer** — a `ScheduleWakeup` or a cron a claude set itself, routine on this fleet and
-  the reason the offloader never stops a slot with one pending (owner, 2026-10-01). The
-  activity verdict has no input for timers, so such a slot will read *would freeze* beside
-  the offloader's *kept — a timer is pending*; a freeze would stop the timer firing, and
-  thawing on attach is no substitute for a wake-up nobody is there to see. The freeze
-  decision has to keep that rule. **No kernel signal stands in for it** (checked
-  2026-10-07): the native build blocks in `epoll_pwait2` and holds no timerfd, so its next
-  deadline is in its own memory alone — and would be the nearest of its housekeeping
-  intervals anyway. A freeze that thaws on a fixed cycle would fire an overdue timer late,
-  page the process back in every cycle, and have to tell its own catch-up burst from a turn.
-  The hook-read hold stays; it comes from `PostToolUse` on the timer tools, not from `Stop`,
-  and fails the wrong way in three places: a timer tool renamed (`ScheduleWakeup`,
-  `CronCreate`, `CronDelete`, named exactly in the hook's matcher), so its hook never fires;
-  `PostToolUse`'s `tool_name`; and `CronDelete`'s `tool_input.id`, whose loss reads as a
-  delete with no target and drops every cron. infra's checks on Claude Code's binary should
-  cover the three tool names as they cover `background_tasks`. The other fields err towards
-  keeping: no `delaySeconds` is a wake-up with no due time, no `stop` leaves a wake-up until
-  it is due, and no `tool_response.id` keeps a cron no delete can match. **Then a message for claude alone** — a
-  remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
-  process's socket, so a real freeze could see those bytes arrive and thaw on them; the
-  measurement cannot, because claude is not stopped, and the bytes it receives are mostly
-  replies to what it sent. So the measurement counts them under *claude itself moved*, and a
-  thaw on claude's own sockets is for the freeze's design, once the logs say how often that
-  line appears. One for a child thaws it now. **And a tool that computes without reading or
-  writing** — a background build's link step, a script crunching numbers — adds no bytes
-  while claude sits at its prompt; the CPU figure on the same line will show it, and with
-  claude frozen alone it runs on and its exit is the thaw. So does file I/O through a
-  mapping — a linker (lld, mold, gold), sqlite with `mmap_size`, LMDB — which never passes
-  through `read`/`write`. **And a server that writes its title over its environment**
-  (postgres, nginx, `setproctitle` users such as gunicorn and celery) is in no slot once it
-  has left claude's tree, nor is anything it forks. And a job that double-forked away and
-  ran wholly between two passes, reaped by init: nobody's counters ever hold it. **A tool
-  waiting locally** — a background `sleep N && gh run view`, `tail -f` on a quiet log,
-  `inotifywait` — adds no bytes either, which is why the freeze is of claude alone: the tool
-  is not frozen, and what it does when the wait ends thaws claude.
-
-**Before it acts, the owner decides:** freezing replaces the 10-minute kill rule (owner,
-2026-10-01), and a frozen row needs a word and a place the approved mockups do not have.
-
-**What the measurement cannot tell the real freeze, for its design.** A child writing to a
-pipe claude reads — an MCP stdio server's notifications, a tool's output — blocks at the pipe's
-64 KB once claude is stopped, about one budget, so thaws by a chatty child read higher here
-than a freeze would see; a child's thaw is better read from what it does to files and sockets
-than from the pipe to claude. Frozen windows, with claude at zero, would read as known whole
-and teach the floor from the others alone; the freeze must not let them, for the reason a
-window spanning an offload does not. The record of a real freeze is the kernel's — the
-process's `T` state — not `activity.state`, which a failed store can lose: a freeze lost from
-the file is a stopped claude nobody thaws. A thaw wants a grace before the next freeze, since a
-thaw is not activity. And the menu should thaw a slot before it attaches, so an attach never
-meets a frozen terminal for up to a pass.
+  window from it holds every byte, and floors survive a full disk.- **What it cannot see**: a slot waiting without
+  reading, writing or computing. **Claude's own timers** — a `ScheduleWakeup`, a `/loop`, a
+  cron it set itself — are the common case: the native build blocks in `epoll_pwait2` and
+  holds no timerfd (checked 2026-10-07), so its next deadline is in its own memory alone. So
+  is **a tool waiting locally** — `sleep N && gh run view`, `tail -f` on a quiet log,
+  `inotifywait`, a server waiting for a request — and **file I/O through a mapping** (a linker
+  such as lld or mold, sqlite with `mmap_size`, LMDB), which never passes through
+  `read`/`write`. **A server that writes its title over its environment** (postgres, nginx,
+  `setproctitle` users) is in no slot once it has left claude's tree, nor is anything it
+  forks; and a job that double-forked away and ran wholly between two passes, reaped by init,
+  is in nobody's counters. Each of these is quiet to the measurement and offloaded after ten
+  minutes.
 
 ## The status line
 
@@ -998,8 +756,8 @@ claude-sessions hooks-config /usr/local/bin/claude-sessions \
 chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
 ```
 
-It installs the eight events of the table and the status line, `PostToolUse` matched to
-exactly the three timer tools, every event but `SessionStart` and `SessionEnd` `async` (see
+It installs the five events of the table and the status line, every event but `SessionStart`
+and `SessionEnd` `async` (see
 *The event table*), and a timeout only on those two: 30 s on `SessionStart`, above the hook's
 own 15 s lock wait, and **1 s on `SessionEnd`** — a longer one would raise the budget every
 `SessionEnd` hook on the box shares. `src/hooks_config.rs` has the reasons and the tests

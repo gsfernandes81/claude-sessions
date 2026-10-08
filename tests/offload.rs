@@ -16,10 +16,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[path = "support/iso.rs"]
-mod iso;
-use iso::iso;
-
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
 struct Slot {
@@ -95,10 +91,9 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// An idle slot `claude-1`: stopped eleven minutes ago, nothing pending, attached when
-/// `socket_mode` has the owner-execute bit (abduco's old signal, kept as the parameter), and a
-/// transcript on disk for its conversation.
-/// With `child`, the stand-in claude has a `sleep` running under it — work a stop would kill.
+/// An idle slot `claude-1`: measured quiet for eleven minutes, attached when `socket_mode` has
+/// the owner-execute bit (abduco's old signal, kept as the parameter), and a transcript on disk
+/// for its conversation. With `child`, the stand-in claude has a `sleep` running under it.
 fn idle_slot(tag: &str, socket_mode: u32, child: bool) -> Slot {
     idle_slot_with(tag, socket_mode, child, true)
 }
@@ -109,11 +104,14 @@ fn idle_slot_with(tag: &str, socket_mode: u32, child: bool, transcript: bool) ->
     slot_with(tag, socket_mode, usize::from(child), transcript)
 }
 
-/// An idle, detached slot whose stand-in claude has `depth` processes in a chain under it: a
-/// `sleep` alone at 1, a shell running the `sleep` at 2.
-fn idle_slot_deep(tag: &str, depth: usize) -> Slot {
-    slot_with(tag, 0o600, depth, true)
+/// A detached slot whose stand-in claude reads in a loop: work the measurement sees.
+fn busy_slot(tag: &str) -> Slot {
+    slot_with(tag, 0o600, BUSY, true)
 }
+
+/// The `depth` that makes the stand-in claude a shell reading a file in a loop, with nothing
+/// under it.
+const BUSY: usize = 3;
 
 fn slot_with(tag: &str, socket_mode: u32, depth: usize, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
@@ -149,8 +147,10 @@ done
         0 => "600",
         1 => "-c 'sleep 600; :'",
         2 => r#"-c 'sh -c "sleep 600; :"; :'"#,
+        BUSY => "-c 'while :; do read l < /etc/services; done'",
         n => panic!("no fixture of depth {n}"),
     };
+    let depth = if depth == BUSY { 0 } else { depth };
 
     let server = Command::new(root.join("bin/zmx"))
         .env_remove("ZMX_SESSION")
@@ -199,32 +199,25 @@ done
     // The path is recorded either way, as the hooks record it from SessionStart on; only
     // whether the file is there differs.
     let transcript_path = root.join("conv-1.jsonl");
-    let stop = now_ms() - 11 * 60 * 1000;
     if transcript {
-        // Last written when its turn ended, as a real one is: a write later than the stop is
-        // activity to the offloader (issue #9).
         std::fs::write(&transcript_path, PROMPTED).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&transcript_path)
-            .unwrap()
-            .set_modified(UNIX_EPOCH + Duration::from_millis(stop))
-            .unwrap();
     }
     let record = format!(
         r#"{{"slot":"claude-1","state":"live","pid":{claude},"proc_start":{claude_start},
             "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}",
-            "busy":false,"needs_you":false,
-            "last_activity_ms":{stop},"last_stop_ms":{stop},"timers":[]}}"#,
-        transcript_path.display()
+            "busy":false,"needs_you":false,"last_activity_ms":{}}}"#,
+        transcript_path.display(),
+        now_ms() - 11 * 60 * 1000
     );
     std::fs::write(root.join("registry/claude-1.json"), record).unwrap();
-    Slot {
+    let s = Slot {
         root,
         server,
         claude,
         claude_start,
-    }
+    };
+    measured_before(&s, -180_000);
+    s
 }
 
 fn offload(root: &Path, extra: &[&str]) -> (bool, String) {
@@ -303,23 +296,22 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     assert!(log.contains("claude-1: closed"), "logged: {log}");
 }
 
-/// 0.4.5: every pass says what the activity rule would do, measured from the kernel and
-/// acted on by nothing. The first pass has no window yet and keeps the slot; one straight
-/// after it is too short to count and leaves the state for the next. The state lives beside
-/// the registry under a name the registry does not read as a slot.
+/// Every pass measures before it decides. A slot never measured has no window yet and is
+/// kept; a pass straight after is too short to count and leaves the state for the next. The
+/// state lives beside the registry under a name the registry does not read as a slot.
 #[test]
 fn every_pass_measures_and_a_short_window_waits_for_the_next() {
     let s = idle_slot("activity", 0o600, false);
+    std::fs::remove_file(s.root.join("registry/activity.state")).unwrap();
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("claude-1: measured — ")
-            && out.contains("the activity rule would keep it: first reading"),
+        out.contains("claude-1: measured — ") && out.contains("a first reading"),
         "got: {out}"
     );
     assert!(
-        out.contains("claude-1: would offload"),
-        "the offloader's own verdict is unchanged: {out}"
+        out.contains("claude-1: kept — not quiet long enough"),
+        "a first reading counts as active: {out}"
     );
     let state =
         std::fs::read_to_string(s.root.join("registry/activity.state")).expect("state written");
@@ -370,145 +362,36 @@ fn floor_kept(s: &Slot) -> bool {
         .contains("87.5")
 }
 
-/// A pass past the first reading, through the real `zmx list` stand-in: quiet and detached
-/// would freeze, attached would keep, and a reading from the future is no reading.
+/// A pass past the first reading, through the real `zmx list` stand-in: quiet and detached is
+/// offloadable, attached is kept, and a reading from the future is no reading.
 #[test]
 fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
-    let s = idle_slot("activity-freeze", 0o600, false);
-    measured_before(&s, -180_000);
+    let s = idle_slot("activity-quiet", 0o600, false);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("claude-1: measured — ") && out.contains("the activity rule would freeze it"),
+        out.contains("claude-1: measured — ") && out.contains("claude-1: would offload, idle 11m"),
         "got: {out}"
     );
 
     let s = idle_slot("activity-attached", 0o700, false);
-    measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
-    assert!(
-        out.contains("the activity rule would keep it: attached"),
-        "got: {out}"
-    );
+    assert!(out.contains("claude-1: kept — attached"), "got: {out}");
 
     let s = idle_slot("activity-future", 0o600, false);
     measured_before(&s, 60 * 60_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
-    assert!(
-        out.contains("the activity rule would keep it: first reading"),
-        "got: {out}"
-    );
+    assert!(out.contains("a first reading"), "got: {out}");
     assert!(
         floor_kept(&s),
         "a future reading starts over but keeps the slot's floor"
     );
-    // ... and a freeze, as it keeps the floor: the slot's until something thaws it.
-    // Calibration: the case above, with no freeze, said "first reading".
-    let s = idle_slot("activity-future-frozen", 0o600, false);
-    measured_frozen(&s, &[], 60 * 60_000);
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("the activity rule would have claude frozen"),
-        "got: {out}"
-    );
-    assert!(frozen_kept(&s), "{out}");
-}
-
-/// A slot the rule would have frozen at its last reading, `at_offset_ms` from now, with
-/// these of the processes under claude read then beside it.
-fn measured_frozen(s: &Slot, seen: &[u32], at_offset_ms: i64) {
-    let now = now_ms() as i64;
-    let mut procs = format!("[{},{},0,0,0]", s.claude, s.claude_start);
-    for pid in seen {
-        procs.push_str(&format!(
-            ",[{pid},{},0,0,0]",
-            stat_fields(*pid).unwrap()[19]
-        ));
-    }
-    std::fs::write(
-        s.root.join("registry/activity.state"),
-        format!(
-            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[{procs}],"minima":[[{},87.5]],"sockets":[],"frozen":[{},{},{}]}}}}"#,
-            now + at_offset_ms,
-            now - 11 * 60_000,
-            now / 3_600_000,
-            now - 180_000,
-            s.claude,
-            s.claude_start
-        ),
-    )
-    .unwrap();
-}
-
-fn frozen_kept(s: &Slot) -> bool {
-    std::fs::read_to_string(s.root.join("registry/activity.state"))
-        .unwrap()
-        .contains("\"frozen\"")
-}
-
-/// Claude frozen alone, through the real pass. A process that was not there at the freeze
-/// and that claude did not start — `gh` under the `bash` of `sleep N && gh run view` — thaws
-/// it. One claude started itself is claude's doing, which a frozen claude could not have
-/// done: the line says the freeze would have stopped it, and the freeze holds. Calibration:
-/// with nothing new under claude, it stays frozen and says nothing more.
-#[test]
-fn a_frozen_claude_is_thawed_by_what_still_runs_and_not_by_what_it_started() {
-    let s = idle_slot_deep("activity-frozen", 2);
-    let tree = chain_under(s.claude);
-    assert_eq!(
-        tree.len(),
-        2,
-        "calibration: claude, a shell, a sleep: {tree:?}"
-    );
-    measured_frozen(&s, &tree, -180_000);
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("the activity rule would have claude frozen, 3m so far\n"),
-        "calibration, nothing changed: {out}"
-    );
-    measured_frozen(&s, &tree[..1], -180_000);
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains("the activity rule would thaw it: a process started\n"),
-        "got: {out}"
-    );
-    assert!(!frozen_kept(&s), "the thaw is stored");
-
-    // A tool call: claude → sh → sleep, all new since the freeze. Claude's doing, named by
-    // what it started directly; the calibration is the thaw above, where the sh was there.
-    let s = idle_slot_deep("activity-own-deep", 2);
-    measured_frozen(&s, &[], -180_000);
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(
-            "the activity rule would have claude frozen, 3m so far, and claude itself started sh, which the freeze would have stopped\n"
-        ),
-        "got: {out}"
-    );
-    assert!(frozen_kept(&s), "the freeze is stored");
-
-    let s = idle_slot_deep("activity-own", 1);
-    measured_frozen(&s, &[], -180_000);
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(
-            "the activity rule would have claude frozen, 3m so far, and claude itself started sleep, which the freeze would have stopped"
-        ),
-        "got: {out}"
-    );
-    assert!(frozen_kept(&s), "the freeze is stored");
 }
 
 /// A live record whose claude died without a word — an OOM kill — has no processes to read;
-/// its floor is carried until the slot is resumed, not dropped, and a freeze held on that
-/// claude is said to end.
+/// its floor is carried until the slot is resumed, not dropped.
 #[test]
 fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
     let s = idle_slot("activity-dead", 0o600, false);
@@ -525,27 +408,6 @@ fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
         !out.contains("claude-1: measured"),
         "nothing to read and nothing held, so nothing to say: {out}"
     );
-    // The same with a freeze held: the claude it froze is gone for certain, and the line
-    // says so rather than letting the freeze end unsaid with the record.
-    let s = idle_slot("activity-dead-frozen", 0o600, false);
-    measured_frozen(&s, &[], -180_000);
-    let path = s.root.join("registry/claude-1.json");
-    let body = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(
-        &path,
-        body.replacen(&format!("\"pid\":{}", s.claude), "\"pid\":4000000", 1),
-    )
-    .unwrap();
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "{out}");
-    assert!(
-        out.contains(
-            "claude-1: measured — nothing to read; the claude it would have frozen has gone, and that freeze with it"
-        ),
-        "{out}"
-    );
-    assert!(!frozen_kept(&s), "{out}");
-    assert!(floor_kept(&s), "{out}");
 }
 
 /// The floor belongs to the slot's name while it has a record: a pass that sees the slot
@@ -569,92 +431,6 @@ fn an_offloaded_slot_keeps_its_floor() {
     assert!(!floor_kept(&s), "calibration: no record, no floor");
 }
 
-/// Issue #9: a slot whose claude finished its turn 11 minutes ago but is still running
-/// in-process background work — four council agents, in the report — reads as idle to every
-/// hook. Calibrated by `an_idle_detached_slot_is_stopped_and_marked_offloaded`: the same
-/// fixture without the work is stopped.
-#[test]
-fn a_slot_running_background_work_is_kept_whatever_its_last_stop_says() {
-    let s = idle_slot("background", 0o600, false);
-    let path = s.root.join("registry/claude-1.json");
-    let body = std::fs::read_to_string(&path).unwrap();
-    let with_work = body.replacen(
-        "\"timers\":[]",
-        "\"timers\":[],\"background\":[\"subagent: council reviewer\",\"workflow: review\"]",
-        1,
-    );
-    assert_ne!(body, with_work, "calibration: the fixture took the field");
-    std::fs::write(&path, with_work).unwrap();
-    for args in [&["--dry-run"][..], &[][..]] {
-        let (ok, out) = offload(&s.root, args);
-        assert!(ok, "offload failed: {out}");
-        assert!(
-            out.contains("claude-1: kept — background work running: subagent: council reviewer"),
-            "got: {out}"
-        );
-    }
-    assert!(alive(s.claude, s.claude_start), "the work goes on");
-    assert_eq!(state_of(&s.root), "live");
-}
-
-/// The other half of issue #9: work that tells no hook but writes — a subagent's transcript
-/// under the conversation's `subagents/`, or a turn a fired wake-up started — restarts the
-/// idle clock.
-#[test]
-fn a_subagent_writing_its_transcript_keeps_the_slot() {
-    let s = idle_slot("subagent-write", 0o600, false);
-    let agents = s.root.join("conv-1/subagents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("agent-a1.jsonl"), "{}\n").unwrap();
-    let (ok, out) = offload(&s.root, &[]);
-    assert!(ok, "offload failed: {out}");
-    assert!(
-        out.contains("claude-1: kept — idle, offloadable in"),
-        "got: {out}"
-    );
-    assert!(alive(s.claude, s.claude_start));
-    assert_eq!(state_of(&s.root), "live");
-}
-
-/// An Esc fires no hook, so the record says busy from its prompt for good. The transcript's
-/// trailing `[Request interrupted by user]` says the turn is over. Calibrated in the same
-/// test: without the marker the same slot is kept.
-#[test]
-fn a_turn_ended_by_esc_is_idle_from_the_esc() {
-    let s = idle_slot("esc", 0o600, false);
-    let path = s.root.join("registry/claude-1.json");
-    let body = std::fs::read_to_string(&path).unwrap();
-    let busy = body.replacen("\"busy\":false", "\"busy\":true", 1);
-    assert_ne!(body, busy, "calibration: the fixture took the change");
-    std::fs::write(&path, busy).unwrap();
-    let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok, "offload failed: {out}");
-    assert!(
-        out.contains("claude-1: kept — something happened since it last went idle"),
-        "calibration, busy and no marker: {out}"
-    );
-
-    // The marker, eleven minutes old, as the last conversational line.
-    let at = now_ms() - 11 * 60 * 1000;
-    let transcript = s.root.join("conv-1.jsonl");
-    let mut text = std::fs::read_to_string(&transcript).unwrap();
-    text.push_str(&format!(
-        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"[Request interrupted by user]\"}}]}},\"timestamp\":\"{}\"}}\n",
-        iso(at)
-    ));
-    std::fs::write(&transcript, text).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&transcript)
-        .unwrap()
-        .set_modified(UNIX_EPOCH + Duration::from_millis(at))
-        .unwrap();
-    let (ok, out) = offload(&s.root, &[]);
-    assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: offloaded"), "got: {out}");
-    assert!(!alive(s.claude, s.claude_start));
-}
-
 #[test]
 fn the_same_slot_attached_is_left_alone() {
     let s = idle_slot("attached", 0o700, false);
@@ -675,17 +451,35 @@ fn a_dry_run_stops_nothing() {
     assert_eq!(state_of(&s.root), "live");
 }
 
+/// A slot doing work is kept by what it measurably does, not by what runs under it.
+/// Calibration both ways: an idle `sleep` under claude holds nothing.
 #[test]
-fn work_running_under_the_slot_keeps_it() {
-    let s = idle_slot("busy", 0o600, true);
+fn a_slot_doing_work_is_kept_and_an_idle_child_holds_nothing() {
+    let s = busy_slot("busy");
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
     assert!(
-        out.contains("claude-1: kept — sleep (pid"),
-        "the sleep under it should hold it: {out}"
+        out.contains("claude-1: kept — not quiet long enough"),
+        "its reading loop should hold it: {out}"
     );
     assert!(alive(s.claude, s.claude_start));
     assert_eq!(state_of(&s.root), "live");
+
+    let s = idle_slot("idle-child", 0o600, true);
+    let child: Vec<(u32, u64)> = chain_under(s.claude)
+        .into_iter()
+        .map(|pid| (pid, stat_fields(pid).unwrap()[19].parse().unwrap()))
+        .collect();
+    let (ok, out) = offload(&s.root, &[]);
+    // The stand-in has no terminal to hang up, so its child outlives it here; zmx's teardown
+    // ends it on a real slot.
+    for &(pid, start) in &child {
+        if alive(pid, start) {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+    assert!(ok, "offload failed: {out}");
+    assert!(out.contains("claude-1: offloaded"), "got: {out}");
 }
 
 /// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.

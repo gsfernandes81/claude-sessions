@@ -105,7 +105,7 @@ exit 0"#,
             r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
 echo marker >> "{out}"
 printf '{{"hook_event_name":"SessionStart","source":"startup","session_id":"conv-e2e","cwd":"%s","transcript_path":"{transcript}"}}' "$PWD" | "{bin}" hook >> "{out}"
-printf '{{"hook_event_name":"SubagentStart","agent_id":"a-e2e","agent_type":"general-purpose","session_id":"conv-e2e"}}' | "{bin}" hook >> "{out}"
+printf '{{"hook_event_name":"Notification","notification_type":"permission_prompt","agent_id":"a-e2e","session_id":"conv-e2e"}}' | "{bin}" hook >> "{out}"
 echo "claude said this on stderr" >&2
 exec sleep 600"#,
             pids = root.join("pids").display(),
@@ -203,11 +203,7 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     );
     assert!(body.contains("\"conv-e2e\""), "{body}");
     assert!(number(&body, "proc_start").is_some(), "with its start time");
-    // Idle since its start, which is what lets a slot opened and never prompted close.
-    assert!(
-        number(&body, "ready_ms") >= number(&body, "last_activity_ms"),
-        "{body}"
-    );
+    assert!(body.contains("\"busy\": false"), "at its prompt: {body}");
     // The stand-in speaks on stderr after its hooks return, so the record can land first.
     let stderr = root.0.join("registry/claude-1.stderr");
     let stderr = file_when(&root.0, &stderr, "nothing on stderr", |s| !s.is_empty());
@@ -219,12 +215,13 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
         "{body}"
     );
     assert!(!body.contains("very long reply"), "{body}");
-    // The slot's own claude announcing an agent: bound by the process tree although the
-    // payload names an `agent_id`, so the agent holds the slot (issue #10).
+    // An agent's permission prompt: fired inside the agent, so it is work under the slot,
+    // seen but not the slot's own waiting.
     let path = root.0.join("registry/claude-1.json");
-    file_when(&root.0, &path, "the agent was never listed", |b| {
-        b.contains("subagent: general-purpose")
+    let body = file_when(&root.0, &path, "the event was never seen", |b| {
+        b.contains("\"Notification\"")
     });
+    assert!(body.contains("\"needs_you\": false"), "{body}");
     // The marker proves the capture; its being alone, that the slot's own hooks said nothing.
     let out = std::fs::read_to_string(root.0.join("hook.out")).unwrap();
     assert_eq!(out, "marker\n");
@@ -237,7 +234,7 @@ fn a_record_stamped_in_another_boot_is_still_bound() {
     std::fs::write(
         root.0.join("registry/claude-6.json"),
         format!(
-            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"wakeup":{far},"prompt":{far},"boot":"an earlier boot"}}}}"#
+            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"prompt":{far},"boot":"an earlier boot"}}}}"#
         ),
     )
     .unwrap();
@@ -259,16 +256,13 @@ fn the_same_line_without_exec_is_not_bound() {
     assert!(!body.contains("\"conv-e2e\""), "{body}");
     // Calibration for the title: a nested claude's transcript names nothing about the slot.
     assert!(!body.contains("ai_title"), "{body}");
-    // And for the agent: once its SubagentStart has demonstrably been handled — the event is
-    // in the record's times — a nested claude's agent is activity, not the slot's work.
+    // And for the agent's event: once it has demonstrably been handled — the event is in the
+    // record's times — a nested claude's is activity, not the slot's waiting.
     let path = root.0.join("registry/claude-2.json");
     let body = file_when(&root.0, &path, "the event was never seen", |b| {
-        b.contains("\"SubagentStart\"")
+        b.contains("\"Notification\"")
     });
-    assert!(
-        !body.contains("subagent: general-purpose"),
-        "and not listed: {body}"
-    );
+    assert!(body.contains("\"needs_you\": false"), "{body}");
 }
 
 /// A stand-in claude whose second hook lands before its first: the first is forked, then held
@@ -276,7 +270,7 @@ fn the_same_line_without_exec_is_not_bound() {
 /// `claude-4` the reverse.
 fn claude_out_of_order(root: &Path) {
     let prompt = r#"{"hook_event_name":"UserPromptSubmit","prompt":"go","session_id":"conv-e2e"}"#;
-    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e","background_tasks":[]}"#;
+    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e"}"#;
     script(
         &root.join("bin/claude"),
         &format!(
@@ -327,7 +321,7 @@ fn a_hook_landing_late_is_ordered_by_when_claude_fired_it() {
 #[test]
 fn a_hook_that_outlives_its_claude_is_stamped_from_its_fork() {
     let root = setup("orphan");
-    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e","background_tasks":[]}"#;
+    let stop = r#"{"hook_event_name":"Stop","session_id":"conv-e2e"}"#;
     let fifo = root.0.join("late.fifo");
     script(
         &root.0.join("bin/claude"),

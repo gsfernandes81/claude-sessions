@@ -1,30 +1,24 @@
 //! Activity, measured: whether a slot is doing anything, read from the kernel rather than
-//! from Claude Code (design.md § *Activity, measured*). Measurement only: every
-//! offload pass says what this rule would do beside what the offloader did — including the
-//! freeze it would hold from pass to pass, and what would thaw it — so the rule can be judged
-//! on the fleet's own sessions before it decides anything.
+//! from Claude Code (design.md § *Activity, measured*). The offloader stops a slot only once
+//! this has read it quiet for [`QUIET_FOR_MS`].
 //!
-//! **Why the kernel.** The offloader's verdicts rest on reading Claude Code: hook payloads,
-//! the task list's filters, which agents announce themselves. Eight review rounds of #10 kept
-//! finding corners of that, and a self-update can move any of them. What a process *does* —
-//! bytes it reads and writes, how often it wakes — means the same on every Claude Code
-//! version and every machine.
+//! **Why the kernel.** What a process *does* — bytes it reads and writes, CPU it uses — means
+//! the same on every Claude Code version and every machine; what Claude Code says in its hooks
+//! moves with each self-update.
 //!
 //! **What is counted.** Bytes through `read`/`write` — `rchar + wchar` in `/proc/<pid>/io`: the
-//! terminal claude repaints, the transcripts it writes, pipes to its tools. The same count on a
-//! Pi 4 and an x86 box, where CPU time is not. The kernel counts by call: `read`/`write` on a
-//! socket count, but `send`/`recv` do not, and claude's own network uses those — so to these
-//! the bytes of every TCP socket a slot's processes hold are added, from the kernel's own
-//! per-socket count (`src/sockdiag.rs`). File I/O through a mapping stays invisible. CPU time
-//! and wake-ups are logged beside the bytes for the data, not judged. The measured figures, the
-//! membership rule, the line and what the rule cannot see are in design.md, which is the one
-//! record of them.
+//! terminal claude repaints, the transcripts it writes, pipes to its tools. The kernel counts by
+//! call: `read`/`write` on a socket count, but `send`/`recv` do not, and claude's own network
+//! uses those — so to these the bytes of every TCP socket a slot's processes hold are added,
+//! from the kernel's own per-socket count (`src/sockdiag.rs`). CPU time is judged beside the
+//! bytes against a fixed line; wake-ups are logged for the data. File I/O through a mapping
+//! stays invisible, and so does a process waiting without moving either.
 //!
 //! **Which way it errs.** Anything not known counts as active: a slot's first reading, a
 //! member that left since the last reading, a process that is there but cannot be read, a
-//! window as long as the quiet period, an attachment `zmx` could not report. A process not
-//! seen last time is counted whole. Concurrent passes may each write the state; the later
-//! write wins and the other's window is simply measured again.
+//! window as long as the quiet period. A process not seen last time is counted whole.
+//! Concurrent passes may each write the state; the later write wins and the other's window is
+//! simply measured again.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,9 +37,13 @@ pub const VAR: &str = "ZMX_SESSION";
 /// would otherwise measure a few seconds, too short to say anything; it is left for the next.
 pub const MIN_WINDOW_MS: Millis = 60_000;
 
-/// How long a slot must go with no window over its budget — a minute's worth of bytes at its
-/// line — before the rule would act: the offloader's own.
-pub const QUIET_FOR_MS: Millis = crate::offload::IDLE_AFTER_STOP_MS;
+/// How long a slot must go with no window over its budget before the offloader stops it
+/// (owner, 2026-10-01).
+pub const QUIET_FOR_MS: Millis = 10 * 60 * 1000;
+
+/// CPU milliseconds per second a slot may use and still be quiet: about eight times an idle
+/// claude's on the fleet (6 ms/s on a Pi, design.md), and well under any turn.
+pub const CPU_LINE: f64 = 50.0;
 
 const FLOOR_FACTOR: f64 = 10.0;
 const LINE_MIN: f64 = 512.0;
@@ -78,30 +76,6 @@ pub struct Sock {
     pub bytes: u64,
 }
 
-/// A socket as one pass found it: with the members that hold it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Held {
-    pub sock: Sock,
-    pub by: Vec<u32>,
-}
-
-/// A member's place in the process tree, from the pass's `/proc` snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Member {
-    pub pid: u32,
-    pub ppid: u32,
-    pub comm: String,
-}
-
-/// The recorded claude the rule would have frozen alone, and since when. A freeze belongs to
-/// one process: a claude offloaded and resumed, or one that crashed, ends it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Frozen {
-    pub at: Millis,
-    pub pid: u32,
-    pub start: u64,
-}
-
 /// What one slot's state carries from pass to pass.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SlotState {
@@ -111,39 +85,6 @@ pub struct SlotState {
     /// The quietest rate seen in each hour of the last day, as `(hour, bytes per second)`.
     pub minima: Vec<(u64, f64)>,
     pub sockets: Vec<Sock>,
-    pub frozen: Option<Frozen>,
-}
-
-/// Bytes one part of a slot moved in a window: through its processes' `read`/`write`, and
-/// through the TCP sockets it holds.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Moved {
-    pub proc: u64,
-    pub tcp: u64,
-}
-
-impl Moved {
-    pub fn total(self) -> u64 {
-        self.proc + self.tcp
-    }
-}
-
-/// A window split between the recorded claude and everything else in the slot: what would
-/// still run, and so could thaw it, were claude frozen alone.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Split {
-    /// Claude's own bytes, with those of any process it started in the window.
-    pub claude: Moved,
-    pub rest: Moved,
-    /// A process claude started in the window, by name: claude's doing, which a frozen claude
-    /// could not have done, so never a thaw.
-    pub claude_change: Option<String>,
-    /// A member claude did not start in the window started, or a member other than claude
-    /// exited — one seen at the last reading, whoever started it, or one gone before it was
-    /// read that was not claude's doing.
-    pub rest_change: Option<&'static str>,
-    /// Members other than the recorded claude.
-    pub others: usize,
 }
 
 /// The window's TCP figures. Their bytes are already in [`Measure::rate`].
@@ -161,8 +102,7 @@ pub struct Measure {
     /// Bytes per second over the window; `None` on a slot's first reading.
     pub rate: Option<f64>,
     pub wakeups: Option<f64>,
-    /// CPU milliseconds per second over the window (0 on a first reading) — logged, not
-    /// judged: it scales with the device.
+    /// CPU milliseconds per second over the window (0 on a first reading).
     pub cpu: f64,
     pub window_ms: Millis,
     pub floor: Option<f64>,
@@ -172,7 +112,6 @@ pub struct Measure {
     /// Why there is no TCP figure, when there is none — and then `rate` is the process bytes
     /// alone.
     pub tcp: Result<Tcp, &'static str>,
-    pub split: Split,
 }
 
 /// What a window may carry and still be quiet: a minute's worth of bytes at the line.
@@ -191,120 +130,55 @@ pub struct Snapshot {
     pub readings: Vec<Reading>,
     /// Members in the pass's `/proc` snapshot that were gone before they could be read.
     pub left: Vec<u32>,
-    /// The slot's TCP sockets with their holders, or why they were not read.
-    pub net: Result<Vec<Held>, &'static str>,
-    /// The recorded claude, while it is alive and was read.
-    pub claude: Option<(u32, u64)>,
-    /// Every member's parent and name: whose doing a new one was.
-    pub tree: Vec<Member>,
+    /// The TCP sockets the slot's members hold, or why they were not read.
+    pub net: Result<Vec<Sock>, &'static str>,
 }
 
-/// The members claude itself started in the window, each with the name of the one claude
-/// started directly — `bash` for the `gh` a tool call runs under it. A member is claude's
-/// doing when it is `new` and its line of parents reaches claude through members that are all
-/// new too. The walk stops at a member that was there last reading — `gh` under the `bash` of
-/// `sleep N && gh run view`, started before the freeze, is the rest's — and at a parent that
-/// is no member, gone before the pass's snapshot so its child was reparented: the rest's,
-/// erring towards a thaw.
-fn claudes_doing(
-    claude: Option<(u32, u64)>,
-    tree: &[Member],
-    new: impl Fn(u32) -> bool,
-) -> BTreeMap<u32, String> {
-    let mut out = BTreeMap::new();
-    let Some((claude, _)) = claude else {
-        return out;
-    };
-    let by_pid: BTreeMap<u32, &Member> = tree.iter().map(|m| (m.pid, m)).collect();
-    for m in tree.iter().filter(|m| m.pid != claude && new(m.pid)) {
-        let mut at = m;
-        // One snapshot's parents form a forest, so the walk ends; the bound makes sure.
-        for _ in 0..tree.len() {
-            if at.ppid == claude {
-                out.insert(m.pid, at.comm.clone());
-                break;
-            }
-            match by_pid.get(&at.ppid) {
-                Some(parent) if parent.pid != claude && new(parent.pid) => at = parent,
-                _ => break,
-            }
-        }
-    }
-    out
-}
-
-/// The window's TCP figures, its sockets' bytes into `split`, and the sockets to remember. A
-/// socket is claude's when every member holding it is claude or claude's doing (`claudes`);
-/// one any other member holds is the rest's, so its traffic would thaw a claude frozen alone,
-/// the safe way.
+/// The window's TCP figures and the sockets to remember.
 ///
 /// A socket closed since the last reading is not counted at all, rather than making the window
 /// active as a member that left does. Its bytes since are lost with it, and claude's
 /// connection pool closes idle sockets as a matter of course, so that rule would keep every
 /// slot; a turn shows anyway, in the screen it redraws and the transcript it appends.
-fn split_sockets(
+fn tcp_window(
     prev: &[Sock],
-    net: Result<Vec<Held>, &'static str>,
-    claudes: impl Fn(u32) -> bool,
+    net: Result<Vec<Sock>, &'static str>,
     window_ms: Millis,
-    split: &mut Split,
-) -> (Result<Tcp, &'static str>, Vec<Sock>) {
+) -> (u64, Result<Tcp, &'static str>, Vec<Sock>) {
     let net = match net {
         Ok(net) => net,
         // Not read this pass: the last reading stands, so the next window holds these bytes.
-        Err(why) => return (Err(why), prev.to_vec()),
+        Err(why) => return (0, Err(why), prev.to_vec()),
     };
-    let mut bytes = 0u64;
-    for Held { sock: s, by } in &net {
-        let moved = match prev.iter().find(|p| p.inode == s.inode) {
+    let bytes: u64 = net
+        .iter()
+        .map(|s| match prev.iter().find(|p| p.inode == s.inode) {
             // An inode reused by a newer socket starts below the old one's count.
             Some(p) if s.bytes >= p.bytes => s.bytes - p.bytes,
             _ => s.bytes,
-        };
-        bytes += moved;
-        if by.iter().all(|&pid| claudes(pid)) {
-            split.claude.tcp += moved;
-        } else {
-            split.rest.tcp += moved;
-        }
-    }
+        })
+        .sum();
     let closed = prev
         .iter()
-        .filter(|p| !net.iter().any(|h| h.sock.inode == p.inode))
+        .filter(|p| !net.iter().any(|s| s.inode == p.inode))
         .count();
     let tcp = Tcp {
         rate: bytes as f64 / (window_ms as f64 / 1000.0),
         sockets: net.len(),
         closed,
     };
-    (Ok(tcp), net.into_iter().map(|h| h.sock).collect())
+    (bytes, Ok(tcp), net)
 }
 
 /// One pass's step for one slot, pure. The caller has already left a window shorter than
 /// [`MIN_WINDOW_MS`] for the next pass.
-///
-/// **Whose a change is.** A member claude started in the window ([`claudes_doing`]) is
-/// claude's: its bytes and sockets are claude's, and it is [`Split::claude_change`], never a
-/// thaw — a stopped process starts nothing. A new member anything else started is the rest's.
-/// A member seen at the last reading that exited is the rest's whoever started it: `sleep N &&
-/// gh run view` ends with claude's own `bash` exiting, and that is the thaw working.
 pub fn step(prev: Option<&SlotState>, now: Millis, snap: Snapshot) -> (SlotState, Measure) {
     let Snapshot {
         readings,
         left,
         net,
-        claude,
-        tree,
     } = snap;
-    let is_claude = |pid: u32, start: u64| claude == Some((pid, start));
     let procs = readings.len();
-    let mut split = Split {
-        others: readings
-            .iter()
-            .filter(|r| !is_claude(r.pid, r.start))
-            .count(),
-        ..Split::default()
-    };
     let Some(prev) = prev else {
         let m = Measure {
             rate: None,
@@ -316,96 +190,56 @@ pub fn step(prev: Option<&SlotState>, now: Millis, snap: Snapshot) -> (SlotState
             quiet_ms: 0,
             procs,
             tcp: Err("first reading"),
-            split,
         };
         let state = SlotState {
             at: now,
             procs: readings,
             last_active: now,
             minima: Vec::new(),
-            sockets: net.map_or_else(|_| Vec::new(), |n| n.into_iter().map(|h| h.sock).collect()),
-            frozen: None,
+            sockets: net.unwrap_or_default(),
         };
         return (state, m);
     };
-    // New since the last reading: by pid and start for a member read, by pid alone for one
-    // gone before it could be.
-    let new = |pid: u32| match readings.iter().find(|r| r.pid == pid) {
-        Some(r) => !prev
-            .procs
-            .iter()
-            .any(|p| p.pid == r.pid && p.start == r.start),
-        None => !prev.procs.iter().any(|p| p.pid == pid),
-    };
-    let doing = claudes_doing(claude, &tree, new);
     let window_ms = now.saturating_sub(prev.at);
-    let (mut wakeups, mut cpu, mut threads_gone) = (0u64, 0u64, false);
+    let (mut bytes, mut wakeups, mut cpu, mut threads_gone) = (0u64, 0u64, 0u64, false);
     for r in &readings {
-        let seen = prev
+        match prev
             .procs
             .iter()
-            .find(|p| p.pid == r.pid && p.start == r.start);
-        let moved = match seen {
+            .find(|p| p.pid == r.pid && p.start == r.start)
+        {
             Some(p) => {
+                bytes += r.bytes.saturating_sub(p.bytes);
                 cpu += r.cpu.saturating_sub(p.cpu);
                 // A thread that exited takes its count with it, so this sum can fall; a window
                 // where it did has no honest figure.
                 threads_gone |= r.wakeups < p.wakeups;
                 wakeups += r.wakeups.saturating_sub(p.wakeups);
-                r.bytes.saturating_sub(p.bytes)
             }
             // Not seen last time: everything it ever did falls in this window, as far as
             // anyone can tell. Counting it all errs towards active.
             None => {
-                wakeups += r.wakeups;
+                bytes += r.bytes;
                 cpu += r.cpu;
-                r.bytes
-            }
-        };
-        if is_claude(r.pid, r.start) {
-            split.claude.proc += moved;
-        } else if let Some(name) = doing.get(&r.pid) {
-            split.claude.proc += moved;
-            split.claude_change.get_or_insert_with(|| name.clone());
-        } else {
-            split.rest.proc += moved;
-            if seen.is_none() {
-                split.rest_change = Some("a process started");
+                wakeups += r.wakeups;
             }
         }
     }
     // A member seen last time and gone now: what it did since went to whoever reaped it — a
-    // member's counters, or init's for an orphan — so this window's bytes are not known whole.
-    // So does one gone before it was read; one of those claude started since the last
-    // reading was claude's doing, like any other it started.
-    let gone: Vec<&Reading> = prev
-        .procs
-        .iter()
-        .filter(|p| {
+    // member's counters, or init's for an orphan — so this window is not known whole. So is
+    // one gone before it was read.
+    let vanished = !left.is_empty()
+        || prev.procs.iter().any(|p| {
             !readings
                 .iter()
                 .any(|r| r.pid == p.pid && r.start == p.start)
-        })
-        .collect();
-    let vanished = !left.is_empty() || !gone.is_empty();
-    for p in &gone {
-        if !is_claude(p.pid, p.start) {
-            split.rest_change = Some("a process exited");
-        }
-    }
-    for pid in &left {
-        match doing.get(pid) {
-            Some(name) => {
-                split.claude_change.get_or_insert_with(|| name.clone());
-            }
-            None => split.rest_change = Some("a process exited"),
-        }
-    }
-    let claudes = |pid: u32| claude.is_some_and(|(c, _)| c == pid) || doing.contains_key(&pid);
-    let (tcp, net) = split_sockets(&prev.sockets, net, claudes, window_ms, &mut split);
-    let bytes = split.claude.total() + split.rest.total();
+        });
+    let (tcp_bytes, tcp, sockets) = tcp_window(&prev.sockets, net, window_ms);
+    bytes += tcp_bytes;
     let secs = window_ms as f64 / 1000.0;
     let rate = bytes as f64 / secs;
+    // USER_HZ is 100 on every Linux, so a tick is 10 ms.
+    let cpu_ms = cpu as f64 * 10.0;
     // The line comes from the history *before* this window: a window never sets its own bar,
     // so a slot with none is held to the low line, as unknown should be.
     let hour = now / HOUR_MS;
@@ -417,20 +251,20 @@ pub fn step(prev: Option<&SlotState>, now: Millis, snap: Snapshot) -> (SlotState
         .collect();
     let floor = minima.iter().map(|&(_, m)| m).reduce(f64::min);
     let line = line(floor);
-    // Active above a minute's worth of bytes at the line, not above the line on average: a turn
-    // that starts in a window's last seconds would be averaged away. Every window is at least a
+    // Active above a minute's worth at the line, not above the line on average: a turn that
+    // starts in a window's last seconds would be averaged away. Every window is at least a
     // minute, so this covers the average too. A window as long as the quiet period cannot say
-    // when in it the bytes fell, and one a member left is not known whole: both active.
-    let budget = budget(line);
+    // when in it anything fell, and one a member left is not known whole: both active.
+    let minute = MIN_WINDOW_MS as f64 / 1000.0;
     let unknown = window_ms >= QUIET_FOR_MS || vanished;
-    let last_active = if bytes as f64 > budget || unknown {
+    let busy = bytes as f64 > budget(line) || cpu_ms > CPU_LINE * minute;
+    let last_active = if busy || unknown {
         now
     } else {
         prev.last_active
     };
     // Only a window known whole teaches the floor: one spanning an offload or a gap, or one a
-    // member left, holds a rate that never happened — a resumed claude's lifetime bytes over
-    // the whole offload would read as a quiet the slot never had.
+    // member left, holds a rate that never happened.
     if !unknown {
         match minima.last_mut() {
             Some((h, m)) if *h == hour => *m = m.min(rate),
@@ -442,206 +276,45 @@ pub fn step(prev: Option<&SlotState>, now: Millis, snap: Snapshot) -> (SlotState
         procs: readings,
         last_active,
         minima,
-        sockets: net,
-        frozen: prev.frozen,
+        sockets,
     };
     let m = Measure {
         rate: Some(rate),
         wakeups: (!threads_gone).then(|| wakeups as f64 / secs),
-        // USER_HZ is 100 on every Linux, so a tick is 10 ms.
-        cpu: cpu as f64 * 10.0 / secs,
+        cpu: cpu_ms / secs,
         window_ms,
         floor,
         line,
         quiet_ms: now.saturating_sub(last_active),
         procs,
         tcp,
-        split,
     };
     (state, m)
 }
 
-/// What the rule would do with a slot, given its window and whether a client is attached
-/// (`None`: zmx could not say).
-pub fn verdict(m: &Measure, attached: Option<bool>) -> String {
-    match (m.rate, attached) {
-        (None, _) => keep("first reading"),
-        (_, Some(true)) => keep("attached"),
-        (_, None) => keep("attachment unknown"),
-        (Some(_), Some(false)) if m.quiet_ms >= QUIET_FOR_MS => {
-            "the activity rule would freeze it".to_string()
-        }
-        (Some(_), Some(false)) => keep(&format!("quiet under {}m", QUIET_FOR_MS / 60_000)),
-    }
-}
-
-fn keep(why: &str) -> String {
-    format!("the activity rule would keep it: {why}")
-}
-
-/// The freeze the rule would make, carried from pass to pass: **claude alone is frozen**, and
-/// everything else in the slot keeps running, so a tool waiting locally — `sleep N && gh run
-/// view`, `tail -f`, a build — still does what it is waiting to do, and that is what thaws
-/// claude: a member claude did not start starting, any member but claude exiting, or the
-/// others moving more than the window's budget. An attach thaws it too. Nothing is frozen
-/// yet; this says what would have been. A freeze ends, said, with the claude it froze.
-///
-/// **What claude itself did meanwhile** — started a process, or moved more than the budget —
-/// is what a freeze would have stopped, a timer of its own above all, and the line says so.
-/// When something thawed it in the same window, the line says both and claims no order:
-/// claude's move may have followed the thaw. So `which the freeze would have stopped` appears
-/// exactly when nothing would have thawed it, which is what makes it countable.
-///
-/// `claude` is the recorded claude while it is alive and was read, and `parent` the name of its
-/// parent: a claude whose parent is not zmx was started from a shell, whose job control would
-/// take the terminal back from a stopped claude, so it is never frozen.
-pub fn shadow(
-    prev: Option<&Frozen>,
-    m: &Measure,
-    attached: Option<bool>,
-    claude: Option<(u32, u64)>,
-    parent: Option<&str>,
-    now: Millis,
-) -> (Option<Frozen>, String) {
-    match prev {
-        Some(f) if claude == Some((f.pid, f.start)) => held(f, m, attached, now),
-        // Crashed, offloaded and resumed, or gone before it was read: the freeze was of that
-        // process and ends with it. Said, so a count of freezes adds up.
-        Some(_) => {
-            let (frozen, said) = fresh(m, attached, claude, parent, now);
-            let said = format!(
-                "{said}; the claude it would have frozen has gone, and that freeze with it"
-            );
-            (frozen, said)
-        }
-        None => fresh(m, attached, claude, parent, now),
-    }
-}
-
-/// A freeze held into this window: thawed, or held, and what claude did meanwhile.
-fn held(f: &Frozen, m: &Measure, attached: Option<bool>, now: Millis) -> (Option<Frozen>, String) {
-    let budget = budget(m.line);
-    let thaw = match attached {
-        Some(true) => Some("attached".to_string()),
-        None => Some("attachment unknown".to_string()),
-        Some(false) => m.split.rest_change.map(str::to_string).or_else(|| {
-            (m.split.rest.total() as f64 > budget)
-                .then(|| format!("its other processes moved {} B", m.split.rest.total()))
-        }),
-    };
-    let own = own_doing(&m.split, budget);
-    match thaw {
-        Some(why) => {
-            let mut said = format!("the activity rule would thaw it: {why}");
-            if let Some(own) = own {
-                said.push_str(&format!(
-                    "; in the same window claude itself {own}, which may have followed the thaw"
-                ));
-            }
-            (None, said)
-        }
-        None => {
-            let mut said = format!(
-                "the activity rule would have claude frozen, {}m so far",
-                now.saturating_sub(f.at) / 60_000
-            );
-            if let Some(own) = own {
-                said.push_str(&format!(
-                    ", and claude itself {own}, which the freeze would have stopped"
-                ));
-            }
-            (Some(*f), said)
-        }
-    }
-}
-
-/// No freeze held: whether the rule would make one now.
-fn fresh(
-    m: &Measure,
-    attached: Option<bool>,
-    claude: Option<(u32, u64)>,
-    parent: Option<&str>,
-    now: Millis,
-) -> (Option<Frozen>, String) {
-    let said = verdict(m, attached);
-    if m.rate.is_none() || m.quiet_ms < QUIET_FOR_MS || attached != Some(false) {
-        return (None, said);
-    }
-    let Some((pid, start)) = claude else {
-        return (None, keep("no recorded claude to freeze"));
-    };
-    if parent != Some("zmx") {
-        return (
-            None,
-            keep(&format!(
-                "claude's parent is {}, not zmx, and a shell's job control would take the terminal from a stopped claude",
-                parent.unwrap_or("unknown")
-            )),
-        );
-    }
-    let said = match m.split.others {
-        0 => said,
-        n => format!("{said} — claude alone, leaving {n} other process(es) running"),
-    };
-    (
-        Some(Frozen {
-            at: now,
-            pid,
-            start,
-        }),
-        said,
-    )
-}
-
-/// What claude itself did in a window, if anything a frozen claude could not have: started a
-/// process, or moved more than the budget — with the TCP part said, since a turn moves bytes
-/// over the network and housekeeping (a config re-read, the status line) mostly does not.
-fn own_doing(split: &Split, budget: f64) -> Option<String> {
-    let moved = (split.claude.total() as f64 > budget).then(|| {
-        format!(
-            "moved {} B ({} B of it tcp)",
-            split.claude.total(),
-            split.claude.tcp
-        )
-    });
-    match (&split.claude_change, moved) {
-        (Some(name), Some(moved)) => Some(format!("started {name} and {moved}")),
-        (Some(name), None) => Some(format!("started {name}")),
-        (None, moved) => moved,
-    }
-}
-
 /// A slot with members there but unreadable: its line, and the state to store. Unknown counts
-/// as active, so the span is measured again next pass from the last reading; and unknown
-/// thaws a freeze, erring running. The state is the stored one, whatever its date, so what the
-/// line says is what is stored.
+/// as active, so the span is measured again next pass from the last reading.
 pub fn unknown(
     slot: &str,
     unreadable: usize,
     stored: Option<&SlotState>,
     now: Millis,
 ) -> (String, Option<SlotState>) {
-    let act = if stored.is_some_and(|o| o.frozen.is_some()) {
-        "thaw it"
-    } else {
-        "keep it"
-    };
     let line = format!(
-        "{slot}: measured — {unreadable} of its processes could not be read; the activity rule would {act}: unknown"
+        "{slot}: measured — {unreadable} of its processes could not be read; active: unknown"
     );
     let state = stored.map(|o| SlotState {
         last_active: now,
-        frozen: None,
         ..o.clone()
     });
     (line, state)
 }
 
-/// A pass's line for one slot: the window, then what the rule would do.
-pub fn describe(slot: &str, m: &Measure, said: &str) -> String {
+/// A pass's line for one slot.
+pub fn describe(slot: &str, m: &Measure) -> String {
     let what = match m.rate {
         Some(r) => format!(
-            "{:.0} B/s over {}s{}, {} wakeups/s, cpu {:.1} ms/s, {} process(es), line {:.0} B/s ({:.0} B a window){}, quiet {}m",
+            "{:.0} B/s over {}s{}, {} wakeups/s, cpu {:.1} ms/s (line {CPU_LINE:.0}), {} process(es), line {:.0} B/s ({:.0} B a window){}, quiet {}m",
             r,
             m.window_ms / 1000,
             match &m.tcp {
@@ -666,20 +339,18 @@ pub fn describe(slot: &str, m: &Measure, said: &str) -> String {
                 .unwrap_or_default(),
             m.quiet_ms / 60_000
         ),
-        None => format!("{} process(es) read", m.procs),
+        None => format!("{} process(es) read, a first reading", m.procs),
     };
-    format!("{slot}: measured — {what}; {said}")
+    format!("{slot}: measured — {what}")
 }
 
 /// One offload pass's measurement of every live slot: each slot's line, and the state stored
-/// for the next pass. Holds no lock and writes nothing but its own file, so it changes nothing
-/// the offloader decides.
+/// for the offloader to read ([`load`]). Holds no lock and writes nothing but its own file.
 pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<String> {
     let Some(table) = table else {
         return vec!["activity: /proc could not be listed; nothing measured".to_string()];
     };
     let env = by_slot(table);
-    let sessions = crate::zmx::sessions();
     let prev = load();
     let mut lines = Vec::new();
     let tcp = if records.iter().any(|r| r.state == State::Live) {
@@ -689,7 +360,7 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     };
     let tcp = tcp.map_err(|e| {
         lines.push(format!(
-            "activity: tcp sockets could not be read ({e}); every slot's bytes are read/write alone, as 0.4.5 judged them"
+            "activity: tcp sockets could not be read ({e}); every slot's bytes are read/write alone"
         ));
         "the dump was refused"
     });
@@ -707,7 +378,7 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
             continue;
         }
         // A reading from the future — the clock stepped back, or a pass that stored while this
-        // one was reading zmx — is no reading; its floor is still the slot's.
+        // one was reading — is no reading; its floor is still the slot's.
         let old = stored.filter(|o| o.at <= now);
         if let Some(o) = old.filter(|o| now.saturating_sub(o.at) < MIN_WINDOW_MS) {
             lines.push(format!(
@@ -717,11 +388,8 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
             ));
             continue;
         }
-        let root = rec.pid.zip(rec.proc_start);
-        let claude =
-            root.filter(|&(pid, start)| table.iter().any(|p| p.pid == pid && p.start == start));
-        let pids = members(table, env.get(&rec.slot), root);
-        let snap = match snapshot(table, &pids, claude, tcp.as_ref().map_err(|e| *e)) {
+        let pids = members(table, env.get(&rec.slot), rec.pid.zip(rec.proc_start));
+        let snap = match snapshot(&pids, tcp.as_ref().map_err(|e| *e)) {
             Ok(snap) => snap,
             Err(unreadable) => {
                 let (line, state) = unknown(&rec.slot, unreadable, stored, now);
@@ -733,52 +401,15 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
             }
         };
         if snap.readings.is_empty() {
-            // Nothing of the slot is left to read, so the claude a freeze held is gone for
-            // certain: said here, or it would end unsaid with the record.
-            if let Some(o) = stored.filter(|o| o.frozen.is_some()) {
-                lines.push(format!(
-                    "{}: measured — nothing to read; the claude it would have frozen has gone, and that freeze with it",
-                    rec.slot
-                ));
-                next.insert(
-                    rec.slot.clone(),
-                    SlotState {
-                        frozen: None,
-                        ..o.clone()
-                    },
-                );
-            }
             continue;
         }
-        // Not the claude looked up above if it was gone before it could be read.
-        let claude = snap.claude;
         let (mut state, m) = step(old, now, snap);
         if old.is_none() {
             if let Some(o) = stored {
                 state.minima = o.minima.clone();
             }
         }
-        let attached = sessions.as_ref().and_then(|all| {
-            all.iter()
-                .find(|s| s.name == rec.slot && s.answered)
-                .map(|s| s.attached)
-        });
-        let parent = claude.and_then(|(pid, _)| {
-            let ppid = table.iter().find(|p| p.pid == pid)?.ppid;
-            Some(table.iter().find(|p| p.pid == ppid)?.comm.as_str())
-        });
-        // Carried as the floor is, past a reading from the future: the freeze is the slot's
-        // until something thaws it.
-        let (frozen, said) = shadow(
-            stored.and_then(|o| o.frozen.as_ref()),
-            &m,
-            attached,
-            claude,
-            parent,
-            now,
-        );
-        state.frozen = frozen;
-        lines.push(describe(&rec.slot, &m, &said));
+        lines.push(describe(&rec.slot, &m));
         next.insert(rec.slot.clone(), state);
     }
     if let Err(e) = store(&next) {
@@ -792,18 +423,16 @@ pub fn pass(records: &[SlotRecord], table: Option<&[Proc]>, now: Millis) -> Vec<
     lines
 }
 
-/// Read one slot's members: their counters, the TCP sockets they hold and who holds each,
-/// their places in the process tree, and which had gone before they could be read. `Err` is
-/// how many are there but cannot be read — unknown, which the caller counts as active.
+/// Read one slot's members: their counters, the TCP sockets they hold, and which had gone
+/// before they could be read. `Err` is how many are there but cannot be read — unknown, which
+/// the caller counts as active.
 fn snapshot(
-    table: &[Proc],
     pids: &[u32],
-    claude: Option<(u32, u64)>,
     tcp: Result<&BTreeMap<u64, u64>, &'static str>,
 ) -> Result<Snapshot, usize> {
     let (mut readings, mut left, mut unreadable) = (Vec::new(), Vec::new(), 0usize);
     let gone = |pid: u32| !std::path::Path::new(&format!("/proc/{pid}")).exists();
-    let mut held: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+    let mut held: Vec<u64> = Vec::new();
     let mut net_err = tcp.err();
     for &pid in pids {
         let Some(r) = read(pid) else {
@@ -821,11 +450,7 @@ fn snapshot(
             continue;
         }
         match crate::sockdiag::held(pid) {
-            Some(inodes) => {
-                for i in inodes {
-                    held.entry(i).or_default().push(pid);
-                }
-            }
+            Some(inodes) => held.extend(inodes),
             // Gone between its counters and its descriptors: a member that left, as above.
             None if gone(pid) => left.push(pid),
             None => net_err = Some("a member's descriptors could not be listed"),
@@ -834,38 +459,21 @@ fn snapshot(
     if unreadable > 0 {
         return Err(unreadable);
     }
+    held.sort_unstable();
+    held.dedup();
     let net = match net_err {
         Some(why) => Err(why),
+        // Not a TCP socket: a Unix or UDP one, which carries no count.
         None => tcp.map(|all| {
             held.into_iter()
-                // Not a TCP socket: a Unix or UDP one, which carries no count.
-                .filter_map(|(inode, by)| {
-                    all.get(&inode).map(|&bytes| Held {
-                        sock: Sock { inode, bytes },
-                        by,
-                    })
-                })
+                .filter_map(|inode| all.get(&inode).map(|&bytes| Sock { inode, bytes }))
                 .collect()
         }),
     };
-    let tree = table
-        .iter()
-        .filter(|p| pids.contains(&p.pid))
-        .map(|p| Member {
-            pid: p.pid,
-            ppid: p.ppid,
-            comm: p.comm.clone(),
-        })
-        .collect();
-    // A claude gone before it was read has nothing left to freeze. (The race is not
-    // unit-testable; `step` sees it as a slot without a claude.)
-    let claude = claude.filter(|&(c, _)| !left.contains(&c));
     Ok(Snapshot {
         readings,
         left,
         net,
-        claude,
-        tree,
     })
 }
 
@@ -1045,16 +653,6 @@ fn to_json(all: &BTreeMap<String, SlotState>) -> Value {
                     .collect(),
             ),
         );
-        if let Some(f) = s.frozen {
-            v.set(
-                "frozen",
-                Value::Arr(vec![
-                    Value::num(f.at as f64),
-                    Value::num(f.pid),
-                    Value::num(f.start as f64),
-                ]),
-            );
-        }
         o.set(slot, v);
     }
     o
@@ -1111,16 +709,6 @@ fn from_json(v: &Value) -> BTreeMap<String, SlotState> {
                 _ => None,
             })
             .collect();
-        let frozen = s.get("frozen").and_then(Value::as_arr).and_then(|a| {
-            match a.iter().filter_map(Value::as_u64).collect::<Vec<_>>()[..] {
-                [at, pid, start] => Some(Frozen {
-                    at,
-                    pid: u32::try_from(pid).ok()?,
-                    start,
-                }),
-                _ => None,
-            }
-        });
         out.insert(
             slot.clone(),
             SlotState {
@@ -1129,7 +717,6 @@ fn from_json(v: &Value) -> BTreeMap<String, SlotState> {
                 last_active,
                 minima,
                 sockets,
-                frozen,
             },
         );
     }
@@ -1140,26 +727,21 @@ fn from_json(v: &Value) -> BTreeMap<String, SlotState> {
 mod tests {
     use super::*;
 
-    /// A reading with sockets read and none held, and no claude recorded: every member is one
-    /// of the others. `left` adds a member gone before it was read.
+    /// A reading with sockets read and none held. `left` adds a member gone before it was read.
     fn plain(readings: Vec<Reading>, left: bool) -> Snapshot {
         Snapshot {
             readings,
             left: if left { vec![99] } else { vec![] },
             net: Ok(vec![]),
-            claude: None,
-            tree: vec![],
         }
     }
 
-    /// A reading with claude at pid 1, these sockets, and nothing claude started.
-    fn with_claude(readings: Vec<Reading>, net: Result<Vec<Held>, &'static str>) -> Snapshot {
+    /// A reading holding these sockets.
+    fn with_net(readings: Vec<Reading>, net: Result<Vec<Sock>, &'static str>) -> Snapshot {
         Snapshot {
             readings,
             left: vec![],
             net,
-            claude: CLAUDE,
-            tree: vec![],
         }
     }
 
@@ -1174,7 +756,6 @@ mod tests {
     }
 
     const T0: Millis = 1_000 * HOUR_MS;
-    const CLAUDE: Option<(u32, u64)> = Some((1, 7));
 
     #[test]
     fn the_line_follows_the_floor_between_its_bounds() {
@@ -1192,7 +773,6 @@ mod tests {
     fn a_first_reading_is_active() {
         let (s, m) = step(None, T0, plain(vec![r(1, 7, 5_000)], false));
         assert_eq!((m.rate, m.quiet_ms, s.last_active), (None, 0, T0));
-        assert!(verdict(&m, Some(false)).contains("would keep"));
     }
 
     #[test]
@@ -1380,7 +960,7 @@ mod tests {
             ),
         );
         assert_eq!(m.wakeups, None);
-        assert!(describe("claude-1", &m, &verdict(&m, Some(false))).contains("? wakeups/s"));
+        assert!(describe("claude-1", &m).contains("? wakeups/s"));
         let (_, m) = step(
             Some(&s),
             T0 + 100_000,
@@ -1445,7 +1025,7 @@ mod tests {
     #[test]
     fn idle_bytes_go_quiet_and_a_turn_wakes_it() {
         // 100 B/s for ten minutes in 3-minute passes, then a turn at 15 KB/s. Calibration in
-        // both directions: the same rule calls the quiet slot freezable and the busy one not.
+        // both directions: the same rule calls the quiet slot quiet and the busy one not.
         let mut s = step(None, T0, plain(vec![r(1, 7, 0)], false)).0;
         let mut bytes = 0;
         let mut at = T0;
@@ -1461,21 +1041,10 @@ mod tests {
         assert_eq!(m.floor, Some(100.0));
         assert_eq!(m.line, 1000.0);
         assert!(m.quiet_ms >= QUIET_FOR_MS, "{m:?}");
-        assert!(
-            verdict(&m, Some(false)).contains("would freeze"),
-            "{}",
-            verdict(&m, Some(false))
-        );
-        assert!(verdict(&m, Some(true)).contains("would keep"), "attached");
-        assert!(
-            verdict(&m, None).contains("would keep"),
-            "attachment unknown"
-        );
         at += 180_000;
         bytes += 180 * 15_000;
         let (_, m) = step(Some(&s), at, plain(vec![r(1, 7, bytes)], false));
         assert_eq!(m.quiet_ms, 0);
-        assert!(verdict(&m, Some(false)).contains("quiet under 10m"));
     }
 
     #[test]
@@ -1525,11 +1094,6 @@ mod tests {
                 last_active: T0 - 5,
                 minima: vec![(1000, 87.5)],
                 sockets: vec![sock(4_000_000_123, 987_654), sock(9, 0)],
-                frozen: Some(Frozen {
-                    at: T0 - 60_000,
-                    pid: 10,
-                    start: 77,
-                }),
             },
         );
         all.insert(
@@ -1544,7 +1108,7 @@ mod tests {
         );
         let back = from_json(&json::parse(&json::to_string_pretty(&to_json(&all))).unwrap());
         assert_eq!(back, all);
-        // A 0.4.5 file, with neither key: read whole, with no sockets and no freeze.
+        // A file with no sockets key: read whole, with none.
         let old = from_json(
             &json::parse(
                 r#"{"claude-1":{"at":5,"last_active":4,"procs":[[1,7,0,0,0]],"minima":[[1000,87.5]]}}"#,
@@ -1614,14 +1178,6 @@ mod tests {
         Sock { inode, bytes }
     }
 
-    /// A socket as a pass finds it, held by these members.
-    fn held(inode: u64, bytes: u64, by: &[u32]) -> Held {
-        Held {
-            sock: sock(inode, bytes),
-            by: by.to_vec(),
-        }
-    }
-
     /// Claude at pid 1 and a child at pid 2, read three minutes ago, quiet for eleven minutes
     /// at a floor of 100: a minute's budget at the line of 1,000 is 60,000 B.
     fn quiet_pair(sockets: Vec<Sock>) -> SlotState {
@@ -1631,62 +1187,28 @@ mod tests {
             last_active: T0 - 11 * 60_000,
             minima: vec![(T0 / HOUR_MS, 100.0)],
             sockets,
-            frozen: None,
         }
     }
 
-    fn moved(proc: u64, tcp: u64) -> Moved {
-        Moved { proc, tcp }
-    }
-
     #[test]
-    fn socket_bytes_count_as_the_slots_and_are_split_by_holder() {
-        // 70 KB through claude's socket by send/recv, which no process counter shows: over the
-        // budget, so the window is active. Calibration: the same window with the socket idle
-        // is quiet.
+    fn socket_bytes_count_as_the_slots() {
+        // 70 KB through a socket by send/recv, which no process counter shows: over the budget,
+        // so the window is active. Calibration: the same window with the socket idle is quiet.
         let s = quiet_pair(vec![sock(50, 1_000), sock(60, 0)]);
         let quiet = || vec![r(1, 7, 18_000), r(2, 8, 0)];
         let (_, m) = step(
             Some(&s),
             T0 + 180_000,
-            with_claude(quiet(), Ok(vec![held(50, 71_000, &[1]), held(60, 0, &[2])])),
+            with_net(quiet(), Ok(vec![sock(50, 71_000), sock(60, 0)])),
         );
         assert_eq!(m.quiet_ms, 0, "{m:?}");
-        assert_eq!(
-            (m.split.claude, m.split.rest),
-            (moved(18_000, 70_000), moved(0, 0))
-        );
         assert_eq!(m.tcp.as_ref().map(|t| t.rate.round()), Ok(389.0));
         let (_, m) = step(
             Some(&s),
             T0 + 180_000,
-            with_claude(quiet(), Ok(vec![held(50, 1_000, &[1]), held(60, 0, &[2])])),
+            with_net(quiet(), Ok(vec![sock(50, 1_000), sock(60, 0)])),
         );
         assert!(m.quiet_ms > QUIET_FOR_MS, "calibration: {m:?}");
-        // Shared by claude and the child, it is the child's: what would still run with claude
-        // frozen. (The calibration of `a_tools_own_socket_is_claudes_when_claude_started_the_tool`.)
-        let (_, m) = step(
-            Some(&s),
-            T0 + 180_000,
-            with_claude(
-                quiet(),
-                Ok(vec![held(50, 1_000, &[1]), held(60, 4_000, &[1, 2])]),
-            ),
-        );
-        assert_eq!(m.split.rest, moved(0, 4_000));
-        // The child's socket is the child's.
-        let (_, m) = step(
-            Some(&s),
-            T0 + 180_000,
-            with_claude(
-                quiet(),
-                Ok(vec![held(50, 1_000, &[1]), held(60, 5_000, &[2])]),
-            ),
-        );
-        assert_eq!(
-            (m.split.claude, m.split.rest),
-            (moved(18_000, 0), moved(0, 5_000))
-        );
     }
 
     #[test]
@@ -1699,35 +1221,26 @@ mod tests {
         let (n, m) = step(
             Some(&s),
             T0 + 180_000,
-            with_claude(
-                quiet(),
-                Ok(vec![held(50, 500, &[1]), held(52, 2_000, &[1])]),
-            ),
+            with_net(quiet(), Ok(vec![sock(50, 500), sock(52, 2_000)])),
         );
-        assert_eq!(m.split.claude, moved(18_000, 2_500), "{m:?}");
         assert_eq!(m.tcp.as_ref().map(|t| (t.sockets, t.closed)), Ok((2, 1)));
+        assert_eq!(m.rate.map(f64::round), Some(114.0), "{m:?}");
         assert!(m.quiet_ms > QUIET_FOR_MS, "{m:?}");
-        assert!(
-            describe("claude-1", &m, "x").contains("(tcp 14 B/s, 2 socket(s), 1 closed uncounted)")
-        );
+        assert!(describe("claude-1", &m).contains("(tcp 14 B/s, 2 socket(s), 1 closed uncounted)"));
         // Not read: the bytes are the processes' alone, the line says why, and the last
         // sockets stand, so the next window that reads them holds what moved meanwhile.
         let (n, m) = step(
             Some(&n),
             T0 + 360_000,
-            with_claude(quiet(), Err("the dump was refused")),
+            with_net(quiet(), Err("the dump was refused")),
         );
-        assert_eq!(m.split.claude, moved(0, 0), "{m:?}");
-        assert!(describe("claude-1", &m, "x").contains("(tcp ?: the dump was refused)"));
+        assert_eq!(m.rate, Some(0.0), "{m:?}");
+        assert!(describe("claude-1", &m).contains("(tcp ?: the dump was refused)"));
         let (_, m) = step(
             Some(&n),
             T0 + 540_000,
-            with_claude(
-                quiet(),
-                Ok(vec![held(50, 500, &[1]), held(52, 72_000, &[1])]),
-            ),
+            with_net(quiet(), Ok(vec![sock(50, 500), sock(52, 72_000)])),
         );
-        assert_eq!(m.split.claude, moved(0, 70_000));
         assert_eq!(m.quiet_ms, 0, "{m:?}");
     }
 
@@ -1735,383 +1248,38 @@ mod tests {
     fn a_member_gone_before_its_sockets_were_listed_leaves_the_tcp_figure_whole() {
         // The race itself — a member exiting between its counters and its descriptors — is not
         // unit-testable; `snapshot` reports it as a member that left, and this is what `step`
-        // makes of that: a thaw-worthy exit and an active window, with the TCP figure intact.
+        // makes of that: an active window, with the TCP figure intact.
         let s = quiet_pair(vec![sock(50, 1_000)]);
         let snap = Snapshot {
             left: vec![2],
-            ..with_claude(
-                vec![r(1, 7, 18_000), r(2, 8, 0)],
-                Ok(vec![held(50, 1_000, &[1])]),
-            )
+            ..with_net(vec![r(1, 7, 18_000), r(2, 8, 0)], Ok(vec![sock(50, 1_000)]))
         };
         let (_, m) = step(Some(&s), T0 + 180_000, snap);
         assert!(m.tcp.is_ok(), "{m:?}");
-        assert_eq!(m.split.rest_change, Some("a process exited"));
         assert_eq!(m.quiet_ms, 0);
     }
 
-    /// The would-be freeze from a quiet, detached window of a claude with one child.
-    fn frozen_pair() -> (SlotState, Frozen) {
+    #[test]
+    fn cpu_over_its_line_is_active_without_a_byte() {
+        // Three minutes of computing that writes nothing: 6 s of CPU, 33 ms/s on average but
+        // more than a minute's worth at the 50 ms/s line. Calibration: an idle claude's 6 ms/s.
         let s = quiet_pair(vec![]);
-        let (n, m) = step(
-            Some(&s),
-            T0 + 180_000,
-            with_claude(vec![r(1, 7, 18_000), r(2, 8, 0)], Ok(vec![])),
-        );
-        let (f, said) = shadow(None, &m, Some(false), CLAUDE, Some("zmx"), T0 + 180_000);
-        assert_eq!(
-            said,
-            "the activity rule would freeze it — claude alone, leaving 1 other process(es) running"
-        );
-        (n, f.expect("frozen"))
-    }
-
-    /// One pass three minutes after [`frozen_pair`]'s freeze.
-    fn after_freeze(snap: Snapshot, attached: Option<bool>) -> (Option<Frozen>, String) {
-        let (s, f) = frozen_pair();
-        let at = T0 + 360_000;
-        let (_, m) = step(Some(&s), at, snap);
-        shadow(Some(&f), &m, attached, CLAUDE, Some("zmx"), at)
-    }
-
-    #[test]
-    fn claude_is_frozen_alone_only_when_quiet_detached_and_under_zmx() {
-        let (_, f) = frozen_pair();
-        assert_eq!((f.pid, f.start, f.at), (1, 7, T0 + 180_000));
-        let s = quiet_pair(vec![]);
+        let cpu = |ticks| Reading {
+            cpu: ticks,
+            ..r(1, 7, 0)
+        };
         let (_, m) = step(
             Some(&s),
             T0 + 180_000,
-            with_claude(vec![r(1, 7, 18_000), r(2, 8, 0)], Ok(vec![])),
+            plain(vec![cpu(600), r(2, 8, 0)], false),
         );
-        let refused = |attached, claude, parent| shadow(None, &m, attached, claude, parent, T0);
-        let (f, said) = refused(Some(false), CLAUDE, Some("fish"));
-        assert!(
-            f.is_none() && said.contains("parent is fish, not zmx"),
-            "{said}"
-        );
-        let (f, said) = refused(Some(false), None, Some("zmx"));
-        assert!(f.is_none() && said.contains("no recorded claude"), "{said}");
-        let (f, said) = refused(Some(true), CLAUDE, Some("zmx"));
-        assert!(f.is_none() && said.ends_with("keep it: attached"), "{said}");
-        // A slot with claude alone in it says so as 0.4.5 did.
-        let (_, m) = step(
-            Some(&SlotState {
-                procs: vec![r(1, 7, 0)],
-                ..quiet_pair(vec![])
-            }),
-            T0 + 180_000,
-            with_claude(vec![r(1, 7, 18_000)], Ok(vec![])),
-        );
-        let (f, said) = shadow(None, &m, Some(false), CLAUDE, Some("zmx"), T0);
-        assert!(f.is_some());
-        assert_eq!(said, "the activity rule would freeze it");
-    }
-
-    #[test]
-    fn what_still_runs_thaws_a_frozen_claude() {
-        let (_, f) = frozen_pair();
-        let pass = |readings, net, attached| after_freeze(with_claude(readings, Ok(net)), attached);
-        // Calibration: nothing changed, so it stays frozen.
-        let (still, said) = pass(vec![r(1, 7, 36_000), r(2, 8, 0)], vec![], Some(false));
-        assert_eq!(still, Some(f));
-        assert_eq!(
-            said,
-            "the activity rule would have claude frozen, 3m so far"
-        );
-        let thawed = |(f, said): (Option<Frozen>, String), why: &str| {
-            assert!(f.is_none(), "{said}");
-            assert_eq!(said, format!("the activity rule would thaw it: {why}"));
-        };
-        // `sleep 600 && gh run view`: the sleep exits.
-        thawed(
-            pass(vec![r(1, 7, 36_000)], vec![], Some(false)),
-            "a process exited",
-        );
-        // ... and gh starts, under the bash (pid 2) claude started before the freeze. (The
-        // same readings with gh as claude's own child are claude's doing, not a thaw: the
-        // calibration half of `a_process_claude_itself_started_is_claudes_not_a_thaw`.)
-        thawed(
-            after_freeze(
-                Snapshot {
-                    tree: vec![member(2, 1, "bash"), member(3, 2, "gh")],
-                    ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 9, 0)], Ok(vec![]))
-                },
-                Some(false),
-            ),
-            "a process started",
-        );
-        // `tail -f` on a log that gets a line, or a child's own network.
-        thawed(
-            pass(vec![r(1, 7, 36_000), r(2, 8, 70_000)], vec![], Some(false)),
-            "its other processes moved 70000 B",
-        );
-        thawed(
-            pass(
-                vec![r(1, 7, 36_000), r(2, 8, 0)],
-                vec![held(60, 70_000, &[2])],
-                Some(false),
-            ),
-            "its other processes moved 70000 B",
-        );
-        thawed(
-            pass(vec![r(1, 7, 36_000), r(2, 8, 0)], vec![], Some(true)),
-            "attached",
-        );
-        thawed(
-            pass(vec![r(1, 7, 36_000), r(2, 8, 0)], vec![], None),
-            "attachment unknown",
-        );
-    }
-
-    fn member(pid: u32, ppid: u32, comm: &str) -> Member {
-        Member {
-            pid,
-            ppid,
-            comm: comm.to_string(),
-        }
-    }
-
-    #[test]
-    fn a_process_claude_itself_started_is_claudes_not_a_thaw() {
-        // Claude's timer fired and it ran a tool: `bash`, and `gh` under it, both new. A
-        // stopped claude starts nothing, so this is what the freeze would have stopped, named by
-        // what claude started directly, and the whole chain's bytes are claude's.
-        let (_, f) = frozen_pair();
-        let tool = vec![member(3, 1, "bash"), member(4, 3, "gh")];
-        let readings = || vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 9, 1_000), r(4, 10, 500)];
-        let snap = Snapshot {
-            tree: tool.clone(),
-            ..with_claude(readings(), Ok(vec![]))
-        };
-        let (still, said) = after_freeze(snap.clone(), Some(false));
-        assert_eq!(still, Some(f));
-        assert_eq!(
-            said,
-            "the activity rule would have claude frozen, 3m so far, and claude itself started bash, which the freeze would have stopped"
-        );
-        let (s, _) = frozen_pair();
-        let (_, m) = step(Some(&s), T0 + 360_000, snap);
-        assert_eq!(
-            (m.split.claude, m.split.rest, m.split.rest_change),
-            (moved(19_500, 0), moved(0, 0), None)
-        );
-        // Calibration: the `bash` was there at the freeze — `sleep N && gh run view` — so the
-        // `gh` under it is what still runs, doing what it waited to do: a thaw, and the rest's.
-        let (s, _) = frozen_pair();
-        let seen = SlotState {
-            procs: vec![r(1, 7, 18_000), r(2, 8, 0), r(3, 9, 0)],
-            ..s
-        };
-        let (_, m) = step(
-            Some(&seen),
-            T0 + 360_000,
-            Snapshot {
-                tree: tool.clone(),
-                ..with_claude(readings(), Ok(vec![]))
-            },
-        );
-        assert_eq!(m.split.rest_change, Some("a process started"));
-        assert_eq!(m.split.rest, moved(1_500, 0));
-        // And one whose parent is no member — reparented — is the rest's, erring towards a
-        // thaw.
-        let (_, said) = after_freeze(
-            Snapshot {
-                tree: vec![member(4, 1234, "gh")],
-                ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(4, 10, 0)], Ok(vec![]))
-            },
-            Some(false),
-        );
-        assert_eq!(said, "the activity rule would thaw it: a process started");
-        // A `bash` claude started that was gone before it was read is claude's too.
-        let (still, said) = after_freeze(
-            Snapshot {
-                left: vec![3],
-                tree: tool,
-                ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(4, 10, 0)], Ok(vec![]))
-            },
-            Some(false),
-        );
-        assert!(
-            still.is_some() && said.contains("claude itself started bash"),
-            "{said}"
-        );
-        // Calibration of that: the bash was there at the freeze and exited as the pass read
-        // it — new by pid it is not, so the gh under it is the rest's, and the exit thaws.
-        let (s, f) = frozen_pair();
-        let seen = SlotState {
-            procs: vec![r(1, 7, 18_000), r(2, 8, 0), r(3, 9, 0)],
-            ..s
-        };
-        let (_, m) = step(
-            Some(&seen),
-            T0 + 360_000,
-            Snapshot {
-                left: vec![3],
-                tree: vec![member(3, 1, "bash"), member(4, 3, "gh")],
-                ..with_claude(vec![r(1, 7, 36_000), r(2, 8, 0), r(4, 10, 500)], Ok(vec![]))
-            },
-        );
-        assert_eq!(
-            (m.split.rest_change, &m.split.claude_change, m.split.rest),
-            (Some("a process exited"), &None, moved(500, 0))
-        );
-        let (thawed, said) = shadow(Some(&f), &m, Some(false), CLAUDE, Some("zmx"), T0 + 360_000);
-        assert_eq!(thawed, None);
-        assert_eq!(said, "the activity rule would thaw it: a process exited");
-        // A pid reused inside the window is a new process, by its start: the old one exited
-        // — a thaw — and the new one, under claude, is claude's start.
-        let (s, _) = frozen_pair();
-        let seen = SlotState {
-            procs: vec![r(1, 7, 18_000), r(2, 8, 0), r(3, 9, 0)],
-            ..s
-        };
-        let (_, m) = step(
-            Some(&seen),
-            T0 + 360_000,
-            Snapshot {
-                tree: vec![member(3, 1, "bash")],
-                ..with_claude(
-                    vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 11, 1_000)],
-                    Ok(vec![]),
-                )
-            },
-        );
-        assert_eq!(
-            (m.split.rest_change, m.split.claude_change.as_deref()),
-            (Some("a process exited"), Some("bash"))
-        );
-    }
-
-    #[test]
-    fn a_tools_own_socket_is_claudes_when_claude_started_the_tool() {
-        // `curl` claude started, moving 70 KB on a socket it alone holds: claude's, so the
-        // freeze holds and the line says what it would have stopped.
-        let (_, f) = frozen_pair();
-        let readings = || vec![r(1, 7, 36_000), r(2, 8, 0), r(3, 9, 1_000)];
-        let (still, said) = after_freeze(
-            Snapshot {
-                tree: vec![member(3, 1, "curl")],
-                ..with_claude(readings(), Ok(vec![held(60, 70_000, &[3])]))
-            },
-            Some(false),
-        );
-        assert_eq!(still, Some(f));
-        assert_eq!(
-            said,
-            "the activity rule would have claude frozen, 3m so far, and claude itself started curl and moved 89000 B (70000 B of it tcp), which the freeze would have stopped"
-        );
-        // Calibration: one shared with a member that was there at the freeze is the rest's.
-        let (still, said) = after_freeze(
-            Snapshot {
-                tree: vec![member(3, 1, "curl")],
-                ..with_claude(readings(), Ok(vec![held(60, 70_000, &[2, 3])]))
-            },
-            Some(false),
-        );
-        assert_eq!(still, None);
-        assert!(
-            said.starts_with("the activity rule would thaw it: its other processes moved 70000 B"),
-            "{said}"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_member_thaws_a_freeze_and_says_what_is_stored() {
-        let (s, f) = frozen_pair();
-        // Stored from the future, frozen: the line says thaw, and the state stored has no
-        // freeze — whatever its date.
-        let future = SlotState {
-            at: T0 + 10 * HOUR_MS,
-            frozen: Some(f),
-            ..s.clone()
-        };
-        let (line, state) = unknown("claude-1", 2, Some(&future), T0 + 360_000);
-        assert_eq!(
-            line,
-            "claude-1: measured — 2 of its processes could not be read; the activity rule would thaw it: unknown"
-        );
-        let state = state.unwrap();
-        assert_eq!((state.frozen, state.at), (None, future.at));
-        assert_eq!(state.last_active, T0 + 360_000);
-        // Calibration: nothing frozen, so nothing to thaw — kept, and counted as active.
-        let (line, state) = unknown("claude-1", 1, Some(&s), T0 + 360_000);
-        assert!(
-            line.ends_with("the activity rule would keep it: unknown"),
-            "{line}"
-        );
-        assert_eq!(state.unwrap().last_active, T0 + 360_000);
-        assert_eq!(unknown("claude-1", 1, None, T0).1, None);
-    }
-
-    #[test]
-    fn a_thaw_and_claudes_own_move_in_one_window_are_both_said() {
-        // The sleep exited and claude moved: which came first is unknowable in a window, so the
-        // line claims no order — and never says "would have stopped", which is kept for the
-        // windows where nothing thawed it.
-        for attached in [Some(false), Some(true)] {
-            let (f, said) = after_freeze(
-                with_claude(vec![r(1, 7, 18_000 + 540_000)], Ok(vec![])),
-                attached,
-            );
-            assert!(f.is_none(), "{said}");
-            let why = if attached == Some(true) {
-                "attached"
-            } else {
-                "a process exited"
-            };
-            assert_eq!(
-                said,
-                format!(
-                    "the activity rule would thaw it: {why}; in the same window claude itself moved 540000 B (0 B of it tcp), which may have followed the thaw"
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn claude_moving_while_frozen_is_said_and_another_claude_ends_the_freeze() {
-        let (s, f) = frozen_pair();
-        let at = T0 + 360_000;
-        // Its own timer fired: claude moved, its child did not. A freeze would have stopped
-        // that, and nothing in the rule would have thawed it — the line says so, with the TCP
-        // part, which is what tells a turn from housekeeping.
+        assert_eq!(m.quiet_ms, 0, "{m:?}");
         let (_, m) = step(
             Some(&s),
-            at,
-            with_claude(
-                vec![r(1, 7, 18_000 + 500_000), r(2, 8, 0)],
-                Ok(vec![held(50, 40_000, &[1])]),
-            ),
+            T0 + 180_000,
+            plain(vec![cpu(108), r(2, 8, 0)], false),
         );
-        let (still, said) = shadow(Some(&f), &m, Some(false), CLAUDE, Some("zmx"), at);
-        assert_eq!(still, Some(f));
-        assert_eq!(
-            said,
-            "the activity rule would have claude frozen, 3m so far, and claude itself moved 540000 B (40000 B of it tcp), which the freeze would have stopped"
-        );
-        // Resumed after an offload: a different claude, so the old freeze is gone, and the new
-        // one is judged afresh — here, attached.
-        let (gone, said) = shadow(Some(&f), &m, Some(true), Some((5, 70)), Some("zmx"), at);
-        assert_eq!(gone, None);
-        assert_eq!(
-            said,
-            "the activity rule would keep it: attached; the claude it would have frozen has gone, and that freeze with it"
-        );
-        // A resumed claude that landed on the same pid is another process, by its start.
-        let (gone, said) = shadow(Some(&f), &m, Some(false), Some((1, 70)), Some("zmx"), at);
-        assert_eq!(gone, None);
-        assert!(
-            said.ends_with("; the claude it would have frozen has gone, and that freeze with it"),
-            "{said}"
-        );
-        // Gone before it was read: no claude at all, and said the same.
-        let (gone, said) = shadow(Some(&f), &m, Some(false), None, None, at);
-        assert_eq!(gone, None);
-        assert!(
-            said.ends_with("; the claude it would have frozen has gone, and that freeze with it"),
-            "{said}"
-        );
+        assert!(m.quiet_ms > QUIET_FOR_MS, "calibration: {m:?}");
     }
 
     #[test]

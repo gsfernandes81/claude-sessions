@@ -68,15 +68,6 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Timer {
-    /// Stable within a slot: a wake-up replaces the previous wake-up, a cron is keyed by its
-    /// own id.
-    pub id: String,
-    pub due_ms: Option<Millis>,
-    pub recurring: bool,
-}
-
 /// A field two hook events can race on.
 #[derive(Debug, Clone, Copy)]
 pub enum Field {
@@ -85,20 +76,16 @@ pub enum Field {
     Life,
     Busy,
     NeedsYou,
-    Background,
-    Wakeup,
     /// `first_prompt`, which the earliest prompt takes rather than the latest.
     Prompt,
 }
 
 impl Field {
-    pub const ALL: [Field; 7] = [
+    pub const ALL: [Field; 5] = [
         Field::Conversation,
         Field::Life,
         Field::Busy,
         Field::NeedsYou,
-        Field::Background,
-        Field::Wakeup,
         Field::Prompt,
     ];
 
@@ -108,8 +95,6 @@ impl Field {
             Field::Life => "life",
             Field::Busy => "busy",
             Field::NeedsYou => "needs_you",
-            Field::Background => "background",
-            Field::Wakeup => "wakeup",
             Field::Prompt => "prompt",
         }
     }
@@ -121,8 +106,6 @@ impl Field {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {
     ticks: [u64; Field::ALL.len()],
-    /// Crons whose delete landed before their create, by timer id.
-    pub deleted: BTreeMap<String, u64>,
     /// The kernel's boot id: ticks count from boot, so another boot's mean nothing.
     boot: String,
 }
@@ -132,7 +115,6 @@ impl Written {
     pub fn new(tick: u64) -> Written {
         Written {
             ticks: [tick; Field::ALL.len()],
-            deleted: BTreeMap::new(),
             boot: procinfo::boot_id(),
         }
     }
@@ -162,28 +144,14 @@ impl Written {
         for f in Field::ALL {
             o.set(f.name(), Value::num(self[f] as f64));
         }
-        let mut deleted = Value::obj();
-        for (id, tick) in &self.deleted {
-            deleted.set(id, Value::num(*tick as f64));
-        }
-        o.set("deleted", deleted);
         o.set("boot", Value::string(&self.boot));
         o
     }
 
     fn from_json(v: Option<&Value>) -> Written {
-        let mut deleted = BTreeMap::new();
-        if let Some(Value::Obj(m)) = v.and_then(|v| v.get("deleted")) {
-            for (id, t) in m {
-                if let Some(t) = t.as_u64() {
-                    deleted.insert(id.clone(), t);
-                }
-            }
-        }
         let tick = |f: Field| v.and_then(|v| v.get(f.name())).and_then(Value::as_u64);
         Written {
             ticks: Field::ALL.map(|f| tick(f).unwrap_or(0)),
-            deleted,
             boot: v
                 .and_then(|v| v.get("boot"))
                 .and_then(Value::as_str)
@@ -231,20 +199,6 @@ pub struct SlotRecord {
     /// The most recent `Stop`. `unread` is this being later than `last_attach_ms`, which is
     /// why neither is derived from the other.
     pub last_stop_ms: Option<Millis>,
-    /// The most recent `SessionStart` that opened a conversation at its prompt — `startup`,
-    /// `resume`, `clear` or `fork`. A claude in that state is idle as surely as one after a
-    /// `Stop`, so the offloader counts idleness from whichever is later. Not `compact`: that
-    /// can fire mid-turn, and nothing in the vendor docs says otherwise.
-    pub ready_ms: Option<Millis>,
-    pub timers: Vec<Timer>,
-    /// The background work running in the slot's claude, one `type: description` per task
-    /// (issues #9, #10). In-process work — a background subagent, a Workflow run, a teammate, a
-    /// cloud session — has no process of its own to see, so the slot keeps a list, and while it
-    /// is not empty the slot is never offloaded. Each `Stop` and each `SubagentStop` replaces it
-    /// with Claude Code's own list; between them a `SubagentStart` adds the agent it announces —
-    /// which is what keeps an agent started in a turn the owner ended with Esc, since an Esc
-    /// fires no `Stop`.
-    pub background: Vec<String>,
     /// False for a session this tool did not start — a `zmx attach work claude` somebody
     /// typed. Listed, marked, and never assumed to behave like one of ours.
     pub registered: bool,
@@ -274,9 +228,6 @@ impl SlotRecord {
             last_activity_ms: made.at,
             last_attach_ms: 0,
             last_stop_ms: None,
-            ready_ms: None,
-            timers: Vec::new(),
-            background: Vec::new(),
             registered: true,
             updated_ms: made.at,
             last_event_ms: BTreeMap::new(),
@@ -285,9 +236,7 @@ impl SlotRecord {
     }
 
     /// When an Esc ended the turn, given the transcript's trailing interrupt marker: the marker,
-    /// if it is no older than the latest activity the hooks recorded (an Esc fires no hook, and
-    /// `SubagentStart`/`SubagentStop` are not activity). The one rule the offloader and the menu
-    /// both read, so they cannot disagree about a slot.
+    /// if it is no older than the latest activity the hooks recorded (an Esc fires no hook).
     pub fn esc_ended(&self, interrupted_at: Option<Millis>) -> Option<Millis> {
         interrupted_at.filter(|&at| at >= self.last_activity_ms)
     }
@@ -337,18 +286,6 @@ impl SlotRecord {
         }
     }
 
-    /// A timer that has not fired yet, by our clock. A slot with one is never offloaded,
-    /// whoever set it.
-    ///
-    /// A timer with no due time counts as pending. That is the deliberate direction: an
-    /// unreadable payload shape should keep a session alive rather than let it be stopped
-    /// while something is still waiting to fire.
-    pub fn has_pending_timer(&self, now: Millis) -> bool {
-        self.timers
-            .iter()
-            .any(|t| t.recurring || t.due_ms.is_none_or(|due| due > now))
-    }
-
     pub fn path(&self) -> PathBuf {
         slot_path(&self.slot)
     }
@@ -371,29 +308,7 @@ impl SlotRecord {
         o.set("last_activity_ms", Value::num(self.last_activity_ms as f64));
         o.set("last_attach_ms", Value::num(self.last_attach_ms as f64));
         set_opt_u64(&mut o, "last_stop_ms", self.last_stop_ms);
-        set_opt_u64(&mut o, "ready_ms", self.ready_ms);
         o.set("updated_ms", Value::num(self.updated_ms as f64));
-        o.set(
-            "timers",
-            Value::Arr(
-                self.timers
-                    .iter()
-                    .map(|t| {
-                        let mut v = Value::obj();
-                        v.set("id", Value::string(&t.id));
-                        set_opt_u64(&mut v, "due_ms", t.due_ms);
-                        v.set("recurring", Value::Bool(t.recurring));
-                        v
-                    })
-                    .collect(),
-            ),
-        );
-        if !self.background.is_empty() {
-            o.set(
-                "background",
-                Value::Arr(self.background.iter().map(Value::string).collect()),
-            );
-        }
         let mut ev = Value::obj();
         for (k, at) in &self.last_event_ms {
             ev.set(k, Value::num(*at as f64));
@@ -416,21 +331,6 @@ impl SlotRecord {
         if slot.is_empty() {
             return None;
         }
-        let timers = v
-            .get("timers")
-            .and_then(Value::as_arr)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        Some(Timer {
-                            id: t.get("id").and_then(Value::as_str)?.to_string(),
-                            due_ms: t.get("due_ms").and_then(Value::as_u64),
-                            recurring: t.get("recurring").and_then(Value::as_bool).unwrap_or(false),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let mut last_event_ms = BTreeMap::new();
         if let Some(Value::Obj(m)) = v.get("last_event_ms") {
             for (k, at) in m {
@@ -458,18 +358,6 @@ impl SlotRecord {
                 .unwrap_or(0),
             last_attach_ms: v.get("last_attach_ms").and_then(Value::as_u64).unwrap_or(0),
             last_stop_ms: v.get("last_stop_ms").and_then(Value::as_u64),
-            ready_ms: v.get("ready_ms").and_then(Value::as_u64),
-            timers,
-            background: v
-                .get("background")
-                .and_then(Value::as_arr)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,
@@ -556,13 +444,12 @@ pub fn all() -> std::io::Result<Vec<SlotRecord>> {
 mod tests {
     use super::*;
 
-    /// Every stamp distinct, and a tombstone.
+    /// Every stamp distinct.
     fn stamped() -> Written {
         let mut w = Written::new(0);
         for (i, f) in Field::ALL.into_iter().enumerate() {
             w.stamp(f, i as u64 + 1);
         }
-        w.deleted.insert("cron:c1".into(), 8);
         w
     }
 
@@ -589,11 +476,6 @@ mod tests {
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
-        rec.timers.push(Timer {
-            id: "wakeup".into(),
-            due_ms: Some(5_000),
-            recurring: false,
-        });
         rec.last_event_ms.insert("Stop".into(), 2_000);
 
         let back = SlotRecord::from_json(&rec.to_json(), "wrong").expect("parses");
@@ -604,7 +486,6 @@ mod tests {
         assert_eq!(back.first_prompt, rec.first_prompt);
         assert_eq!(back.written, rec.written);
         assert!(back.needs_you);
-        assert_eq!(back.timers, rec.timers);
         assert_eq!(back.last_event_ms.get("Stop"), Some(&2_000));
     }
 
@@ -620,7 +501,6 @@ mod tests {
             "a record with no `registered` field is one of ours"
         );
         assert!(!rec.unread());
-        assert!(rec.timers.is_empty());
     }
 
     #[test]
@@ -698,23 +578,5 @@ mod tests {
         assert!(rec.unread(), "it finished after you last looked");
         rec.last_attach_ms = 150;
         assert!(!rec.unread(), "you have looked since");
-    }
-
-    #[test]
-    fn a_timer_with_no_due_time_counts_as_pending() {
-        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
-        rec.timers.push(Timer {
-            id: "wakeup".into(),
-            due_ms: None,
-            recurring: false,
-        });
-        assert!(rec.has_pending_timer(10_000));
-        rec.timers[0].due_ms = Some(5_000);
-        assert!(!rec.has_pending_timer(10_000), "it has already fired");
-        rec.timers[0].recurring = true;
-        assert!(
-            rec.has_pending_timer(10_000),
-            "a recurring timer is always pending"
-        );
     }
 }
