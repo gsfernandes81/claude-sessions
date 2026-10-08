@@ -273,13 +273,18 @@ pub fn apply(
             // older than the slot's last start or end binds nothing.
             if rec.written.claim(Field::Life, tick) {
                 rec.state = State::Live;
+                // A different process cannot be running the old one's background work or its
+                // session crons, and a resume empties those before restoring its own.
+                let new_process = pid.is_some() && (pid, proc_start) != (rec.pid, rec.proc_start);
+                if new_process && rec.written.claim(Field::Background, tick) {
+                    rec.background.clear();
+                }
+                if (new_process || ev.source() == Some("resume"))
+                    && rec.written.claim(Field::Timers, tick)
+                {
+                    rec.timers.retain(|t| t.durable);
+                }
                 if pid.is_some() {
-                    // A different process cannot be running the old one's background work.
-                    if (pid, proc_start) != (rec.pid, rec.proc_start)
-                        && rec.written.claim(Field::Background, tick)
-                    {
-                        rec.background.clear();
-                    }
                     rec.pid = pid;
                     rec.proc_start = proc_start;
                 }
@@ -314,6 +319,8 @@ pub fn apply(
             Outcome::Changed
         }
         "Stop" => {
+            // Before `Busy` is claimed, which tells this turn's wake-up from an older one.
+            take_session_timers(rec, ev, fired);
             active(rec, at);
             if rec.written.claim(Field::Busy, tick) {
                 rec.busy = false;
@@ -324,7 +331,6 @@ pub fn apply(
             if rec.written.claim(Field::Background, tick) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
-            take_session_timers(rec, ev, fired);
             Outcome::Changed
         }
         // Agents between the parent's `Stop`s (issue #10) edit the list and are not activity:
@@ -431,8 +437,10 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
             let target = response
                 .and_then(|v| v.get("scheduledFor"))
                 .and_then(Value::as_u64);
+            // Claude Code's stop cancels every one-shot of the loop; a cron one-shot it takes
+            // with them is back in the turn's own list.
             if stop || target == Some(0) {
-                rec.timers.retain(|t| !is_wake_up(t));
+                rec.timers.retain(|t| t.durable || t.recurring);
                 return Outcome::Changed;
             }
             // An unknown payload shape records no due time, which counts as pending: it errs
@@ -510,12 +518,6 @@ fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
     }
 }
 
-/// A `/loop` wake-up, under any of its names: the only session timers with a due time, though
-/// a wake-up whose due went unread has none.
-fn is_wake_up(t: &Timer) -> bool {
-    t.id == WAKE_UP || t.id == KEEPALIVE || (!t.durable && t.due_ms.is_some())
-}
-
 /// Takes a `Stop`'s `session_crons` as the whole of the session's timers, unless the list is
 /// unreadable or a newer timer has landed. Durable crons are not in it and stay; one deleted
 /// since the list was made stays deleted. A `SubagentStop` carries the same list, but from
@@ -523,18 +525,20 @@ fn is_wake_up(t: &Timer) -> bool {
 /// the `Stop`, so it is not read.
 ///
 /// The list carries no due times, so an entry keeps the one on record, and the one one-shot
-/// the record has not seen is the wake-up set since the last list. A one-shot gone with none
-/// in its place has fired a turn that set none, which the keepalive may follow.
+/// the record has not seen is the wake-up set in this turn, if one was. A one-shot gone with
+/// none in its place has fired a turn that set none, which the keepalive may follow.
 fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     let Moment { tick, at } = fired;
     let Some(mut listed) = ev.session_crons() else {
         return;
     };
+    // Set since the turn's prompt or the last `Stop`, and not yet fired; a wake-up left by a
+    // turn that reached no `Stop` is not the listed one.
+    let this_turn = rec.written[Field::Timers] > rec.written[Field::Busy];
     if !rec.written.claim(Field::Timers, tick) {
         return;
     }
-    let held = std::mem::take(&mut rec.timers);
-    let due_of = |id: &str| held.iter().find(|t| t.id == id).map(|t| t.due_ms);
+    let due_of = |id: &str| rec.timers.iter().find(|t| t.id == id).map(|t| t.due_ms);
     for t in &mut listed {
         if let Some(due) = due_of(&t.id) {
             t.due_ms = due;
@@ -545,13 +549,15 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
         .filter(|t| !t.recurring && due_of(&t.id).is_none())
         .collect();
     if let [wake_up] = &mut unseen[..] {
-        wake_up.due_ms = due_of(WAKE_UP).flatten();
+        wake_up.due_ms = due_of(WAKE_UP)
+            .flatten()
+            .filter(|&due| this_turn && due > at);
     }
     let woke = unseen.is_empty()
-        && held.iter().any(|t| {
+        && rec.timers.iter().any(|t| {
             !t.durable && !t.recurring && t.id != KEEPALIVE && !listed.iter().any(|l| l.id == t.id)
         });
-    rec.timers = held.into_iter().filter(|t| t.durable).collect();
+    rec.timers.retain(|t| t.durable);
     for t in listed {
         if !deleted_since(rec, &t.id, tick) {
             upsert(rec, t);
@@ -1604,6 +1610,16 @@ mod tests {
         )
     }
 
+    /// A wake-up due at 90 s, listed by its turn's `Stop` as `w1`.
+    fn listed_wake_up() -> SlotRecord {
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
+        );
+        rec
+    }
+
     #[test]
     fn a_wake_up_is_due_when_claude_code_says() {
         let mut rec = slot();
@@ -1615,11 +1631,7 @@ mod tests {
 
     #[test]
     fn a_listed_wake_up_keeps_its_due_time() {
-        let mut rec = slot();
-        land(
-            &mut rec,
-            &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
-        );
+        let mut rec = listed_wake_up();
         assert_eq!(ids(&rec), ["cron:w1"]);
         assert!(rec.has_pending_timer(89_999), "calibration: not yet due");
         assert!(
@@ -1627,7 +1639,27 @@ mod tests {
             "a turn reaching no Stop is not held"
         );
         land(&mut rec, &[(&listing(&["w1"]), 4_000)]);
+        assert_eq!(
+            ids(&rec),
+            ["cron:w1"],
+            "a standing wake-up arms no keepalive"
+        );
         assert_eq!(rec.timers[0].due_ms, Some(90_000), "a later list keeps it");
+
+        let mut rec = slot();
+        let with_cron = r#"{"hook_event_name":"Stop","session_crons":[
+            {"id":"r1","recurring":true},{"id":"w1","recurring":false}]}"#;
+        land(&mut rec, &[(&wake_up(90_000), 2_000), (with_cron, 3_000)]);
+        assert_eq!(ids(&rec), ["cron:r1", "cron:w1"]);
+        assert_eq!(
+            rec.timers[1].due_ms,
+            Some(90_000),
+            "the one-shot is the wake-up"
+        );
+        assert_eq!(
+            rec.timers[0].due_ms, None,
+            "a new cron is never mistaken for it"
+        );
 
         let mut rec = slot();
         land(
@@ -1642,11 +1674,7 @@ mod tests {
 
     #[test]
     fn a_wake_up_gone_with_none_in_its_place_is_held_for_the_keepalive() {
-        let mut rec = slot();
-        land(
-            &mut rec,
-            &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
-        );
+        let mut rec = listed_wake_up();
         land(&mut rec, &[(&listing(&[]), 100_000)]);
         assert_eq!(ids(&rec), ["keepalive"]);
         assert!(
@@ -1661,11 +1689,7 @@ mod tests {
             "the keepalive does not re-arm itself"
         );
 
-        let mut rec = slot();
-        land(
-            &mut rec,
-            &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
-        );
+        let mut rec = listed_wake_up();
         land(
             &mut rec,
             &[(&wake_up(200_000), 99_000), (&listing(&["w2"]), 100_000)],
@@ -1690,13 +1714,21 @@ mod tests {
         );
 
         let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
+        let mut rec = listed_wake_up();
+        land(&mut rec, &[(stop, 50_000), (&listing(&[]), 51_000)]);
+        assert!(rec.timers.is_empty(), "a stopped loop arms no keepalive");
+
         let mut rec = slot();
         land(
             &mut rec,
-            &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
+            &[
+                (&listing(&["w1"]), 3_000),
+                (&wake_up(90_000), 2_000),
+                (stop, 50_000),
+                (&listing(&[]), 51_000),
+            ],
         );
-        land(&mut rec, &[(stop, 50_000), (&listing(&[]), 51_000)]);
-        assert!(rec.timers.is_empty(), "a stopped loop arms no keepalive");
+        assert!(rec.timers.is_empty(), "nor one whose due went unread");
     }
 
     #[test]
@@ -1708,15 +1740,77 @@ mod tests {
             [(agent, 95_000), (&*stop, 100_000)],
             [(&*stop, 100_000), (agent, 100_050)],
         ] {
-            let mut rec = slot();
-            land(
-                &mut rec,
-                &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
-            );
+            let mut rec = listed_wake_up();
             land(&mut rec, &order);
             assert_eq!(ids(&rec), ["keepalive"]);
             assert_eq!(rec.timers[0].due_ms, Some(100_000 + KEEPALIVE_MS));
         }
+    }
+
+    #[test]
+    fn a_wake_up_from_a_turn_that_reached_no_stop_lends_its_due_to_none() {
+        // In order: the turn's own wake-up lends its due.
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[(&wake_up(3_650_000), 40_000), (&listing(&["w2"]), 50_000)],
+        );
+        assert_eq!(rec.timers[0].due_ms, Some(3_650_000), "calibration");
+        // A wake-up that fired a turn ending in an error, then that turn's next wake-up
+        // landing after its `Stop`.
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[
+                (&wake_up(22_000), 2_000),
+                (&listing(&["w2"]), 50_000),
+                (&wake_up(3_650_000), 40_000),
+            ],
+        );
+        assert_eq!(rec.timers[0].due_ms, None);
+        assert!(rec.has_pending_timer(50_000 + 11 * 60_000));
+        // A wake-up an Esc cancelled, then a prompted turn's, landing after its `Stop`.
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[
+                (&wake_up(900_000), 2_000),
+                (PROMPT, 10_000),
+                (&listing(&["w2"]), 50_000),
+                (&wake_up(3_650_000), 40_000),
+            ],
+        );
+        assert_eq!(rec.timers[0].due_ms, None);
+    }
+
+    #[test]
+    fn a_resume_or_a_new_process_drops_the_session_timers_and_a_clear_keeps_them() {
+        let start = |source: &str| {
+            format!(
+                r#"{{"hook_event_name":"SessionStart","session_id":"other","source":"{source}"}}"#
+            )
+        };
+        for (source, kept) in [
+            ("clear", &["cron:d", "cron:s"][..]),
+            ("resume", &["cron:d"][..]),
+        ] {
+            let mut rec = slot();
+            rec.timers.push(timer("cron:s", false));
+            rec.timers.push(timer("cron:d", true));
+            own(&mut rec, &ev(&start(source)), 2_000);
+            assert_eq!(ids(&rec), kept, "{source}");
+        }
+        let mut rec = slot();
+        rec.timers.push(timer("cron:s", false));
+        apply(
+            &mut rec,
+            &ev(&start("startup")),
+            Moment::ms(2_000),
+            Binding::Own,
+            Some(200),
+            Some(9),
+        );
+        assert!(rec.timers.is_empty(), "a new process");
     }
 
     #[test]

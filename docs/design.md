@@ -145,7 +145,7 @@ terminal.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms` = when it fired; `compact` changes none of those |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live; a `resume` or a different process drops the session's timers, durable crons kept, as Claude Code empties its session crons there. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms` = when it fired; `compact` changes none of those |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | activity, idle since it fired; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9); **the session's timers = its `session_crons`**, durable crons kept, a missing or unreadable list being no news (#13; see *Timers* below) |
 | `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
@@ -200,30 +200,38 @@ in landing order; a hook whose `sh` forked rather than exec'd it, and whose clau
 stamped from its own start, a stall after the fork; a nested `claude -p` under a tool call
 kills its last async hooks when it exits; a `SessionEnd`, which waits only 400 ms for the
 slot's lock, gives up behind an async hook stalled while holding it, so the record stays live
-with a dead process, which the menu shows as offloaded and `reconcile` settles; a conversation
-resumed into a fresh slot carries the session crons Claude Code resurrects from its transcript
-unseen until its first `Stop`; and a session cron an in-process teammate set is removed without
-a turn when it fires after the teammate has ended, so it is held until the next `Stop`. One is
-never corrected, and is not worth correcting (owner, 2026-10-08): a durable cron Claude Code
-retires itself — a one-shot once it fires or is found missed at startup, a recurring one after
-its last fire past seven days' age unless it is permanent — is held for the slot's life, since
-it leaves its file without a hook and no list names it.
+with a dead process, which the menu shows as offloaded and `reconcile` settles; a resumed
+conversation carries the session crons Claude Code resurrects from its transcript unseen until
+its first `Stop`; a session cron an in-process teammate set is removed without a turn of the
+slot's own when it fires, so it is held until the next `Stop`; and an Esc cancels a loop's
+wake-up without a hook, so the record holds it until its due, at most an hour after it was set,
+or, when its due went unread, until the next `Stop`. A loop's turn that ends in an API error
+fires `StopFailure`, which is not installed, and Claude Code arms the keepalive after it, so no
+hold covers that keepalive. One is never corrected, and is not worth correcting (owner,
+2026-10-08): a durable cron Claude Code retires itself — a one-shot once it fires or is found
+missed at startup, a recurring one after its last fire past seven days' age unless it is
+permanent — is held for the slot's life, since it leaves its file without a hook and no list
+names it.
 
 **Timers** (#13). Each `Stop` carries `session_crons`, Claude Code's in-memory crons with a
 `/loop` wake-up among them as a one-shot (seen on 2.1.292, read in 2.1.293), and the record
-takes it as the session's timers, so a cron whose delete went unread leaves at the next list. A
-`SubagentStop` carries the same list but is not read: from mid-turn it lacks a one-shot that
+takes it as the session's timers, so a cron whose delete went unread leaves at the next list.
+`/clear` and a fork keep those crons and so does the record; a resume and a new process do not.
+A `SubagentStop` carries the same list but is not read: from mid-turn it lacks a one-shot that
 has fired and the keepalive not yet armed, and one landing after the `Stop` is older than the
 keepalive too. The list has no due times: an entry keeps the one on record, and the one
-one-shot the record has not seen is the wake-up set since the last list, due when the
-`ScheduleWakeup` response's `scheduledFor` says; with two unseen, neither has a due, and both
-are held until a later list. A one-shot gone from a list with none in its place has fired a
-turn that set none, and Claude Code may then arm its `/loop` keepalive, 1200 s from just after
-that turn's `Stop`, rounded up to the minute and in no list, so the record holds a `keepalive`
-timer for 22 minutes from the `Stop`; a cron one-shot firing looks the same and is held too.
-`ScheduleWakeup` with `stop`, or with a `scheduledFor` of 0, ends every wake-up. Durable crons
-(`CronCreate` with `durable`, kept in the project's `.claude/scheduled_tasks.json`) are never
-listed: they come only from `PostToolUse` and leave only with their own `CronDelete`.
+one-shot the record has not seen is the wake-up set in this turn, due when the `ScheduleWakeup`
+response's `scheduledFor` says, if that is still ahead; a wake-up left by a turn that reached
+no `Stop` lends its due to none. A one-shot without a due, two unseen included, is held until a
+later list lacks it. A one-shot gone from a list with none in its place has fired a turn that
+set none, and Claude Code may then arm its `/loop` keepalive, 1200 s from when the turn's
+`Stop` hooks have returned, rounded up to the minute and in no list, so the record holds a
+`keepalive` timer for 22 minutes from the `Stop`; a cron one-shot firing looks the same and is
+held too. The 22 minutes assume no synchronous `Stop` hook holds the turn for more than about a
+minute: claude-sessions' own are async. `ScheduleWakeup` with `stop`, or with a `scheduledFor`
+of 0, ends every one-shot, as Claude Code's stop does. Durable crons (`CronCreate` with
+`durable`, kept in the project's `.claude/scheduled_tasks.json`) are never listed: they come
+only from `PostToolUse` and leave only with their own `CronDelete`.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
@@ -676,15 +684,16 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   cron's: `CronCreate` renamed (it is named exactly in the hook's matcher) or `PostToolUse`'s
   `tool_name` renamed, and its hook does nothing; or `durable` gone from both the call's
   response and its input, and the next list drops it as a session cron. infra's checks on
-  Claude Code's binary should cover `session_crons` and the three tool names as they cover
-  `background_tasks`; `durable` is too common a word for a word grep (207 matches in 2.1.293),
-  so its check is the extended regex `humanSchedule:\w+\(\w+\),recurring:\w+,durable:\w+\}`,
-  `CronCreate`'s result, counted with `grep -aoE … | wc -l` (the binary is minified, so `-c`
-  counts lines), which reads exactly 1 on 2.1.293, and a 0 or a 2 both fail. The rest err
-  towards keeping: no readable `session_crons` is no news, an entry without `recurring` is a
-  one-shot as Claude Code reads it, no `scheduledFor` falls back to the asked delay and no
-  `delaySeconds` either is a wake-up with no due time, a delete with no readable id leaves a
-  session cron to the next list and holds a durable one for the slot's life, and no
+  Claude Code's binary should cover `session_crons`, `ScheduleWakeup`, `CronCreate` and
+  `CronDelete` as words, as they cover `background_tasks`; `durable` is too common a word for a
+  word grep (207 matches in 2.1.293), so its check is the extended regex
+  `humanSchedule:[$\w]+\([$\w]+\),recurring:[$\w]+,durable:[$\w]+\}`, `CronCreate`'s result
+  (minified names can carry `$`), counted with `grep -aoE … | wc -l` (`-c` counts lines of a
+  minified binary), calibrated to read exactly 1 on 2.1.293, where a 0 or a 2 both
+  fail. The rest err towards keeping: no readable `session_crons` is no news, an entry without
+  `recurring` is a one-shot as Claude Code reads it, no `scheduledFor` falls back to the asked
+  delay and no `delaySeconds` either is a wake-up with no due time, a delete with no readable
+  id leaves a session cron to the next list and holds a durable one for the slot's life, and no
   `tool_response.id` keeps a durable cron no delete can match. **Then a message for claude alone** — a
   remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
   process's socket, so a real freeze could see those bytes arrive and thaw on them; the

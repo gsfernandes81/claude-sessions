@@ -70,8 +70,8 @@ impl State {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timer {
-    /// Stable within a slot: a cron is keyed by its own id, and a wake-up is `wakeup` until a
-    /// `Stop` lists it under one.
+    /// Stable within a slot: a cron is keyed by its own id, a wake-up is `wakeup` until a
+    /// `Stop` lists it under one, and the hold for a `/loop` keepalive is `keepalive`.
     pub id: String,
     pub due_ms: Option<Millis>,
     pub recurring: bool,
@@ -344,8 +344,8 @@ impl SlotRecord {
     /// A timer that has not fired yet, by our clock. A slot with one is never offloaded,
     /// whoever set it.
     ///
-    /// A timer with no due time counts as pending: a listed cron until a later list lacks it,
-    /// and a wake-up whose payload could not be read, erring towards keeping the session alive.
+    /// A timer with no due time counts as pending: a session cron until a later list lacks it,
+    /// a durable cron until its delete, and a wake-up whose payload could not be read.
     pub fn has_pending_timer(&self, now: Millis) -> bool {
         self.timers
             .iter()
