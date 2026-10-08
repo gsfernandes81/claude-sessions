@@ -353,7 +353,8 @@ pub fn apply(
         }
         // Its list is `Stop`'s and is taken whole the same way; it never names a foreground
         // agent, so one an Esc cut off leaves at the next. A payload with no list says nothing
-        // about what runs (claude-sessions#12).
+        // about what runs (claude-sessions#12). Its `session_crons` is from mid-turn or after
+        // the `Stop`, so only `Stop`'s is read (*Timers*).
         "SubagentStop" => match ev.background_tasks() {
             None => Outcome::Ignored("no background_tasks in the payload"),
             Some(running) => {
@@ -436,8 +437,8 @@ fn field<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a Value> {
     v.and_then(|v| v.get(key))
 }
 
-/// Claims `Field::Timers` against other wake-ups and lists, so an older stop never drops a
-/// newer wake-up.
+/// Sets or ends the loop's wake-up. Once a newer write to the session's timers has landed, it
+/// can only raise the due that write lent, or clear it when the wake-up ended or was unreadable.
 fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let Moment { tick, at } = fired;
     let input = ev.tool_input();
@@ -453,8 +454,6 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
         .map(|d| (at + (d * 1000.0) as Millis).div_ceil(60_000) * 60_000);
     let due = target.or(asked);
     if !rec.written.claim(Field::Timers, tick) {
-        // A newer write to the session's timers has landed. The due a list lent is only ever
-        // raised, or made unknown by an ended or unreadable wake-up.
         let wanted = if ended { None } else { due };
         let held = rec
             .timers
@@ -535,9 +534,7 @@ fn loop_wake_up(t: &Timer) -> bool {
 
 /// Takes a `Stop`'s `session_crons` as the whole of the session's timers, unless the list is
 /// unreadable or a newer timer has landed. Durable crons are not in it and stay; one deleted
-/// since the list was made stays deleted. A `SubagentStop` carries the same list, but from
-/// mid-turn, after a fired one-shot has gone and before the keepalive is armed, or from after
-/// the `Stop`, so it is not read.
+/// since the list was made stays deleted.
 ///
 /// The list carries no due times, so an entry keeps the one on record, and the one one-shot
 /// the record has not seen is the wake-up set in this turn, if one was. A one-shot gone with
@@ -1566,6 +1563,19 @@ mod tests {
         land(&mut rec, &[(NO_CRONS, 3_000), (create, 2_000)]);
         assert_eq!(ids(&rec), ["cron:c1"]);
         assert!(rec.timers[0].durable);
+        let mut beside = slot();
+        land(
+            &mut beside,
+            &[
+                (&cron_create("d", true, true), 5_000),
+                (&wake_up(90_000), 4_000),
+            ],
+        );
+        assert_eq!(
+            ids(&beside),
+            ["cron:d", "wakeup"],
+            "a durable create states nothing about the session's timers"
+        );
         land(&mut rec, &[(NO_CRONS, 4_000)]);
         assert_eq!(ids(&rec), ["cron:c1"]);
         let mut early = slot();
