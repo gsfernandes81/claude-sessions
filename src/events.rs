@@ -443,15 +443,16 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
                 .map(|d| at + (d.max(0.0) * 1000.0) as Millis);
             let due = target.or(asked);
             if !rec.written.claim(Field::Timers, tick) {
-                // A newer list holds this wake-up under its own id, perhaps with an older one's
-                // due; a later due is never wrong to hold.
-                let listed = rec
+                // A newer write to the session's timers has landed. The due a list lent is only
+                // ever raised, or made unknown by an ended or unreadable wake-up.
+                let wanted = if ended { None } else { due };
+                let held = rec
                     .timers
                     .iter_mut()
                     .find(|t| t.due_ms.is_some() && t.id != KEEPALIVE);
-                return match (listed, due) {
-                    (Some(t), Some(due)) if !ended && t.due_ms < Some(due) => {
-                        t.due_ms = Some(due);
+                return match held {
+                    Some(t) if wanted.is_none_or(|w| t.due_ms < Some(w)) => {
+                        t.due_ms = wanted;
                         Outcome::Changed
                     }
                     _ => Outcome::Ignored("a newer timer has landed"),
@@ -482,7 +483,18 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
                 return Outcome::Ignored("deleted before its create landed");
             }
             if !durable && !rec.written.claim(Field::Timers, tick) {
-                return Outcome::Ignored("a newer timer has landed");
+                // A cron is never the wake-up whose due a newer list may have lent it.
+                return match rec
+                    .timers
+                    .iter_mut()
+                    .find(|t| t.id == key && t.due_ms.is_some())
+                {
+                    Some(t) => {
+                        t.due_ms = None;
+                        Outcome::Changed
+                    }
+                    None => Outcome::Ignored("a newer timer has landed"),
+                };
             }
             let recurring = said("recurring").and_then(Value::as_bool).unwrap_or(true);
             upsert(rec, Timer::new(key, recurring, durable));
@@ -521,9 +533,9 @@ fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
     }
 }
 
-/// What Claude Code's stop cancels: the loop's wake-ups, which alone carry a due.
+/// What Claude Code's stop cancels: the loop's wake-ups, `wakeup` and whatever carries a due.
 fn loop_wake_up(t: &Timer) -> bool {
-    t.id == WAKE_UP || t.id == KEEPALIVE || (!t.recurring && t.due_ms.is_some())
+    t.id == WAKE_UP || t.due_ms.is_some()
 }
 
 /// Takes a `Stop`'s `session_crons` as the whole of the session's timers, unless the list is
@@ -566,7 +578,9 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
         && rec.timers.iter().any(|t| {
             !t.durable && !t.recurring && t.id != KEEPALIVE && !listed.iter().any(|l| l.id == t.id)
         });
-    rec.timers.retain(|t| t.durable);
+    // The keepalive is in no list, so only its due ends its hold.
+    rec.timers
+        .retain(|t| t.durable || (t.id == KEEPALIVE && t.due_ms > Some(at)));
     for t in listed {
         if !deleted_since(rec, &t.id, tick) {
             upsert(rec, t);
@@ -1502,6 +1516,9 @@ mod tests {
         let mut rec = slot();
         land(&mut rec, &[(SESSION_CREATE, 3_000), (NO_CRONS, 2_000)]);
         assert_eq!(ids(&rec), ["cron:c1"], "an older list predates it");
+        let mut rec = slot();
+        land(&mut rec, &[(NO_CRONS, 3_000), (SESSION_CREATE, 2_000)]);
+        assert!(rec.timers.is_empty(), "a list fired later has seen it go");
     }
 
     #[test]
@@ -1699,7 +1716,13 @@ mod tests {
         );
         assert!(rec.has_pending_timer(100_000 + KEEPALIVE_MS - 1));
         assert!(!rec.has_pending_timer(100_000 + KEEPALIVE_MS));
-        land(&mut rec, &[(&listing(&[]), 200_000)]);
+        land(&mut rec, &[(&listing(&[]), 100_050)]);
+        assert_eq!(
+            ids(&rec),
+            ["keepalive"],
+            "a second Stop in the turn keeps it"
+        );
+        land(&mut rec, &[(&listing(&[]), 100_000 + KEEPALIVE_MS)]);
         assert!(
             rec.timers.is_empty(),
             "the keepalive does not re-arm itself"
@@ -1759,6 +1782,16 @@ mod tests {
             ],
         );
         assert_eq!(ids(&rec), ["keepalive"]);
+
+        let mut rec = slot();
+        let unreadable = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{},"tool_response":{}}"#;
+        land(&mut rec, &[(unreadable, 2_000)]);
+        assert_eq!(rec.timers[0].due_ms, None, "calibration");
+        land(&mut rec, &[(stop, 3_000)]);
+        assert!(
+            rec.timers.is_empty(),
+            "a wake-up with no due is the loop's too"
+        );
     }
 
     #[test]
@@ -1782,6 +1815,45 @@ mod tests {
         assert_eq!(rec.timers[0].due_ms, Some(3_650_000));
         own(&mut rec, &ev(&wake_up(60_000)), 39_000);
         assert_eq!(rec.timers[0].due_ms, Some(3_650_000), "never lowered");
+
+        let mut rec = listed_wake_up();
+        land(&mut rec, &[(&listing(&[]), 100_000)]);
+        own(&mut rec, &ev(&wake_up(9_000_000)), 99_000);
+        assert_eq!(
+            rec.timers[0].due_ms,
+            Some(100_000 + KEEPALIVE_MS),
+            "the keepalive hold is not a lent due"
+        );
+    }
+
+    #[test]
+    fn a_due_lent_to_a_cron_is_taken_back_by_the_hooks_that_disprove_it() {
+        let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true},"tool_response":{"scheduledFor":0}}"#;
+        let create = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1","recurring":false,"durable":false}}"#;
+        let list = r#"{"hook_event_name":"Stop","session_crons":[{"id":"c1","recurring":false}]}"#;
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[
+                (&wake_up(200_000), 2_000),
+                (stop, 3_000),
+                (create, 4_000),
+                (list, 50_000),
+            ],
+        );
+        assert_eq!(ids(&rec), ["cron:c1"]);
+        assert_eq!(
+            rec.timers[0].due_ms, None,
+            "calibration: in order, nothing is lent"
+        );
+        for late in [stop, create] {
+            let mut rec = slot();
+            land(&mut rec, &[(&wake_up(200_000), 2_000), (list, 50_000)]);
+            assert_eq!(rec.timers[0].due_ms, Some(200_000), "lent");
+            assert_eq!(own(&mut rec, &ev(late), 3_000), Outcome::Changed);
+            assert_eq!(rec.timers[0].due_ms, None, "{late}");
+            assert!(rec.has_pending_timer(200_001));
+        }
     }
 
     #[test]

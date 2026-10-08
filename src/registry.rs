@@ -438,17 +438,11 @@ impl SlotRecord {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
-                        let id = t.get("id").and_then(Value::as_str)?;
                         Some(Timer {
-                            id: id.to_string(),
+                            id: t.get("id").and_then(Value::as_str)?.to_string(),
                             due_ms: t.get("due_ms").and_then(Value::as_u64),
                             recurring: t.get("recurring").and_then(Value::as_bool).unwrap_or(false),
-                            // Absent only before `durable` was written, when a cron was held
-                            // until its delete.
-                            durable: t
-                                .get("durable")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(id.starts_with("cron:")),
+                            durable: t.get("durable").and_then(Value::as_bool).unwrap_or(false),
                         })
                     })
                     .collect()
@@ -645,17 +639,6 @@ mod tests {
         );
         assert!(!rec.unread());
         assert!(rec.timers.is_empty());
-    }
-
-    #[test]
-    fn a_cron_from_before_durable_is_held_until_its_delete() {
-        let v = crate::json::parse(
-            r#"{"slot":"claude-1","timers":[{"id":"cron:a","recurring":true},{"id":"wakeup"}]}"#,
-        )
-        .unwrap();
-        let rec = SlotRecord::from_json(&v, "claude-1").expect("parses");
-        assert!(rec.timers[0].durable);
-        assert!(!rec.timers[1].durable);
     }
 
     #[test]
