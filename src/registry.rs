@@ -180,13 +180,6 @@ impl Written {
         self.ticks[f as usize] = tick;
     }
 
-    /// A conversation started at `tick`: nothing older than it is applied, so neither are the
-    /// deletes it would be ordered against.
-    pub fn begin_conversation(&mut self, tick: u64) {
-        self.stamp(Field::Conversation, tick);
-        self.deleted.clear();
-    }
-
     /// Takes the session's timers for an event that states them whole.
     pub fn claim_timers_whole(&mut self, tick: u64) -> bool {
         let newer = self.claim(Field::Timers, tick);
@@ -646,10 +639,8 @@ mod tests {
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
-        rec.timers.push(Timer {
-            due_ms: Some(5_000),
-            ..Timer::new("wakeup", false, true)
-        });
+        rec.timers.push(Timer::one_shot("wakeup", Some(5_000)));
+        rec.timers.push(Timer::new("cron:c1", true, true));
         rec.last_event_ms.insert("Stop".into(), 2_000);
 
         let back = SlotRecord::from_json(&rec.to_json(), "wrong").expect("parses");

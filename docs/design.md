@@ -187,12 +187,12 @@ shell's start-up otherwise. A new record is stamped with the tick it is made in,
 fired before it, such as the last hook of a claude whose slot name is being reused, can write
 it; stamps from another boot, told by the kernel's boot id, are forgotten when a hook next
 loads the record. A late event of the conversation before the current one (a `Stop` of the one
-`/clear` left) is dropped, and a newer one from a conversation the record has not heard start
-adopts it, as the lost `SessionStart` would have. A deleted cron is remembered with its
-delete's tick, so neither a late create nor an older list brings it back. Only a hook that
-cannot read `/proc` is stamped when it lands. `prompt_id` cannot do this: a prompt typed
-mid-turn fires its `UserPromptSubmit` under the running turn's id, and the turn it later starts
-fires none.
+`/clear` left) is dropped, all but its timers, which are the process's, and a newer one from a
+conversation the record has not heard start adopts it, as the lost `SessionStart` would have. A
+deleted cron is remembered with its delete's tick, so neither a late create nor an older list
+brings it back. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id`
+cannot do this: a prompt typed mid-turn fires its `UserPromptSubmit` under the running turn's
+id, and the turn it later starts fires none.
 
 What stays uncorrected, each until the next event of its kind: a turn drained from Claude
 Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through
@@ -239,13 +239,14 @@ up to the minute and so not in that `Stop`'s list, so the record holds a `keepal
 22 minutes from the `Stop`, and no later list ends it sooner, a second `Stop` of a turn a hook
 blocked included; a `Stop` before it fires lists it as a one-shot the record has not seen, held
 until a list lacks it and then for a keepalive hold of its own; a cron one-shot firing looks
-the same and is held too. The 22 minutes assume no synchronous `Stop` hook holds the turn for
-more than about a minute: claude-sessions' own are async. `ScheduleWakeup` with `stop`, or with
-a `scheduledFor` of 0, ends the loop's wake-ups — `wakeup`, the keepalive hold and a listed
-one-shot carrying a due — as Claude Code's stop does, and a cron one-shot stays, as it does
-there. Durable crons (`CronCreate` with `durable`, kept in the project's
-`.claude/scheduled_tasks.json`) are never listed: they come only from `PostToolUse` and leave
-only with their own `CronDelete`.
+the same and is held too. The keepalive follows only a turn a wake-up fired, never one it fired
+itself, since Claude Code allows one in a row, so a turn the keepalive fired arms no hold. The
+22 minutes assume no synchronous `Stop` hook holds the turn for more than about a minute:
+claude-sessions' own are async. `ScheduleWakeup` with `stop`, or with a `scheduledFor` of 0,
+ends the loop's wake-ups — `wakeup`, the keepalive hold and a listed one-shot carrying a due —
+as Claude Code's stop does, and a cron one-shot stays, as it does there. Durable crons
+(`CronCreate` with `durable`, kept in the project's `.claude/scheduled_tasks.json`) are never
+listed: they come only from `PostToolUse` and leave only with their own `CronDelete`.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
@@ -708,15 +709,16 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   `\{id:[$[:alnum:]_]+\.id,schedule:[$[:alnum:]_]+\.cron,recurring:[$[:alnum:]_]+\.recurring`,
   the list's entries and their keys; `kind:"loop",scheduledFor:[$[:alnum:]_]+`, a wake-up armed
   into the store the list is read from; and
-  `[$[:alnum:]_]+=60,[$[:alnum:]_]+=3600,[$[:alnum:]_]+=1200,`, the loop module's clamp bounds
-  and the keepalive's 1200 s that `KEEPALIVE_MS` assumes. Each is counted with `grep -aoE … |
-  wc -l` (`-c` counts lines of a minified binary; `\w` inside brackets is two literals to POSIX
-  grep, and minified names can carry `$`), and each reads exactly 1 on 2.1.293, where a 0 or a
-  2 both fail. The rest err towards keeping: an entry without `recurring` is a one-shot as
-  Claude Code reads it, no `scheduledFor` falls back to the asked delay and no `delaySeconds`
-  either is a wake-up with no due time, a delete with no readable id leaves a session cron to
-  the next list and holds a durable one for the slot's life, and no `tool_response.id` keeps a
-  durable cron no delete can match. **Then a message for claude alone** — a
+  `[$[:alnum:]_]+=60,[$[:alnum:]_]+=3600,[$[:alnum:]_]+=1200,[$[:alnum:]_]+=1;`, the loop
+  module's clamp bounds, the keepalive's 1200 s that `KEEPALIVE_MS` assumes and its budget of
+  one in a row that the hold assumes. Each is counted with `grep -aoE … | wc -l` (`-c` counts
+  lines of a minified binary; `\w` inside brackets is two literals to POSIX grep, and minified
+  names can carry `$`), and each reads exactly 1 on 2.1.293, where a 0 or a 2 both fail. The
+  rest err towards keeping: an entry without `recurring` is a one-shot as Claude Code reads it,
+  no `scheduledFor` falls back to the asked delay and no `delaySeconds` either is a wake-up
+  with no due time, a delete with no readable id leaves a session cron to the next list and
+  holds a durable one for the slot's life, and no `tool_response.id` keeps a durable cron no
+  delete can match. **Then a message for claude alone** — a
   remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
   process's socket, so a real freeze could see those bytes arrive and thaw on them; the
   measurement cannot, because claude is not stopped, and the bytes it receives are mostly

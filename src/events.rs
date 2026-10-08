@@ -217,7 +217,7 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written.begin_conversation(tick);
+    rec.written.stamp(Field::Conversation, tick);
 }
 
 /// Apply an event Claude Code fired at `fired` to a record. `pid`/`proc_start` describe the
@@ -248,7 +248,12 @@ pub fn apply(
         // a newer one can have forked in the same tick.
         let started = rec.written[Field::Conversation];
         if tick < started || (tick == started && rec.session_id.is_some()) {
-            return Outcome::Ignored("an event of an earlier conversation");
+            // The session's timers are the process's, and `/clear` keeps them.
+            return match ev.name() {
+                "PostToolUse" => apply_timer(rec, ev, fired),
+                "Stop" if take_session_timers(rec, ev, fired) => Outcome::Changed,
+                _ => Outcome::Ignored("an event of an earlier conversation"),
+            };
         }
         begin_conversation(rec, id, tick);
     }
@@ -445,7 +450,7 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
     // without either, no due time, which counts as pending.
     let asked = field(input, "delaySeconds")
         .and_then(Value::as_f64)
-        .map(|d| (at + (d.max(0.0) * 1000.0) as Millis).div_ceil(60_000) * 60_000);
+        .map(|d| (at + (d * 1000.0) as Millis).div_ceil(60_000) * 60_000);
     let due = target.or(asked);
     if !rec.written.claim(Field::Timers, tick) {
         // A newer write to the session's timers has landed. The due a list lent is only ever
@@ -536,16 +541,16 @@ fn loop_wake_up(t: &Timer) -> bool {
 /// The list carries no due times, so an entry keeps the one on record, and the one one-shot
 /// the record has not seen is the wake-up set in this turn, if one was. A one-shot gone with
 /// none in its place has fired a turn that set none, which the keepalive may follow.
-fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
+fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> bool {
     let Moment { tick, at } = fired;
     let Some(mut listed) = ev.session_crons() else {
-        return;
+        return false;
     };
     // Written after the last prompt or `Stop` fired; a later prompt disowns a wake-up left by
     // a turn that reached no `Stop`.
     let this_turn = rec.written[Field::Timers] > rec.written[Field::Busy];
     if !rec.written.claim_timers_whole(tick) {
-        return;
+        return false;
     }
     let mut unseen = Vec::new();
     for t in &mut listed {
@@ -578,6 +583,7 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     if woke {
         upsert(rec, Timer::one_shot(KEEPALIVE, Some(at + KEEPALIVE_MS)));
     }
+    true
 }
 
 fn cron_key(id: &str) -> String {
@@ -647,7 +653,7 @@ mod tests {
         )
     }
     const WAKE_UP_STOP: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup",
-        "tool_input":{"stop":true},"tool_response":{"scheduledFor":0}}"#;
+        "tool_input":{"stop":true}}"#;
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
         apply(rec, e, Moment::ms(now), Binding::Own, Some(100), Some(7))
     }
@@ -1217,8 +1223,8 @@ mod tests {
             2_000,
         );
         assert!(
-            !rec.written.deleted_since("cron:c1", 0),
-            "a cron of the last one is not this one's"
+            rec.written.deleted_since("cron:c1", 0),
+            "the process's crons, and their deletes, outlive a /clear"
         );
         assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), None);
         assert_eq!(rec.last_event_ms.get("SessionStart"), Some(&2_000));
@@ -1956,6 +1962,52 @@ mod tests {
             Some(9),
         );
         assert!(rec.timers.is_empty(), "a new process");
+
+        let mut rec = slot();
+        rec.timers.push(timer("cron:s", false));
+        rec.background.push("shell: x".into());
+        apply(
+            &mut rec,
+            &ev(&start("clear")),
+            Moment::ms(2_000),
+            Binding::Own,
+            None,
+            None,
+        );
+        assert_eq!(ids(&rec), ["cron:s"], "a start that names no process");
+        assert_eq!(rec.background.len(), 1);
+        assert_eq!((rec.pid, rec.proc_start), (Some(100), Some(7)));
+    }
+
+    #[test]
+    fn the_last_conversations_timer_hooks_still_apply_after_a_clear() {
+        let old = |body: &str| body.replacen('{', r#"{"session_id":"first","#, 1);
+        let clear = r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#;
+        let (create, delete) = (old(&cron_create("c1", true, true)), old(&cron_delete("d")));
+        let (late_create, early_delete) =
+            (old(&cron_create("c2", true, true)), old(&cron_delete("c2")));
+        let mut rec = slot();
+        rec.timers.push(timer("cron:d", true));
+        land(
+            &mut rec,
+            &[
+                (&early_delete, 1_500),
+                (clear, 3_000),
+                (&create, 2_000),
+                (&delete, 2_100),
+                (&late_create, 1_000),
+            ],
+        );
+        assert_eq!(rec.session_id.as_deref(), Some("second"), "calibration");
+        assert_eq!(ids(&rec), ["cron:c1"]);
+        let stop = old(r#"{"hook_event_name":"Stop","session_crons":[]}"#);
+        own(&mut rec, &ev(&stop), 2_500);
+        assert_eq!(
+            ids(&rec),
+            ["cron:c1"],
+            "its list is applied by its own stamp"
+        );
+        assert_eq!(rec.last_stop_ms, None, "and nothing else of it");
     }
 
     #[test]
