@@ -101,10 +101,7 @@ fn main() -> ExitCode {
         // swallowed, a panic included.
         "hook" => {
             std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
-            match std::panic::catch_unwind(cmd_hook) {
-                Ok(Ok(())) | Err(_) => {}
-                Ok(Err(e)) => log(&format!("hook: {e}")),
-            }
+            contained(cmd_hook, log);
             ExitCode::SUCCESS
         }
         "reconcile" => report(cmd_reconcile()),
@@ -229,6 +226,17 @@ fn log(line: &str) {
 }
 
 // ── hook ────────────────────────────────────────────────────────────────────
+
+/// Run the hook's work and let nothing out: an error is logged, and a panic stops here, having
+/// been logged by the panic hook the caller installed.
+fn contained(
+    work: impl FnOnce() -> std::io::Result<()> + std::panic::UnwindSafe,
+    log: impl Fn(&str),
+) {
+    if let Ok(Err(e)) = std::panic::catch_unwind(work) {
+        log(&format!("hook: {e}"));
+    }
+}
 
 fn cmd_hook() -> std::io::Result<()> {
     let mut body = String::new();
@@ -589,4 +597,21 @@ fn cmd_close(slot: &str) -> std::io::Result<()> {
     registry::store(&rec)?;
     say!("{slot}: closed. the conversation is still on disk for claude --resume");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn the_hook_lets_no_error_or_panic_out() {
+        let said = RefCell::new(Vec::new());
+        let log = |l: &str| said.borrow_mut().push(l.to_string());
+        contained(|| Ok(()), log);
+        assert!(said.borrow().is_empty(), "calibration: nothing to say");
+        contained(|| Err(std::io::Error::other("no registry")), log);
+        assert_eq!(*said.borrow(), ["hook: no registry"]);
+        contained(|| panic!("a registry bug"), log);
+    }
 }
