@@ -143,11 +143,11 @@ terminal.
 
 | event | registry effect |
 |---|---|
-| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared; `compact` changes neither |
+| `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared; `compact` changes neither. A **different** process drops the slot's keep-alive: it was the waiting process's |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | activity, idle since it fired |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` |
-| `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
+| `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would put every unanswered session under Needs you |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
 
@@ -188,19 +188,19 @@ this: a prompt typed mid-turn fires its `UserPromptSubmit` under the running tur
 turn it later starts fires none.
 
 What stays uncorrected, each until the next event of its kind: a turn drained from Claude
-Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through
-its transcript's writes, as it did before async; events fired within one 10 ms clock tick apply
-in landing order; a hook whose `sh` forked rather than exec'd it, and whose claude has gone, is
-stamped from its own start, a stall after the fork; a nested `claude -p` under a tool call
-kills its last async hooks when it exits; and a `SessionEnd`, which waits only 400 ms for the
-slot's lock, gives up behind an async hook stalled while holding it, so the record stays live
-with a dead process, which the menu shows as offloaded and `reconcile` settles.
+Code's prompt queue (a prompt typed mid-turn) fires no hook, so the menu reads it idle; events
+fired within one 10 ms clock tick apply in landing order; a hook whose `sh` forked rather than
+exec'd it, and whose claude has gone, is stamped from its own start, a stall after the fork; a
+nested `claude -p` under a tool call kills its last async hooks when it exits; and a
+`SessionEnd`, which waits only 400 ms for the slot's lock, gives up behind an async hook
+stalled while holding it, so the record stays live with a dead process, which the menu shows
+as offloaded and `reconcile` settles.
 
 Two details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
 
 - `SessionStart.source` has five values including **`fork`**, and carries
-  `seconds_since_last_response` on a resume — a better idle clock than anything computed here.
+  `seconds_since_last_response` on a resume.
 - `SessionEnd.reason` has six including **`resume`**. Treating `resume` as an end marks a slot
   closed every time a conversation is resumed.
 
@@ -208,15 +208,19 @@ Two details that cost something if missed, read from the vendor hook documentati
 
 **Offloadable when: detached · not kept alive · measured quiet for 10 minutes** (§ *Activity,
 measured*). Nothing the hooks say enters it: a slot is stopped when its processes have moved
-no bytes and used no CPU worth counting for ten minutes, whatever its last `Stop`, its
+no more than a trickle of bytes and CPU for ten minutes, whatever its last `Stop`, its
 `needs_you` or its claude's own timers say. The hooks feed the menu, not the offloader.
 
 **What that cannot see is held by asking** (owner, 2026-10-08). Work that waits without
 reading, writing or computing — a `sleep` before a check, a long build's quiet link, a server
 waiting for a request, a `/loop` wake-up or a cron claude set itself — reads as quiet. Claude
 runs `claude-sessions keepalive <duration>` before such a wait (the keep-alive skill says
-when), and the offloader leaves the slot alone until then. The duration is mandatory and
-capped, so a forgotten keep-alive ends by itself.
+when), and the offloader leaves the slot alone until then; quiet time still accrues
+meanwhile, so a slot quiet throughout is offloaded at the first pass after it ends. The
+duration is mandatory and capped at 12 hours, so a forgotten keep-alive ends by itself, and
+it belongs to the process that asked: a `SessionStart` binding a new process drops it. The
+slot is found as the hook finds it (`bind::slot`), so a session somebody attached by hand
+can ask too.
 
 **Still the menu's: an Esc fires no hook at all, and the transcript says so instead.** Seen
 on 2.1.291 under a pty with every hook logging (2026-10-06): Esc mid-reply and Esc mid-tool
@@ -268,12 +272,17 @@ Built 2026-10-01 in `src/offload.rs`, reduced to the measurement on 2026-10-08. 
 invocation, run from the box's timer; `--dry-run` decides and reports without signalling.
 Where the rules above left a choice, this is the choice and why:
 
-- **Measured first.** Every pass measures every live slot (`activity::pass`) before it decides
-  anything, and decides on what that stored: how long each slot had been quiet **as of its
-  last reading** — never as of now, so a pass that could not measure (an unreadable `/proc`,
-  a state file that would not save) does not let an old quiet go on growing. A reading more
-  than 5 minutes old decides nothing, and a slot without a fresh one is kept; 5 minutes is
-  more than a pass apart, so the menu's make-room offer can use the last pass's.
+- **Measured first, and only on what was measured.** Every pass measures every running
+  (`live` or `offloading`) slot (`activity::pass`) before it decides anything, and decides on
+  what it read itself: a slot it did not read — too soon after the last reading, nothing
+  readable, no `/proc` — is kept. Quiet is how long the slot had been quiet **as of that
+  reading**, never as of now, and only if the reading measured the slot's current claude, by
+  pid and start time: a slot's state outlives its process, and a reading of the claude before
+  a resume says nothing of this one.
+- **Run it every few minutes; 3 is assumed.** A window of 10 minutes or more counts as active
+  (it cannot say when in it anything fell), so a timer that slow never offloads anything. The
+  menu's make-room offer decides on the last stored reading, and only on one at most 5 minutes
+  old, so a timer slower than that leaves the offer nothing to make.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
@@ -284,7 +293,8 @@ Where the rules above left a choice, this is the choice and why:
   a close, and a stop that fails leaves the slot `live` for the next pass, where an offload
   leaves it `offloading`.
 - **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
-  offload, from the measurements the last pass stored; accepted, the stop is `judge`'s again
+  offload, from the measurements the last pass stored, under the same freshness and process
+  checks; accepted, the stop is `judge`'s again
   under the lock, so a keep-alive or a transcript that went in between is respected.
 - **Not being able to look keeps it.** A zmx that does not answer for the slot (attached
   cannot be ruled out), a slot not yet measured, a record with no pid — each is a reason to
@@ -296,8 +306,9 @@ Where the rules above left a choice, this is the choice and why:
   reported and the slot left `offloading` for the next pass to decide again. Then, if the
   claude's parent really was a `zmx` daemon, zmx is given up to 2 s to drop the session —
   which hangs up its terminal, ending whatever ran under claude.
-- **The lock is taken only by a slot about to be stopped** (issue #1). A slot that is kept
-  never touches its lock, and `--dry-run` takes none at all. A candidate takes its lock,
+- **The lock is taken only by a slot about to be stopped.** A hook waits on a held lock, so the
+  slow part of a pass — reading `/proc` — holds none. A slot that is kept never touches its
+  lock, and `--dry-run` takes none at all. A candidate takes its lock,
   re-reads its record, and decides again before anything is signalled.
 - **The kill's own `SessionEnd` hook cannot write.** The offloader holds the slot lock from
   decision through kill, so that hook waits its 400 ms, gives up and logs it, and the
@@ -334,10 +345,9 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   not by its language: `read`/`write` is counted (Node, Go, ssh, and blocking TLS through
   OpenSSL — Python's `ssl` module, `requests`); `send`/`recv` is not (Bun, Rust's std
   sockets, Python's plain sockets and asyncio). Measured on 2.1.291 with agent view off,
-  here, under a real `offload --dry-run`: idle 95–139 B/s, 21–25 wakeups/s; a streaming
-  reply 9,342 B/s, 47 wakeups/s — about 70× in bytes, 2× in wake-ups. These figures are
-  `read`/`write` alone; the TCP count below sits on top of them. Wake-ups (voluntary
-  context switches over live threads) are logged beside the bytes for the data.- **CPU, against a fixed line.** CPU time (`utime + stime` with reaped children's) over a
+  here, under a real `offload --dry-run`: idle 95–139 B/s, a streaming reply 9,342 B/s —
+  about 70×. These figures are `read`/`write` alone; the TCP count below sits on top of them.
+- **CPU, against a fixed line.** CPU time (`utime + stime` with reaped children's) over a
   window is active above a minute's worth at 50 ms/s — about eight times an idle claude's 6
   ms/s measured on the fleet, and well under any turn. It scales with the device, which is why
   it has a fixed line rather than a floor: it catches work that computes without moving bytes
@@ -373,7 +383,8 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   many closed uncounted — of those held at the last reading; one that opened and closed
   inside the window shows nowhere. A new socket counts whole; one whose inode a newer socket
   reused counts whole when its count is below the old one's and as a continuation otherwise
-  — inode numbers come from a counter, so reuse inside a window is not expected.- **Which processes: the environment.** With agent view off, claude is one process: an
+  — inode numbers come from a counter, so reuse inside a window is not expected.
+- **Which processes: the environment.** With agent view off, claude is one process: an
   in-process subagent shows as claude's own bytes, and its tools as claude's children
   (measured: a background agent's `sleep` appeared as `bash` → `sleep` under claude, nothing
   outside its tree). zmx sets `ZMX_SESSION` to the session's name for the program it runs,
@@ -405,7 +416,8 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   time it is read. An earlier claude's orphan is left out, but children it forks after the
   new claude started are younger and carry the name, so they count — and their turnover
   keeps the window active: the safe direction, and visible as a slot that never goes quiet.
-  Agent view, which runs a service outside any slot, stays off.- **The line: each slot's own floor.** A slot's floor is its quietest window in the last 24
+  Agent view, which runs a service outside any slot, stays off.
+- **The line: each slot's own floor.** A slot's floor is its quietest window in the last 24
   hours, hour by hour; the line is ten times the floor learned *before* the window, held
   between 512 B/s and 4 KB/s, and 512 for a slot with no floor yet. **A window is active
   when its bytes exceed a minute's worth at the line** — not when its average does, which
@@ -418,12 +430,14 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   near-silent floor from making a stray read look like a turn. All bytes, so no device
   enters. **Its blind spot:** a slot only ever seen busy learns that work as its floor, and
   then the 4 KB/s cap is its only protection — measured streaming is 9,342 B/s, about 2.3×
-  the cap, so work that averages under 4 KB/s from a slot's first windows can read as quiet.
-  The logs show the floor beside every rate, which is how to spot it.- **Each pass prints** `claude-1: measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), 25.2
-  wakeups/s, cpu 6.1 ms/s (line 50), 1 process(es), line 950 B/s (57000 B a window) from floor
-  95, quiet 14m`, then the offloader's own line for the slot. These lines go to the pass's
-  stdout only, not to `offload.log`. Wake-ups read `?` in a window where their sum fell — a
-  thread that exited takes its count with it.
+  the cap, so work that averages under a third of the line from a slot's first windows — about
+  1.4 KB/s at the cap, at a 3-minute cadence — can read as quiet.
+  The logs show the floor beside every rate, which is how to spot it.
+- **Each pass prints** `claude-1: measured — 95 B/s over 180s (tcp 3 B/s, 2 socket(s)), cpu
+  1098 ms (3000 ms a window), 1 process(es), line 950 B/s (57000 B a window) from floor 95,
+  quiet 14m`, then the offloader's own line for the slot. A window active whatever it measured
+  says why: `, active: a process left` or `, active: a window as long as the quiet period`.
+  These lines go to the pass's stdout only, not to `offload.log`.
 - **What is unknown counts as active**: a slot's first reading, a member that left since the
   last one, a process that is there but cannot be read (the slot is reported as unknown and
   kept) — a setuid or otherwise non-dumpable member,
@@ -433,7 +447,8 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   in it the bytes fell. A process not seen last time is counted whole — all it ever did
   falls in the window — which errs towards active without forcing it. A window under a
   minute — a pass run by hand right after the timer's — is left for the next, with a line
-  saying so.- **State** is `activity.state` beside the registry — not `.json`, which the registry reads
+  saying so.
+- **State** is `activity.state` beside the registry — not `.json`, which the registry reads
   as a slot — written whole and renamed into place. Two passes at once may each write it;
   the later wins and the other's window is measured again. **The state belongs to the slot's
   name** for as long as it has a record, and is carried as it was unless a reading replaces
@@ -445,7 +460,8 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   offload — is active and teaches nothing, since its rate never happened. A name closed and
   reused inherits it, which mostly carries the container's idle noise across. A pass that
   cannot save it leaves the last saved state in place: counters are cumulative, so the next
-  window from it holds every byte, and floors survive a full disk.- **What it cannot see**, and `claude-sessions keepalive` is for: a slot waiting without
+  window from it holds every byte, and floors survive a full disk.
+- **What it cannot see**, and `claude-sessions keepalive` is for: a slot waiting without
   reading, writing or computing. **Claude's own timers** — a `ScheduleWakeup`, a `/loop`, a
   cron it set itself — are the common case: the native build blocks in `epoll_pwait2` and
   holds no timerfd (checked 2026-10-07), so its next deadline is in its own memory alone. So
@@ -778,11 +794,13 @@ tool without editing a shared one.
 
 **The keep-alive skill goes beside it.** `claude-sessions skill` prints
 `skills/keepalive/SKILL.md`, which tells claude when to run `claude-sessions keepalive` and
-for how short a time (§ *The offloader*). An image installs it from the binary alone:
+for how short a time (§ *The offloader*). It goes in Claude Code's config directory, which in
+infra's containers is a volume, so an image build cannot put it there: install it **at every
+container start**, which also updates it with a new pin.
 
 ```
-mkdir -p ~/.claude/skills/keepalive
-claude-sessions skill > ~/.claude/skills/keepalive/SKILL.md
+d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/keepalive"
+mkdir -p "$d" && claude-sessions skill > "$d/SKILL.md"
 ```
 
 **The question was whether that file makes Claude Code stop and ask.** The binary carries a

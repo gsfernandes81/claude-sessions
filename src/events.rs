@@ -12,7 +12,7 @@
 //!
 //! **A nested claude must never rebind the slot.** A `claude -p` from a Bash tool call, or a
 //! subagent, inherits `CLAUDE_SESSIONS_SLOT` and fires the same hooks. Its events count as
-//! *work running under* the slot — enough to keep the offloader off it — and nothing more.
+//! *work running under* the slot, and nothing more.
 
 use crate::clock::{Millis, Moment};
 use crate::json::{self, Value};
@@ -92,7 +92,7 @@ impl Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Changed,
-    /// Deliberately nothing, with the reason — `idle_prompt`, a `clear` end, an unknown tool.
+    /// Deliberately nothing, with the reason — `idle_prompt`, a `clear` end, a late event.
     Ignored(&'static str),
 }
 
@@ -100,7 +100,7 @@ pub enum Outcome {
 ///
 /// `idle_prompt` is NOT one of them, and that is the single most important omission in this
 /// file: it fires about a minute after every `Stop` nobody answers, so treating it as "needs
-/// you" would pin every detached session open forever and the offloader would never run again.
+/// you" would put every unanswered session under Needs you, which then means nothing.
 fn needs_you_type(t: &str) -> bool {
     matches!(
         t,
@@ -191,6 +191,10 @@ pub fn apply(
             if rec.written.claim(Field::Life, tick) {
                 rec.state = State::Live;
                 if pid.is_some() {
+                    // A keep-alive is the waiting process's, and a new process is not waiting.
+                    if (pid, proc_start) != (rec.pid, rec.proc_start) {
+                        rec.keep_until_ms = None;
+                    }
                     rec.pid = pid;
                     rec.proc_start = proc_start;
                 }
@@ -680,6 +684,32 @@ mod tests {
     }
 
     #[test]
+    fn a_keepalive_is_the_process_that_asked_for_it() {
+        let start = |source: &str| {
+            ev(&format!(
+                r#"{{"hook_event_name":"SessionStart","source":"{source}","session_id":"first"}}"#
+            ))
+        };
+        let mut rec = slot();
+        rec.keep_until_ms = Some(60_000);
+        own(&mut rec, &start("clear"), 2_000);
+        assert_eq!(
+            rec.keep_until_ms,
+            Some(60_000),
+            "calibration: the same process"
+        );
+        apply(
+            &mut rec,
+            &start("resume"),
+            Moment::ms(3_000),
+            Binding::Own,
+            Some(200),
+            Some(8),
+        );
+        assert_eq!(rec.keep_until_ms, None, "a new process asked for nothing");
+    }
+
+    #[test]
     fn a_start_at_the_prompt_is_idle_and_a_compaction_changes_nothing_about_it() {
         for source in ["startup", "resume", "clear", "fork"] {
             let mut rec = slot();
@@ -770,10 +800,7 @@ mod tests {
             rec.session_id, before,
             "the slot's conversation is untouched"
         );
-        assert_eq!(
-            rec.last_activity_ms, 5_000,
-            "so the offloader leaves it alone"
-        );
+        assert_eq!(rec.last_activity_ms, 5_000);
     }
 
     #[test]
@@ -797,7 +824,7 @@ mod tests {
     #[test]
     fn an_idle_prompt_notification_changes_nothing() {
         // It fires about a minute after every Stop nobody answers. Treating it as "needs you"
-        // would pin every detached session open and the offloader would never run again.
+        // would put every unanswered session under Needs you.
         let mut rec = slot();
         let out = own(
             &mut rec,

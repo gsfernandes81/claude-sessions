@@ -126,9 +126,9 @@ pub struct Proc {
 
 /// Every process visible in `/proc`, or `None` if `/proc` could not be listed at all.
 ///
-/// `None` and an empty table are different answers and callers must keep them apart: "no
-/// descendants" read from a failed listing would let the offloader stop a slot whose child it
-/// simply could not see. A process that exits mid-walk is skipped, which is the truth.
+/// `None` and an empty table are different answers and callers must keep them apart: a failed
+/// listing is not a slot with no processes, and a pass that gets one measures nothing. A
+/// process that exits mid-walk is skipped, which is the truth.
 pub fn table() -> Option<Vec<Proc>> {
     let entries = fs::read_dir("/proc").ok()?;
     let mut out = Vec::new();

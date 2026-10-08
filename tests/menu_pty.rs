@@ -44,7 +44,7 @@ fn record(slot: &str, title: &str, transcript: &std::path::Path) -> String {
     format!(
         r#"{{"slot":"{slot}","state":"offloaded","title":"{title}","session_id":"s-{slot}",
             "cwd":"/workspace","transcript_path":"{t}","needs_you":false,
-            "last_activity_ms":{at},"timers":[]}}"#
+            "last_activity_ms":{at}}}"#
     )
 }
 
@@ -280,7 +280,7 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
         format!(
             r#"{{"slot":"claude-1","state":"live","pid":{pid},"proc_start":{start},
                 "session_id":"s-1","cwd":"/workspace","title":"a stubborn session",
-                "needs_you":false,"last_activity_ms":{at},"timers":[]}}"#
+                "needs_you":false,"last_activity_ms":{at}}}"#
         ),
     )
     .unwrap();
@@ -428,7 +428,7 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
     let at = now_ms() - 3_600_000;
     let body = format!(
         r#"{{"slot":"claude-1","state":"offloaded","title":"behind the pipe","session_id":"s-1",
-            "cwd":"/workspace","needs_you":false,"last_activity_ms":{at},"timers":[]}}"#
+            "cwd":"/workspace","needs_you":false,"last_activity_ms":{at}}}"#
     );
     std::fs::write(&pipe, &body).unwrap();
     // A regular file in the pipe's place at once, before the next reading two seconds on:

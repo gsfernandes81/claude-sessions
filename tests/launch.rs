@@ -203,7 +203,6 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     );
     assert!(body.contains("\"conv-e2e\""), "{body}");
     assert!(number(&body, "proc_start").is_some(), "with its start time");
-    assert!(body.contains("\"busy\": false"), "at its prompt: {body}");
     // The stand-in speaks on stderr after its hooks return, so the record can land first.
     let stderr = root.0.join("registry/claude-1.stderr");
     let stderr = file_when(&root.0, &stderr, "nothing on stderr", |s| !s.is_empty());

@@ -907,7 +907,7 @@ fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
     registry::all()
         .ok()?
         .iter()
-        .filter(|r| matches!(r.state, State::Live | State::Offloading))
+        .filter(|r| r.state.is_running())
         .filter_map(|r| {
             let verdict = offload::judge(r, now, &offload::look(r, &measured, now)).ok()?;
             let offload::Verdict::Offload { idle } = verdict else {
@@ -1534,6 +1534,12 @@ exit 1"#,
             activity::SlotState {
                 at: clock::now(),
                 last_active: clock::now() - 11 * 60 * 1000,
+                procs: vec![activity::Reading {
+                    pid,
+                    start,
+                    bytes: 0,
+                    cpu: 0,
+                }],
                 ..Default::default()
             },
         );

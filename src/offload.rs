@@ -2,11 +2,11 @@
 //! leave everything needed to bring it back.
 //!
 //! **It acts on measured activity alone** (`activity.rs`): a detached slot whose processes
-//! have moved no bytes and used no CPU worth counting for [`QUIET_FOR_MS`] is stopped, whatever
+//! have moved only a trickle of bytes and CPU for [`QUIET_FOR_MS`] is stopped, whatever
 //! Claude Code's hooks last said. Work that waits without doing either — a sleep before a
 //! check, a long network call — is held by `claude-sessions keepalive`. Anything this pass
-//! cannot see — a slot not yet measured, a record with no pid, an attachment zmx did not
-//! report — keeps the slot.
+//! cannot see — a slot it did not read, a reading of an earlier claude, a record with no pid,
+//! an attachment zmx did not report — keeps the slot.
 //!
 //! **The decision and the kill happen under one hold of the slot's lock.** The record is
 //! re-read after the lock is taken, the decision is made from that copy, the slot is marked
@@ -147,7 +147,7 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     // `Offloading` is a pass that died between deciding and finishing. Deciding again is
     // right: if the slot is still quiet the job is finished, and if a SessionStart has since
     // made it live, it is no longer `Offloading`.
-    if !matches!(rec.state, State::Live | State::Offloading) {
+    if !rec.state.is_running() {
         return Err(Hold::NotLive(rec.state));
     }
     if rec.pid.is_none() || rec.proc_start.is_none() {
@@ -160,10 +160,8 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     if rec.session_id.is_none() || rec.cwd.is_none() {
         return Err(Hold::NotResumable);
     }
-    if let Some(until) = rec.keep_until_ms.filter(|&until| until > now) {
-        return Err(Hold::KeptAlive {
-            left_ms: until - now,
-        });
+    if let Some(left_ms) = rec.kept_for(now) {
+        return Err(Hold::KeptAlive { left_ms });
     }
     match seen.attached {
         Some(true) => return Err(Hold::Attached),
@@ -185,15 +183,18 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
 /// on the last pass's, and well under the quiet period.
 const FRESH_MS: Millis = QUIET_FOR_MS / 2;
 
-/// How long a slot was quiet as of its last reading, if that reading is fresh. Quiet is known
-/// only up to the reading, never to now: a pass that could not measure must not let an old
-/// quiet go on growing.
-pub fn quiet_for(m: Option<&SlotState>, now: Millis) -> Option<Millis> {
+/// How long the slot's claude `(pid, start)` was quiet as of the last reading, if that reading
+/// is fresh and measured that very process. Quiet is known only up to the reading, never to
+/// now: a pass that could not measure must not let an old quiet go on growing. And a slot's
+/// state outlives its process, so a reading of the claude before a resume says nothing of
+/// this one.
+pub fn quiet_for(m: Option<&SlotState>, claude: (u32, u64), now: Millis) -> Option<Millis> {
     m.filter(|m| m.at <= now && now - m.at <= FRESH_MS)
+        .filter(|m| m.procs.iter().any(|r| (r.pid, r.start) == claude))
         .map(|m| m.at.saturating_sub(m.last_active))
 }
 
-/// Gather what `decide` and `judge` need for one slot, from the measurements a pass stored.
+/// Gather what `decide` and `judge` need for one slot, from a pass's measurements.
 pub fn look(rec: &SlotRecord, measured: &BTreeMap<String, SlotState>, now: Millis) -> Seen {
     let (Some(pid), Some(start)) = (rec.pid, rec.proc_start) else {
         return Seen::default();
@@ -210,7 +211,7 @@ pub fn look(rec: &SlotRecord, measured: &BTreeMap<String, SlotState>, now: Milli
             None
         },
         conversation: rec.has_conversation(),
-        quiet: quiet_for(measured.get(&rec.slot), now),
+        quiet: quiet_for(measured.get(&rec.slot), (pid, start), now),
     }
 }
 
@@ -310,19 +311,17 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         );
     }
     let (mut offloaded, mut closed) = (0usize, 0usize);
-    // One snapshot of /proc for the whole pass, taken holding no lock. Reading every
-    // process's stat and cmdline is the slow part of a pass, and a hook that arrives while a
-    // slot's lock is held has to wait for it — issue #1: a prompt dropped that way leaves a
-    // busy claude reading as idle, and ten minutes later the offloader would stop it.
+    // One snapshot of /proc for the whole pass, taken holding no lock: it is the slow part of
+    // a pass, and a hook that arrives while a slot's lock is held waits for it.
     let table = procinfo::table();
     let records = registry::all()?;
-    // Measured first: what this pass decides on.
-    for line in activity::pass(&records, table.as_deref(), clock::now()) {
+    // Measured first, and decided only on what this pass read: a slot it did not read is kept.
+    let (lines, measured) = activity::pass(&records, table.as_deref(), clock::now());
+    for line in lines {
         say!("{line}");
     }
-    let measured = activity::load();
     for listed in records {
-        if !matches!(listed.state, State::Live | State::Offloading) {
+        if !listed.state.is_running() {
             continue;
         }
         // First decision from the snapshot and the record as listed, holding nothing. Every
@@ -719,23 +718,29 @@ mod tests {
     }
 
     #[test]
-    fn quiet_is_known_only_up_to_a_fresh_reading() {
+    fn quiet_is_known_only_up_to_a_fresh_reading_of_this_process() {
+        const CLAUDE: (u32, u64) = (100, 7);
         let reading = |at, last_active| SlotState {
             at,
             last_active,
+            procs: vec![activity::Reading {
+                pid: CLAUDE.0,
+                start: CLAUDE.1,
+                bytes: 0,
+                cpu: 0,
+            }],
             ..Default::default()
         };
+        let quiet = |m: &SlotState, claude| quiet_for(Some(m), claude, NOW);
         let m = reading(NOW - 60_000, NOW - 60_000 - QUIET_FOR_MS);
-        assert_eq!(quiet_for(Some(&m), NOW), Some(QUIET_FOR_MS), "calibration");
+        assert_eq!(quiet(&m, CLAUDE), Some(QUIET_FOR_MS), "calibration");
+        assert_eq!(quiet(&m, (200, 8)), None, "the claude before a resume");
+        assert_eq!(quiet(&m, (100, 8)), None, "its pid, reused");
         let stale = reading(NOW - FRESH_MS - 1, NOW - 3 * QUIET_FOR_MS);
-        assert_eq!(
-            quiet_for(Some(&stale), NOW),
-            None,
-            "a pass that could not measure"
-        );
+        assert_eq!(quiet(&stale, CLAUDE), None, "a pass that could not measure");
         let future = reading(NOW + 1, NOW - QUIET_FOR_MS);
-        assert_eq!(quiet_for(Some(&future), NOW), None);
-        assert_eq!(quiet_for(None, NOW), None);
+        assert_eq!(quiet(&future, CLAUDE), None);
+        assert_eq!(quiet_for(None, CLAUDE, NOW), None);
     }
 
     #[test]

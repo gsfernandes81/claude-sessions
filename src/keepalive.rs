@@ -7,9 +7,9 @@
 //! keep-alive skill, `skills/keepalive/SKILL.md`, says when). The duration is mandatory and
 //! capped, so a keep-alive nobody ends still ends.
 
+use crate::activity::QUIET_FOR_MS;
 use crate::clock::{self, Millis};
 use crate::{bind, lockfile, registry};
-use std::io;
 
 /// The longest keep-alive one call may ask for.
 pub const MAX_MS: Millis = 12 * 60 * 60 * 1000;
@@ -18,50 +18,54 @@ pub const MAX_MS: Millis = 12 * 60 * 60 * 1000;
 /// is refused rather than cut, so a caller that asked for more knows it did not get it.
 pub fn parse(s: &str) -> Result<Millis, String> {
     let s = s.trim();
+    let unreadable = || format!("{s:?} is not a duration: use 90s, 25m or 2h");
     let (digits, unit) = match s.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => s.split_at(at),
         None => (s, "s"),
     };
-    let n: Millis = digits
-        .parse()
-        .map_err(|_| format!("{s:?} is not a duration: use 90s, 25m or 2h"))?;
+    let n: Millis = digits.parse().map_err(|_| unreadable())?;
     let unit_ms = match unit {
         "s" => 1_000,
         "m" => 60_000,
         "h" => 3_600_000,
-        _ => return Err(format!("{s:?} is not a duration: use 90s, 25m or 2h")),
+        _ => return Err(unreadable()),
     };
     let ms = n.saturating_mul(unit_ms);
     if ms > MAX_MS {
         return Err(format!(
-            "{s} is longer than the {}h a keep-alive may last; ask again when it runs out",
+            "{s} is longer than the {}h a keep-alive may last, so nothing was set: ask for at \
+             most that, and again before it runs out",
             MAX_MS / 3_600_000
         ));
     }
     Ok(ms)
 }
 
-/// Set the slot's keep-alive to `ms` from now, or end it for 0, under the slot's lock. The
-/// slot is the one this process runs in, by `CLAUDE_SESSIONS_SLOT`. `Ok` is the line to say.
-pub fn run(ms: Millis) -> io::Result<String> {
-    let Some(slot) = bind::slot_from_env() else {
-        return Err(io::Error::other(
-            "not inside a claude-sessions slot (no CLAUDE_SESSIONS_SLOT), so nothing to keep alive",
-        ));
+/// Set the keep-alive of the slot this process runs in to `asked` from now, or end it for 0,
+/// under the slot's lock. `Ok` is the line to say, `Err` why nothing was set.
+pub fn run(asked: &str) -> Result<String, String> {
+    let ms = parse(asked)?;
+    let Some((slot, _)) = bind::slot() else {
+        return Err("not inside a claude-sessions slot, so nothing to keep alive".into());
     };
     let _lock =
-        lockfile::SlotLock::acquire(&registry::lock_path(&slot), lockfile::INTERACTIVE_WAIT)?;
-    let Some(mut rec) = registry::load(&slot)? else {
-        return Err(io::Error::other(format!("{slot} has no record")));
-    };
+        lockfile::SlotLock::acquire(&registry::lock_path(&slot), lockfile::INTERACTIVE_WAIT)
+            .map_err(|e| format!("{slot}: {e}"))?;
+    let mut rec = registry::load(&slot)
+        .map_err(|e| format!("{slot}: {e}"))?
+        .ok_or_else(|| format!("{slot} has no record"))?;
     let now = clock::now();
     rec.keep_until_ms = (ms > 0).then(|| now + ms);
     rec.updated_ms = now;
-    registry::store(&rec)?;
+    registry::store(&rec).map_err(|e| format!("{slot}: {e}"))?;
+    let after = format!(
+        "a slot detached and quiet for {} minutes is offloaded at the next pass",
+        QUIET_FOR_MS / 60_000
+    );
     Ok(match ms {
-        0 => format!("{slot}: keep-alive ended; offloaded once quiet for 10 minutes"),
+        0 => format!("{slot}: keep-alive ended; {after}"),
         _ => format!(
-            "{slot}: kept alive for {}, then offloaded once quiet for 10 minutes",
+            "{slot}: kept alive for {}; quiet time still counts meanwhile, and once it ends {after}",
             spelled(ms)
         ),
     })
@@ -69,10 +73,12 @@ pub fn run(ms: Millis) -> io::Result<String> {
 
 /// A duration as [`parse`] reads it, in the largest unit that says it exactly.
 fn spelled(ms: Millis) -> String {
-    match ms {
-        _ if ms % 3_600_000 == 0 => format!("{}h", ms / 3_600_000),
-        _ if ms % 60_000 == 0 => format!("{}m", ms / 60_000),
-        _ => format!("{}s", ms / 1_000),
+    if ms % 3_600_000 == 0 {
+        format!("{}h", ms / 3_600_000)
+    } else if ms % 60_000 == 0 {
+        format!("{}m", ms / 60_000)
+    } else {
+        format!("{}s", ms / 1_000)
     }
 }
 

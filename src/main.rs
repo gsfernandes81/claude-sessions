@@ -4,7 +4,7 @@
 //! `render.rs` from `menu.rs`'s state, acting through `launch.rs`); everything else here is
 //! the registry, the hook that feeds it, and the passes that keep it agreeing with reality.
 //!
-//! Arguments are parsed by hand. Eight subcommands and three flags is not worth a parser, and
+//! Arguments are parsed by hand. A handful of subcommands and flags is not worth a parser, and
 //! this binary is on the ssh path in a container pulled by checksum — every dependency is one
 //! more thing to cross-compile for musl and one more thing to read before trusting.
 
@@ -150,12 +150,11 @@ fn main() -> ExitCode {
             let Some(asked) = args.get(1) else {
                 return fail("keepalive needs a duration: claude-sessions keepalive 25m");
             };
-            match keepalive::parse(asked).map(keepalive::run) {
-                Ok(Ok(line)) => {
+            match keepalive::run(asked) {
+                Ok(line) => {
                     say!("{line}");
                     ExitCode::SUCCESS
                 }
-                Ok(Err(e)) => fail(&e.to_string()),
                 Err(e) => fail(&e),
             }
         }
@@ -189,8 +188,8 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill        the keep-alive skill that tells claude when to run that,
-                               for ~/.claude/skills/keepalive/SKILL.md
+  claude-sessions skill        the keep-alive skill that tells claude when to run that, for
+                               skills/keepalive/SKILL.md in Claude Code's config directory
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status
@@ -247,7 +246,7 @@ fn cmd_hook() -> std::io::Result<()> {
         }
     };
 
-    let Some((slot, registered)) = slot_for_hook() else {
+    let Some((slot, registered)) = bind::slot() else {
         log(&format!("no slot for a {} event; not ours", ev.name()));
         return Ok(());
     };
@@ -298,24 +297,6 @@ fn cmd_hook() -> std::io::Result<()> {
         }
         Outcome::Ignored(_why) => Ok(()),
     }
-}
-
-/// The slot this hook belongs to, and whether we started it.
-///
-/// The environment is the fast answer: the menu sets `CLAUDE_SESSIONS_SLOT` when it starts a
-/// slot. Failing that — a `zmx attach work claude` somebody typed, which nothing here started —
-/// zmx names its own session in `ZMX_SESSION`, so the session is listed as unregistered rather
-/// than ignored. Only with a zmx daemon above us: the variable is inherited, and a process that
-/// merely carries it out of a session is not in one.
-fn slot_for_hook() -> Option<(String, bool)> {
-    if let Some(slot) = bind::slot_from_env() {
-        return Some((slot, true));
-    }
-    let name = std::env::var("ZMX_SESSION")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    procinfo::ancestor_named(std::process::id(), "zmx", 10)?;
-    Some((name, false))
 }
 
 // ── reconcile ───────────────────────────────────────────────────────────────
@@ -428,11 +409,7 @@ fn cmd_list() -> std::io::Result<()> {
             "{}{}{}{}{}",
             if r.needs_you { "!" } else { "" },
             if r.unread() { "*" } else { "" },
-            if r.keep_until_ms.is_some_and(|until| until > now) {
-                "k"
-            } else {
-                ""
-            },
+            if r.kept_for(now).is_some() { "k" } else { "" },
             // Attached is only meaningful for a session we know to be alive.
             if alive && sess.is_some_and(|s| s.attached) {
                 "@"
@@ -558,11 +535,14 @@ fn cmd_doctor() -> std::io::Result<()> {
         );
         say!("  session   : {}", or_none(rec.session_id.clone()));
         say!(
-            "  flags     : busy={} needs_you={} unread={} kept alive until={}",
+            "  flags     : busy={} needs_you={} unread={} kept alive={}",
             rec.busy,
             rec.needs_you,
             rec.unread(),
-            or_none(rec.keep_until_ms.map(|t| t.to_string()))
+            or_none(
+                rec.kept_for(now)
+                    .map(|left| format!("{}m more", left.div_ceil(60_000)))
+            )
         );
         if rec.last_event_ms.is_empty() {
             say!("  events    : none seen — the hooks are not installed, or not firing");

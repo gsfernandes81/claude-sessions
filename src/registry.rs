@@ -55,6 +55,10 @@ impl State {
             State::Closed => "closed",
         }
     }
+    /// A claude is, or may still be, running: the states the offloader measures and decides on.
+    pub fn is_running(self) -> bool {
+        matches!(self, State::Live | State::Offloading)
+    }
     /// An unknown state reads as `live`, which is the reading that cannot lose a session: a
     /// live slot wrongly called offloaded would be resumed into a second process on the same
     /// conversation, and that forks it.
@@ -200,7 +204,7 @@ pub struct SlotRecord {
     /// why neither is derived from the other.
     pub last_stop_ms: Option<Millis>,
     /// Until when the offloader leaves this slot alone, whatever it measures: set by
-    /// `claude-sessions keepalive` from inside the slot.
+    /// `claude-sessions keepalive` from inside the slot, for the process that asked.
     pub keep_until_ms: Option<Millis>,
     /// False for a session this tool did not start — a `zmx attach work claude` somebody
     /// typed. Listed, marked, and never assumed to behave like one of ours.
@@ -280,6 +284,13 @@ impl SlotRecord {
             .or_else(|| self.ai_title.clone())
             .or_else(|| self.first_prompt.clone())
             .unwrap_or_else(|| "(no title yet)".into())
+    }
+
+    /// How much longer a keep-alive holds this slot, if one does.
+    pub fn kept_for(&self, now: Millis) -> Option<Millis> {
+        self.keep_until_ms
+            .filter(|&until| until > now)
+            .map(|until| until - now)
     }
 
     /// Derived, never stored: it finished something while you were away.

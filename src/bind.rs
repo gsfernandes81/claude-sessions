@@ -14,11 +14,21 @@ use crate::clock::Moment;
 use crate::events::Binding;
 use crate::procinfo;
 
-/// The slot name from the environment, if this process was started under one.
-pub fn slot_from_env() -> Option<String> {
-    std::env::var("CLAUDE_SESSIONS_SLOT")
-        .ok()
-        .filter(|s| !s.is_empty())
+/// The slot this process runs in, and whether we started it.
+///
+/// The environment is the fast answer: the menu sets `CLAUDE_SESSIONS_SLOT` when it starts a
+/// slot. Failing that — a `zmx attach work claude` somebody typed, which nothing here started —
+/// zmx names its own session in `ZMX_SESSION`, so the session is listed as unregistered rather
+/// than ignored. Only with a zmx daemon above us: the variable is inherited, and a process that
+/// merely carries it out of a session is not in one.
+pub fn slot() -> Option<(String, bool)> {
+    let var = |k| std::env::var(k).ok().filter(|s: &String| !s.is_empty());
+    if let Some(slot) = var("CLAUDE_SESSIONS_SLOT") {
+        return Some((slot, true));
+    }
+    let name = var("ZMX_SESSION")?;
+    procinfo::ancestor_named(std::process::id(), "zmx", 10)?;
+    Some((name, false))
 }
 
 /// How a hook sits on its line of parents.

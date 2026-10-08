@@ -33,6 +33,10 @@ registry implementation and one set of tests:
 | `claude-sessions` | the menu — the default, and what an ssh login lands on |
 | `claude-sessions hook` | fed by Claude Code's hooks; the only writer of session state |
 | `claude-sessions offload` | stops a session nobody is using, keeping its conversation — closing it if it never had one |
+| `claude-sessions keepalive` | asked by claude before a quiet wait, so the offloader leaves its session alone for that long |
+| `claude-sessions skill` | the skill that tells claude when to ask for that |
+| `claude-sessions list` | every slot, one line each |
+| `claude-sessions hooks-config` | the Claude Code settings that install the hooks and the status line |
 | `claude-sessions reconcile` | makes the registry agree with reality after a restart |
 | `claude-sessions close` | ends a session without opening it |
 | `claude-sessions doctor` | says what it can and cannot see, per slot |
@@ -40,9 +44,8 @@ registry implementation and one set of tests:
 
 ## Status
 
-**Nothing is deployed and nothing is released.** The design is settled and the screens are
-approved; the code is not written. Start at
-[`docs/handoff/2026-10-01-bootstrap.md`](docs/handoff/2026-10-01-bootstrap.md).
+Released as GitHub releases; nothing is deployed yet. Where the work stands is
+[`docs/handoff/2026-10-02-menu.md`](docs/handoff/2026-10-02-menu.md).
 
 - [`docs/design.md`](docs/design.md) — what it does and why, in enough detail to build from
 - [`docs/mockups.md`](docs/mockups.md) — the eight screens, approved and binding
