@@ -12,7 +12,8 @@
 //! uses those — so to these the bytes of every TCP socket a slot's processes hold are added,
 //! from the kernel's own per-socket count (`src/sockdiag.rs`). CPU time is judged beside the
 //! bytes against a fixed line; wake-ups are logged for the data. File I/O through a mapping
-//! stays invisible, and so does a process waiting without moving either.
+//! stays invisible, and so does a process waiting without moving either: that is what
+//! `claude-sessions keepalive` is for.
 //!
 //! **Which way it errs.** Anything not known counts as active: a slot's first reading, a
 //! member that left since the last reading, a process that is there but cannot be read, a

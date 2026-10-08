@@ -199,6 +199,9 @@ pub struct SlotRecord {
     /// The most recent `Stop`. `unread` is this being later than `last_attach_ms`, which is
     /// why neither is derived from the other.
     pub last_stop_ms: Option<Millis>,
+    /// Until when the offloader leaves this slot alone, whatever it measures: set by
+    /// `claude-sessions keepalive` from inside the slot.
+    pub keep_until_ms: Option<Millis>,
     /// False for a session this tool did not start — a `zmx attach work claude` somebody
     /// typed. Listed, marked, and never assumed to behave like one of ours.
     pub registered: bool,
@@ -228,6 +231,7 @@ impl SlotRecord {
             last_activity_ms: made.at,
             last_attach_ms: 0,
             last_stop_ms: None,
+            keep_until_ms: None,
             registered: true,
             updated_ms: made.at,
             last_event_ms: BTreeMap::new(),
@@ -308,6 +312,7 @@ impl SlotRecord {
         o.set("last_activity_ms", Value::num(self.last_activity_ms as f64));
         o.set("last_attach_ms", Value::num(self.last_attach_ms as f64));
         set_opt_u64(&mut o, "last_stop_ms", self.last_stop_ms);
+        set_opt_u64(&mut o, "keep_until_ms", self.keep_until_ms);
         o.set("updated_ms", Value::num(self.updated_ms as f64));
         let mut ev = Value::obj();
         for (k, at) in &self.last_event_ms {
@@ -358,6 +363,7 @@ impl SlotRecord {
                 .unwrap_or(0),
             last_attach_ms: v.get("last_attach_ms").and_then(Value::as_u64).unwrap_or(0),
             last_stop_ms: v.get("last_stop_ms").and_then(Value::as_u64),
+            keep_until_ms: v.get("keep_until_ms").and_then(Value::as_u64),
             registered: v.get("registered").and_then(Value::as_bool).unwrap_or(true),
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,
@@ -476,6 +482,7 @@ mod tests {
         rec.state = State::Offloaded;
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
+        rec.keep_until_ms = Some(5_000);
         rec.last_event_ms.insert("Stop".into(), 2_000);
 
         let back = SlotRecord::from_json(&rec.to_json(), "wrong").expect("parses");
@@ -486,6 +493,7 @@ mod tests {
         assert_eq!(back.first_prompt, rec.first_prompt);
         assert_eq!(back.written, rec.written);
         assert!(back.needs_you);
+        assert_eq!(back.keep_until_ms, Some(5_000));
         assert_eq!(back.last_event_ms.get("Stop"), Some(&2_000));
     }
 
@@ -501,6 +509,7 @@ mod tests {
             "a record with no `registered` field is one of ours"
         );
         assert!(!rec.unread());
+        assert_eq!(rec.keep_until_ms, None);
     }
 
     #[test]

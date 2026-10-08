@@ -47,6 +47,7 @@ mod events;
 mod fmt;
 mod hooks_config;
 mod json;
+mod keepalive;
 mod launch;
 mod live;
 mod lockfile;
@@ -76,6 +77,8 @@ use std::io::Write;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The keep-alive skill, printed by `claude-sessions skill` so an image needs only the binary.
+const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 
 /// The menu's exit status when its terminal went away: 128 + SIGHUP, what a shell reports
 /// for a hangup, so the door can tell it from a failure worth explaining.
@@ -143,6 +146,23 @@ fn main() -> ExitCode {
             statusline::run();
             ExitCode::SUCCESS
         }
+        "keepalive" => {
+            let Some(asked) = args.get(1) else {
+                return fail("keepalive needs a duration: claude-sessions keepalive 25m");
+            };
+            match keepalive::parse(asked).map(keepalive::run) {
+                Ok(Ok(line)) => {
+                    say!("{line}");
+                    ExitCode::SUCCESS
+                }
+                Ok(Err(e)) => fail(&e.to_string()),
+                Err(e) => fail(&e),
+            }
+        }
+        "skill" => {
+            say_nl!("{SKILL}");
+            ExitCode::SUCCESS
+        }
         "offload" => match args.get(1).map(String::as_str) {
             None => report(offload::run(false)),
             Some("--dry-run") => report(offload::run(true)),
@@ -162,9 +182,15 @@ fn usage() -> String {
   claude-sessions reconcile    make the registry agree with reality after a restart
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
-  claude-sessions offload      measure every slot, and stop each one quiet for 10 minutes
-                               and detached; run from a timer
+  claude-sessions offload      measure every slot, and stop each one quiet for 10 minutes,
+                               detached and not kept alive; run from a timer
                   [--dry-run]  say what it would stop, and stop nothing
+  claude-sessions keepalive DURATION
+                               keep the slot this runs in from being offloaded for DURATION
+                               (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
+                               quietly
+  claude-sessions skill        the keep-alive skill that tells claude when to run that,
+                               for ~/.claude/skills/keepalive/SKILL.md
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status
@@ -399,9 +425,14 @@ fn cmd_list() -> std::io::Result<()> {
         let sess = sessions.iter().find(|s| s.name == r.slot);
         let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
         let marks = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             if r.needs_you { "!" } else { "" },
             if r.unread() { "*" } else { "" },
+            if r.keep_until_ms.is_some_and(|until| until > now) {
+                "k"
+            } else {
+                ""
+            },
             // Attached is only meaningful for a session we know to be alive.
             if alive && sess.is_some_and(|s| s.attached) {
                 "@"
@@ -527,10 +558,11 @@ fn cmd_doctor() -> std::io::Result<()> {
         );
         say!("  session   : {}", or_none(rec.session_id.clone()));
         say!(
-            "  flags     : busy={} needs_you={} unread={}",
+            "  flags     : busy={} needs_you={} unread={} kept alive until={}",
             rec.busy,
             rec.needs_you,
-            rec.unread()
+            rec.unread(),
+            or_none(rec.keep_until_ms.map(|t| t.to_string()))
         );
         if rec.last_event_ms.is_empty() {
             say!("  events    : none seen — the hooks are not installed, or not firing");

@@ -3,7 +3,9 @@
 //!
 //! **It acts on measured activity alone** (`activity.rs`): a detached slot whose processes
 //! have moved no bytes and used no CPU worth counting for [`QUIET_FOR_MS`] is stopped, whatever
-//! Claude Code's hooks last said. Anything this pass cannot see — a slot not yet measured, a record with no pid, an attachment zmx did not
+//! Claude Code's hooks last said. Work that waits without doing either — a sleep before a
+//! check, a long network call — is held by `claude-sessions keepalive`. Anything this pass
+//! cannot see — a slot not yet measured, a record with no pid, an attachment zmx did not
 //! report — keeps the slot.
 //!
 //! **The decision and the kill happen under one hold of the slot's lock.** The record is
@@ -71,6 +73,7 @@ pub enum Hold {
     NoPid,
     Gone,
     NotResumable,
+    KeptAlive { left_ms: Millis },
     Attached,
     NoSession,
     Unmeasured,
@@ -87,6 +90,9 @@ impl fmt::Display for Hold {
                 f,
                 "no conversation id or directory recorded, so it could not be brought back"
             ),
+            Hold::KeptAlive { left_ms } => {
+                write!(f, "kept alive for {}m more", left_ms.div_ceil(60_000))
+            }
             Hold::Attached => write!(f, "attached"),
             Hold::NoSession => write!(
                 f,
@@ -134,8 +140,8 @@ pub fn judge(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Verdict, Hold
 
 /// The rule, pure: may this slot be stopped now? `Ok` carries how long it has been quiet.
 ///
-/// Stoppable when: live · its process alive · resumable · detached · measured quiet for
-/// [`QUIET_FOR_MS`].
+/// Stoppable when: live · its process alive · resumable · not kept alive · detached ·
+/// measured quiet for [`QUIET_FOR_MS`].
 pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold> {
     // `Offloading` is a pass that died between deciding and finishing. Deciding again is
     // right: if the slot is still quiet the job is finished, and if a SessionStart has since
@@ -152,6 +158,11 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     // Stopping a slot that could not be resumed would be closing it with extra steps.
     if rec.session_id.is_none() || rec.cwd.is_none() {
         return Err(Hold::NotResumable);
+    }
+    if let Some(until) = rec.keep_until_ms.filter(|&until| until > now) {
+        return Err(Hold::KeptAlive {
+            left_ms: until - now,
+        });
     }
     match seen.attached {
         Some(true) => return Err(Hold::Attached),
@@ -341,8 +352,8 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             }
             Err(e) => return Err(e),
         };
-        // Re-read under the lock: the copy listed above may be stale by now — a resume. The
-        // process tree is read again for the stop.
+        // Re-read under the lock: the copy listed above may be stale by now — a keepalive, or a
+        // resume. The process tree is read again for the stop.
         let Some(mut rec) = registry::load(&slot)? else {
             continue;
         };
@@ -677,6 +688,20 @@ mod tests {
         rec.needs_you = true;
         rec.last_activity_ms = NOW;
         assert_eq!(decide(&rec, NOW, &seen), Ok(QUIET_FOR_MS + 1));
+    }
+
+    #[test]
+    fn a_keepalive_holds_it_until_its_time() {
+        let (mut rec, seen) = idle();
+        rec.keep_until_ms = Some(NOW + 90_000);
+        assert_eq!(
+            decide(&rec, NOW, &seen),
+            Err(Hold::KeptAlive { left_ms: 90_000 })
+        );
+        assert!(
+            decide(&rec, NOW + 90_000, &seen).is_ok(),
+            "and not a moment past it"
+        );
     }
 
     #[test]

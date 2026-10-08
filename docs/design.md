@@ -44,7 +44,7 @@ The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
 `session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
-`needs_you`
+`needs_you` · `keep_until` (set by `claude-sessions keepalive`)
 
 **States:** `attached` / `detached` — read from `zmx list`, never stored — plus `offloaded` and
 `closed`. **Unread is derived, not stored:** a `Stop` later than `last_attach` means the
@@ -206,10 +206,17 @@ Two details that cost something if missed, read from the vendor hook documentati
 
 ## The offloader
 
-**Offloadable when: detached · measured quiet for 10 minutes** (§ *Activity,
+**Offloadable when: detached · not kept alive · measured quiet for 10 minutes** (§ *Activity,
 measured*). Nothing the hooks say enters it: a slot is stopped when its processes have moved
 no bytes and used no CPU worth counting for ten minutes, whatever its last `Stop`, its
 `needs_you` or its claude's own timers say. The hooks feed the menu, not the offloader.
+
+**What that cannot see is held by asking** (owner, 2026-10-08). Work that waits without
+reading, writing or computing — a `sleep` before a check, a long build's quiet link, a server
+waiting for a request, a `/loop` wake-up or a cron claude set itself — reads as quiet. Claude
+runs `claude-sessions keepalive <duration>` before such a wait (the keep-alive skill says
+when), and the offloader leaves the slot alone until then. The duration is mandatory and
+capped, so a forgotten keep-alive ends by itself.
 
 **Still the menu's: an Esc fires no hook at all, and the transcript says so instead.** Seen
 on 2.1.291 under a pty with every hook logging (2026-10-06): Esc mid-reply and Esc mid-tool
@@ -275,7 +282,7 @@ Where the rules above left a choice, this is the choice and why:
   leaves it `offloading`.
 - **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
   offload, from the measurements the last pass stored; accepted, the stop is `judge`'s again
-  under the lock, so a transcript that went in between makes it a close.
+  under the lock, so a keep-alive or a transcript that went in between is respected.
 - **Not being able to look keeps it.** A zmx that does not answer for the slot (attached
   cannot be ruled out), a slot not yet measured, a record with no pid — each is a reason to
   keep.
@@ -311,7 +318,7 @@ filters, which agents announce themselves, its timer tools. Eleven review rounds
 What a slot's processes *do* means the same on every Claude Code version and every machine,
 so that is the whole rule now (owner, 2026-10-08): **a window is active when its bytes exceed
 a minute's worth at the slot's line, or its CPU a minute's worth at 50 ms/s**, and a slot
-quiet for ten minutes and detached is offloaded. `src/activity.rs` and
+quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.rs` and
 `src/sockdiag.rs` have the details and the tests.
 
 - **Bytes through `read`/`write`, which is not all of the network.** `rchar + wchar` in
@@ -435,7 +442,7 @@ quiet for ten minutes and detached is offloaded. `src/activity.rs` and
   offload — is active and teaches nothing, since its rate never happened. A name closed and
   reused inherits it, which mostly carries the container's idle noise across. A pass that
   cannot save it leaves the last saved state in place: counters are cumulative, so the next
-  window from it holds every byte, and floors survive a full disk.- **What it cannot see**: a slot waiting without
+  window from it holds every byte, and floors survive a full disk.- **What it cannot see**, and `claude-sessions keepalive` is for: a slot waiting without
   reading, writing or computing. **Claude's own timers** — a `ScheduleWakeup`, a `/loop`, a
   cron it set itself — are the common case: the native build blocks in `epoll_pwait2` and
   holds no timerfd (checked 2026-10-07), so its next deadline is in its own memory alone. So
@@ -446,7 +453,7 @@ quiet for ten minutes and detached is offloaded. `src/activity.rs` and
   `setproctitle` users) is in no slot once it has left claude's tree, nor is anything it
   forks; and a job that double-forked away and ran wholly between two passes, reaped by init,
   is in nobody's counters. Each of these is quiet to the measurement and offloaded after ten
-  minutes.
+  minutes unless claude asked for longer.
 
 ## The status line
 
@@ -765,6 +772,15 @@ that hold it to the state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
 then every `managed-settings.d/*.json` alphabetically, and `infra` can own one file for this
 tool without editing a shared one.
+
+**The keep-alive skill goes beside it.** `claude-sessions skill` prints
+`skills/keepalive/SKILL.md`, which tells claude when to run `claude-sessions keepalive` and
+for how short a time (§ *The offloader*). An image installs it from the binary alone:
+
+```
+mkdir -p ~/.claude/skills/keepalive
+claude-sessions skill > ~/.claude/skills/keepalive/SKILL.md
+```
 
 **The question was whether that file makes Claude Code stop and ask.** The binary carries a
 consent dialog — *"Managed settings require approval"*, *"unchanged since your last

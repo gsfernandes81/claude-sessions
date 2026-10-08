@@ -482,6 +482,58 @@ fn a_slot_doing_work_is_kept_and_an_idle_child_holds_nothing() {
     assert!(out.contains("claude-1: offloaded"), "got: {out}");
 }
 
+fn keepalive(root: &Path, slot: Option<&str>, asked: &str) -> (bool, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.env_remove("ZMX_SESSION")
+        .env_remove("CLAUDE_SESSIONS_SLOT")
+        .args(["keepalive", asked])
+        .env("CLAUDE_SESSIONS_DIR", root.join("registry"));
+    if let Some(slot) = slot {
+        cmd.env("CLAUDE_SESSIONS_SLOT", slot);
+    }
+    let out = cmd.output().expect("keepalive runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr),
+    )
+}
+
+/// A quiet slot that asked to be kept alive is kept until it asks no more. Calibration: the
+/// same slot is offloaded before the keep-alive and after it ends.
+#[test]
+fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
+    let s = idle_slot("keepalive", 0o600, false);
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(
+        ok && out.contains("claude-1: would offload"),
+        "calibration: {out}"
+    );
+
+    let (ok, out) = keepalive(&s.root, Some("claude-1"), "25m");
+    assert!(ok, "{out}");
+    assert!(out.contains("claude-1: kept alive for 25m"), "{out}");
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("claude-1: kept — kept alive for 25m more"),
+        "{out}"
+    );
+    assert!(alive(s.claude, s.claude_start));
+
+    let (ok, out) = keepalive(&s.root, Some("claude-1"), "0");
+    assert!(ok && out.contains("keep-alive ended"), "{out}");
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(ok && out.contains("claude-1: would offload"), "{out}");
+
+    let (ok, out) = keepalive(&s.root, None, "25m");
+    assert!(
+        !ok && out.contains("not inside a claude-sessions slot"),
+        "{out}"
+    );
+    let (ok, out) = keepalive(&s.root, Some("claude-1"), "13h");
+    assert!(!ok && out.contains("longer than the 12h"), "{out}");
+}
+
 /// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.
 fn hold_lock(path: &Path, secs: f64) -> Child {
     let child = Command::new("flock")
