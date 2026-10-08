@@ -15,6 +15,7 @@
 //! named like the fixture's slot, the activity measurement would count them as its members.
 
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,21 +31,13 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        // Only the claude this slot recorded: once it has gone, its pid, and any child of that
-        // pid, may be another test's process or anything on the machine running the tests.
-        // From the leaf up, so nothing under claude is orphaned to outlive the test.
-        if alive(self.claude, self.claude_start) {
-            let mut tree = chain_under(self.claude);
-            tree.insert(0, self.claude);
-            for pid in tree.iter().rev() {
-                let _ = Command::new("kill")
-                    .env_remove("ZMX_SESSION")
-                    .args(["-9", &pid.to_string()])
-                    .stderr(Stdio::null())
-                    .status();
-            }
-        }
-        let _ = self.server.kill();
+        // Everything the fixture started is in the server's process group, orphans included;
+        // the server is not waited for until here, so its pid — the group's id — is still ours.
+        let _ = Command::new("kill")
+            .env_remove("ZMX_SESSION")
+            .args(["-9", "--", &format!("-{}", self.server.id())])
+            .stderr(Stdio::null())
+            .status();
         let _ = self.server.wait();
         let _ = std::fs::remove_dir_all(&self.root);
     }
@@ -66,17 +59,6 @@ fn stat_fields(pid: u32) -> Option<Vec<String>> {
 /// Alive and not a zombie, with this start time.
 fn alive(pid: u32, start: u64) -> bool {
     stat_fields(pid).is_some_and(|f| f[0] != "Z" && f[19].parse::<u64>().ok() == Some(start))
-}
-
-/// The chain of processes under `pid`, nearest first.
-fn chain_under(pid: u32) -> Vec<u32> {
-    let mut chain = Vec::new();
-    let mut at = pid;
-    while let Some(child) = child_of(at) {
-        chain.push(child);
-        at = child;
-    }
-    chain
 }
 
 fn child_of(ppid: u32) -> Option<u32> {
@@ -148,7 +130,7 @@ done
         Load::Busy => "-c 'while :; do read l < /etc/services; done'",
     };
 
-    let mut server = Command::new(root.join("bin/zmx"))
+    let server = Command::new(root.join("bin/zmx"))
         .env_remove("ZMX_SESSION")
         .arg("-c")
         .arg(format!(
@@ -159,33 +141,34 @@ done
         // The shell reports its child's signal ("Terminated", "Killed"), which is the test
         // working, not failing; it would only be noise in the CI log.
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .expect("spawn the stand-in server");
+    // From here a panic drops the slot, which kills everything it started.
+    let mut s = Slot {
+        root,
+        server,
+        claude: 0,
+        claude_start: 0,
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     let claude = loop {
-        if let Some(pid) = child_of(server.id()) {
+        if let Some(pid) = child_of(s.server.id()) {
             if std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default()
                 == "claude\n"
             {
                 break pid;
             }
         }
-        if Instant::now() >= deadline {
-            let _ = server.kill();
-            let _ = server.wait();
-            panic!("the stand-in claude never started");
-        }
+        assert!(
+            Instant::now() < deadline,
+            "the stand-in claude never started"
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
-    let claude_start: u64 = stat_fields(claude).unwrap()[19].parse().unwrap();
-    // From here a panic drops the slot, which kills everything it started.
-    let s = Slot {
-        root,
-        server,
-        claude,
-        claude_start,
-    };
-    let root = &s.root;
+    s.claude = claude;
+    s.claude_start = stat_fields(claude).unwrap()[19].parse().unwrap();
+    let (claude_start, root) = (s.claude_start, s.root.clone());
     // The sleep under claude forks after claude does; wait for it, so a pass measures it.
     while load == Load::Child && child_of(claude).is_none() {
         assert!(Instant::now() < deadline, "the child never started");
@@ -506,18 +489,9 @@ fn a_slot_doing_work_is_kept_and_an_idle_child_holds_nothing() {
     assert_eq!(state_of(&s.root), "live");
 
     let s = slot("idle-child", Load::Child, false, true);
-    let child: Vec<(u32, u64)> = chain_under(s.claude)
-        .into_iter()
-        .map(|pid| (pid, stat_fields(pid).unwrap()[19].parse().unwrap()))
-        .collect();
+    // The stand-in has no terminal to hang up, so its child outlives the offload here; zmx's
+    // teardown ends it on a real slot, and the fixture's drop here.
     let (ok, out) = offload(&s.root, &[]);
-    // The stand-in has no terminal to hang up, so its child outlives it here; zmx's teardown
-    // ends it on a real slot.
-    for &(pid, start) in &child {
-        if alive(pid, start) {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
-    }
     assert!(ok, "offload failed: {out}");
     assert!(out.contains("claude-1: offloaded"), "got: {out}");
 }

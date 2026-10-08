@@ -1230,7 +1230,7 @@ mod tests {
     #[test]
     fn cpu_over_its_line_is_active_without_a_byte() {
         // Three minutes of computing that writes nothing: 6 s of CPU, 33 ms/s on average but
-        // more than a minute's worth at the 50 ms/s line. Calibration: an idle claude's 6 ms/s.
+        // more than a minute's worth at the 50 ms/s line. Calibration: 6 ms/s, the quiet end of idle.
         let s = quiet_pair(vec![]);
         let cpu = |ticks| Reading {
             cpu: ticks,
