@@ -147,7 +147,6 @@ done
         Load::Child => "-c 'sleep 600; :'",
         Load::Busy => "-c 'while :; do read l < /etc/services; done'",
     };
-    let depth = usize::from(load == Load::Child);
 
     let server = Command::new(root.join("bin/zmx"))
         .env_remove("ZMX_SESSION")
@@ -178,15 +177,24 @@ done
         std::thread::sleep(Duration::from_millis(10));
     };
     let claude_start: u64 = stat_fields(claude).unwrap()[19].parse().unwrap();
-    // The work under claude forks after claude does. A test that read `/proc` before it was
-    // all there would see a shorter chain — and a pass that saw claude → sh alone would print
-    // what a rule stopping at claude's direct children also prints.
-    while chain_under(claude).len() < depth {
-        assert!(
-            Instant::now() < deadline,
-            "the chain under the stand-in claude never reached depth {depth}: {:?}",
-            chain_under(claude)
-        );
+    // The sleep under claude forks after claude does; wait for it, so a pass measures it.
+    while load == Load::Child && child_of(claude).is_none() {
+        assert!(Instant::now() < deadline, "the child never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Busy is a megabyte read before the pass looks, far past any slot's budget, however
+    // slowly a loaded runner schedules the loop.
+    let read = || {
+        std::fs::read_to_string(format!("/proc/{claude}/io"))
+            .ok()
+            .and_then(|io| {
+                io.lines()
+                    .find_map(|l| l.strip_prefix("rchar: ")?.parse::<u64>().ok())
+            })
+            .unwrap_or(0)
+    };
+    while load == Load::Busy && read() < 1_000_000 {
+        assert!(Instant::now() < deadline, "the busy loop never got going");
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -565,6 +573,42 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
     );
     let (ok, out) = keepalive(&s.root, Some("claude-1"), "13h");
     assert!(!ok && out.contains("longer than the 12h"), "{out}");
+}
+
+/// A session somebody attached by hand has no `CLAUDE_SESSIONS_SLOT`: a keep-alive asked from
+/// inside it finds the slot as the hook does, by `ZMX_SESSION` under a zmx daemon.
+/// Calibration: the same variable with no zmx above it is no slot.
+#[test]
+fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
+    let s = idle_slot("keepalive-by-hand", false);
+    let ask = |via_zmx: bool| {
+        let line = format!("{BIN} keepalive 25m; :");
+        let mut cmd = if via_zmx {
+            let mut c = Command::new(s.root.join("bin/zmx"));
+            c.args(["-c", &line]);
+            c
+        } else {
+            let mut c = Command::new(BIN);
+            c.args(["keepalive", "25m"]);
+            c
+        };
+        let out = cmd
+            .env_remove("CLAUDE_SESSIONS_SLOT")
+            .env("ZMX_SESSION", "claude-1")
+            .env("CLAUDE_SESSIONS_DIR", s.root.join("registry"))
+            .output()
+            .expect("keepalive runs");
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
+    };
+    let out = ask(false);
+    assert!(out.contains("not inside a claude-sessions slot"), "{out}");
+    let out = ask(true);
+    assert!(out.contains("claude-1: kept alive for 25m"), "{out}");
+    let (ok, out) = offload(&s.root, &["--dry-run"]);
+    assert!(
+        ok && out.contains("claude-1: kept — kept alive for 25m more"),
+        "{out}"
+    );
 }
 
 /// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.

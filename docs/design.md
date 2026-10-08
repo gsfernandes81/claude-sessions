@@ -146,7 +146,7 @@ terminal.
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared; `compact` changes neither. A **different** process drops the slot's keep-alive: it was the waiting process's |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | activity, idle since it fired |
-| `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` |
+| `Notification`, type `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` | `needs_you` |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would put every unanswered session under Needs you |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
@@ -268,9 +268,8 @@ only logs what it would kill.
 
 ### How `claude-sessions offload` reads those rules
 
-Built 2026-10-01 in `src/offload.rs`, reduced to the measurement on 2026-10-08. One pass per
-invocation, run from the box's timer; `--dry-run` decides and reports without signalling.
-Where the rules above left a choice, this is the choice and why:
+`src/offload.rs`. One pass per invocation, run from the box's timer; `--dry-run` decides and
+reports without signalling. Where the rules above left a choice, this is the choice and why:
 
 - **Measured first, and only on what was measured.** Every pass measures every running
   (`live` or `offloading`) slot (`activity::pass`) before it decides anything, and decides on
@@ -325,12 +324,10 @@ Where the rules above left a choice, this is the choice and why:
 
 ## Activity, measured (what the offloader acts on)
 
-**Why.** Every rule the offloader once had read Claude Code: hook payloads, its task list's
-filters, which agents announce themselves, its timer tools. Eleven review rounds of the
-`session_crons` work kept finding corners of that reading (the branch
-`session-crons-0.4.7-wip` keeps it), and a self-update can move any of them without a word.
-What a slot's processes *do* means the same on every Claude Code version and every machine,
-so that is the whole rule now (owner, 2026-10-08): **a window is active when its bytes exceed
+**Why.** Rules that read Claude Code — its hook payloads, its task lists, its timer tools —
+keep growing corners, and a self-update can move any of them without a word. What a slot's
+processes *do* means the same on every Claude Code version and every machine, so that is the
+whole rule (owner, 2026-10-08): **a window is active when its bytes exceed
 a minute's worth at the slot's line, or its CPU a minute's worth at 50 ms/s**, and a slot
 quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.rs` and
 `src/sockdiag.rs` have the details and the tests.
@@ -454,7 +451,7 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
   name** for as long as it has a record, and is carried as it was unless a reading replaces
   it — an offloaded slot, a crashed one with nothing left to read, a pass too soon after the
   last — so a resume under the same name does not relearn its floor from busy windows. A reading dated
-  after the pass (a clock stepped back, or a pass that stored while this one waited on zmx)
+  after the pass (a clock stepped back, or a pass that stored while this one was reading)
   starts over but keeps the floor. **Only a window known whole teaches the floor**: one as
   long as the quiet period, or one a member left — the first after a resume spans the whole
   offload — is active and teaches nothing, since its rate never happened. A name closed and
@@ -489,9 +486,9 @@ menu's amber stays reserved for *waiting for you*.
 `hooks-config` installs it as `statusLine` in the same drop-in as the hooks, with
 `refreshInterval: 60` — RAM and load move without any Claude Code event, and otherwise it
 would re-run only on one; Claude Code redraws only when the text changes. Each run is a
-child of claude for a few milliseconds, so an offload pass whose snapshot catches one counts
-it as work under the slot and keeps the slot for that pass: the safe direction, one pass late. A managed setting
-outranks a user's own, so it replaces any status line set per user. It reads a few small
+child of claude for a few milliseconds; a pass never counts it (no `claude-sessions` is a
+slot's process), though a shell wrapping it may be, which errs towards keeping. A managed
+setting outranks a user's own, so it replaces any status line set per user. It reads a few small
 files and nothing else. The session JSON Claude Code writes on its stdin is drained, but for
 at most a moment's quiet, so a pipe whose writer stays open cannot hold it.
 

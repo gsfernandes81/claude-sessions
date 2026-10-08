@@ -2,8 +2,8 @@
 //! doing between logins.
 //!
 //! **It is written by `claude-sessions hook` and nobody else.** Every other subcommand reads
-//! it, or changes a field the hooks cannot know about — `last_attach_ms`, and the
-//! `offloading` state. That split is what keeps "what happened" and "what we did about it"
+//! it, or changes a field the hooks cannot know about — `last_attach_ms`, `keep_until_ms`
+//! (`claude-sessions keepalive`), and the `offloading` state. That split is what keeps "what happened" and "what we did about it"
 //! from racing.
 //!
 //! **Attached is not stored.** Whether a client is on a slot right now is a fact zmx
@@ -286,10 +286,10 @@ impl SlotRecord {
             .unwrap_or_else(|| "(no title yet)".into())
     }
 
-    /// How much longer a keep-alive holds this slot, if one does.
+    /// How much longer a keep-alive holds this slot, if one does: only while it runs.
     pub fn kept_for(&self, now: Millis) -> Option<Millis> {
         self.keep_until_ms
-            .filter(|&until| until > now)
+            .filter(|&until| until > now && self.state.is_running())
             .map(|until| until - now)
     }
 

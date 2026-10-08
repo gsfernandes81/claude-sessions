@@ -185,8 +185,9 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill        the keep-alive skill that tells claude when to run that, for
-                               skills/keepalive/SKILL.md in Claude Code's config directory
+  claude-sessions skill        print the keep-alive skill that tells claude when to run that,
+                               to be saved as skills/keepalive/SKILL.md in Claude Code's
+                               config directory
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status
@@ -244,8 +245,8 @@ fn cmd_hook() -> std::io::Result<()> {
     let ev = match events::Event::parse(&body) {
         Ok(ev) => ev,
         Err(e) => {
-            // A payload shape this version does not know degrades to no evidence, which is
-            // safe: the offloader's rule is that it needs evidence to act, not to hold off.
+            // A payload shape this version does not know changes nothing: the menu shows what
+            // it last knew, and the offloader reads no hooks.
             log(&format!(
                 "unparseable payload ({e}): {}",
                 body.chars().take(200).collect::<String>()

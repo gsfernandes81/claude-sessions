@@ -408,8 +408,8 @@ pub fn pass(
             Err(unreadable) => {
                 let (line, state) = unknown(&rec.slot, unreadable, stored, now);
                 lines.push(line);
+                // Stored for the menu, but not a reading this pass took: the pass keeps the slot.
                 if let Some(state) = state {
-                    read_now.insert(rec.slot.clone(), state.clone());
                     next.insert(rec.slot.clone(), state);
                 }
                 continue;

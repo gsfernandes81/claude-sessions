@@ -9,7 +9,7 @@
 //! an attachment zmx did not report — keeps the slot.
 //!
 //! **The decision and the kill happen under one hold of the slot's lock.** The record is
-//! re-read after the lock is taken, the decision is made from that copy, the slot is marked
+//! re-read after the lock is taken, the decision is made from that copy, an offload is marked
 //! `offloading` before the first signal and `offloaded` after the last, and only then is the
 //! lock let go. That is what stops the menu resuming a slot between "idle" and "dead", and
 //! what makes the `SessionEnd` the kill provokes read as an offload rather than an `/exit`.
@@ -144,8 +144,8 @@ pub fn judge(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Verdict, Hold
 /// Stoppable when: live · its process alive · resumable · not kept alive · detached ·
 /// measured quiet for [`QUIET_FOR_MS`].
 pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold> {
-    // `Offloading` is a pass that died between deciding and finishing. Deciding again is
-    // right: if the slot is still quiet the job is finished, and if a SessionStart has since
+    // `Offloading` is a stop that failed or a pass that died before finishing. Deciding again
+    // is right: if the slot is still quiet the job is finished, and if a SessionStart has since
     // made it live, it is no longer `Offloading`.
     if !rec.state.is_running() {
         return Err(Hold::NotLive(rec.state));
@@ -736,6 +736,11 @@ mod tests {
         assert_eq!(quiet(&m, CLAUDE), Some(QUIET_FOR_MS), "calibration");
         assert_eq!(quiet(&m, (200, 8)), None, "the claude before a resume");
         assert_eq!(quiet(&m, (100, 8)), None, "its pid, reused");
+        assert_eq!(
+            quiet(&m, (200, 7)),
+            None,
+            "another process in the same tick"
+        );
         let stale = reading(NOW - FRESH_MS - 1, NOW - 3 * QUIET_FOR_MS);
         assert_eq!(quiet(&stale, CLAUDE), None, "a pass that could not measure");
         let future = reading(NOW + 1, NOW - QUIET_FOR_MS);

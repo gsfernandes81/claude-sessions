@@ -6,8 +6,8 @@ description: Use in a claude-sessions slot before you start or wait on something
 # Keeping a quiet wait alive
 
 This session runs in a claude-sessions slot. When nobody is attached, the offloader stops a
-slot whose processes have used little CPU and moved only a trickle of data — a few KB a
-minute — for **10 minutes**, and the owner resumes it later. It cannot tell a wait from an
+slot whose processes have used little CPU and moved only a trickle of data — up to tens of
+KB a minute — for **10 minutes**, and the owner resumes it later. It cannot tell a wait from an
 idle session: a `sleep 900 && gh run view`, a remote build you poll later, your own
 `ScheduleWakeup`, a dev server waiting for a request, or a loop printing a line a minute all
 look idle, and the work dies with the session.
