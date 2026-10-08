@@ -264,7 +264,8 @@ only, and was **armed on 2026-10-03** on the owner's word — and on a fact that
 session that started it (it keeps background sessions running after the terminal closes), so
 on a box with agent view on the sweep's rule would pick out working supervisors; with it off
 there is no legitimate one, and a transient daemon left behind is a leak. `--dry-run` still
-only logs what it would kill.
+only logs what it would kill. It stayed when the offloader was reduced to the measurement
+(owner, 2026-10-08): it stops no slot, only daemons no slot owns.
 
 ### How `claude-sessions offload` reads those rules
 

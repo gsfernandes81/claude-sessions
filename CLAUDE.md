@@ -5,9 +5,12 @@ The fleet's configuration lives in a separate private `infra` repo, which consum
 as a **pinned, checksummed GitHub release** — never as a git dependency and never built in
 place.
 
-**Nothing here has ever run on a box.** There are no users, no installed copies and no
-compatibility to preserve. Say so rather than inventing caution about breaking things that do
-not exist yet.
+**It runs on the fleet.** `infra` pins a release into the base of its dev containers on
+`zero`, which run the menu, the hook and an offload pass every 3 minutes (since base
+2026.10.06). A release reaches them at infra's next pin bump, so a change to what the registry
+or `activity.state` holds must still read what the last release wrote — and read it the safe
+way: what it cannot read is unknown, and unknown keeps a slot. Beyond that there is one user,
+the owner; say so rather than inventing caution.
 
 ## What it is, in one paragraph
 

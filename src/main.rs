@@ -613,6 +613,10 @@ mod tests {
         assert!(said.borrow().is_empty(), "calibration: nothing to say");
         contained(|| Err(std::io::Error::other("no registry")), log);
         assert_eq!(*said.borrow(), ["hook: no registry"]);
-        contained(|| panic!("a registry bug"), log);
+        // Unwound without the panic hook, which would put another test's terminal back.
+        contained(
+            || std::panic::resume_unwind(Box::new("a registry bug")),
+            log,
+        );
     }
 }
