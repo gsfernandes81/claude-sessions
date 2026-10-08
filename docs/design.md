@@ -44,7 +44,7 @@ The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
 `session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
-`needs_you` · `timers` (each with its due time, and whether it recurs)
+`needs_you` · `timers` (each with its due time, whether it recurs, and whether it is durable)
 
 **States:** `attached` / `detached` — read from `zmx list`, never stored — plus `offloaded` and
 `closed`. **Unread is derived, not stored:** a `Stop` later than `last_attach` means the
@@ -147,12 +147,12 @@ terminal.
 |---|---|
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared, `ready_ms` = when it fired; `compact` changes none of those |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
-| `Stop` | activity, idle since it fired; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9) |
+| `Stop` | activity, idle since it fired; **`background` = the payload's `background_tasks`**, replacing what was there (issue #9); **the session's timers = its `session_crons`**, durable crons kept (#13) |
 | `SubagentStart` | `subagent: <agent_type>` joins `background` unless listed (issue #10); **not** activity |
-| `SubagentStop` | **`background` = the payload's `background_tasks`**, as on `Stop`, but one with no list is no news, not an empty list (#12); **not** activity |
+| `SubagentStop` | **`background` = the payload's `background_tasks`** and **the session's timers = its `session_crons`**, as on `Stop`, but a list that is missing or unreadable is no news, not an empty list (#12); **not** activity |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `agent_needs_input` | `needs_you` — never offloaded while set |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would make every detached session permanent |
-| `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time |
+| `PostToolUse` on `ScheduleWakeup` / `CronCreate` / `CronDelete` | add or remove a timer, with its due time; a cron is durable when the call's response says so, and a delete with no readable id does nothing |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
 
@@ -174,7 +174,7 @@ event fired, however long the hook then takes to arrive — seen on 2.1.292, the
 in event order. Events are ordered by that tick, which is exact, so events fired in one tick
 tie; the times the record shows or compares with file times are its wall-clock reading
 (`clock::Moment`). For each field two events can race on — the conversation, live or closed,
-`busy`, `needs_you`, `background`, the wake-up — the record keeps the tick of the event that
+`busy`, `needs_you`, `background`, the session's timers — the record keeps the tick of the event that
 last wrote it (`written`), and only an event of the same tick or later writes it again;
 activity only moves forward, and `first_prompt` is the earliest prompt fired. A tie on the
 conversation goes to the one on record, whose start was synchronous; and since claude forks the
@@ -188,8 +188,8 @@ claude whose slot name is being reused, can write it; stamps from another boot, 
 kernel's boot id, are forgotten when a hook next loads the record. A late event of the
 conversation before the current one (a `Stop` of the one `/clear` left) is dropped, and a newer
 one from a conversation the record has not heard start adopts it, as the lost `SessionStart`
-would have. A cron deleted before its create lands is remembered, so the late create is not
-taken. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id` cannot do
+would have. A deleted cron is remembered with its delete's tick, so neither a late create nor
+an older list brings it back. Only a hook that cannot read `/proc` is stamped when it lands. `prompt_id` cannot do
 this: a prompt typed mid-turn fires its `UserPromptSubmit` under the running turn's id, and the
 turn it later starts fires none.
 
@@ -200,7 +200,9 @@ in landing order; a hook whose `sh` forked rather than exec'd it, and whose clau
 stamped from its own start, a stall after the fork; a nested `claude -p` under a tool call
 kills its last async hooks when it exits; and a `SessionEnd`, which waits only 400 ms for the
 slot's lock, gives up behind an async hook stalled while holding it, so the record stays live
-with a dead process, which the menu shows as offloaded and `reconcile` settles.
+with a dead process, which the menu shows as offloaded and `reconcile` settles. One is never
+corrected: a durable one-shot cron that has fired is held for the slot's life, since Claude
+Code removes it from its file without a hook and no list names it.
 
 Three details that cost something if missed, read from the vendor hook documentation on
 2026-10-01:
@@ -649,14 +651,19 @@ been read. `src/activity.rs` and `src/sockdiag.rs` have the details and the test
   deadline is in its own memory alone — and would be the nearest of its housekeeping
   intervals anyway. A freeze that thaws on a fixed cycle would fire an overdue timer late,
   page the process back in every cycle, and have to tell its own catch-up burst from a turn.
-  The hook-read hold stays; it comes from `PostToolUse` on the timer tools, not from `Stop`,
-  and fails the wrong way in three places: a timer tool renamed (`ScheduleWakeup`,
-  `CronCreate`, `CronDelete`, named exactly in the hook's matcher), so its hook never fires;
-  `PostToolUse`'s `tool_name`; and `CronDelete`'s `tool_input.id`, whose loss reads as a
-  delete with no target and drops every cron. infra's checks on Claude Code's binary should
-  cover the three tool names as they cover `background_tasks`. The other fields err towards
-  keeping: no `delaySeconds` is a wake-up with no due time, no `stop` leaves a wake-up until
-  it is due, and no `tool_response.id` keeps a cron no delete can match. **Then a message for claude alone** — a
+  The hook-read hold stays. Each `Stop` and `SubagentStop` lists the session's timers in
+  `session_crons`, a wake-up as a one-shot cron (2.1.292), and the record takes that list
+  as the session's timers; `PostToolUse` on the timer tools holds the slot from the call to
+  that `Stop`, and is the only source for a **durable** cron, which Claude Code keeps in the
+  project's `.claude/scheduled_tasks.json` and never lists. So what fails the wrong way is a
+  durable cron's: `CronCreate` renamed (it is named exactly in the hook's matcher) or
+  `PostToolUse`'s `tool_name` renamed, and its hook does nothing; or `durable` gone from
+  both the call's response and its input, and the next list drops it as a session cron.
+  infra's checks on Claude Code's binary should cover `session_crons`, the three tool names
+  and `durable` as they cover `background_tasks`. The rest err towards keeping: no readable
+  `session_crons` is no news, no `delaySeconds` is a wake-up with no due time, a delete with
+  no readable id leaves the crons to the next list, and no `tool_response.id` keeps a durable
+  cron no delete can match. **Then a message for claude alone** — a
   remote session's, a websocket monitor's. The kernel goes on receiving into a stopped
   process's socket, so a real freeze could see those bytes arrive and thaw on them; the
   measurement cannot, because claude is not stopped, and the bytes it receives are mostly

@@ -124,6 +124,25 @@ impl Event {
             .collect();
         Some(list)
     }
+    /// `Stop` / `SubagentStop`: the session's crons, its wake-up among them as a one-shot,
+    /// from Claude Code's in-memory store (read in the 2.1.292 binary). Durable crons live in
+    /// the project's `.claude/scheduled_tasks.json` instead and are never listed. `None` where
+    /// the field is absent or an entry has no id, which is no news, as for `background_tasks`.
+    pub fn session_crons(&self) -> Option<Vec<Timer>> {
+        self.0
+            .get("session_crons")?
+            .as_arr()?
+            .iter()
+            .map(|c| {
+                Some(Timer {
+                    id: cron_key(c.get("id")?.as_str()?),
+                    due_ms: None,
+                    recurring: c.get("recurring").and_then(Value::as_bool).unwrap_or(true),
+                    durable: false,
+                })
+            })
+            .collect()
+    }
     /// `SubagentStart`: the kind of agent it announces.
     pub fn agent_type(&self) -> Option<&str> {
         self.s("agent_type")
@@ -305,6 +324,7 @@ pub fn apply(
             if rec.written.claim(Field::Background, tick) {
                 rec.background = ev.background_tasks().unwrap_or_default();
             }
+            take_session_timers(rec, ev, tick);
             Outcome::Changed
         }
         // Agents between the parent's `Stop`s (issue #10) edit the list and are not activity:
@@ -321,20 +341,23 @@ pub fn apply(
             }
             Outcome::Changed
         }
-        // Its list is `Stop`'s and is taken whole the same way; it never names a foreground
+        // Its lists are `Stop`'s and are taken whole the same way; it never names a foreground
         // agent, so one an Esc cut off leaves at the next. A payload with no list says nothing
         // about what runs (claude-sessions#12).
-        "SubagentStop" => match ev.background_tasks() {
-            None => Outcome::Ignored("no background_tasks in the payload"),
-            Some(running) => {
-                if rec.written.claim(Field::Background, tick) {
+        "SubagentStop" => {
+            let tasks = match ev.background_tasks() {
+                None => Outcome::Ignored("no background_tasks in the payload"),
+                Some(running) if rec.written.claim(Field::Background, tick) => {
                     rec.background = running;
                     Outcome::Changed
-                } else {
-                    Outcome::Ignored("a newer list has landed")
                 }
+                Some(_) => Outcome::Ignored("a newer list has landed"),
+            };
+            match (tasks, take_session_timers(rec, ev, tick)) {
+                (Outcome::Ignored(_), Outcome::Changed) => Outcome::Changed,
+                (tasks, _) => tasks,
             }
-        },
+        }
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
                 if rec.written.claim(Field::NeedsYou, tick) {
@@ -390,13 +413,16 @@ pub const TIMER_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "CronDelete"
 /// `CronList` is not here and must not be: it reads timers, it does not create one. Nor is
 /// `TaskStop`, which stops a background task rather than a timer. A slot pinned open by a
 /// listing would never be offloadable again.
+///
+/// A session timer is also in the next `Stop`'s list, which settles it, so a write here claims
+/// `Field::Timers` against that list. A durable cron never is, and only its delete removes it.
 fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let Moment { tick, at } = fired;
     let input = ev.tool_input();
     match ev.tool_name().unwrap_or("") {
         "ScheduleWakeup" => {
-            if !rec.written.claim(Field::Wakeup, tick) {
-                return Outcome::Ignored("a newer wake-up has landed");
+            if !rec.written.claim(Field::Timers, tick) {
+                return Outcome::Ignored("a newer timer has landed");
             }
             let stop = input
                 .and_then(|v| v.get("stop"))
@@ -418,66 +444,85 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
                     id: "wakeup".into(),
                     due_ms: due,
                     recurring: false,
+                    durable: false,
                 },
             );
             Outcome::Changed
         }
         "CronCreate" => {
-            let id = ev
-                .tool_response()
+            // The response says what was made; the input is only what was asked for.
+            let response = ev.tool_response();
+            let said = |key: &str| {
+                response
+                    .and_then(|v| v.get(key))
+                    .or_else(|| input.and_then(|v| v.get(key)))
+            };
+            let id = response
                 .and_then(|v| v.get("id"))
                 .and_then(Value::as_str)
                 .or_else(|| input.and_then(|v| v.get("name")).and_then(Value::as_str))
                 .unwrap_or("cron");
-            let key = format!("cron:{id}");
-            if rec
-                .written
-                .deleted
-                .get(&key)
-                .is_some_and(|&del| del >= tick)
-            {
+            let durable = said("durable").and_then(Value::as_bool).unwrap_or(false);
+            let key = cron_key(id);
+            if deleted_since(rec, &key, tick) {
                 return Outcome::Ignored("deleted before its create landed");
+            }
+            if !durable && !rec.written.claim(Field::Timers, tick) {
+                return Outcome::Ignored("a newer timer has landed");
             }
             upsert(
                 rec,
                 Timer {
                     id: key,
                     due_ms: None,
-                    recurring: true,
+                    recurring: said("recurring").and_then(Value::as_bool).unwrap_or(true),
+                    durable,
                 },
             );
             Outcome::Changed
         }
         "CronDelete" => {
-            let id = input
+            let Some(id) = input
                 .and_then(|v| v.get("id").or_else(|| v.get("name")))
-                .and_then(Value::as_str);
-            match id {
-                Some(id) => {
-                    let key = format!("cron:{id}");
-                    let before = rec.timers.len();
-                    rec.timers.retain(|t| t.id != key);
-                    // Not created yet as far as the record knows: its create may land later.
-                    if rec.timers.len() == before {
-                        rec.written.deleted.insert(key, tick);
-                    }
-                    Outcome::Changed
-                }
-                // A delete whose target cannot be read drops every cron: the alternative is a
-                // slot pinned open forever by a timer that no longer exists.
-                None => {
-                    let before = rec.timers.len();
-                    rec.timers.retain(|t| !t.recurring);
-                    if rec.timers.len() == before {
-                        Outcome::Ignored("no such timer")
-                    } else {
-                        Outcome::Changed
-                    }
-                }
-            }
+                .and_then(Value::as_str)
+            else {
+                return Outcome::Ignored("no cron id; the next Stop lists the session's crons");
+            };
+            let key = cron_key(id);
+            rec.timers.retain(|t| t.id != key);
+            let deleted = rec.written.deleted.entry(key).or_insert(tick);
+            *deleted = (*deleted).max(tick);
+            Outcome::Changed
         }
         _ => Outcome::Ignored("tool does not set a timer"),
     }
+}
+
+/// Takes a `Stop`'s or `SubagentStop`'s `session_crons` as the whole of the session's timers.
+/// Durable crons are not in it and stay; one deleted since the list was made stays deleted.
+fn take_session_timers(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
+    let Some(listed) = ev.session_crons() else {
+        return Outcome::Ignored("no session_crons in the payload");
+    };
+    if !rec.written.claim(Field::Timers, tick) {
+        return Outcome::Ignored("a newer timer has landed");
+    }
+    rec.timers.retain(|t| t.durable);
+    for t in listed {
+        if !deleted_since(rec, &t.id, tick) {
+            upsert(rec, t);
+        }
+    }
+    Outcome::Changed
+}
+
+fn cron_key(id: &str) -> String {
+    format!("cron:{id}")
+}
+
+/// Whether `key` was deleted at or after `tick`, so that what fired then predates the delete.
+fn deleted_since(rec: &SlotRecord, key: &str, tick: u64) -> bool {
+    rec.written.deleted.get(key).is_some_and(|&del| del >= tick)
 }
 
 /// Titles read from the conversation's transcript (`transcript.rs`), applied after the event
@@ -1321,6 +1366,128 @@ mod tests {
 
     // ── timers ───────────────────────────────────────────────────────────────
 
+    /// A `Stop` as 2.1.292 sends it with one session cron. Its wake-up, when it has one, is
+    /// listed the same way as a one-shot.
+    const STOP_WITH_CRONS: &str = r#"{"hook_event_name":"Stop","background_tasks":[],
+        "session_crons":[{"id":"s1","schedule":"*/5 * * * *","recurring":true,"prompt":"check"}]}"#;
+    const NO_CRONS: &str = r#"{"hook_event_name":"Stop","background_tasks":[],"session_crons":[]}"#;
+    const SESSION_CREATE: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate",
+        "tool_input":{"cron":"0 9 * * *","prompt":"p","durable":true},
+        "tool_response":{"id":"c1","recurring":true,"durable":false}}"#;
+    const DURABLE_CREATE: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate",
+        "tool_input":{"cron":"0 9 * * *","prompt":"p","durable":true},
+        "tool_response":{"id":"c1","recurring":true,"durable":true}}"#;
+
+    fn timer(id: &str, durable: bool) -> Timer {
+        Timer {
+            id: id.into(),
+            due_ms: None,
+            recurring: true,
+            durable,
+        }
+    }
+    fn ids(rec: &SlotRecord) -> Vec<&str> {
+        let mut ids: Vec<&str> = rec.timers.iter().map(|t| t.id.as_str()).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_stops_crons_are_the_session_timers_and_durable_ones_stay() {
+        let mut rec = slot();
+        rec.timers.push(timer("cron:gone", false));
+        rec.timers.push(timer("cron:kept", true));
+        own(
+            &mut rec,
+            &ev(
+                r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":60}}"#,
+            ),
+            2_000,
+        );
+        own(&mut rec, &ev(STOP_WITH_CRONS), 3_000);
+        assert_eq!(ids(&rec), ["cron:kept", "cron:s1"]);
+    }
+
+    #[test]
+    fn a_stop_or_subagentstop_without_a_readable_list_is_no_news() {
+        let no_id =
+            r#"{"hook_event_name":"Stop","session_crons":[{"id":"s1"},{"recurring":true}]}"#;
+        let agent = r#"{"hook_event_name":"SubagentStop","agent_type":"Explore"}"#;
+        for body in [STOP, no_id, agent] {
+            let mut rec = slot();
+            rec.timers.push(timer("cron:a", false));
+            own(&mut rec, &ev(body), 2_000);
+            assert_eq!(ids(&rec), ["cron:a"], "{body}");
+        }
+    }
+
+    #[test]
+    fn a_subagentstop_with_a_list_settles_the_timers_too() {
+        let mut rec = slot();
+        rec.timers.push(timer("cron:a", false));
+        let out = own(
+            &mut rec,
+            &ev(r#"{"hook_event_name":"SubagentStop","session_crons":[]}"#),
+            2_000,
+        );
+        assert_eq!(out, Outcome::Changed);
+        assert!(rec.timers.is_empty());
+    }
+
+    #[test]
+    fn a_one_shot_that_has_fired_is_gone_from_the_next_list() {
+        let one_shot = r#"{"hook_event_name":"Stop",
+            "session_crons":[{"id":"w1","schedule":"30 14 8 10 *","recurring":false,"prompt":"go"}]}"#;
+        let mut rec = slot();
+        own(&mut rec, &ev(one_shot), 2_000);
+        assert!(
+            rec.has_pending_timer(u64::MAX),
+            "calibration: listed, unfired"
+        );
+        own(&mut rec, &ev(NO_CRONS), 3_000);
+        assert!(!rec.has_pending_timer(0));
+    }
+
+    #[test]
+    fn a_session_cron_is_settled_by_the_newer_of_its_create_and_a_list() {
+        let mut rec = slot();
+        land(&mut rec, &[(SESSION_CREATE, 2_000), (NO_CRONS, 3_000)]);
+        assert!(
+            rec.timers.is_empty(),
+            "a later list without it has seen it go"
+        );
+        let mut rec = slot();
+        land(&mut rec, &[(NO_CRONS, 2_000), (SESSION_CREATE, 3_000)]);
+        assert_eq!(ids(&rec), ["cron:c1"], "calibration: in order");
+        let mut rec = slot();
+        land(&mut rec, &[(SESSION_CREATE, 3_000), (NO_CRONS, 2_000)]);
+        assert_eq!(ids(&rec), ["cron:c1"], "an older list predates it");
+    }
+
+    #[test]
+    fn a_durable_cron_is_never_settled_by_a_list() {
+        let mut rec = slot();
+        land(&mut rec, &[(NO_CRONS, 3_000), (DURABLE_CREATE, 2_000)]);
+        assert_eq!(ids(&rec), ["cron:c1"]);
+        assert!(rec.timers[0].durable);
+        land(&mut rec, &[(NO_CRONS, 4_000)]);
+        assert_eq!(ids(&rec), ["cron:c1"]);
+        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
+        land(&mut rec, &[(delete, 5_000)]);
+        assert!(rec.timers.is_empty(), "its delete is what removes it");
+    }
+
+    #[test]
+    fn an_older_list_does_not_bring_back_a_deleted_cron() {
+        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"s1"}}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(STOP_WITH_CRONS, 2_000), (delete, 3_000)]);
+        assert!(rec.timers.is_empty(), "calibration: in order");
+        let mut rec = slot();
+        land(&mut rec, &[(delete, 3_000), (STOP_WITH_CRONS, 2_000)]);
+        assert!(rec.timers.is_empty());
+    }
+
     #[test]
     fn a_wake_up_becomes_a_pending_timer_and_stopping_it_removes_it() {
         let mut rec = slot();
@@ -1411,27 +1578,22 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_we_cannot_read_drops_every_cron() {
-        // The safe direction: a slot pinned open forever by a timer that no longer exists is
-        // worse than losing the mark on one that does.
+    fn a_delete_we_cannot_read_leaves_the_timers_to_the_next_list() {
         let mut rec = slot();
-        rec.timers.push(Timer {
-            id: "cron:a".into(),
-            due_ms: None,
-            recurring: true,
-        });
-        rec.timers.push(Timer {
-            id: "wakeup".into(),
-            due_ms: Some(9_000),
-            recurring: false,
-        });
-        own(
+        rec.timers.push(timer("cron:a", false));
+        let out = own(
             &mut rec,
             &ev(r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{}}"#),
             2_000,
         );
-        assert_eq!(rec.timers.len(), 1, "the crons went, the wake-up stayed");
-        assert_eq!(rec.timers[0].id, "wakeup");
+        assert!(matches!(out, Outcome::Ignored(_)));
+        assert_eq!(rec.timers.len(), 1);
+        own(&mut rec, &ev(STOP_WITH_CRONS), 3_000);
+        assert_eq!(
+            ids(&rec),
+            ["cron:s1"],
+            "the list it was missing from settles it"
+        );
     }
 
     #[test]

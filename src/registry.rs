@@ -75,6 +75,9 @@ pub struct Timer {
     pub id: String,
     pub due_ms: Option<Millis>,
     pub recurring: bool,
+    /// Kept by Claude Code across restarts, in the project's `.claude/scheduled_tasks.json`,
+    /// and absent from the `session_crons` a `Stop` lists.
+    pub durable: bool,
 }
 
 /// A field two hook events can race on.
@@ -86,7 +89,8 @@ pub enum Field {
     Busy,
     NeedsYou,
     Background,
-    Wakeup,
+    /// The session's own timers: wake-ups and crons that are not durable.
+    Timers,
     /// `first_prompt`, which the earliest prompt takes rather than the latest.
     Prompt,
 }
@@ -98,7 +102,7 @@ impl Field {
         Field::Busy,
         Field::NeedsYou,
         Field::Background,
-        Field::Wakeup,
+        Field::Timers,
         Field::Prompt,
     ];
 
@@ -109,7 +113,7 @@ impl Field {
             Field::Busy => "busy",
             Field::NeedsYou => "needs_you",
             Field::Background => "background",
-            Field::Wakeup => "wakeup",
+            Field::Timers => "timers",
             Field::Prompt => "prompt",
         }
     }
@@ -121,7 +125,7 @@ impl Field {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {
     ticks: [u64; Field::ALL.len()],
-    /// Crons whose delete landed before their create, by timer id.
+    /// When each cron was deleted, by timer id, so an older event cannot bring it back.
     pub deleted: BTreeMap<String, u64>,
     /// The kernel's boot id: ticks count from boot, so another boot's mean nothing.
     boot: String,
@@ -383,6 +387,7 @@ impl SlotRecord {
                         v.set("id", Value::string(&t.id));
                         set_opt_u64(&mut v, "due_ms", t.due_ms);
                         v.set("recurring", Value::Bool(t.recurring));
+                        v.set("durable", Value::Bool(t.durable));
                         v
                     })
                     .collect(),
@@ -426,6 +431,7 @@ impl SlotRecord {
                             id: t.get("id").and_then(Value::as_str)?.to_string(),
                             due_ms: t.get("due_ms").and_then(Value::as_u64),
                             recurring: t.get("recurring").and_then(Value::as_bool).unwrap_or(false),
+                            durable: t.get("durable").and_then(Value::as_bool).unwrap_or(false),
                         })
                     })
                     .collect()
@@ -593,6 +599,7 @@ mod tests {
             id: "wakeup".into(),
             due_ms: Some(5_000),
             recurring: false,
+            durable: true,
         });
         rec.last_event_ms.insert("Stop".into(), 2_000);
 
@@ -707,6 +714,7 @@ mod tests {
             id: "wakeup".into(),
             due_ms: None,
             recurring: false,
+            durable: false,
         });
         assert!(rec.has_pending_timer(10_000));
         rec.timers[0].due_ms = Some(5_000);

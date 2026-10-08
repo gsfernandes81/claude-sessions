@@ -1146,6 +1146,7 @@ mod tests {
             id: "wakeup".into(),
             due_ms: Some(NOW + 1),
             recurring: false,
+            durable: false,
         });
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::PendingTimer));
         rec.timers[0].due_ms = None;
