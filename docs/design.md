@@ -174,24 +174,25 @@ event fired, however long the hook then takes to arrive — seen on 2.1.292, the
 in event order. Events are ordered by that tick, which is exact, so events fired in one tick
 tie; the times the record shows or compares with file times are its wall-clock reading
 (`clock::Moment`). For each field two events can race on — the conversation, live or closed,
-`busy`, `needs_you`, `background`, the session's timers — the record keeps the tick of the
-event that last wrote it (`written`), and only an event of the same tick or later writes it
-again; activity only moves forward, and `first_prompt` is the earliest prompt fired. A tie on
-the conversation goes to the one on record, whose start was synchronous; and since claude forks
-the first prompt's hook only after the start's has finished, a start is never behind its own
-first prompt. An async hook can outlive its claude: one that read its claude alive keeps the
-binding it read, and the stamps refuse what is older than the slot's last start or end, binding
-included; one that finds no claude above it is stamped from its own start, which is the fork
-itself when `sh` exec'd it and later only by the shell's start-up otherwise. A new record is
-stamped with the tick it is made in, so nothing fired before it, such as the last hook of a
-claude whose slot name is being reused, can write it; stamps from another boot, told by the
-kernel's boot id, are forgotten when a hook next loads the record. A late event of the
-conversation before the current one (a `Stop` of the one `/clear` left) is dropped, and a newer
-one from a conversation the record has not heard start adopts it, as the lost `SessionStart`
-would have. A deleted cron is remembered with its delete's tick, so neither a late create nor
-an older list brings it back. Only a hook that cannot read `/proc` is stamped when it lands.
-`prompt_id` cannot do this: a prompt typed mid-turn fires its `UserPromptSubmit` under the
-running turn's id, and the turn it later starts fires none.
+`busy`, `needs_you`, `background`, the session's timers (with the exceptions *Timers* gives) —
+the record keeps the tick of the event that last wrote it (`written`), and only an event of the
+same tick or later writes it again; activity only moves forward, and `first_prompt` is the
+earliest prompt fired. A tie on the conversation goes to the one on record, whose start was
+synchronous; and since claude forks the first prompt's hook only after the start's has
+finished, a start is never behind its own first prompt. An async hook can outlive its claude:
+one that read its claude alive keeps the binding it read, and the stamps refuse what is older
+than the slot's last start or end, binding included; one that finds no claude above it is
+stamped from its own start, which is the fork itself when `sh` exec'd it and later only by the
+shell's start-up otherwise. A new record is stamped with the tick it is made in, so nothing
+fired before it, such as the last hook of a claude whose slot name is being reused, can write
+it; stamps from another boot, told by the kernel's boot id, are forgotten when a hook next
+loads the record. A late event of the conversation before the current one (a `Stop` of the one
+`/clear` left) is dropped, and a newer one from a conversation the record has not heard start
+adopts it, as the lost `SessionStart` would have. A deleted cron is remembered with its
+delete's tick, so neither a late create nor an older list brings it back. Only a hook that
+cannot read `/proc` is stamped when it lands. `prompt_id` cannot do this: a prompt typed
+mid-turn fires its `UserPromptSubmit` under the running turn's id, and the turn it later starts
+fires none.
 
 What stays uncorrected, each until the next event of its kind: a turn drained from Claude
 Code's prompt queue (a prompt typed mid-turn) fires no hook, so it reads idle except through
@@ -206,14 +207,17 @@ its first `Stop`, and that `Stop`'s keepalive too; a session cron an in-process 
 removed without a turn of the slot's own when it fires, so it is held until the next `Stop` and
 then for the keepalive hold, as any one-shot gone from a list is (*Timers*); an Esc cancels a
 loop's wake-up without a hook, so the record holds it until its due, at most an hour after it
-was set, or until the next `Stop` and then for the keepalive hold; and after a turn that
-reached no `Stop`, a turn no hook announces can list its wake-up before that wake-up's own hook
-lands, with the old wake-up's due until it does. A loop's turn that ends in an API error fires
-`StopFailure`, which is not installed, and Claude Code arms the keepalive after it, so no hold
-covers that keepalive. One is never corrected, and is not worth correcting (owner, 2026-10-08):
-a durable cron Claude Code retires itself — a one-shot once it fires or is found missed at
-startup, a recurring one after its last fire past seven days' age unless it is permanent — is
-held for the slot's life, since it leaves its file without a hook and no list names it.
+was set, or, when it holds the wake-up with no due, until the next `Stop`, which a detached
+slot does not reach until its owner comes back, and then for the keepalive hold (a wake-up is
+held with no due when a prompt was typed after the call, when the `Stop` landed before the
+wake-up's hook, or when two one-shots were unseen); and after a turn that reached no `Stop`, a
+turn no hook announces can list its wake-up before that wake-up's own hook lands, with the old
+wake-up's due until it does. A loop's turn that ends in an API error fires `StopFailure`, which
+is not installed, and Claude Code arms the keepalive after it, so no hold covers that
+keepalive. One is never corrected, and is not worth correcting (owner, 2026-10-08): a durable
+cron Claude Code retires itself — a one-shot once it fires or is found missed at startup, a
+recurring one after its last fire past seven days' age unless it is permanent — is held for the
+slot's life, since it leaves its file without a hook and no list names it.
 
 **Timers** (#13). Each `Stop` carries `session_crons`, Claude Code's in-memory crons with a
 `/loop` wake-up among them as a one-shot (seen on 2.1.292, read in 2.1.293), and the record

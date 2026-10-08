@@ -1142,12 +1142,7 @@ mod tests {
     #[test]
     fn a_pending_timer_keeps_it_whoever_set_it_and_a_fired_one_does_not() {
         let (mut rec, seen) = idle();
-        rec.timers.push(Timer {
-            id: "wakeup".into(),
-            due_ms: Some(NOW + 1),
-            recurring: false,
-            durable: false,
-        });
+        rec.timers.push(Timer::one_shot("wakeup", Some(NOW + 1)));
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::PendingTimer));
         rec.timers[0].due_ms = None;
         assert_eq!(

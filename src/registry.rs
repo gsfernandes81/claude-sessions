@@ -90,6 +90,16 @@ impl Timer {
             durable,
         }
     }
+
+    /// A session timer that fires once.
+    pub fn one_shot(id: impl Into<String>, due_ms: Option<Millis>) -> Timer {
+        Timer {
+            id: id.into(),
+            due_ms,
+            recurring: false,
+            durable: false,
+        }
+    }
 }
 
 /// A field two hook events can race on.
@@ -142,7 +152,7 @@ impl Field {
 pub struct Written {
     ticks: [u64; Field::ALL.len()],
     /// When each cron was deleted, by timer id, so an older event cannot bring it back.
-    pub deleted: BTreeMap<String, u64>,
+    deleted: BTreeMap<String, u64>,
     /// The kernel's boot id: ticks count from boot, so another boot's mean nothing.
     boot: String,
 }
@@ -168,6 +178,32 @@ impl Written {
 
     pub fn stamp(&mut self, f: Field, tick: u64) {
         self.ticks[f as usize] = tick;
+    }
+
+    /// A conversation started at `tick`: nothing older than it is applied, so neither are the
+    /// deletes it would be ordered against.
+    pub fn begin_conversation(&mut self, tick: u64) {
+        self.stamp(Field::Conversation, tick);
+        self.deleted.clear();
+    }
+
+    /// Takes the session's timers for an event that states them whole.
+    pub fn claim_timers_whole(&mut self, tick: u64) -> bool {
+        let newer = self.claim(Field::Timers, tick);
+        if newer {
+            self.stamp(Field::Listed, tick);
+        }
+        newer
+    }
+
+    pub fn delete(&mut self, key: String, tick: u64) {
+        let at = self.deleted.entry(key).or_default();
+        *at = (*at).max(tick);
+    }
+
+    /// Whether `key` was deleted at or after `tick`, so that what fired then predates it.
+    pub fn deleted_since(&self, key: &str, tick: u64) -> bool {
+        self.deleted.get(key).is_some_and(|&at| at >= tick)
     }
 
     /// Stamps made in another boot are forgotten.
@@ -583,7 +619,7 @@ mod tests {
         for (i, f) in Field::ALL.into_iter().enumerate() {
             w.stamp(f, i as u64 + 1);
         }
-        w.deleted.insert("cron:c1".into(), 8);
+        w.delete("cron:c1".into(), 8);
         w
     }
 
@@ -611,10 +647,8 @@ mod tests {
         rec.needs_you = true;
         rec.last_stop_ms = Some(2_000);
         rec.timers.push(Timer {
-            id: "wakeup".into(),
             due_ms: Some(5_000),
-            recurring: false,
-            durable: true,
+            ..Timer::new("wakeup", false, true)
         });
         rec.last_event_ms.insert("Stop".into(), 2_000);
 
@@ -725,12 +759,7 @@ mod tests {
     #[test]
     fn a_timer_with_no_due_time_counts_as_pending() {
         let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
-        rec.timers.push(Timer {
-            id: "wakeup".into(),
-            due_ms: None,
-            recurring: false,
-            durable: false,
-        });
+        rec.timers.push(Timer::one_shot("wakeup", None));
         assert!(rec.has_pending_timer(10_000));
         rec.timers[0].due_ms = Some(5_000);
         assert!(!rec.has_pending_timer(10_000), "it has already fired");

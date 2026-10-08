@@ -217,8 +217,7 @@ fn begin_conversation(rec: &mut SlotRecord, id: &str, tick: u64) {
     rec.first_prompt = None;
     rec.transcript_path = None;
     rec.last_event_ms.clear();
-    rec.written.stamp(Field::Conversation, tick);
-    rec.written.deleted.clear();
+    rec.written.begin_conversation(tick);
 }
 
 /// Apply an event Claude Code fired at `fired` to a record. `pid`/`proc_start` describe the
@@ -280,9 +279,8 @@ pub fn apply(
                     rec.background.clear();
                 }
                 if (new_process || ev.source() == Some("resume"))
-                    && rec.written.claim(Field::Timers, tick)
+                    && rec.written.claim_timers_whole(tick)
                 {
-                    rec.written.stamp(Field::Listed, tick);
                     rec.timers.retain(|t| t.durable);
                 }
                 if pid.is_some() {
@@ -443,11 +441,11 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
     // because the loop has ended.
     let target = field(ev.tool_response(), "scheduledFor").and_then(Value::as_u64);
     let ended = stop || target == Some(0);
-    // An unknown payload shape records no due time, which counts as pending: it errs towards
-    // keeping the session alive.
+    // Without Claude Code's target, the asked delay rounded up to the minute as it rounds it;
+    // without either, no due time, which counts as pending.
     let asked = field(input, "delaySeconds")
         .and_then(Value::as_f64)
-        .map(|d| at + (d.max(0.0) * 1000.0) as Millis);
+        .map(|d| (at + (d.max(0.0) * 1000.0) as Millis).div_ceil(60_000) * 60_000);
     let due = target.or(asked);
     if !rec.written.claim(Field::Timers, tick) {
         // A newer write to the session's timers has landed. The due a list lent is only ever
@@ -468,7 +466,7 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
     if ended {
         rec.timers.retain(|t| !loop_wake_up(t));
     } else {
-        upsert(rec, one_shot(WAKE_UP, due));
+        upsert(rec, Timer::one_shot(WAKE_UP, due));
     }
     Outcome::Changed
 }
@@ -481,12 +479,11 @@ fn create_cron(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
     // The response says what was made; the input is only what was asked for.
     let said = |key: &str| field(response, key).or_else(|| field(input, key));
     let id = field(response, "id")
-        .or_else(|| field(input, "name"))
         .and_then(Value::as_str)
         .unwrap_or("cron");
     let durable = said("durable").and_then(Value::as_bool).unwrap_or(false);
     let key = cron_key(id);
-    if deleted_since(rec, &key, tick) {
+    if rec.written.deleted_since(&key, tick) {
         return Outcome::Ignored("deleted before its create landed");
     }
     if !durable {
@@ -507,16 +504,12 @@ fn create_cron(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
 
 fn delete_cron(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
     let input = ev.tool_input();
-    let Some(id) = field(input, "id")
-        .or_else(|| field(input, "name"))
-        .and_then(Value::as_str)
-    else {
+    let Some(id) = field(input, "id").and_then(Value::as_str) else {
         return Outcome::Ignored("no cron id");
     };
     let key = cron_key(id);
     rec.timers.retain(|t| t.id != key);
-    let deleted = rec.written.deleted.entry(key).or_default();
-    *deleted = (*deleted).max(tick);
+    rec.written.delete(key, tick);
     Outcome::Changed
 }
 
@@ -528,13 +521,6 @@ const KEEPALIVE: &str = "keepalive";
 /// Counted from the `Stop`: the keepalive's 1200 s from its arming, which comes after, rounded
 /// up to the minute as Claude Code rounds it (2.1.293), with a minute to spare.
 const KEEPALIVE_MS: Millis = (1_200 + 2 * 60) * 1_000;
-
-fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
-    Timer {
-        due_ms,
-        ..Timer::new(id, false, false)
-    }
-}
 
 /// What Claude Code's stop cancels: the loop's wake-ups, `wakeup` and whatever carries a due.
 fn loop_wake_up(t: &Timer) -> bool {
@@ -555,13 +541,12 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     let Some(mut listed) = ev.session_crons() else {
         return;
     };
-    // Set since the turn's prompt or the last `Stop`, and not yet fired; a wake-up left by a
-    // turn that reached no `Stop` is not the listed one.
+    // Written after the last prompt or `Stop` fired; a later prompt disowns a wake-up left by
+    // a turn that reached no `Stop`.
     let this_turn = rec.written[Field::Timers] > rec.written[Field::Busy];
-    if !rec.written.claim(Field::Timers, tick) {
+    if !rec.written.claim_timers_whole(tick) {
         return;
     }
-    rec.written.stamp(Field::Listed, tick);
     let mut unseen = Vec::new();
     for t in &mut listed {
         match rec.timers.iter().find(|r| r.id == t.id) {
@@ -586,22 +571,17 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     rec.timers
         .retain(|t| t.durable || (t.id == KEEPALIVE && t.due_ms > Some(at)));
     for t in listed {
-        if !deleted_since(rec, &t.id, tick) {
+        if !rec.written.deleted_since(&t.id, tick) {
             upsert(rec, t);
         }
     }
     if woke {
-        upsert(rec, one_shot(KEEPALIVE, Some(at + KEEPALIVE_MS)));
+        upsert(rec, Timer::one_shot(KEEPALIVE, Some(at + KEEPALIVE_MS)));
     }
 }
 
 fn cron_key(id: &str) -> String {
     format!("cron:{id}")
-}
-
-/// Whether `key` was deleted at or after `tick`, so that what fired then predates the delete.
-fn deleted_since(rec: &SlotRecord, key: &str, tick: u64) -> bool {
-    rec.written.deleted.get(key).is_some_and(|&del| del >= tick)
 }
 
 /// Titles read from the conversation's transcript (`transcript.rs`), applied after the event
@@ -655,6 +635,19 @@ mod tests {
         r.proc_start = Some(7);
         r
     }
+    fn cron_create(id: &str, recurring: bool, durable: bool) -> String {
+        format!(
+            r#"{{"hook_event_name":"PostToolUse","tool_name":"CronCreate",
+            "tool_response":{{"id":"{id}","recurring":{recurring},"durable":{durable}}}}}"#
+        )
+    }
+    fn cron_delete(id: &str) -> String {
+        format!(
+            r#"{{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{{"id":"{id}"}}}}"#
+        )
+    }
+    const WAKE_UP_STOP: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup",
+        "tool_input":{"stop":true},"tool_response":{"scheduledFor":0}}"#;
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
         apply(rec, e, Moment::ms(now), Binding::Own, Some(100), Some(7))
     }
@@ -819,8 +812,8 @@ mod tests {
 
     #[test]
     fn a_cron_deleted_before_its_create_lands_is_not_pending() {
-        let create = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1"}}"#;
-        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
+        let create: &str = &cron_create("c1", true, false);
+        let delete: &str = &cron_delete("c1");
         let mut rec = slot();
         land(&mut rec, &[(create, 2_000), (delete, 3_000)]);
         assert!(rec.timers.is_empty(), "calibration: in order");
@@ -838,7 +831,7 @@ mod tests {
     #[test]
     fn a_wake_up_stopped_before_its_setting_lands_is_not_pending() {
         let set = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"delaySeconds":600}}"#;
-        let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
+        let stop = WAKE_UP_STOP;
         let mut rec = slot();
         land(&mut rec, &[(set, 2_000)]);
         assert_eq!(rec.timers.len(), 1, "calibration");
@@ -1217,14 +1210,14 @@ mod tests {
             &ev(r#"{"hook_event_name":"UserPromptSubmit","prompt":"x"}"#),
             1_500,
         );
-        rec.written.deleted.insert("cron:c1".into(), 150);
+        rec.written.delete("cron:c1".into(), 150);
         own(
             &mut rec,
             &ev(r#"{"hook_event_name":"SessionStart","source":"clear","session_id":"second"}"#),
             2_000,
         );
         assert!(
-            rec.written.deleted.is_empty(),
+            !rec.written.deleted_since("cron:c1", 0),
             "a cron of the last one is not this one's"
         );
         assert_eq!(rec.last_event_ms.get("UserPromptSubmit"), None);
@@ -1452,12 +1445,6 @@ mod tests {
     const SESSION_CREATE: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate",
         "tool_input":{"cron":"0 9 * * *","prompt":"p","durable":true},
         "tool_response":{"id":"c1","recurring":true,"durable":false}}"#;
-    const DURABLE_CREATE: &str = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate",
-        "tool_input":{"cron":"0 9 * * *","prompt":"p","durable":true},
-        "tool_response":{"id":"c1","recurring":true,"durable":true}}"#;
-
-    const DURABLE_DELETE: &str =
-        r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"c1"}}"#;
 
     fn timer(id: &str, durable: bool) -> Timer {
         Timer::new(id, true, durable)
@@ -1528,14 +1515,8 @@ mod tests {
 
     #[test]
     fn a_session_cron_yields_only_to_a_newer_list_or_start() {
-        let create = |id: &str| {
-            format!(
-                r#"{{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{{"id":"{id}","durable":false}}}}"#
-            )
-        };
-        let delete =
-            r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"b"}}"#;
-        let (a, b) = (create("a"), create("b"));
+        let delete: &str = &cron_delete("b");
+        let (a, b) = (cron_create("a", true, false), cron_create("b", true, false));
         for (order, what) in [
             (
                 vec![(PROMPT, 1_500), (&*a, 2_000), (&*wake_up(900_000), 3_000)],
@@ -1567,21 +1548,19 @@ mod tests {
     #[test]
     fn a_durable_cron_is_never_settled_by_a_list() {
         let mut rec = slot();
-        land(&mut rec, &[(NO_CRONS, 3_000), (DURABLE_CREATE, 2_000)]);
+        let (create, delete): (&str, &str) = (&cron_create("c1", true, true), &cron_delete("c1"));
+        land(&mut rec, &[(NO_CRONS, 3_000), (create, 2_000)]);
         assert_eq!(ids(&rec), ["cron:c1"]);
         assert!(rec.timers[0].durable);
         land(&mut rec, &[(NO_CRONS, 4_000)]);
         assert_eq!(ids(&rec), ["cron:c1"]);
         let mut early = slot();
-        land(
-            &mut early,
-            &[(DURABLE_DELETE, 3_000), (DURABLE_CREATE, 2_000)],
-        );
+        land(&mut early, &[(delete, 3_000), (create, 2_000)]);
         assert!(
             early.timers.is_empty(),
             "a durable cron's delete outranks its late create"
         );
-        land(&mut rec, &[(DURABLE_DELETE, 5_000)]);
+        land(&mut rec, &[(delete, 5_000)]);
         assert!(rec.timers.is_empty(), "its delete is what removes it");
     }
 
@@ -1617,7 +1596,7 @@ mod tests {
 
     #[test]
     fn an_older_list_does_not_bring_back_a_deleted_cron() {
-        let delete = r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"s1"}}"#;
+        let delete: &str = &cron_delete("s1");
         let mut rec = slot();
         land(&mut rec, &[(STOP_WITH_CRONS, 2_000), (delete, 3_000)]);
         assert!(rec.timers.is_empty(), "calibration: in order");
@@ -1653,16 +1632,14 @@ mod tests {
             10_000,
         );
         assert_eq!(rec.timers.len(), 1);
-        assert_eq!(rec.timers[0].due_ms, Some(10_000 + 1_800_000));
+        assert_eq!(
+            rec.timers[0].due_ms,
+            Some(1_860_000),
+            "10 s + 1800 s, rounded up to the minute as Claude Code rounds it"
+        );
         assert!(rec.has_pending_timer(20_000));
 
-        own(
-            &mut rec,
-            &ev(
-                r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#,
-            ),
-            11_000,
-        );
+        own(&mut rec, &ev(WAKE_UP_STOP), 11_000);
         assert!(
             rec.timers.is_empty(),
             "a stopped loop no longer pins the slot"
@@ -1798,7 +1775,7 @@ mod tests {
 
     #[test]
     fn a_stop_ends_the_loops_wake_ups_and_nothing_else() {
-        let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
+        let stop = WAKE_UP_STOP;
         let mut rec = listed_wake_up();
         rec.timers.push(timer("cron:r", false));
         rec.timers.push(Timer::new("cron:d", false, true));
@@ -1871,8 +1848,8 @@ mod tests {
 
     #[test]
     fn a_due_lent_to_a_cron_is_taken_back_by_the_hooks_that_disprove_it() {
-        let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true},"tool_response":{"scheduledFor":0}}"#;
-        let create = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1","recurring":false,"durable":false}}"#;
+        let stop = WAKE_UP_STOP;
+        let create: &str = &cron_create("c1", false, false);
         let list = r#"{"hook_event_name":"Stop","session_crons":[{"id":"c1","recurring":false}]}"#;
         let mut rec = slot();
         land(
@@ -1994,7 +1971,7 @@ mod tests {
             );
         }
         assert_eq!(rec.timers.len(), 1, "one loop, one timer");
-        assert_eq!(rec.timers[0].due_ms, Some(2_000 + 120_000));
+        assert_eq!(rec.timers[0].due_ms, Some(180_000));
     }
 
     #[test]
@@ -2020,26 +1997,17 @@ mod tests {
         own(
             &mut rec,
             &ev(
-                r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_input":{"name":"nightly"},"tool_response":{"id":"cr_7"}}"#,
+                r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"cr_7"}}"#,
             ),
             1_000,
         );
-        assert_eq!(
-            rec.timers[0].id, "cron:cr_7",
-            "the response's id wins over the name"
-        );
+        assert_eq!(rec.timers[0].id, "cron:cr_7");
         assert!(
             rec.has_pending_timer(u64::MAX),
             "a recurring timer never expires"
         );
 
-        own(
-            &mut rec,
-            &ev(
-                r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"cr_7"}}"#,
-            ),
-            2_000,
-        );
+        own(&mut rec, &ev(&cron_delete("cr_7")), 2_000);
         assert!(rec.timers.is_empty());
     }
 
