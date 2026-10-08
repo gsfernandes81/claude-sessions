@@ -103,18 +103,21 @@ pub enum Field {
     Background,
     /// The session's own timers: wake-ups and crons that are not durable.
     Timers,
+    /// The session's timers as a list or a start last stated them whole.
+    Listed,
     /// `first_prompt`, which the earliest prompt takes rather than the latest.
     Prompt,
 }
 
 impl Field {
-    pub const ALL: [Field; 7] = [
+    pub const ALL: [Field; 8] = [
         Field::Conversation,
         Field::Life,
         Field::Busy,
         Field::NeedsYou,
         Field::Background,
         Field::Timers,
+        Field::Listed,
         Field::Prompt,
     ];
 
@@ -126,6 +129,7 @@ impl Field {
             Field::NeedsYou => "needs_you",
             Field::Background => "background",
             Field::Timers => "timers",
+            Field::Listed => "listed",
             Field::Prompt => "prompt",
         }
     }

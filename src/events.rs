@@ -282,6 +282,7 @@ pub fn apply(
                 if (new_process || ev.source() == Some("resume"))
                     && rec.written.claim(Field::Timers, tick)
                 {
+                    rec.written.stamp(Field::Listed, tick);
                     rec.timers.retain(|t| t.durable);
                 }
                 if pid.is_some() {
@@ -417,104 +418,106 @@ pub const TIMER_TOOLS: [&str; 3] = ["ScheduleWakeup", "CronCreate", "CronDelete"
 /// `TaskStop`, which stops a background task rather than a timer. A slot pinned open by a
 /// listing would never be offloadable again.
 ///
-/// A session timer is also in the next `Stop`'s list, which settles it, so a write here claims
-/// `Field::Timers` against that list. A durable cron never is, and only its delete removes it.
+/// A session timer is also in the next `Stop`'s list, which settles it. A durable cron never
+/// is, and only its delete removes it.
 fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
-    let Moment { tick, at } = fired;
-    let input = ev.tool_input();
-    let response = ev.tool_response();
     match ev.tool_name().unwrap_or("") {
-        "ScheduleWakeup" => {
-            let stop = input
-                .and_then(|v| v.get("stop"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            // Claude Code's own target, clamped and rounded to the minute; 0 when it armed
-            // nothing because the loop has ended.
-            let target = response
-                .and_then(|v| v.get("scheduledFor"))
-                .and_then(Value::as_u64);
-            let ended = stop || target == Some(0);
-            // An unknown payload shape records no due time, which counts as pending: it errs
-            // towards keeping the session alive.
-            let asked = input
-                .and_then(|v| v.get("delaySeconds"))
-                .and_then(Value::as_f64)
-                .map(|d| at + (d.max(0.0) * 1000.0) as Millis);
-            let due = target.or(asked);
-            if !rec.written.claim(Field::Timers, tick) {
-                // A newer write to the session's timers has landed. The due a list lent is only
-                // ever raised, or made unknown by an ended or unreadable wake-up.
-                let wanted = if ended { None } else { due };
-                let held = rec
-                    .timers
-                    .iter_mut()
-                    .find(|t| t.due_ms.is_some() && t.id != KEEPALIVE);
-                return match held {
-                    Some(t) if wanted.is_none_or(|w| t.due_ms < Some(w)) => {
-                        t.due_ms = wanted;
-                        Outcome::Changed
-                    }
-                    _ => Outcome::Ignored("a newer timer has landed"),
-                };
-            }
-            if ended {
-                rec.timers.retain(|t| !loop_wake_up(t));
-            } else {
-                upsert(rec, one_shot(WAKE_UP, due));
-            }
-            Outcome::Changed
-        }
-        "CronCreate" => {
-            // The response says what was made; the input is only what was asked for.
-            let said = |key: &str| {
-                response
-                    .and_then(|v| v.get(key))
-                    .or_else(|| input.and_then(|v| v.get(key)))
-            };
-            let id = response
-                .and_then(|v| v.get("id"))
-                .and_then(Value::as_str)
-                .or_else(|| input.and_then(|v| v.get("name")).and_then(Value::as_str))
-                .unwrap_or("cron");
-            let durable = said("durable").and_then(Value::as_bool).unwrap_or(false);
-            let key = cron_key(id);
-            if deleted_since(rec, &key, tick) {
-                return Outcome::Ignored("deleted before its create landed");
-            }
-            if !durable && !rec.written.claim(Field::Timers, tick) {
-                // A cron is never the wake-up whose due a newer list may have lent it.
-                return match rec
-                    .timers
-                    .iter_mut()
-                    .find(|t| t.id == key && t.due_ms.is_some())
-                {
-                    Some(t) => {
-                        t.due_ms = None;
-                        Outcome::Changed
-                    }
-                    None => Outcome::Ignored("a newer timer has landed"),
-                };
-            }
-            let recurring = said("recurring").and_then(Value::as_bool).unwrap_or(true);
-            upsert(rec, Timer::new(key, recurring, durable));
-            Outcome::Changed
-        }
-        "CronDelete" => {
-            let Some(id) = input
-                .and_then(|v| v.get("id").or_else(|| v.get("name")))
-                .and_then(Value::as_str)
-            else {
-                return Outcome::Ignored("no cron id");
-            };
-            let key = cron_key(id);
-            rec.timers.retain(|t| t.id != key);
-            let deleted = rec.written.deleted.entry(key).or_default();
-            *deleted = (*deleted).max(tick);
-            Outcome::Changed
-        }
+        "ScheduleWakeup" => schedule_wake_up(rec, ev, fired),
+        "CronCreate" => create_cron(rec, ev, fired.tick),
+        "CronDelete" => delete_cron(rec, ev, fired.tick),
         _ => Outcome::Ignored("tool does not set a timer"),
     }
+}
+
+fn field<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    v.and_then(|v| v.get(key))
+}
+
+/// Claims `Field::Timers` against other wake-ups and lists, so an older stop never drops a
+/// newer wake-up.
+fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
+    let Moment { tick, at } = fired;
+    let input = ev.tool_input();
+    let stop = field(input, "stop").and_then(Value::as_bool) == Some(true);
+    // Claude Code's own target, clamped and rounded to the minute; 0 when it armed nothing
+    // because the loop has ended.
+    let target = field(ev.tool_response(), "scheduledFor").and_then(Value::as_u64);
+    let ended = stop || target == Some(0);
+    // An unknown payload shape records no due time, which counts as pending: it errs towards
+    // keeping the session alive.
+    let asked = field(input, "delaySeconds")
+        .and_then(Value::as_f64)
+        .map(|d| at + (d.max(0.0) * 1000.0) as Millis);
+    let due = target.or(asked);
+    if !rec.written.claim(Field::Timers, tick) {
+        // A newer write to the session's timers has landed. The due a list lent is only ever
+        // raised, or made unknown by an ended or unreadable wake-up.
+        let wanted = if ended { None } else { due };
+        let held = rec
+            .timers
+            .iter_mut()
+            .find(|t| t.due_ms.is_some() && t.id != KEEPALIVE);
+        return match held {
+            Some(t) if wanted.is_none_or(|w| t.due_ms < Some(w)) => {
+                t.due_ms = wanted;
+                Outcome::Changed
+            }
+            _ => Outcome::Ignored("a newer timer has landed"),
+        };
+    }
+    if ended {
+        rec.timers.retain(|t| !loop_wake_up(t));
+    } else {
+        upsert(rec, one_shot(WAKE_UP, due));
+    }
+    Outcome::Changed
+}
+
+/// A session cron yields only to what has since stated the session's crons whole: a list, or
+/// a start that emptied them. Cron ids are unique and deletes are ordered by tombstone, so
+/// creates need no order among themselves.
+fn create_cron(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
+    let (input, response) = (ev.tool_input(), ev.tool_response());
+    // The response says what was made; the input is only what was asked for.
+    let said = |key: &str| field(response, key).or_else(|| field(input, key));
+    let id = field(response, "id")
+        .or_else(|| field(input, "name"))
+        .and_then(Value::as_str)
+        .unwrap_or("cron");
+    let durable = said("durable").and_then(Value::as_bool).unwrap_or(false);
+    let key = cron_key(id);
+    if deleted_since(rec, &key, tick) {
+        return Outcome::Ignored("deleted before its create landed");
+    }
+    if !durable {
+        if rec.written[Field::Listed] > tick {
+            // A cron is never the wake-up whose due that list may have lent it.
+            let lent = rec.timers.iter_mut().find(|t| t.id == key);
+            return match lent.and_then(|t| t.due_ms.take()) {
+                Some(_) => Outcome::Changed,
+                None => Outcome::Ignored("a newer list has landed"),
+            };
+        }
+        rec.written.claim(Field::Timers, tick);
+    }
+    let recurring = said("recurring").and_then(Value::as_bool).unwrap_or(true);
+    upsert(rec, Timer::new(key, recurring, durable));
+    Outcome::Changed
+}
+
+fn delete_cron(rec: &mut SlotRecord, ev: &Event, tick: u64) -> Outcome {
+    let input = ev.tool_input();
+    let Some(id) = field(input, "id")
+        .or_else(|| field(input, "name"))
+        .and_then(Value::as_str)
+    else {
+        return Outcome::Ignored("no cron id");
+    };
+    let key = cron_key(id);
+    rec.timers.retain(|t| t.id != key);
+    let deleted = rec.written.deleted.entry(key).or_default();
+    *deleted = (*deleted).max(tick);
+    Outcome::Changed
 }
 
 /// The timer a `ScheduleWakeup` sets, until a list names it under its own cron id.
@@ -558,6 +561,7 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     if !rec.written.claim(Field::Timers, tick) {
         return;
     }
+    rec.written.stamp(Field::Listed, tick);
     let mut unseen = Vec::new();
     for t in &mut listed {
         match rec.timers.iter().find(|r| r.id == t.id) {
@@ -578,7 +582,7 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
         && rec.timers.iter().any(|t| {
             !t.durable && !t.recurring && t.id != KEEPALIVE && !listed.iter().any(|l| l.id == t.id)
         });
-    // The keepalive is in no list, so only its due ends its hold.
+    // A list does not end the keepalive hold; only its due does.
     rec.timers
         .retain(|t| t.durable || (t.id == KEEPALIVE && t.due_ms > Some(at)));
     for t in listed {
@@ -1517,8 +1521,47 @@ mod tests {
         land(&mut rec, &[(SESSION_CREATE, 3_000), (NO_CRONS, 2_000)]);
         assert_eq!(ids(&rec), ["cron:c1"], "an older list predates it");
         let mut rec = slot();
-        land(&mut rec, &[(NO_CRONS, 3_000), (SESSION_CREATE, 2_000)]);
+        let outs = land(&mut rec, &[(NO_CRONS, 3_000), (SESSION_CREATE, 2_000)]);
         assert!(rec.timers.is_empty(), "a list fired later has seen it go");
+        assert!(matches!(outs[1], Outcome::Ignored(_)));
+    }
+
+    #[test]
+    fn a_session_cron_yields_only_to_a_newer_list_or_start() {
+        let create = |id: &str| {
+            format!(
+                r#"{{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{{"id":"{id}","durable":false}}}}"#
+            )
+        };
+        let delete =
+            r#"{"hook_event_name":"PostToolUse","tool_name":"CronDelete","tool_input":{"id":"b"}}"#;
+        let (a, b) = (create("a"), create("b"));
+        for (order, what) in [
+            (
+                vec![(PROMPT, 1_500), (&*a, 2_000), (&*wake_up(900_000), 3_000)],
+                "calibration",
+            ),
+            (
+                vec![(PROMPT, 1_500), (&*wake_up(900_000), 3_000), (&*a, 2_000)],
+                "after a wake-up",
+            ),
+            (
+                vec![(&*b, 3_000), (delete, 4_000), (&*a, 2_000)],
+                "after another cron",
+            ),
+        ] {
+            let mut rec = slot();
+            land(&mut rec, &order);
+            assert!(ids(&rec).contains(&"cron:a"), "{what}");
+            assert!(rec.has_pending_timer(u64::MAX), "{what}");
+        }
+        let resume = r#"{"hook_event_name":"SessionStart","source":"resume"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(resume, 3_000), (&*a, 2_000)]);
+        assert!(
+            rec.timers.is_empty(),
+            "a resume emptied the crons after it fired"
+        );
     }
 
     #[test]

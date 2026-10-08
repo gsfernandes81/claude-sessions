@@ -174,12 +174,6 @@ mod tests {
         assert!(matcher.chars().all(|c| c.is_ascii_alphabetic() || c == '|'));
         for tool in matcher.split('|') {
             let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
-            // Seed a cron so a delete has something to delete.
-            let seed = Event::parse(
-                r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c1"}}"#,
-            )
-            .unwrap();
-            events::apply(&mut rec, &seed, Moment::ms(1), Binding::Own, None, None);
             let body = format!(
                 r#"{{"hook_event_name":"PostToolUse","tool_name":"{tool}","tool_input":{{"delaySeconds":60,"id":"c1"}},"tool_response":{{"id":"c2"}}}}"#
             );
