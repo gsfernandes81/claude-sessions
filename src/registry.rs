@@ -630,6 +630,16 @@ mod tests {
     }
 
     #[test]
+    fn a_timer_without_durable_reads_as_a_session_timer() {
+        let v = crate::json::parse(
+            r#"{"slot":"claude-1","timers":[{"id":"cron:a","recurring":true}]}"#,
+        )
+        .unwrap();
+        let rec = SlotRecord::from_json(&v, "claude-1").expect("parses");
+        assert!(!rec.timers[0].durable);
+    }
+
+    #[test]
     fn an_unknown_state_reads_as_live() {
         // The direction matters: calling a live slot offloaded would have the menu resume it
         // into a second process on the same conversation, which forks it.

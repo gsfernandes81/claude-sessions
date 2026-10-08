@@ -237,7 +237,7 @@ fn a_record_stamped_in_another_boot_is_still_bound() {
     std::fs::write(
         root.0.join("registry/claude-6.json"),
         format!(
-            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"wakeup":{far},"prompt":{far},"boot":"an earlier boot"}}}}"#
+            r#"{{"slot":"claude-6","state":"closed","written":{{"conversation":{far},"life":{far},"busy":{far},"needs_you":{far},"background":{far},"timers":{far},"prompt":{far},"boot":"an earlier boot"}}}}"#
         ),
     )
     .unwrap();

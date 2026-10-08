@@ -124,7 +124,7 @@ impl Event {
             .collect();
         Some(list)
     }
-    /// `Stop` / `SubagentStop`: the session's crons, its wake-up among them as a one-shot,
+    /// `Stop`: the session's crons, its wake-up among them as a one-shot,
     /// from Claude Code's in-memory store (seen on 2.1.292, read in 2.1.293). Durable crons live in
     /// the project's `.claude/scheduled_tasks.json` instead and are never listed. `None` where
     /// the field is absent or an entry has no id, which is no news.
@@ -137,7 +137,7 @@ impl Event {
                 Some(Timer {
                     id: cron_key(c.get("id")?.as_str()?),
                     due_ms: None,
-                    recurring: c.get("recurring").and_then(Value::as_bool).unwrap_or(true),
+                    recurring: c.get("recurring").and_then(Value::as_bool).unwrap_or(false),
                     durable: false,
                 })
             })
@@ -341,21 +341,20 @@ pub fn apply(
             }
             Outcome::Changed
         }
-        // Its lists are `Stop`'s and are taken whole the same way; it never names a foreground
+        // Its list is `Stop`'s and is taken whole the same way; it never names a foreground
         // agent, so one an Esc cut off leaves at the next. A payload with no list says nothing
         // about what runs (claude-sessions#12).
-        "SubagentStop" => {
-            let timers = take_session_timers(rec, ev, fired);
-            match ev.background_tasks() {
-                Some(running) if rec.written.claim(Field::Background, tick) => {
+        "SubagentStop" => match ev.background_tasks() {
+            None => Outcome::Ignored("no background_tasks in the payload"),
+            Some(running) => {
+                if rec.written.claim(Field::Background, tick) {
                     rec.background = running;
                     Outcome::Changed
+                } else {
+                    Outcome::Ignored("a newer list has landed")
                 }
-                _ if timers => Outcome::Changed,
-                None => Outcome::Ignored("no background_tasks in the payload"),
-                Some(_) => Outcome::Ignored("a newer list has landed"),
             }
-        }
+        },
         "Notification" => match ev.notification_type() {
             Some(t) if needs_you_type(t) => {
                 if rec.written.claim(Field::NeedsYou, tick) {
@@ -462,9 +461,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
             if deleted_since(rec, &key, tick) {
                 return Outcome::Ignored("deleted before its create landed");
             }
-            // A newer list without it has seen it go; one that holds it has seen it exist.
-            let held = rec.timers.iter().any(|t| t.id == key);
-            if !durable && !held && !rec.written.claim(Field::Timers, tick) {
+            if !durable && !rec.written.claim(Field::Timers, tick) {
                 return Outcome::Ignored("a newer timer has landed");
             }
             upsert(
@@ -483,7 +480,7 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
                 .and_then(|v| v.get("id").or_else(|| v.get("name")))
                 .and_then(Value::as_str)
             else {
-                return Outcome::Ignored("no cron id; the next Stop lists the session's crons");
+                return Outcome::Ignored("no cron id");
             };
             let key = cron_key(id);
             rec.timers.retain(|t| t.id != key);
@@ -497,11 +494,12 @@ fn apply_timer(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
 
 /// The timer a `ScheduleWakeup` sets, until a list names it under its own cron id.
 const WAKE_UP: &str = "wakeup";
-/// What may follow a wake-up's turn that set no other: Claude Code's `/loop` keepalive, armed
+/// What may follow a one-shot's turn that set no other: Claude Code's `/loop` keepalive, armed
 /// after that turn's `Stop` and so in no list until the next.
 const KEEPALIVE: &str = "keepalive";
-/// The keepalive's 1200 s, rounded up to the minute as Claude Code rounds it (2.1.293).
-const KEEPALIVE_MS: Millis = (1_200 + 60) * 1_000;
+/// Counted from the `Stop`: the keepalive's 1200 s from its arming, which comes after, rounded
+/// up to the minute as Claude Code rounds it (2.1.293), with a minute to spare.
+const KEEPALIVE_MS: Millis = (1_200 + 2 * 60) * 1_000;
 
 fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
     Timer {
@@ -512,25 +510,28 @@ fn one_shot(id: &str, due_ms: Option<Millis>) -> Timer {
     }
 }
 
-/// A `/loop` wake-up, under any of its names: the only session timers with a due time.
+/// A `/loop` wake-up, under any of its names: the only session timers with a due time, though
+/// a wake-up whose due went unread has none.
 fn is_wake_up(t: &Timer) -> bool {
     t.id == WAKE_UP || t.id == KEEPALIVE || (!t.durable && t.due_ms.is_some())
 }
 
-/// Takes a `Stop`'s or `SubagentStop`'s `session_crons` as the whole of the session's timers,
-/// unless the list is unreadable or a newer timer has landed. Durable crons are not in it and
-/// stay; one deleted since the list was made stays deleted.
+/// Takes a `Stop`'s `session_crons` as the whole of the session's timers, unless the list is
+/// unreadable or a newer timer has landed. Durable crons are not in it and stay; one deleted
+/// since the list was made stays deleted. A `SubagentStop` carries the same list, but from
+/// mid-turn, after a fired one-shot has gone and before the keepalive is armed, or from after
+/// the `Stop`, so it is not read.
 ///
 /// The list carries no due times, so an entry keeps the one on record, and the one one-shot
-/// the record has not seen is the wake-up set since the last list. A wake-up gone with none in
-/// its place has fired a turn that set none, which the keepalive may follow.
-fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> bool {
+/// the record has not seen is the wake-up set since the last list. A one-shot gone with none
+/// in its place has fired a turn that set none, which the keepalive may follow.
+fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) {
     let Moment { tick, at } = fired;
     let Some(mut listed) = ev.session_crons() else {
-        return false;
+        return;
     };
     if !rec.written.claim(Field::Timers, tick) {
-        return false;
+        return;
     }
     let held = std::mem::take(&mut rec.timers);
     let due_of = |id: &str| held.iter().find(|t| t.id == id).map(|t| t.due_ms);
@@ -547,9 +548,9 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> bool 
         wake_up.due_ms = due_of(WAKE_UP).flatten();
     }
     let woke = unseen.is_empty()
-        && held
-            .iter()
-            .any(|t| is_wake_up(t) && t.id != KEEPALIVE && !listed.iter().any(|l| l.id == t.id));
+        && held.iter().any(|t| {
+            !t.durable && !t.recurring && t.id != KEEPALIVE && !listed.iter().any(|l| l.id == t.id)
+        });
     rec.timers = held.into_iter().filter(|t| t.durable).collect();
     for t in listed {
         if !deleted_since(rec, &t.id, tick) {
@@ -559,7 +560,6 @@ fn take_session_timers(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> bool 
     if woke {
         upsert(rec, one_shot(KEEPALIVE, Some(at + KEEPALIVE_MS)));
     }
-    true
 }
 
 fn cron_key(id: &str) -> String {
@@ -1447,10 +1447,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_or_subagentstop_without_a_readable_list_is_no_news() {
+    fn a_subagentstop_or_a_stop_without_a_readable_list_is_no_news() {
         let no_id =
             r#"{"hook_event_name":"Stop","session_crons":[{"id":"s1"},{"recurring":true}]}"#;
-        let agent = r#"{"hook_event_name":"SubagentStop","agent_type":"Explore"}"#;
+        let agent = r#"{"hook_event_name":"SubagentStop","session_crons":[]}"#;
         let not_a_list = r#"{"hook_event_name":"Stop","session_crons":"x"}"#;
         for body in [STOP, no_id, agent, not_a_list] {
             let mut rec = slot();
@@ -1461,20 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn a_subagentstop_with_a_list_settles_the_timers_too() {
-        let mut rec = slot();
-        rec.timers.push(timer("cron:a", false));
-        let out = own(
-            &mut rec,
-            &ev(r#"{"hook_event_name":"SubagentStop","session_crons":[]}"#),
-            2_000,
-        );
-        assert_eq!(out, Outcome::Changed);
-        assert!(rec.timers.is_empty());
-    }
-
-    #[test]
-    fn a_one_shot_that_has_fired_is_gone_from_the_next_list() {
+    fn a_one_shot_that_has_fired_is_held_only_for_the_keepalive() {
         let one_shot = r#"{"hook_event_name":"Stop",
             "session_crons":[{"id":"w1","schedule":"30 14 8 10 *","recurring":false,"prompt":"go"}]}"#;
         let mut rec = slot();
@@ -1484,7 +1471,8 @@ mod tests {
             "calibration: listed, unfired"
         );
         own(&mut rec, &ev(NO_CRONS), 3_000);
-        assert!(!rec.has_pending_timer(0));
+        assert_eq!(ids(&rec), ["keepalive"]);
+        assert!(!rec.has_pending_timer(3_000 + KEEPALIVE_MS));
     }
 
     #[test]
@@ -1528,30 +1516,21 @@ mod tests {
         let mut rec = slot();
         land(&mut rec, &[(SESSION_CREATE, 2_000)]);
         assert!(!rec.timers[0].durable, "the response wins over the input");
-    }
-
-    #[test]
-    fn a_late_create_of_a_listed_cron_still_lands() {
+        let bare = r#"{"hook_event_name":"PostToolUse","tool_name":"CronCreate","tool_response":{"id":"c2"}}"#;
         let mut rec = slot();
-        let listed = r#"{"hook_event_name":"Stop","session_crons":[{"id":"c1","recurring":true}]}"#;
-        land(&mut rec, &[(listed, 3_000)]);
-        rec.timers[0].due_ms = Some(1);
-        land(&mut rec, &[(SESSION_CREATE, 2_000)]);
-        assert_eq!(
-            rec.timers[0].due_ms, None,
-            "the list saw it exist, so its create is not stale"
-        );
+        land(&mut rec, &[(bare, 2_000)]);
+        assert!(rec.timers[0].recurring, "CronCreate's own default");
     }
 
     #[test]
-    fn a_listed_entry_without_recurring_is_taken_as_recurring() {
+    fn a_listed_entry_without_recurring_is_a_one_shot_as_claude_code_reads_it() {
         let mut rec = slot();
         own(
             &mut rec,
             &ev(r#"{"hook_event_name":"Stop","session_crons":[{"id":"s1"}]}"#),
             2_000,
         );
-        assert!(rec.timers[0].recurring);
+        assert!(!rec.timers[0].recurring);
     }
 
     #[test]
@@ -1573,6 +1552,12 @@ mod tests {
             ],
         );
         assert!(rec.timers.is_empty(), "nor when it was on record");
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[(delete, 5_000), (delete, 3_000), (STOP_WITH_CRONS, 4_000)],
+        );
+        assert!(rec.timers.is_empty(), "the later of two deletes stands");
     }
 
     #[test]
@@ -1664,6 +1649,10 @@ mod tests {
         );
         land(&mut rec, &[(&listing(&[]), 100_000)]);
         assert_eq!(ids(&rec), ["keepalive"]);
+        assert!(
+            rec.has_pending_timer(100_000 + 5_000 + 1_260_000),
+            "armed seconds after the Stop and rounded up a whole minute"
+        );
         assert!(rec.has_pending_timer(100_000 + KEEPALIVE_MS - 1));
         assert!(!rec.has_pending_timer(100_000 + KEEPALIVE_MS));
         land(&mut rec, &[(&listing(&[]), 200_000)]);
@@ -1684,6 +1673,22 @@ mod tests {
         assert_eq!(ids(&rec), ["cron:w2"], "calibration: rescheduled");
         assert_eq!(rec.timers[0].due_ms, Some(200_000));
 
+        let mut rec = slot();
+        land(
+            &mut rec,
+            &[(&listing(&["w1"]), 3_000), (&wake_up(90_000), 2_000)],
+        );
+        assert_eq!(
+            rec.timers[0].due_ms, None,
+            "its wake-up landed after the list"
+        );
+        land(&mut rec, &[(&listing(&[]), 100_000)]);
+        assert_eq!(
+            ids(&rec),
+            ["keepalive"],
+            "a one-shot without a due goes the same way"
+        );
+
         let stop = r#"{"hook_event_name":"PostToolUse","tool_name":"ScheduleWakeup","tool_input":{"stop":true}}"#;
         let mut rec = slot();
         land(
@@ -1692,6 +1697,26 @@ mod tests {
         );
         land(&mut rec, &[(stop, 50_000), (&listing(&[]), 51_000)]);
         assert!(rec.timers.is_empty(), "a stopped loop arms no keepalive");
+    }
+
+    #[test]
+    fn a_subagentstop_list_neither_drops_nor_arms_the_keepalive() {
+        let agent =
+            r#"{"hook_event_name":"SubagentStop","background_tasks":[],"session_crons":[]}"#;
+        let stop = listing(&[]);
+        for order in [
+            [(agent, 95_000), (&*stop, 100_000)],
+            [(&*stop, 100_000), (agent, 100_050)],
+        ] {
+            let mut rec = slot();
+            land(
+                &mut rec,
+                &[(&wake_up(90_000), 2_000), (&listing(&["w1"]), 3_000)],
+            );
+            land(&mut rec, &order);
+            assert_eq!(ids(&rec), ["keepalive"]);
+            assert_eq!(rec.timers[0].due_ms, Some(100_000 + KEEPALIVE_MS));
+        }
     }
 
     #[test]
