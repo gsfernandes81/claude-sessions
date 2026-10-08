@@ -25,6 +25,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
     Own,
+    /// A tool call made in an in-process agent of the slot's own claude.
+    Agent,
     Nested,
 }
 
@@ -231,12 +233,16 @@ pub fn apply(
     proc_start: Option<u64>,
 ) -> Outcome {
     let Moment { tick, at } = fired;
-    // A nested claude is work, not a new identity, and its events keep the slot's activity
-    // fresh. In-process agents are not nested: the slot's own claude fires their
-    // `SubagentStart`/`SubagentStop`, which keep `background` (issues #9, #10).
-    if binding == Binding::Nested {
+    // A nested claude or an agent is work, not a new identity, and its events keep the slot's
+    // activity fresh. The slot's own claude fires its agents' `SubagentStart`/`SubagentStop`,
+    // which keep `background` (issues #9, #10).
+    if binding != Binding::Own {
         seen(rec, ev, at);
         active(rec, at);
+        // An agent's crons are its claude's; a nested claude's are its own process's.
+        if binding == Binding::Agent && ev.name() == "PostToolUse" {
+            apply_timer(rec, ev, fired);
+        }
         return Outcome::Changed;
     }
 
@@ -437,8 +443,8 @@ fn field<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a Value> {
     v.and_then(|v| v.get(key))
 }
 
-/// Sets or ends the loop's wake-up. Once a newer write to the session's timers has landed, it
-/// can only raise the due that write lent, or clear it when the wake-up ended or was unreadable.
+/// Sets or ends the loop's wake-up, unless a newer one has. Once a newer list has landed, it
+/// can only raise the due that list lent, or clear it when the wake-up ended or was unreadable.
 fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome {
     let Moment { tick, at } = fired;
     let input = ev.tool_input();
@@ -453,7 +459,7 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
         .and_then(Value::as_f64)
         .map(|d| (at + (d * 1000.0) as Millis).div_ceil(60_000) * 60_000);
     let due = target.or(asked);
-    if !rec.written.claim(Field::Timers, tick) {
+    if !rec.written.claim(Field::Timers, tick) && rec.written[Field::Listed] > tick {
         let wanted = if ended { None } else { due };
         let held = rec
             .timers
@@ -467,7 +473,9 @@ fn schedule_wake_up(rec: &mut SlotRecord, ev: &Event, fired: Moment) -> Outcome 
             _ => Outcome::Ignored("a newer timer has landed"),
         };
     }
-    rec.written.stamp(Field::WakeUp, tick);
+    if !rec.written.claim(Field::WakeUp, tick) {
+        return Outcome::Ignored("a newer wake-up has landed");
+    }
     if ended {
         rec.timers.retain(|t| !loop_wake_up(t));
     } else {
@@ -1479,7 +1487,8 @@ mod tests {
     fn a_subagentstop_or_a_stop_without_a_readable_list_is_no_news() {
         let no_id =
             r#"{"hook_event_name":"Stop","session_crons":[{"id":"s1"},{"recurring":true}]}"#;
-        let agent = r#"{"hook_event_name":"SubagentStop","session_crons":[]}"#;
+        let agent =
+            r#"{"hook_event_name":"SubagentStop","background_tasks":[],"session_crons":[]}"#;
         let not_a_list = r#"{"hook_event_name":"Stop","session_crons":"x"}"#;
         for body in [STOP, no_id, agent, not_a_list] {
             let mut rec = slot();
@@ -1758,8 +1767,8 @@ mod tests {
             rec.has_pending_timer(100_000 + 5_000 + 1_260_000),
             "armed seconds after the Stop and rounded up a whole minute"
         );
-        assert!(rec.has_pending_timer(100_000 + KEEPALIVE_MS - 1));
-        assert!(!rec.has_pending_timer(100_000 + KEEPALIVE_MS));
+        assert!(rec.has_pending_timer(100_000 + 22 * 60_000 - 1));
+        assert!(!rec.has_pending_timer(100_000 + 22 * 60_000));
         land(&mut rec, &[(&listing(&[]), 100_050)]);
         assert_eq!(
             ids(&rec),
@@ -1858,6 +1867,69 @@ mod tests {
         assert_eq!(ids(&rec), ["cron:d"]);
         assert_eq!(rec.timers[0].due_ms, None);
         assert!(rec.has_pending_timer(3_700_000));
+    }
+
+    #[test]
+    fn a_wake_up_is_not_refused_by_a_create_landing_first() {
+        let c: &str = &cron_create("c", true, false);
+        let list: &str = &listing(&["c"]);
+        let stopping = |order: &[usize]| {
+            let mut rec = listed_wake_up();
+            let events = [
+                (PROMPT, 10_000),
+                (WAKE_UP_STOP, 11_000),
+                (c, 12_000),
+                (list, 13_000),
+            ];
+            land(
+                &mut rec,
+                &order.iter().map(|&k| events[k]).collect::<Vec<_>>(),
+            );
+            ids(&rec).join(",")
+        };
+        assert_eq!(stopping(&[0, 1, 2, 3]), "cron:c", "calibration: in order");
+        assert_eq!(stopping(&[0, 2, 1, 3]), "cron:c");
+        let w: &str = &wake_up(900_000);
+        let listed: &str = &listing(&["w"]);
+        let setting = |order: &[(&str, Millis)]| {
+            let mut rec = slot();
+            land(&mut rec, order);
+            rec.timers
+                .iter()
+                .find(|t| t.id == "cron:w")
+                .and_then(|t| t.due_ms)
+        };
+        assert_eq!(
+            setting(&[(w, 2_000), (c, 3_000), (listed, 5_000)]),
+            Some(900_000),
+            "calibration: in order"
+        );
+        assert_eq!(
+            setting(&[(c, 3_000), (w, 2_000), (listed, 5_000)]),
+            Some(900_000)
+        );
+    }
+
+    #[test]
+    fn an_agents_timer_tools_reach_its_claudes_timers() {
+        let create: &str = &cron_create("d", true, true);
+        let delete: &str = &cron_delete("d");
+        let by = |binding: Binding, body: &str, rec: &mut SlotRecord, at: Millis| {
+            apply(rec, &ev(body), Moment::ms(at), binding, None, None)
+        };
+        let mut nested = slot();
+        by(Binding::Nested, create, &mut nested, 2_000);
+        assert!(
+            nested.timers.is_empty(),
+            "calibration: a nested claude's are its own"
+        );
+        let mut rec = slot();
+        by(Binding::Agent, create, &mut rec, 2_000);
+        own(&mut rec, &ev(NO_CRONS), 3_000);
+        assert_eq!(ids(&rec), ["cron:d"]);
+        by(Binding::Agent, delete, &mut rec, 4_000);
+        assert!(rec.timers.is_empty());
+        assert_eq!(rec.pid, Some(100), "nor does it bind");
     }
 
     #[test]
@@ -1990,6 +2062,21 @@ mod tests {
             rec.timers.push(recurring("cron:d", true));
             own(&mut rec, &ev(&start(source)), 2_000);
             assert_eq!(ids(&rec), kept, "{source}");
+        }
+        let resume = r#"{"hook_event_name":"SessionStart","source":"resume","session_id":"first"}"#;
+        let list: &str = &listing(&["l"]);
+        for (order, kept) in [
+            ([(resume, 3_000), (list, 5_000)], true),
+            ([(list, 5_000), (resume, 3_000)], true),
+            ([(list, 3_000), (resume, 5_000)], false),
+        ] {
+            let mut rec = slot();
+            land(&mut rec, &order);
+            assert_eq!(
+                rec.timers.iter().any(|t| t.id == "cron:l"),
+                kept,
+                "{order:?}"
+            );
         }
         let mut rec = slot();
         rec.timers.push(recurring("cron:s", false));
