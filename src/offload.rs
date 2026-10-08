@@ -62,8 +62,9 @@ pub struct Seen {
     /// The record's current conversation has a transcript on disk
     /// ([`SlotRecord::has_conversation`]). Without one, a stop is a close.
     pub conversation: bool,
-    /// When the slot was last measured active, or `None` before its first measurement.
-    pub last_active: Option<Millis>,
+    /// How long the slot had been quiet at its last reading ([`quiet_for`]), or `None` with no
+    /// fresh reading.
+    pub quiet: Option<Millis>,
 }
 
 /// Why a slot was kept. Every variant is a reason to do nothing.
@@ -169,10 +170,9 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
         None => return Err(Hold::NoSession),
         Some(false) => {}
     }
-    let Some(last_active) = seen.last_active else {
+    let Some(idle) = seen.quiet else {
         return Err(Hold::Unmeasured);
     };
-    let idle = now.saturating_sub(last_active);
     if idle < QUIET_FOR_MS {
         return Err(Hold::TooRecent {
             left_ms: QUIET_FOR_MS - idle,
@@ -181,8 +181,20 @@ pub fn decide(rec: &SlotRecord, now: Millis, seen: &Seen) -> Result<Millis, Hold
     Ok(idle)
 }
 
+/// How long a reading may be old and still decide: more than a pass apart, so the menu can act
+/// on the last pass's, and well under the quiet period.
+const FRESH_MS: Millis = QUIET_FOR_MS / 2;
+
+/// How long a slot was quiet as of its last reading, if that reading is fresh. Quiet is known
+/// only up to the reading, never to now: a pass that could not measure must not let an old
+/// quiet go on growing.
+pub fn quiet_for(m: Option<&SlotState>, now: Millis) -> Option<Millis> {
+    m.filter(|m| m.at <= now && now - m.at <= FRESH_MS)
+        .map(|m| m.at.saturating_sub(m.last_active))
+}
+
 /// Gather what `decide` and `judge` need for one slot, from the measurements a pass stored.
-pub fn look(rec: &SlotRecord, measured: &BTreeMap<String, SlotState>) -> Seen {
+pub fn look(rec: &SlotRecord, measured: &BTreeMap<String, SlotState>, now: Millis) -> Seen {
     let (Some(pid), Some(start)) = (rec.pid, rec.proc_start) else {
         return Seen::default();
     };
@@ -198,7 +210,7 @@ pub fn look(rec: &SlotRecord, measured: &BTreeMap<String, SlotState>) -> Seen {
             None
         },
         conversation: rec.has_conversation(),
-        last_active: measured.get(&rec.slot).map(|m| m.last_active),
+        quiet: quiet_for(measured.get(&rec.slot), now),
     }
 }
 
@@ -315,7 +327,8 @@ pub fn run(dry_run: bool) -> io::Result<()> {
         }
         // First decision from the snapshot and the record as listed, holding nothing. Every
         // slot that is kept — nearly all of them, nearly always — ends here.
-        let verdict = match judge(&listed, clock::now(), &look(&listed, &measured)) {
+        let now = clock::now();
+        let verdict = match judge(&listed, now, &look(&listed, &measured, now)) {
             Ok(verdict) => verdict,
             Err(hold) => {
                 say!("{}: kept — {hold}", listed.slot);
@@ -358,7 +371,8 @@ pub fn run(dry_run: bool) -> io::Result<()> {
             continue;
         };
         let fresh = procinfo::table();
-        let verdict = match judge(&rec, clock::now(), &look(&rec, &measured)) {
+        let now = clock::now();
+        let verdict = match judge(&rec, now, &look(&rec, &measured, now)) {
             Ok(verdict) => verdict,
             Err(hold) => {
                 say!("{slot}: kept — {hold}");
@@ -662,7 +676,7 @@ mod tests {
             alive: true,
             attached: Some(false),
             conversation: true,
-            last_active: Some(NOW - QUIET_FOR_MS - 1),
+            quiet: Some(QUIET_FOR_MS + 1),
         };
         (r, seen)
     }
@@ -705,9 +719,29 @@ mod tests {
     }
 
     #[test]
+    fn quiet_is_known_only_up_to_a_fresh_reading() {
+        let reading = |at, last_active| SlotState {
+            at,
+            last_active,
+            ..Default::default()
+        };
+        let m = reading(NOW - 60_000, NOW - 60_000 - QUIET_FOR_MS);
+        assert_eq!(quiet_for(Some(&m), NOW), Some(QUIET_FOR_MS), "calibration");
+        let stale = reading(NOW - FRESH_MS - 1, NOW - 3 * QUIET_FOR_MS);
+        assert_eq!(
+            quiet_for(Some(&stale), NOW),
+            None,
+            "a pass that could not measure"
+        );
+        let future = reading(NOW + 1, NOW - QUIET_FOR_MS);
+        assert_eq!(quiet_for(Some(&future), NOW), None);
+        assert_eq!(quiet_for(None, NOW), None);
+    }
+
+    #[test]
     fn an_unmeasured_slot_is_kept() {
         let (rec, mut seen) = idle();
-        seen.last_active = None;
+        seen.quiet = None;
         assert_eq!(decide(&rec, NOW, &seen), Err(Hold::Unmeasured));
     }
 
@@ -739,7 +773,7 @@ mod tests {
         assert_eq!(judge(&rec, NOW, &seen), Err(Hold::Attached));
         let (rec, mut seen) = idle();
         seen.conversation = false;
-        seen.last_active = Some(NOW - 1_000);
+        seen.quiet = Some(1_000);
         assert!(matches!(
             judge(&rec, NOW, &seen),
             Err(Hold::TooRecent { .. })
@@ -749,12 +783,12 @@ mod tests {
     #[test]
     fn ten_quiet_minutes_is_the_line() {
         let (rec, mut seen) = idle();
-        seen.last_active = Some(NOW - QUIET_FOR_MS + 1_000);
+        seen.quiet = Some(QUIET_FOR_MS - 1_000);
         assert_eq!(
             decide(&rec, NOW, &seen),
             Err(Hold::TooRecent { left_ms: 1_000 })
         );
-        seen.last_active = Some(NOW - QUIET_FOR_MS);
+        seen.quiet = Some(QUIET_FOR_MS);
         assert!(
             decide(&rec, NOW, &seen).is_ok(),
             "exactly ten minutes is enough"

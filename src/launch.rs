@@ -855,7 +855,7 @@ pub(crate) fn offload_then_open_with(
         // may have taken a while to answer. The offloader's own rule, asked again under the
         // lock, is the only thing that may stop a slot.
         let table = procinfo::table();
-        let seen = offload::look(&rec, &activity::load());
+        let seen = offload::look(&rec, &activity::load(), clock::now());
         let verdict = match offload::judge(&rec, clock::now(), &seen) {
             Ok(verdict) => verdict,
             Err(hold) => {
@@ -909,7 +909,7 @@ fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
         .iter()
         .filter(|r| matches!(r.state, State::Live | State::Offloading))
         .filter_map(|r| {
-            let verdict = offload::judge(r, now, &offload::look(r, &measured)).ok()?;
+            let verdict = offload::judge(r, now, &offload::look(r, &measured, now)).ok()?;
             let offload::Verdict::Offload { idle } = verdict else {
                 return None;
             };

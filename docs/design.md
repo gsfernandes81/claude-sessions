@@ -269,8 +269,11 @@ invocation, run from the box's timer; `--dry-run` decides and reports without si
 Where the rules above left a choice, this is the choice and why:
 
 - **Measured first.** Every pass measures every live slot (`activity::pass`) before it decides
-  anything, and decides on what that stored: the time each slot was last measured active. A
-  slot not measured yet — its first reading, or the state file lost — is kept.
+  anything, and decides on what that stored: how long each slot had been quiet **as of its
+  last reading** — never as of now, so a pass that could not measure (an unreadable `/proc`,
+  a state file that would not save) does not let an old quiet go on growing. A reading more
+  than 5 minutes old decides nothing, and a slot without a fresh one is kept; 5 minutes is
+  more than a pass apart, so the menu's make-room offer can use the last pass's.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
