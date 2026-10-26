@@ -139,6 +139,8 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     .unwrap();
 
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -234,6 +236,8 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", root.join("registry"))
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&root.join("zmx")))
         .env("ZMX_DIR", root.join("zmx"));
@@ -286,6 +290,8 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     .unwrap();
 
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -403,6 +409,8 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
     assert!(made.success(), "mkfifo");
 
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -470,6 +478,8 @@ fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
         std::fs::create_dir_all(d).unwrap();
     }
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)

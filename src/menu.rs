@@ -43,11 +43,14 @@ pub enum Action {
     Quit,
     /// Open the row at this index: attach if live, resume if offloaded.
     Open(usize),
-    New,
-    Shell,
+    /// A new session in this container.
+    New(String),
+    /// A shell in this container.
+    Shell(String),
     /// Close the row at this index — the owner has said `y`.
     Close(usize),
-    /// Mockup 4's `y`: offload `victim`, then open `then` (or start a new slot when `None`).
+    /// Mockup 4's `y`: offload `victim`, then open `then` (or start a new slot in the
+    /// victim's container when `None`).
     OffloadThenOpen {
         victim: usize,
         then: Option<usize>,
@@ -59,34 +62,81 @@ pub enum Action {
     Unarchive(usize),
 }
 
-/// A dialog, plus what answering it needs that the drawing does not. Rows are named by key,
-/// not index: a reading taken while the question is up can regroup them.
+/// A row named the way a question remembers it: its container and its key, never its index,
+/// since a reading taken while the question is up can regroup the rows.
+type Id = (String, RowKey);
+
+/// A dialog, plus what answering it needs that the drawing does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
     Close {
-        key: RowKey,
+        key: Id,
     },
     NoRoom {
-        then: Option<RowKey>,
-        victim: Option<RowKey>,
+        then: Option<Id>,
+        victim: Option<Id>,
     },
     ResumeFailed {
-        key: RowKey,
+        key: Id,
     },
+}
+
+/// Whether the hub can talk to a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Asked, and no answer yet.
+    Connecting,
+    Up,
+    /// Not answering, and what was said about it — ssh's last line, most often.
+    Down(String),
+}
+
+/// One container, as the menu knows it: its name (the hub's ssh alias for it), the header
+/// its own agent last sent, where `n` and `s` start in it, and whether it answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub name: String,
+    pub header: Header,
+    pub workspace: String,
+    pub reach: Reach,
+}
+
+impl Place {
+    pub fn new(name: &str) -> Place {
+        Place {
+            name: name.to_string(),
+            header: Header {
+                host: name.to_string(),
+                memory: None,
+            },
+            workspace: "/workspace".to_string(),
+            reach: Reach::Connecting,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Menu {
     pub width: u16,
     pub height: u16,
-    header: Header,
-    workspace: String,
-    /// Every row, in the order the owner has been looking at, archived ones included.
+    /// Every container, in the order the hub was given them.
+    places: Vec<Place>,
+    /// The home screen's header: the hub's own name and, where the pool is readable, the
+    /// pool's memory.
+    home: Header,
+    /// Showing one container's sessions — always, when there is only one container. `None`
+    /// is the home: every container's open sessions, then the containers.
+    focus: Option<String>,
+    /// Every row, in the order the owner has been looking at, archived ones included, from
+    /// every container.
     all: Vec<Row>,
-    /// What is drawn and what the cursor moves over: `all`, with the archived rows behind the
-    /// Archived heading's row, and shown only while it is open.
+    /// What is drawn and what the cursor moves over: `all`, cut to what the screen shows —
+    /// one container's rows with the archived ones behind the Archived heading's row, shown
+    /// only while it is open; or, at home, every container's open rows and a row for each
+    /// container.
     rows: Vec<Row>,
-    /// The Archived group is open. Shut whenever the menu starts (owner, 2026-10-03).
+    /// The Archived group is open. Shut whenever the menu starts (owner, 2026-10-03), and
+    /// whenever the focus moves.
     archive_open: bool,
     cursor: usize,
     scroll: usize,
@@ -97,12 +147,33 @@ pub struct Menu {
 }
 
 impl Menu {
+    /// One container's menu, with no home to go back to: what a single container, or a test,
+    /// draws. Its rows' `host` is empty.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(width: u16, height: u16, header: Header, workspace: String, rows: Vec<Row>) -> Menu {
+        let place = Place {
+            name: String::new(),
+            header: header.clone(),
+            workspace,
+            reach: Reach::Up,
+        };
+        Menu::hub(width, height, header, vec![place], rows)
+    }
+
+    /// The hub's menu over `places`. With one container it opens on that container's
+    /// sessions and `Esc` quits, exactly as a single container's menu; with more it opens on
+    /// the home.
+    pub fn hub(width: u16, height: u16, home: Header, places: Vec<Place>, rows: Vec<Row>) -> Menu {
+        let focus = match places.as_slice() {
+            [only] => Some(only.name.clone()),
+            _ => None,
+        };
         let mut m = Menu {
             width,
             height,
-            header,
-            workspace,
+            places,
+            home,
+            focus,
             all: Vec::new(),
             rows: Vec::new(),
             archive_open: false,
@@ -121,12 +192,38 @@ impl Menu {
         &self.rows
     }
 
-    pub fn workspace(&self) -> &str {
-        &self.workspace
+    /// Every row from every container, whatever is on screen.
+    pub fn all_rows(&self) -> &[Row] {
+        &self.all
     }
 
-    pub fn set_header(&mut self, header: Header) {
-        self.header = header;
+    fn has_home(&self) -> bool {
+        self.places.len() > 1
+    }
+
+    fn place(&self, name: &str) -> Option<&Place> {
+        self.places.iter().find(|p| p.name == name)
+    }
+
+    /// Where `n` and `s` start in the container on screen, or in the cursor's container.
+    pub fn workspace(&self) -> &str {
+        self.target()
+            .and_then(|h| self.place(&h))
+            .map_or("/workspace", |p| p.workspace.as_str())
+    }
+
+    /// The home screen's header.
+    pub fn set_home(&mut self, header: Header) {
+        self.home = header;
+    }
+
+    /// A container's header, workspace and reach, as its agent last said. The containers'
+    /// rows are counts of rows, so they are rebuilt with it.
+    pub fn set_place(&mut self, place: Place) {
+        if let Some(p) = self.places.iter_mut().find(|p| p.name == place.name) {
+            *p = place;
+        }
+        self.refresh();
     }
 
     pub fn set_status(&mut self, status: Option<String>) {
@@ -141,29 +238,24 @@ impl Menu {
 
     /// Take a fresh reading of the rows, keeping the order the owner has been looking at.
     ///
-    /// `first` sorts into groups — each in `gather`'s order, which is most recent first,
+    /// `first` sorts into groups — each in the reading's order, which is most recent first,
     /// except Idle, where unread rows come first. Afterwards, rows that are still in the same
     /// group keep their places, rows that are gone go, and rows that are new or have changed
     /// group join the top of theirs. The cursor stays on the row it was on.
     pub fn replace_rows(&mut self, fresh: Vec<Row>, first: bool) {
-        let under_cursor = self.rows.get(self.cursor).map(|r| r.key.clone());
         let next: Vec<Row> = if first {
             let mut next = fresh;
-            // Stable, so `gather`'s recency order survives within each group.
+            // Stable, so the reading's recency order survives within each group.
             next.sort_by_key(|r| (r.group(), r.group() == Group::Idle && !r.unread));
             next
         } else {
             let mut next = Vec::with_capacity(fresh.len());
             for g in Group::ALL {
-                let stayed = |f: &Row| {
-                    self.all
-                        .iter()
-                        .any(|old| old.key == f.key && old.group() == g)
-                };
+                let stayed = |f: &Row| self.all.iter().any(|old| old.same(f) && old.group() == g);
                 let arrived = fresh.iter().filter(|f| f.group() == g && !stayed(f));
                 next.extend(arrived.cloned());
                 for old in self.all.iter().filter(|old| old.group() == g) {
-                    if let Some(f) = fresh.iter().find(|f| f.key == old.key && f.group() == g) {
+                    if let Some(f) = fresh.iter().find(|f| f.same(old) && f.group() == g) {
                         next.push(f.clone());
                     }
                 }
@@ -171,8 +263,15 @@ impl Menu {
             next
         };
         self.all = next;
+        self.refresh();
+    }
+
+    /// Rebuild what is drawn from `all`, keeping the cursor on its row and dropping a
+    /// question about a row that has gone.
+    fn refresh(&mut self) {
+        let under_cursor = self.rows.get(self.cursor).map(id);
         // An archive emptied is shut again, so the group shows shut whenever it reappears.
-        if !self.all.iter().any(|r| r.archived) {
+        if !self.in_scope().any(|r| r.archived) {
             self.archive_open = false;
         }
         self.rows = self.visible();
@@ -197,15 +296,31 @@ impl Menu {
         self.keep_cursor_visible();
     }
 
-    /// The rows as drawn: every row not archived, then — when anything is archived — the
-    /// Archived heading's row, counting them, then the archived rows if the group is open.
+    /// The rows the screen is about: the focused container's, or at home every container's
+    /// open rows — not closed, not archived; those belong to one container's screen.
+    fn in_scope(&self) -> impl Iterator<Item = &Row> {
+        let focus = self.focus.clone();
+        self.all.iter().filter(move |r| match &focus {
+            Some(h) => r.host == *h,
+            None => !r.closed && !r.archived,
+        })
+    }
+
+    /// The rows as drawn. For one container: every row not archived, then — when anything is
+    /// archived — the Archived heading's row, counting them, then the archived rows if the
+    /// group is open. At home: every container's open rows, then a row per container.
     fn visible(&self) -> Vec<Row> {
         let (archived, mut out): (Vec<Row>, Vec<Row>) =
-            self.all.iter().cloned().partition(|r| r.archived);
+            self.in_scope().cloned().partition(|r| r.archived);
+        if self.focus.is_none() {
+            out.extend(self.places.iter().map(|p| self.container_row(p)));
+            return out;
+        }
         if archived.is_empty() {
             return out;
         }
         out.push(Row {
+            host: self.focus.clone().unwrap_or_default(),
             key: RowKey::ArchiveFold,
             wants_you: false,
             busy: false,
@@ -217,6 +332,7 @@ impl Menu {
             archived: false,
             title: Group::Archived.name().to_string(),
             age: archived.len().to_string(),
+            at: 0,
         });
         if self.archive_open {
             out.extend(archived);
@@ -224,25 +340,103 @@ impl Menu {
         out
     }
 
+    /// A container on the home screen: its name, and how many sessions it has open — or that
+    /// it is not answering, which says so in words, never by colour.
+    fn container_row(&self, p: &Place) -> Row {
+        let open = self
+            .all
+            .iter()
+            .filter(|r| r.host == p.name && !r.closed && !r.archived)
+            .count();
+        let age = match &p.reach {
+            Reach::Connecting => "connecting".to_string(),
+            Reach::Down(_) => "not answering".to_string(),
+            Reach::Up if open == 0 => "nothing open".to_string(),
+            Reach::Up => format!("{open} open"),
+        };
+        Row {
+            host: p.name.clone(),
+            key: RowKey::Container,
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: false,
+            archived: false,
+            title: p.name.clone(),
+            age,
+            at: 0,
+        }
+    }
+
     /// `Enter` on the Archived heading: open the group or shut it, the cursor staying put.
     fn toggle_archive(&mut self) -> Action {
         self.archive_open = !self.archive_open;
         self.rows = self.visible();
+        let host = self.focus.clone().unwrap_or_default();
         self.cursor = self
-            .index_of(&RowKey::ArchiveFold)
+            .index_of(&(host, RowKey::ArchiveFold))
             .unwrap_or(self.cursor)
             .min(self.rows.len().saturating_sub(1));
         self.keep_cursor_visible();
         Action::Redraw
     }
 
-    fn index_of(&self, key: &RowKey) -> Option<usize> {
-        self.rows.iter().position(|r| r.key == *key)
+    /// Show one container's sessions alone, or go back to the home with `None`.
+    fn show(&mut self, focus: Option<String>) -> Action {
+        let from = self.focus.clone();
+        self.focus = focus;
+        self.archive_open = false;
+        self.rows = self.visible();
+        // Into a container, the cursor starts at its top; back out, it is on the container
+        // it came from, so `Enter` goes straight back in.
+        self.cursor = match (&self.focus, from) {
+            (None, Some(from)) => self.index_of(&(from, RowKey::Container)).unwrap_or(0),
+            _ => 0,
+        };
+        self.scroll = 0;
+        self.keep_cursor_visible();
+        Action::Redraw
+    }
+
+    fn index_of(&self, key: &Id) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| r.host == key.0 && r.key == key.1)
+    }
+
+    /// Which container `n` and `s` act in: the one on screen, else the cursor's.
+    fn target(&self) -> Option<String> {
+        self.focus
+            .clone()
+            .or_else(|| self.rows.get(self.cursor).map(|r| r.host.clone()))
+    }
+
+    /// The focused container is not answering, and why.
+    fn down(&self) -> Option<String> {
+        let p = self.place(self.focus.as_deref()?)?;
+        match &p.reach {
+            Reach::Down(why) => Some(why.clone()),
+            _ => None,
+        }
+    }
+
+    fn header(&self) -> Header {
+        match self.focus.as_deref().and_then(|h| self.place(h)) {
+            Some(p) => p.header.clone(),
+            None => self.home.clone(),
+        }
     }
 
     /// How many lines the hint takes at this width, counted by the renderer that draws it.
     fn hint_lines(&self) -> usize {
-        crate::render::hint_line_count(self.width, self.rows.is_empty())
+        crate::render::hint_line_count(self.width, self.rows.is_empty(), self.back())
+    }
+
+    /// One container's screen, with a home to go back to.
+    fn back(&self) -> bool {
+        self.focus.is_some() && self.has_home()
     }
 
     /// Lines of the list that fit between the header's rule and the closing rule.
@@ -281,8 +475,11 @@ impl Menu {
         View {
             width: self.width,
             height: self.height,
-            header: self.header.clone(),
-            workspace: self.workspace.clone(),
+            header: self.header(),
+            home: self.focus.is_none(),
+            back: self.back(),
+            down: self.down(),
+            workspace: self.workspace().to_string(),
             rows: self.rows.clone(),
             cursor: self.cursor,
             scroll: self.scroll,
@@ -300,23 +497,24 @@ impl Menu {
         self.keep_cursor_visible();
     }
 
-    /// Ask the owner something a launch came back with (mockups 4 and 5). Indices are into
-    /// the rows as they were when the launch was asked for, which they still are.
-    pub fn ask_no_room(&mut self, dialog: Dialog, then: Option<usize>) {
+    /// Ask the owner something a launch came back with (mockups 4 and 5). `then` is the row
+    /// that was asked to open, by index into the rows as they were when it was asked for;
+    /// `host` is the container that answered, which the offered slot is in.
+    pub fn ask_no_room(&mut self, dialog: Dialog, then: Option<usize>, host: &str) {
         let victim = match &dialog {
             Dialog::NoRoom {
-                offer: Some((index, _, _)),
+                offer: Some((key, _, _)),
                 ..
-            } => self.rows.get(*index).map(|r| r.key.clone()),
+            } => Some((host.to_string(), key.clone())),
             _ => None,
         };
-        let then = then.and_then(|i| self.rows.get(i)).map(|r| r.key.clone());
+        let then = then.and_then(|i| self.rows.get(i)).map(id);
         self.ask = Some((Ask::NoRoom { then, victim }, dialog));
     }
 
     pub fn ask_resume_failed(&mut self, dialog: Dialog, index: usize) {
         if let Some(r) = self.rows.get(index) {
-            let key = r.key.clone();
+            let key = id(r);
             self.ask = Some((Ask::ResumeFailed { key }, dialog));
         }
     }
@@ -342,7 +540,7 @@ impl Menu {
             title: row.title.clone(),
             running: !row.offloaded,
         };
-        let key = row.key.clone();
+        let key = id(row);
         self.ask = Some((Ask::Close { key }, dialog));
         Action::Redraw
     }
@@ -392,11 +590,19 @@ impl Menu {
                 Some(i) => self.move_to(i),
                 None => Action::None,
             },
+            Key::Enter if self.on(|r| r.key == RowKey::Container) => {
+                let host = self.rows[self.cursor].host.clone();
+                self.show(Some(host))
+            }
             Key::Enter if self.on(|r| r.key == RowKey::ArchiveFold) => self.toggle_archive(),
             Key::Enter if !self.rows.is_empty() => Action::Open(self.cursor),
-            Key::Char('n') => Action::New,
-            Key::Char('s') => Action::Shell,
+            Key::Char('n') => self.target().map_or(Action::None, Action::New),
+            Key::Char('s') => self.target().map_or(Action::None, Action::Shell),
             Key::Char('c') if self.on(|r| r.key == RowKey::ArchiveFold) => Action::None,
+            Key::Char('c') if self.on(|r| r.key == RowKey::Container) => {
+                self.status = Some("c closes a session; Enter shows this container's".into());
+                Action::Redraw
+            }
             Key::Char('c') if self.on(|r| r.archived) => Action::Unarchive(self.cursor),
             Key::Char('c')
                 if self.on(|r| r.closed && matches!(r.key, RowKey::Conversation { .. })) =>
@@ -412,6 +618,9 @@ impl Menu {
                 self.screen = Screen::Keys;
                 Action::Redraw
             }
+            // From one container, back to every container; from the home, or a container
+            // with no home, out.
+            Key::Esc if self.back() => self.show(None),
             Key::Esc => Action::Quit,
             Key::Resize => Action::Redraw,
             _ => Action::None,
@@ -437,8 +646,8 @@ impl Menu {
             m.ask = None;
             Action::Redraw
         };
-        // `replace_rows` drops a dialog whose row has gone, so these find their rows.
-        let at = |m: &Menu, k: &RowKey| m.index_of(k).unwrap_or(m.cursor);
+        // `refresh` drops a dialog whose row has gone, so these find their rows.
+        let at = |m: &Menu, k: &Id| m.index_of(k).unwrap_or(m.cursor);
         match (ask, key) {
             (_, Key::Resize) => Action::Redraw,
             (Ask::Close { key }, Key::Char('y')) => {
@@ -469,6 +678,10 @@ impl Menu {
             _ => Action::None,
         }
     }
+}
+
+fn id(r: &Row) -> Id {
+    (r.host.clone(), r.key.clone())
 }
 
 /// The clock the list's ages are measured from: now, floored to the minute. See the module
@@ -518,6 +731,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
         // minute's redraw, never between them.
         let archived = archive::is_archived(marks.get(&c.id).copied(), c.last_ms, clock);
         let row = Row {
+            host: String::new(),
             key: RowKey::Conversation {
                 id: c.id,
                 cwd: c.cwd,
@@ -531,6 +745,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             archived,
             title: c.title,
             age: fmt::age(clock.saturating_sub(c.last_ms)),
+            at: c.last_ms,
         };
         dated.push((c.last_ms, row));
     }
@@ -543,6 +758,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
         // When zmx made it is the only clock a session with no record has.
         let since = sess.created.map(|s| s * 1000).unwrap_or(clock);
         rows.push(Row {
+            host: String::new(),
             key: RowKey::Socket(sess.name.clone()),
             wants_you: false,
             // Nothing says what a session with no hooks is doing; it is listed as Idle.
@@ -554,6 +770,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             archived: false,
             title: sess.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
+            at: since,
         });
     }
     rows
@@ -572,6 +789,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         )
         .is_some();
     Row {
+        host: String::new(),
         key: RowKey::Slot(r.slot.clone()),
         wants_you: r.needs_you && !interrupted,
         busy: r.busy && !interrupted,
@@ -588,6 +806,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1).
         title: r.display_title(),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
+        at: r.last_activity_ms,
     }
 }
 
@@ -647,6 +866,7 @@ mod tests {
 
     fn row(name: &str) -> Row {
         Row {
+            host: String::new(),
             key: RowKey::Slot(name.into()),
             wants_you: false,
             unread: false,
@@ -657,6 +877,7 @@ mod tests {
             archived: false,
             title: name.into(),
             age: "1m".into(),
+            at: 0,
         }
     }
 
@@ -1018,8 +1239,8 @@ mod tests {
     #[test]
     fn the_keys_the_design_lists() {
         let mut m = menu(vec![row("a")]);
-        assert_eq!(m.key(Key::Char('n')), Action::New);
-        assert_eq!(m.key(Key::Char('s')), Action::Shell);
+        assert_eq!(m.key(Key::Char('n')), Action::New(String::new()));
+        assert_eq!(m.key(Key::Char('s')), Action::Shell(String::new()));
         assert_eq!(m.key(Key::Esc), Action::Quit);
         assert_eq!(m.key(Key::Char('q')), Action::Quit);
         assert_eq!(
@@ -1088,9 +1309,9 @@ mod tests {
             used: 1,
             limit: 2,
             want: 1,
-            offer: Some((1, "2d".into(), "b".into())),
+            offer: Some((RowKey::Slot("b".into()), "2d".into(), "b".into())),
         };
-        m.ask_no_room(dialog.clone(), Some(2));
+        m.ask_no_room(dialog.clone(), Some(2), "");
         assert_eq!(
             m.view().about,
             Some(1),
@@ -1112,6 +1333,7 @@ mod tests {
                 offer: None,
             },
             None,
+            "",
         );
         assert_eq!(m.key(Key::Char('y')), Action::None);
         assert_eq!(m.key(Key::Char('n')), Action::Redraw);
@@ -1195,5 +1417,136 @@ mod tests {
             "1m",
             "both roll at 120 s"
         );
+    }
+
+    fn hub_menu(rows: Vec<Row>) -> Menu {
+        let mut places: Vec<Place> = ["infra-dev", "or3-dev", "ds-dev"]
+            .into_iter()
+            .map(Place::new)
+            .collect();
+        places[0].reach = Reach::Up;
+        places[1].reach = Reach::Up;
+        places[2].reach = Reach::Down("ssh: connect to host ds-dev port 2222".into());
+        Menu::hub(40, 24, header(), places, rows)
+    }
+
+    fn in_(host: &str, name: &str) -> Row {
+        Row {
+            host: host.into(),
+            ..row(name)
+        }
+    }
+
+    #[test]
+    fn the_home_shows_every_containers_open_sessions_then_the_containers() {
+        let mut closed = in_("infra-dev", "old");
+        closed.closed = true;
+        closed.key = RowKey::Conversation {
+            id: "old".into(),
+            cwd: "/workspace".into(),
+        };
+        let m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b"), closed]);
+        assert_eq!(names(&m), ["a", "b", "infra-dev", "or3-dev", "ds-dev"]);
+        let v = m.view();
+        assert!(v.home && !v.back && v.down.is_none());
+        let says: Vec<&str> = m.rows()[2..].iter().map(|r| r.age.as_str()).collect();
+        assert_eq!(
+            says,
+            ["1 open", "1 open", "not answering"],
+            "closed is not open"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_container_shows_it_alone_and_esc_comes_back_to_it() {
+        let mut closed = in_("infra-dev", "old");
+        closed.closed = true;
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b"), closed]);
+        m.key(Key::End);
+        m.key(Key::Up);
+        m.key(Key::Up);
+        assert_eq!(m.rows()[m.view().cursor].title, "infra-dev");
+        assert_eq!(m.key(Key::Enter), Action::Redraw);
+        assert_eq!(names(&m), ["a", "old"], "its sessions, closed ones too");
+        let v = m.view();
+        assert!(!v.home && v.back, "one container, with a way back");
+        assert_eq!(v.cursor, 0, "from its top");
+        assert_eq!(m.key(Key::Char('n')), Action::New("infra-dev".into()));
+        assert_eq!(m.key(Key::Esc), Action::Redraw, "Esc goes back, not out");
+        assert!(m.view().home);
+        assert_eq!(
+            m.rows()[m.view().cursor].title,
+            "infra-dev",
+            "back on the container it came from"
+        );
+        assert_eq!(m.key(Key::Esc), Action::Quit, "and from the home, out");
+    }
+
+    #[test]
+    fn at_home_n_and_s_act_in_the_cursors_container_and_c_on_a_container_explains() {
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
+        m.key(Key::Down);
+        assert_eq!(m.key(Key::Char('n')), Action::New("or3-dev".into()));
+        assert_eq!(m.key(Key::Char('s')), Action::Shell("or3-dev".into()));
+        m.key(Key::End);
+        assert_eq!(m.key(Key::Char('s')), Action::Shell("ds-dev".into()));
+        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
+        assert!(
+            m.view()
+                .status
+                .is_some_and(|s| s.contains("c closes a session"))
+        );
+    }
+
+    #[test]
+    fn a_container_not_answering_is_shown_so_when_focused_and_its_rows_go() {
+        let mut m = hub_menu(vec![in_("infra-dev", "a")]);
+        m.key(Key::End);
+        m.key(Key::Enter);
+        let v = m.view();
+        assert!(v.rows.is_empty());
+        assert_eq!(
+            v.down.as_deref(),
+            Some("ssh: connect to host ds-dev port 2222")
+        );
+        // It answers: the place says so, and its rows arrive.
+        let mut p = Place::new("ds-dev");
+        p.reach = Reach::Up;
+        m.set_place(p);
+        m.replace_rows(vec![in_("infra-dev", "a"), in_("ds-dev", "z")], false);
+        assert_eq!(names(&m), ["z"]);
+        assert_eq!(m.view().down, None);
+    }
+
+    #[test]
+    fn two_containers_slots_of_one_name_are_two_rows() {
+        let mut m = hub_menu(vec![
+            in_("infra-dev", "claude-1"),
+            in_("or3-dev", "claude-1"),
+        ]);
+        assert_eq!(names(&m)[..2], ["claude-1", "claude-1"]);
+        m.key(Key::Down);
+        // A fresh reading in which only infra-dev's changed group keeps or3-dev's under the
+        // cursor, by its container as well as its key.
+        let mut busy = in_("infra-dev", "claude-1");
+        busy.busy = true;
+        m.replace_rows(vec![busy, in_("or3-dev", "claude-1")], false);
+        let v = m.view();
+        assert_eq!(v.rows[v.cursor].host, "or3-dev");
+    }
+
+    #[test]
+    fn one_container_has_no_home_and_esc_quits() {
+        let mut m = Menu::hub(
+            40,
+            24,
+            header(),
+            vec![Place::new("local")],
+            vec![in_("local", "a")],
+        );
+        let v = m.view();
+        assert!(!v.home && !v.back);
+        assert_eq!(names(&m), ["a"]);
+        assert_eq!(m.key(Key::Esc), Action::Quit);
     }
 }

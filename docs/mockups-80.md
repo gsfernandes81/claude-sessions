@@ -263,3 +263,103 @@ infra-dev · 6 open · 812M of 1.0G
 ⠋ closing session
 Enter open   n new   c close   ? keys   s shell
 ```
+
+## The hub (2026-10-26)
+
+The four screens of [`mockups.md`](mockups.md) § *The hub*, at 80 columns. Rows are indented
+under their headings here, the tag column with them.
+
+### Mockup 12 — Every container, the hub's home
+```
+dev · 5 open · 1.9G of 3.0G
+────────────────────────────────────────────────────────────────────────────────
+── Needs you · 1 ───────────────────────────────────────────────────────────────
+  infra permission: write hosts/one                                           2m
+
+── Working · 1 ─────────────────────────────────────────────────────────────────
+  or3   loop: watch the base build                                           now
+
+── Idle · 2 ────────────────────────────────────────────────────────────────────
+  infra retire the old tunnel                                                14m
+  dd    claude                                                                5h
+
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  infra mount guards on one                                                   2d
+
+── Containers · 4 ──────────────────────────────────────────────────────────────
+  infra-dev                                                               3 open
+  or3-dev                                                                 1 open
+  dd-dev                                                                  1 open
+  ds-dev                                                           not answering
+────────────────────────────────────────────────────────────────────────────────
+Enter open   n new   c close   ? keys   s shell
+```
+
+### Mockup 13 — One container, from the home
+```
+infra-dev · 6 open · 812M of 1.0G
+────────────────────────────────────────────────────────────────────────────────
+── Needs you · 1 ───────────────────────────────────────────────────────────────
+  permission: write hosts/one                                                 2m
+
+── Working · 1 ─────────────────────────────────────────────────────────────────
+  loop: watch the base build                                                 now
+
+── Idle · 3 ────────────────────────────────────────────────────────────────────
+  retire the old tunnel                                                      14m
+  immich upgrade                                                              3m
+  claude                                                                      5h
+
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
+
+── Closed · 7 ──────────────────────────────────────────────────────────────────
+  fix the dns records                                                         3d
+  tunnel cutover notes                                                        4d
+  bcache register script                                                      5d
+  syncthing share rename                                                      6d
+  … 3 more
+────────────────────────────────────────────────────────────────────────────────
+Enter open   n new   c close   ? keys   s shell   Esc back
+```
+
+### Mockup 14 — A container not answering
+```
+ds-dev · not answering
+────────────────────────────────────────────────────────────────────────────────
+
+  ds-dev is not answering:
+  ssh: connect to host ds-dev port 2222: Connection refused
+
+  s   try a shell there anyway
+  Esc back to every container
+
+────────────────────────────────────────────────────────────────────────────────
+? keys   s shell   Esc back
+```
+
+### Mockup 15 — The keys, at the home
+```
+dev · keys
+────────────────────────────────────────────────────────────────────────────────
+Enter  open the session; resumes it
+       if offloaded; on a container,
+       show only its sessions
+n      new session in the cursor's
+       container
+c      close the session
+s      a shell in the cursor's container
+Esc    quit the launcher; from one
+       container, back to all of them
+?      this
+
+Needs you  a prompt is waiting
+Working    claude is mid-turn
+Idle       at its prompt, waiting
+Offloaded  stopped to save memory
+Containers every container the hub
+           reaches; Enter on one shows
+           its sessions, closed ones too
+────────────────────────────────────────────────────────────────────────────────
+Enter open   n new   c close   ? keys   s shell
+```

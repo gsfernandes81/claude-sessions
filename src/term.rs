@@ -497,6 +497,38 @@ fn restore_after_panic() {
     }
 }
 
+/// A second self-pipe, for threads rather than signals: the hub's connections call [`wake`]
+/// when a container has said something, so a menu blocked in [`RawTerminal::wait`] returns
+/// [`Input::Woken`] and looks. Made on first use, and lives as long as the process.
+static WAKE: OnceLock<Option<(UnixStream, UnixStream)>> = OnceLock::new();
+
+fn wake_pair() -> Option<&'static (UnixStream, UnixStream)> {
+    WAKE.get_or_init(|| {
+        let (r, w) = UnixStream::pair().ok()?;
+        (r.set_nonblocking(true).is_ok() && w.set_nonblocking(true).is_ok()).then_some((r, w))
+    })
+    .as_ref()
+}
+
+/// Wake a [`RawTerminal::wait`] in any thread. A full pipe is a wait already due to wake.
+pub fn wake() {
+    if let Some((_, w)) = wake_pair() {
+        let _ = io::Write::write(&mut &*w, &[1]);
+    }
+}
+
+fn take_wake() -> bool {
+    let Some((r, _)) = wake_pair() else {
+        return false;
+    };
+    let mut sink = [0u8; 64];
+    let mut woken = false;
+    while matches!(io::Read::read(&mut &*r, &mut sink), Ok(n) if n > 0) {
+        woken = true;
+    }
+    woken
+}
+
 fn take_winch() -> bool {
     if let Some(mut pipe) = WINCH_PIPE.get() {
         let mut sink = [0u8; 64];
@@ -530,6 +562,8 @@ pub enum Input {
     /// Never empty. A resize arrives as [`Key::Resize`] among them.
     Keys(Vec<Key>),
     Timeout,
+    /// Another thread called [`wake`]: something it has is worth a look.
+    Woken,
 }
 
 /// The menu's terminal: raw, on the alternate screen, cursor hidden, mouse clicks reported.
@@ -634,6 +668,7 @@ impl RawTerminal {
                 },
             };
             let wake = WINCH_PIPE.get().map_or(-1, |p| p.as_raw_fd());
+            let woke = wake_pair().map_or(-1, |(r, _)| r.as_raw_fd());
             let mut fds = [
                 PollFd {
                     fd: self.input,
@@ -645,9 +680,14 @@ impl RawTerminal {
                     events: POLLIN,
                     revents: 0,
                 },
+                PollFd {
+                    fd: woke,
+                    events: POLLIN,
+                    revents: 0,
+                },
             ];
-            // SAFETY: two valid pollfds; a negative fd is ignored by poll(2).
-            let rc = unsafe { poll(fds.as_mut_ptr(), 2, ms) };
+            // SAFETY: three valid pollfds; a negative fd is ignored by poll(2).
+            let rc = unsafe { poll(fds.as_mut_ptr(), 3, ms) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -668,8 +708,14 @@ impl RawTerminal {
             if take_winch() {
                 keys.push(Key::Resize);
             }
+            // Drained either way: the loop that is woken looks at everything it has, so a
+            // wake that arrives with keys is not owed a turn of its own.
+            let woken = fds[2].revents & POLLIN != 0 && take_wake();
             if !keys.is_empty() {
                 return Ok(Input::Keys(keys));
+            }
+            if woken {
+                return Ok(Input::Woken);
             }
         }
     }

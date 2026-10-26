@@ -163,6 +163,8 @@ exec sleep 600"#,
     );
 
     let mut cmd = Command::new(BIN);
+    // This machine alone, whatever hub configuration the machine running the tests has.
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     cmd.env("CLAUDE_SESSIONS_DIR", root.join("registry"))
         .env("CLAUDE_SESSIONS_ZMX", &zmx)
         .env("CLAUDE_SESSIONS_CLAUDE", root.join("bin/claude"))

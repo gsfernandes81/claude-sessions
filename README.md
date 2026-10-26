@@ -1,9 +1,10 @@
 # claude-sessions
 
-**Several Claude Code sessions per box, cheap when idle, and findable again after a
-disconnect.** One `ssh` into a dev container lands on a list of the open sessions, says which
-of them is waiting for you, and opens the one you pick — reattached if it is still running,
-resumed from disk if it was stopped to save memory.
+**Several Claude Code sessions in several dev containers, cheap when idle, and findable again
+after a disconnect.** One `ssh` into the hub lands on a list of every container's open
+sessions, says which of them is waiting for you, and opens the one you pick — reattached if it
+is still running, resumed from disk if it was stopped to save memory. `Enter` on a container
+shows that one alone, its closed conversations too.
 
 It was built for three Raspberry Pis reached over a metered satellite link, and it is honest
 about that: a Pi 5 with 4 GB holding four dev containers, driven from a phone in portrait at
@@ -26,13 +27,19 @@ one deliberately.
 ## What it is
 
 One Rust binary with subcommands, so the hook path, the offloader and the menu share one
-registry implementation and one set of tests:
+registry implementation and one set of tests. The menu and the offload timer run in a **hub**
+that reaches every dev container over ssh; everything that reads or changes a container's
+sessions runs in that container, from the same binary, which the hub installs into a volume
+they all mount ([`docs/design.md`](docs/design.md) § *The hub*):
 
 | | |
 |---|---|
-| `claude-sessions` | the menu — the default, and what an ssh login lands on |
+| `claude-sessions` | the menu over every container — the default, and what the hub's ssh login lands on |
+| `claude-sessions offload-all` | one offload pass in every container, over ssh; the hub's timer runs it every 3 minutes |
+| `claude-sessions install DIR` | this binary, its hooks drop-in and its skill, into the volume every container mounts |
+| `claude-sessions agent` | a container's half of the hub, run over ssh |
 | `claude-sessions hook` | fed by Claude Code's hooks; the only writer of session state |
-| `claude-sessions offload` | stops a session nobody is using, keeping its conversation — closing it if it never had one |
+| `claude-sessions offload` | in a container: stops a session nobody is using, keeping its conversation — closing it if it never had one |
 | `claude-sessions keepalive` | asked by claude before a quiet wait, so the offloader leaves its session alone for that long |
 | `claude-sessions skill` | the skill that tells claude when to ask for that |
 | `claude-sessions list` | every slot, one line each |
@@ -44,17 +51,17 @@ registry implementation and one set of tests:
 
 ## Status
 
-Released as GitHub releases, which infra's dev base pins. Where the work stands is
-[`docs/handoff/2026-10-02-menu.md`](docs/handoff/2026-10-02-menu.md).
+Released as GitHub releases, which infra's hub image pins. Where the work stands is
+[`docs/handoff/2026-10-26-hub.md`](docs/handoff/2026-10-26-hub.md).
 
 - [`docs/design.md`](docs/design.md) — what it does and why, in enough detail to build from
-- [`docs/mockups.md`](docs/mockups.md) — the eight screens, approved and binding
+- [`docs/mockups.md`](docs/mockups.md) — the screens, approved and binding
 - [`CLAUDE.md`](CLAUDE.md) — how work is done in this repo
 
 ## How it gets to a box
 
-A GitHub release carries static musl binaries, cross-compiled. The consumer is a
-`Dockerfile.base` in a private config repo, which downloads a **pinned** tag and checks a
+A GitHub release carries static musl binaries, cross-compiled. The consumer is the hub's
+Dockerfile in a private config repo, which downloads a **pinned** tag and checks a
 per-architecture SHA-256 — so this repo must stay public (that build runs on a public runner
 with no token) and a published release must never be re-cut under the same tag.
 

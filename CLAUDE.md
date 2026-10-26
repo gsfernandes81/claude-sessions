@@ -5,12 +5,17 @@ The fleet's configuration lives in a separate private `infra` repo, which consum
 as a **pinned, checksummed GitHub release** — never as a git dependency and never built in
 place.
 
-**It runs on the fleet.** `infra` pins a release into the base of its dev containers on
-`zero`, which run the menu, the hook and an offload pass every 3 minutes (since base
-2026.10.06). A release reaches them at infra's next pin bump, so a change to what the registry
+**It runs on the fleet.** Until infra's hub is brought up, `infra` pins a release into the base
+of its dev containers on `zero`, which run the menu, the hook and an offload pass every 3
+minutes (since base 2026.10.06). From 0.5.0 the release is pinned in the **hub's** image
+instead, and the hub installs the binary into a volume every dev container mounts (`install`,
+design § *The hub*): the menu and the offload timer run in the hub, everything else in each
+container. A release reaches them at infra's next pin bump, so a change to what the registry
 or `activity.state` holds must still read what the last release wrote — and read it the safe
-way: what it cannot read is unknown, and unknown keeps a slot. Beyond that there is one user,
-the owner; say so rather than inventing caution.
+way: what it cannot read is unknown, and unknown keeps a slot. The hub and its containers run
+the same bytes, but a container not yet restarted onto a new hub keeps the agent process it
+has, so the wire (`src/proto.rs`) reads tolerantly too. Beyond that there is one user, the
+owner; say so rather than inventing caution.
 
 ## What it is, in one paragraph
 
@@ -95,7 +100,8 @@ The state machine is the product, so it is tested as one. Over the event table i
 two writers at once. Plus the always-exit-0 test above.
 
 Rendering is tested against a test backend at **40×24 and 80×24** — the two widths the
-mockups are drawn at — and the zero-idle-bytes property under a pty.
+mockups are drawn at — and the zero-idle-bytes property under a pty, for one container and for
+the hub over a stand-in ssh (`tests/hub_pty.rs`), a container that does not answer included.
 
 **Calibrate a check against known-good state before trusting its verdict.** A check that can
 pass for the wrong reason is worse than no check, because it stops you looking. If a new test
@@ -116,6 +122,8 @@ does not read healthy against a working case first, the test is wrong.
   thing the checksum exists to prevent. Cut a new tag instead.
 - `claude-sessions --version` must work on a bare static binary with no config and no network:
   the consuming image runs it as a **fatal** build check, and a static binary has no excuse.
+- `claude-sessions install DIR` is the other half of the contract: what it writes, and where
+  the drop-in it writes says the binary is, are what every dev container's hooks run.
 - This repo stays **public**. The consuming build has no token.
 
 ## Git

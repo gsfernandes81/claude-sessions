@@ -39,7 +39,13 @@ fn read_u64(path: &str) -> Option<u64> {
 }
 
 pub fn read() -> Memory {
-    let limit = match fs::read_to_string("/sys/fs/cgroup/memory.max") {
+    read_at("/sys/fs/cgroup")
+}
+
+/// The same reading of any cgroup v2 directory: the hub reads the dev containers' shared pool
+/// this way, where infra mounts it read-only (`CLAUDE_SESSIONS_POOL`).
+pub fn read_at(dir: &str) -> Memory {
+    let limit = match fs::read_to_string(format!("{dir}/memory.max")) {
         Ok(s) if s.trim() == "max" => None,
         Ok(s) => s.trim().parse().ok(),
         Err(_) => None,
@@ -51,8 +57,8 @@ pub fn read() -> Memory {
     // headroom never refuses (`room_for`).
     Memory {
         limit,
-        current: read_u64("/sys/fs/cgroup/memory.current"),
-        reclaimable: fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        current: read_u64(&format!("{dir}/memory.current")),
+        reclaimable: fs::read_to_string(format!("{dir}/memory.stat"))
             .ok()
             .and_then(|s| stat_field(&s, "inactive_file")),
     }

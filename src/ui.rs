@@ -26,6 +26,9 @@ pub enum RowKey {
     /// The Archived group's heading (owner, 2026-10-03): the one line the cursor can rest on
     /// that is not a session. `Enter` on it folds the archive open or shut.
     ArchiveFold,
+    /// A container, on the list of every container (the hub's home): `Enter` on it shows that
+    /// container's sessions alone. Which container is the row's `host`.
+    Container,
 }
 
 /// The groups the list is drawn in, top to bottom (owner, 2026-10-03). Every row is in
@@ -45,16 +48,20 @@ pub enum Group {
     /// Closed and put away — with `c`, or after 30 days unused — under one heading, folded
     /// shut until the owner opens it (owner, 2026-10-03).
     Archived,
+    /// Every container the hub reaches, last on its home screen (2026-10-26): `Enter` on one
+    /// shows only its sessions.
+    Containers,
 }
 
 impl Group {
-    pub const ALL: [Group; 6] = [
+    pub const ALL: [Group; 7] = [
         Group::NeedsYou,
         Group::Working,
         Group::Idle,
         Group::Offloaded,
         Group::Closed,
         Group::Archived,
+        Group::Containers,
     ];
 
     /// The heading, as drawn.
@@ -66,6 +73,7 @@ impl Group {
             Group::Offloaded => "Offloaded",
             Group::Closed => "Closed",
             Group::Archived => "Archived",
+            Group::Containers => "Containers",
         }
     }
 }
@@ -73,6 +81,9 @@ impl Group {
 /// One row of the list, already decided: the renderer formats it and judges nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// The container the row is in, as the hub names it — its ssh alias, `local` for this
+    /// machine. Two containers can each have a `claude-1`, so a row is the pair.
+    pub host: String,
     pub key: RowKey,
     /// A prompt is waiting: the row is in Needs you.
     pub wants_you: bool,
@@ -90,15 +101,25 @@ pub struct Row {
     pub archived: bool,
     pub title: String,
     /// Already formatted: `now`, `14m`, `5h`, `2d`. On the Archived heading's row, how many
-    /// conversations are archived.
+    /// conversations are archived; on a container's row, how many sessions it has open.
     pub age: String,
+    /// When it was last active, in milliseconds: how rows from several containers are put in
+    /// one recency order. Within one container the order is the container's own.
+    pub at: u64,
 }
 
 impl Row {
+    /// Whether two rows stand for the same thing: the same key in the same container.
+    pub fn same(&self, other: &Row) -> bool {
+        self.host == other.host && self.key == other.key
+    }
+
     /// Which group the row is drawn in. Being stopped outranks anything the record last said
     /// about the process, and a prompt waiting outranks being mid-turn.
     pub fn group(&self) -> Group {
-        if self.archived || self.key == RowKey::ArchiveFold {
+        if self.key == RowKey::Container {
+            Group::Containers
+        } else if self.archived || self.key == RowKey::ArchiveFold {
             Group::Archived
         } else if self.closed {
             Group::Closed
@@ -130,13 +151,14 @@ pub enum Dialog {
     /// Mockup 3. `running` picks the explanation: a live slot's process is stopped, an
     /// offloaded one is only hidden; either way the conversation stays on disk.
     Close { title: String, running: bool },
-    /// Mockup 4. `offer` is the slot that could make room — its index in the rows, idle age
-    /// and title — or `None` when nothing is offloadable, and then the dialog can only say so.
+    /// Mockup 4. `offer` is the slot that could make room — its key, in the same container as
+    /// the session being opened, its idle age and its title — or `None` when nothing is
+    /// offloadable, and then the dialog can only say so.
     NoRoom {
         used: u64,
         limit: u64,
         want: u64,
-        offer: Option<(usize, String, String)>,
+        offer: Option<(RowKey, String, String)>,
     },
     /// Mockup 5. `session` is the conversation id as shown (its first 8 characters),
     /// `killed_for_memory` whether the container's OOM-kill count rose while it started,
@@ -165,6 +187,13 @@ pub struct View {
     pub width: u16,
     pub height: u16,
     pub header: Header,
+    /// The hub's home: every container's open sessions, each row tagged with its container,
+    /// and the containers themselves last (mockup 12).
+    pub home: bool,
+    /// One container's sessions, reached from the home: `Esc` goes back to it (mockup 13).
+    pub back: bool,
+    /// One container that is not answering, and why (mockup 14). Its list is empty.
+    pub down: Option<String>,
     /// Where `n` starts a session and `s` a shell — `/workspace` in the mockups.
     pub workspace: String,
     pub rows: Vec<Row>,
@@ -277,6 +306,21 @@ pub enum Key {
 pub trait Terminal {
     fn suspend(&mut self) -> std::io::Result<()>;
     fn resume(&mut self) -> std::io::Result<()>;
+
+    /// Run a child with the terminal handed over, and take the terminal back whatever
+    /// happened. A container's agent overrides it: there the terminal is the hub's, and the
+    /// child is run there, through `ssh -t` back into the container (`agent.rs`).
+    fn run(
+        &mut self,
+        cmd: &mut std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        self.suspend()?;
+        let status = cmd.status();
+        // A failure to take the terminal back is not reported: the menu repaints the whole
+        // screen on its next frame, which is the only repair on offer.
+        let _ = self.resume();
+        status
+    }
 }
 
 /// What came of asking `launch.rs` to do something, for the menu to show.

@@ -34,6 +34,90 @@ takes the slot's lock (`src/transcript.rs`). Until 0.3.1 the menu preferred the 
 Claude Code's live sessions file, which on the boxes showed one of Claude's long replies in
 place of a title (owner, 2026-10-03); that file is no longer read for titles at all.
 
+## The hub, and what runs in each container (2026-10-26)
+
+**One menu over every dev container**, the owner's call (2026-10-25, infra's `plans/dev-pool.md`
+and `docs/decisions.md`): `claude-sessions` with no arguments is now the **hub**, run in a
+small container of its own that reaches every dev container over ssh. Rewritten for that one
+consumer rather than kept general; with one container configured it is exactly the old
+single-container menu.
+
+**What runs where, and why the split is where it is.** The offloader's measurement reads
+`/proc/<pid>/io` and the socket-diagnostics netlink, which answer only inside the container's
+own pid and network namespaces; a slot's lock is a `flock` in the container's own registry;
+`zmx attach` needs the container's sockets. So nothing that reads or changes a container's
+sessions moved: the hook, the registry, the measurement, the launcher and every lock run in the
+container from the same code as before. What moved is the **menu** and the **timer**:
+
+| | runs in | |
+|---|---|---|
+| `claude-sessions` (the menu) | the hub | rows from each container's agent; actions sent to it (`src/run.rs`, `src/hub.rs`) |
+| `claude-sessions offload-all` | the hub, every 3 minutes | `ssh <c> claude-sessions offload` in every container at once, each line prefixed with its container |
+| `claude-sessions agent` | each container, over `ssh -T` from the hub | snapshots out, actions in (`src/agent.rs`, the wire in `src/proto.rs`) |
+| `claude-sessions agent exec <hex>` | each container, over `ssh -t` from the hub | a child an action needs at the owner's terminal: `zmx attach`, a shell |
+| `hook`, `keepalive`, `statusline`, `offload`, `reconcile`, `doctor`, `list`, `close` | each container | unchanged |
+
+**One binary, installed by the hub.** `claude-sessions install DIR` writes this binary, the
+hooks drop-in naming it and the keep-alive skill into `DIR`, which the hub's start runs into a
+volume every dev container mounts read-only at the same path (`/opt/claude-sessions` in infra).
+So the hub and every container run the same bytes, pinned once, in the hub's image; a release
+reaches a container at the hub's next start, and a container's own image never names a
+version. Every file goes in through a temporary name and a rename, so a running hook keeps the
+binary it started from.
+
+**The agent is a channel, not a second menu.** It sends the rows `menu::gather` reads, with the
+container's header and workspace, when they change and when the minute turns (for the ages) —
+never on a timer of its own, so an idle hub still writes nothing to the owner's terminal. An
+action arrives naming a row by its key; the agent finds it among the rows it last sent, so an
+index means what it meant on the owner's screen, and hands it to `launch.rs` exactly as the
+local menu did: decided under the slot's lock, the record written before the lock goes.
+
+**Only the child crosses back.** Where the launcher would hand the terminal to `zmx` or a shell,
+the agent's `Terminal::run` sends the command to the hub instead (`{"id":N,"run":…}`); the hub
+lends its terminal and runs it back in the container as `ssh -t <c> claude-sessions agent exec
+<hex>` — hex, because the container's login shell parses that line, fish in one and bash in
+another, and a word of `[0-9a-f]` means the same to both — and answers with the exit status, or
+with an error when ssh itself failed (255), which the launcher reports as a refusal rather than
+as a session that ended. Then the launcher carries on in the container: it reads the record,
+writes `last_attach`, settles a failed resume. The agent sends its fresh rows before it says the
+action is done, so the hub never draws the old ones after it. The hub's multiplexed ssh
+(`ControlMaster`, infra's `ssh_config`) makes that second connection cost a round trip, not a
+handshake.
+
+**The scrollback variables still follow the login.** They are set on a slot's claude only where
+the owner's login has not set them (*Binding a hook to a slot*); the login is now the hub's, so
+the hub sends the ones it has with every action, and the agent treats them as its own login's —
+left off the slot's command line, and given to the child with the login's value.
+
+**Rows are a container and a key.** Two containers can each have a `claude-1`, so a row's
+identity is the pair (`Row::same`), and every question the menu keeps — a dialog's session, the
+cursor across a fresh reading — names the pair. Rows from several containers are interleaved by
+when each was last active, newest first, without reordering any container's own (`hub::merge`).
+
+**A container that does not answer** is drawn as such (mockup 14) and asked again every 15
+seconds. Not shown as `connecting` meanwhile: a retry that fails must change nothing on the
+screen, or a dead container would make an idle hub talk four times a minute; the hub test holds
+that through two retries. `s` on it still tries `ssh -t <c>`, which may answer where the agent
+did not. **Which containers** is `CLAUDE_SESSIONS_HOSTS`, else `~/.config/claude-sessions/hosts`
+(one ssh alias a line), else `local` — this machine, with the agent a child process and no ssh,
+which is how the old single-container menu and the tests run. What reaching a container takes
+(user, port, key, multiplexing) is the hub's own `~/.ssh/config`; `CLAUDE_SESSIONS_REMOTE` names
+the program in the containers when it is not on their `PATH`.
+
+**The offloader's rule is unchanged; only its timer moved.** `offload-all` starts every
+container's pass at once and waits for all, so each container is still measured every three
+minutes, which the CPU budget depends on (*How `claude-sessions offload` reads those rules*). A
+container that does not answer, or whose pass fails, is one line of the run and makes it exit
+non-zero after the others have finished; it never stops another container's pass. A container
+whose owner wants nothing stopped sets `CLAUDE_SESSIONS_OFFLOAD=0` in its environment, and its
+pass says so and looks at nothing.
+
+**Room is still a container's own**: each container keeps its own memory ceiling inside the
+pool (infra's `cgroup_parent`), and the no-room offer is from the same container as the session
+being opened. The home's header shows the pool where infra mounts it read-only
+(`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory); offering a slot in another container to make
+room in the pool is not built.
+
 ## Slots, conversations, and what is stored
 
 A **slot** is one `zmx` session named `claude-<n>`, i.e. one running `claude` process. A
@@ -269,7 +353,8 @@ only logs what it would kill. It stayed when the offloader was reduced to the me
 
 ### How `claude-sessions offload` reads those rules
 
-`src/offload.rs`. One pass per invocation, run from the box's timer; `--dry-run` decides and
+`src/offload.rs`. One pass per invocation, run in each container by the hub's `offload-all`
+(*The hub*); `--dry-run` decides and
 reports without signalling. Where the rules above left a choice, this is the choice and why:
 
 - **Measured first, and only on what was measured.** Every pass measures every running
@@ -498,8 +583,19 @@ at most a moment's quiet, so a pipe whose writer stays open cannot hold it.
 
 ## The menu
 
-- **Lists every live and offloaded slot, every unregistered `zmx` session, and every
-  conversation on disk started in the workspace that is not running**, **grouped by state**
+**Two levels at the hub** (2026-10-26; mockups 12 to 15, the owner's "focus on one container /
+repo if we wish", the design left to this repo). **The home** lists every container's open
+sessions in the groups below — Closed and Archived are one container's, and not shown there —
+each row led by its container's tag, the name without `-dev`, dim; then a **Containers** group,
+one row each, saying how many sessions it has open or that it is not answering. `Enter` on a
+container shows **that container alone**: the screens and keys below, exactly, with `Esc back`
+on the hint line, and `Esc` returning to the home with the cursor on that container. At the
+home `n` and `s` act in the cursor's container, `c` on a container's row says what `c` is for,
+and `Esc` quits. With one container there is no home and `Esc` quits from its screen.
+
+- **One container's screen lists every live and offloaded slot, every unregistered `zmx`
+  session, and every conversation on disk started in the workspace that is not running**,
+  **grouped by state**
   (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`, `Closed`, `Archived`, an
   empty group not drawn, one blank line between groups. **A heading is a labelled rule with a
   count**, `── Closed · 7 ────` (owner, 2026-10-03, chosen from three drawn options): the rule
@@ -694,15 +790,16 @@ offload, whose row would not be listed either way.
 
 ## The door
 
-`claude-sessions-door` (shipped by `infra`, beside its other container programs) runs
-`claude-sessions`; if that exits non-zero it prints why and `exec "$SHELL" -l`. `$SHELL`
-rather than a named shell, because some containers set `bash` and some `fish`. A clean quit
-exits 0 and ends the ssh session. **When the terminal goes away under the menu** — an ssh link
-dropping, routine on a phone — the menu exits **129** (128 + SIGHUP, what a shell reports for
-a hangup) and writes nothing: there is nobody to tell (issue #6). Nothing in the binary prints
-with `print!`/`println!`/`eprintln!`, which panic when the other end has gone; a lint holds
-that, and panics unwind rather than abort, so not even a bug dumps core into the menu's
-working directory, a git checkout.
+**The door is the hub's** (2026-10-26). The hub's `ssh dev` login lands on `claude-sessions`;
+infra's door script there runs it, and if it exits non-zero prints why and `exec "$SHELL" -l`.
+A dev container's own login lands in a shell — the menu is not there any more — and a forwarded
+command runs as given, which is what the hub's `ssh <c> claude-sessions agent` needs. A clean
+quit exits 0 and ends the ssh session. **When the terminal goes away under the menu** — an ssh
+link dropping, routine on a phone — the menu exits **129** (128 + SIGHUP, what a shell reports
+for a hangup) and writes nothing: there is nobody to tell (issue #6). The agents see their ssh
+channels close and exit with it. Nothing in the binary prints with `print!`/`println!`/
+`eprintln!`, which panic when the other end has gone; a lint holds that, and panics unwind
+rather than abort, so not even a bug dumps core into the menu's working directory.
 
 ## What `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` is, and why it is not enough
 
@@ -778,10 +875,16 @@ so every repo in a container gets them without touching its own `.claude/`. **Th
 prints that file**, so the hooks installed and the events handled cannot drift apart:
 
 ```
-claude-sessions hooks-config /usr/local/bin/claude-sessions \
-  > /etc/claude-code/managed-settings.d/claude-sessions.json
-chmod 0644 /etc/claude-code/managed-settings.d/claude-sessions.json
+claude-sessions hooks-config /opt/claude-sessions/bin/claude-sessions
 ```
+
+**Since the hub (2026-10-26) the hub writes it**, with the binary and the skill:
+`claude-sessions install /opt/claude-sessions` puts `managed-settings.d/claude-sessions.json`
+in the shared volume, 0644, and infra mounts that directory over the container's
+`/etc/claude-code/managed-settings.d/`, read-only. A mount and not a symlink, so Claude Code
+reads a plain directory of plain files and nothing depends on how it treats a link; and
+read-only, so no claude in a container can rewrite the hooks every claude runs. Before the hub
+it was generated into each image at build time.
 
 It installs the five events of the table and the status line, every event but `SessionStart`
 and `SessionEnd` `async` (see
@@ -797,11 +900,12 @@ tool without editing a shared one.
 `skills/keepalive/SKILL.md`, which tells claude when to run `claude-sessions keepalive` and
 for how short a time (§ *The offloader*). It goes in Claude Code's config directory, which in
 infra's containers is a volume, so an image build cannot put it there: install it **at every
-container start**, which also updates it with a new pin.
+container start**, from the copy `install` put in the shared volume, which also brings it up
+to date with the hub's version.
 
 ```
 d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/keepalive"
-mkdir -p "$d" && claude-sessions skill > "$d/SKILL.md"
+mkdir -p "$d" && cp /opt/claude-sessions/skills/keepalive/SKILL.md "$d/SKILL.md"
 ```
 
 **The question was whether that file makes Claude Code stop and ask.** The binary carries a

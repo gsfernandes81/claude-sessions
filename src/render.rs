@@ -58,6 +58,36 @@ const HINTS: [Hint; 5] = [
 ];
 /// With nothing listed there is nothing to open or close (mockup 2).
 const HINTS_EMPTY: [Hint; 3] = [("n", "new"), ("?", "keys"), WAY_OUT];
+/// One container's screen reached from the home: the same, and the way back (mockup 13).
+const BACK: Hint = ("Esc", "back");
+const HINTS_BACK: [Hint; 6] = [
+    ("Enter", "open"),
+    ("n", "new"),
+    ("c", "close"),
+    ("?", "keys"),
+    WAY_OUT,
+    BACK,
+];
+const HINTS_EMPTY_BACK: [Hint; 4] = [("n", "new"), ("?", "keys"), WAY_OUT, BACK];
+/// A container that is not answering has nothing to open and nowhere to start one; a shell
+/// is still worth a try, since ssh may answer where the agent did not (mockup 14).
+const HINTS_DOWN: [Hint; 3] = [("?", "keys"), WAY_OUT, BACK];
+
+/// The hint line for a screen: whether its list is empty, whether `Esc` goes back to the
+/// home, and whether its container is not answering.
+fn hint_set(empty: bool, back: bool, down: bool) -> &'static [Hint] {
+    match (empty, back, down) {
+        (_, _, true) => &HINTS_DOWN,
+        (true, false, _) => &HINTS_EMPTY,
+        (true, true, _) => &HINTS_EMPTY_BACK,
+        (false, false, _) => &HINTS,
+        (false, true, _) => &HINTS_BACK,
+    }
+}
+
+fn view_hints(view: &View) -> &'static [Hint] {
+    hint_set(view.rows.is_empty(), view.back, view.down.is_some())
+}
 /// Between hint items, and between most dialog buttons: three spaces, as every mockup draws.
 const GAP: &str = "   ";
 
@@ -375,9 +405,8 @@ fn keyed(
 /// mockup 8, while the shorter items wrap one to a line.
 /// How many lines the hint takes at `width` — for `menu.rs`, which has to know how many rows
 /// fit above it, and must count them the way they are drawn.
-pub fn hint_line_count(width: u16, empty: bool) -> usize {
-    let items: &[Hint] = if empty { &HINTS_EMPTY } else { &HINTS };
-    hint_lines(items, GAP, usize::from(width)).len()
+pub fn hint_line_count(width: u16, empty: bool, back: bool) -> usize {
+    hint_lines(hint_set(empty, back, false), GAP, usize::from(width)).len()
 }
 
 fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
@@ -409,8 +438,14 @@ fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
 fn header(view: &View) -> Line {
     // Closed rows are listed but are not open (owner, 2026-10-03). While the list is first
     // being read there is no count to give, so none is given.
-    let mut rest = match view.rows.iter().filter(|r| !r.closed).count() {
+    let open = view
+        .rows
+        .iter()
+        .filter(|r| !r.closed && r.key != RowKey::Container)
+        .count();
+    let mut rest = match open {
         _ if loading(view) => String::new(),
+        _ if view.down.is_some() => " · not answering".to_string(),
         0 => " · nothing open".to_string(),
         n => format!(" · {n} open"),
     };
@@ -511,11 +546,19 @@ fn list_lines(view: &View, w: usize, room: usize) -> Vec<Line> {
     let items = layout(&view.rows);
     let (shown, more) = window(&items, view.scroll, room);
     let indent = indent(w);
+    let tags = tag_width(view);
     let mut out: Vec<Line> = items[shown]
         .iter()
         .map(|item| match *item {
             Item::Heading(g) => heading(g, &count(&view.rows, g), w, false),
-            Item::Row(i) => row(&view.rows[i], w, indent, i == view.cursor, spin_on(view, i)),
+            Item::Row(i) => row(
+                &view.rows[i],
+                w,
+                indent,
+                i == view.cursor,
+                spin_on(view, i),
+                tags,
+            ),
             Item::Fold(i) => heading(Group::Archived, &view.rows[i].age, w, i == view.cursor),
             Item::Blank => blank(),
         })
@@ -577,10 +620,47 @@ fn heading_style(g: Group) -> Style {
     }
 }
 
+/// The most columns a container's tag takes on the home screen.
+const TAG_MOST: usize = 8;
+
+/// The tag a home row carries for its container (mockup 12): the container's name without
+/// the `-dev` every dev container's name ends in, so `infra-dev` is `infra`. Cut to
+/// [`TAG_MOST`] columns.
+pub fn tag(host: &str) -> String {
+    let short = host
+        .strip_suffix("-dev")
+        .filter(|s| !s.is_empty())
+        .unwrap_or(host);
+    short.chars().take(TAG_MOST).collect()
+}
+
+/// How wide the tag column is on this screen: the longest tag among its sessions, or `None`
+/// on one container's screen, where every row is in the same container and a tag would say
+/// nothing.
+fn tag_width(view: &View) -> Option<usize> {
+    if !view.home {
+        return None;
+    }
+    view.rows
+        .iter()
+        .filter(|r| r.key != RowKey::Container)
+        .map(|r| width(&tag(&r.host)))
+        .max()
+}
+
 /// A session: its title, cut to fit, and its age right-aligned in the last five columns. No
 /// marks and no number (owner, 2026-10-03): the group says what state it is in, an unread
-/// title is bold, and a session attached somewhere else is drawn dim.
-fn row(r: &Row, w: usize, indent: usize, cursor: bool, spin: Option<&str>) -> Line {
+/// title is bold, and a session attached somewhere else is drawn dim. On the home screen the
+/// title follows its container's tag, dim, in a column `tags` wide; a container's own row is
+/// its name and how many sessions it has open, right-aligned in as many columns as that takes.
+fn row(
+    r: &Row,
+    w: usize,
+    indent: usize,
+    cursor: bool,
+    spin: Option<&str>,
+    tags: Option<usize>,
+) -> Line {
     // The cursor is reverse video across the whole row (owner, 2026-10-02): a monochrome
     // terminal shows it too, and the styles inside it still read.
     let st = |s: Style| Style {
@@ -589,9 +669,25 @@ fn row(r: &Row, w: usize, indent: usize, cursor: bool, spin: Option<&str>) -> Li
         ..s
     };
     let title_style = if r.unread { BOLD } else { FG };
-    let title_w = w.saturating_sub(AGE_WIDTH + indent);
     let mut line = Line::default();
     line.pad(indent, st(FG));
+    if r.key == RowKey::Container {
+        let says = width(&r.age).min(w.saturating_sub(indent + 1));
+        let title_w = w.saturating_sub(indent + says + 1);
+        let title: String = r.title.chars().take(title_w).collect();
+        let age: String = r.age.chars().take(says).collect();
+        line.push(&title, st(FG))
+            .pad(w - says, st(FG))
+            .push(&age, st(DIM));
+        return line;
+    }
+    let mut indent = indent;
+    if let Some(tw) = tags {
+        line.push(&tag(&r.host), st(DIM))
+            .pad(indent + tw + 1, st(FG));
+        indent += tw + 1;
+    }
+    let title_w = w.saturating_sub(AGE_WIDTH + indent);
     // Cut, with no ellipsis: the fold line is the one place `…` is drawn, as a word.
     let title: String = r.title.chars().take(title_w).collect();
     line.push(&title, st(title_style))
@@ -619,15 +715,19 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
         let mut line = Line::default();
         line.push(b.glyph(), FG).push(" ", FG).push(&b.what, DIM);
         out.push(line);
-        hint_lines(&HINTS_EMPTY, GAP, w)
+        hint_lines(hint_set(true, view.back, false), GAP, w)
+    } else if let Some(why) = &view.down {
+        out.extend(down_body(view, why, w));
+        hint_lines(&HINTS_DOWN, GAP, w)
     } else if view.rows.is_empty() {
         out.extend(empty_body(view, w));
-        hint_lines(&HINTS_EMPTY, GAP, w)
+        hint_lines(view_hints(view), GAP, w)
     } else {
-        let tail = 1 + status_lines(view, w).len() + hints_len(w);
+        let hints = hint_lines(view_hints(view), GAP, w);
+        let tail = 1 + status_lines(view, w).len() + hints.len();
         let room = h.saturating_sub(out.len() + tail);
         out.extend(list_lines(view, w, room));
-        hint_lines(&HINTS, GAP, w)
+        hints
     };
     let mut footer = vec![rule(w)];
     footer.extend(status_lines(view, w).iter().map(|l| text(l, FG)));
@@ -670,10 +770,6 @@ pub fn status_line_count(width: u16, status: &str) -> usize {
     wrap(status, usize::from(width)).len()
 }
 
-fn hints_len(w: usize) -> usize {
-    hint_lines(&HINTS, GAP, w).len()
-}
-
 /// Mockup 2, between the rules. `s   a shell instead` is the owner's correction of
 /// 2026-10-02 (it read `q`, which quits).
 fn empty_body(view: &View, w: usize) -> Vec<Line> {
@@ -683,6 +779,44 @@ fn empty_body(view: &View, w: usize) -> Vec<Line> {
     let start = format!("start one in {}", view.workspace);
     keyed(&mut out, 2, ("n", BLUE), 4, &[&start], w);
     keyed(&mut out, 2, ("s", BLUE), 4, &["a shell instead"], w);
+    if view.back {
+        keyed(
+            &mut out,
+            2,
+            ("Esc", BLUE),
+            4,
+            &["back to every container"],
+            w,
+        );
+    }
+    out.push(blank());
+    out
+}
+
+/// Mockup 14: one container that is not answering, between the rules — that it is not, what
+/// was said about it, and the two ways on.
+fn down_body(view: &View, why: &str, w: usize) -> Vec<Line> {
+    let mut out = vec![blank()];
+    let said = format!("{} is not answering:", view.header.host);
+    paragraph(&mut out, &said, 2, w, FG);
+    paragraph(&mut out, why, 2, w, DIM);
+    out.push(blank());
+    keyed(
+        &mut out,
+        2,
+        ("s", BLUE),
+        4,
+        &["try a shell there anyway"],
+        w,
+    );
+    keyed(
+        &mut out,
+        2,
+        ("Esc", BLUE),
+        4,
+        &["back to every container"],
+        w,
+    );
     out.push(blank());
     out
 }
@@ -698,23 +832,59 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     let new = format!("new session in {ws}");
     let shell = format!("a shell in {ws}");
     // `Enter`'s line breaks after "it" at 80 columns as well as at 40: the approved screens
-    // break it there, so it is two segments rather than one wrapped sentence.
-    let keys: [(&str, &[&str]); 6] = [
-        (
-            "Enter",
-            &["open the session; resumes it", "if offloaded or closed"],
-        ),
-        ("n", &[&new]),
-        ("c", &["close the session, or", "archive a closed one"]),
-        ("s", &[&shell]),
-        ("Esc", &["quit the launcher"]),
-        ("?", &["this"]),
-    ];
+    // break it there, so it is two segments rather than one wrapped sentence. The home's own
+    // keys (mockup 15) act in the container under the cursor.
+    let keys: [(&str, &[&str]); 6] = if view.home {
+        [
+            (
+                "Enter",
+                &[
+                    "open the session; resumes it",
+                    "if offloaded; on a container,",
+                    "show only its sessions",
+                ],
+            ),
+            ("n", &["new session in the cursor's", "container"]),
+            ("c", &["close the session"]),
+            ("s", &["a shell in the cursor's container"]),
+            (
+                "Esc",
+                &[
+                    "quit the launcher; from one",
+                    "container, back to all of them",
+                ],
+            ),
+            ("?", &["this"]),
+        ]
+    } else {
+        [
+            (
+                "Enter",
+                &["open the session; resumes it", "if offloaded or closed"],
+            ),
+            ("n", &[&new]),
+            ("c", &["close the session, or", "archive a closed one"]),
+            ("s", &[&shell]),
+            if view.back {
+                ("Esc", &["back to every container"])
+            } else {
+                ("Esc", &["quit the launcher"])
+            },
+            ("?", &["this"]),
+        ]
+    };
     for (key, what) in keys {
         keyed(&mut out, 0, (key, BLUE), 7, what, w);
     }
     out.push(blank());
-    for g in Group::ALL {
+    // The home lists no closed or archived sessions — those are one container's — and one
+    // container's screen lists no containers.
+    let groups = Group::ALL.into_iter().filter(|g| match g {
+        Group::Closed | Group::Archived => !view.home,
+        Group::Containers => view.home,
+        _ => true,
+    });
+    for g in groups {
         let what: &[&str] = match g {
             Group::NeedsYou => &["a prompt is waiting"],
             Group::Working => &["claude is mid-turn"],
@@ -726,16 +896,16 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
                 "30 days unused; Enter on it",
                 "opens or shuts it",
             ],
+            Group::Containers => &[
+                "every container the hub",
+                "reaches; Enter on one shows",
+                "its sessions, closed ones too",
+            ],
         };
         keyed(&mut out, 0, (g.name(), heading_style(g)), 11, what, w);
     }
-    let hints: &[Hint] = if view.rows.is_empty() {
-        &HINTS_EMPTY
-    } else {
-        &HINTS
-    };
     let mut footer = vec![rule(w)];
-    footer.extend(hint_lines(hints, GAP, w));
+    footer.extend(hint_lines(view_hints(view), GAP, w));
     (out, footer)
 }
 
@@ -753,7 +923,14 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
         if room.saturating_sub(body.len()) >= 2 {
             let g = r.1.group();
             out.push(heading(g, &count(&view.rows, g), w, false));
-            out.push(row(r.1, w, indent(w), r.0 == view.cursor, None));
+            out.push(row(
+                r.1,
+                w,
+                indent(w),
+                r.0 == view.cursor,
+                None,
+                tag_width(view),
+            ));
         }
     }
     out.extend(boxed(body, w, box_w));
@@ -918,6 +1095,7 @@ mod tests {
     /// offloaded, `x` closed.
     fn row(flags: &str, title: &str, age: &str) -> Row {
         Row {
+            host: String::new(),
             key: RowKey::Slot(title.to_string()),
             wants_you: flags.contains('!'),
             busy: flags.contains('b'),
@@ -928,6 +1106,7 @@ mod tests {
             archived: false,
             title: title.to_string(),
             age: age.to_string(),
+            at: 0,
         }
     }
 
@@ -964,6 +1143,9 @@ mod tests {
                 host: "infra-dev".to_string(),
                 memory: Some((used_mib * MIB, 1024 * MIB)),
             },
+            home: false,
+            back: false,
+            down: None,
             workspace: "/workspace".to_string(),
             rows,
             cursor: 0,
@@ -1003,7 +1185,7 @@ mod tests {
                 limit: 1024 * MIB,
                 want: 250 * MIB,
                 offer: Some((
-                    RETIRE,
+                    RowKey::Slot("retire the old tunnel".into()),
                     "14m".to_string(),
                     "retire the old tunnel".to_string(),
                 )),
@@ -1096,6 +1278,72 @@ mod tests {
         }
     }
 
+    /// A row in a container, as the hub's home has them.
+    fn at(host: &str, flags: &str, title: &str, age: &str) -> Row {
+        Row {
+            host: host.to_string(),
+            ..row(flags, title, age)
+        }
+    }
+
+    fn container(host: &str, says: &str) -> Row {
+        Row {
+            host: host.to_string(),
+            key: RowKey::Container,
+            ..row("", host, says)
+        }
+    }
+
+    /// The home of mockup 12: four containers, five sessions open in three of them, and one
+    /// container not answering.
+    fn home_rows() -> Vec<Row> {
+        vec![
+            at("infra-dev", "!", "permission: write hosts/one", "2m"),
+            at("or3-dev", "b", "loop: watch the base build", "now"),
+            at("infra-dev", "*", "retire the old tunnel", "14m"),
+            at("dd-dev", "", "claude", "5h"),
+            at("infra-dev", "z", "mount guards on one", "2d"),
+            container("infra-dev", "3 open"),
+            container("or3-dev", "1 open"),
+            container("dd-dev", "1 open"),
+            container("ds-dev", "not answering"),
+        ]
+    }
+
+    fn mockup_12(w: u16) -> View {
+        View {
+            header: Header {
+                host: "dev".to_string(),
+                memory: Some((1946 * MIB, 3072 * MIB)),
+            },
+            home: true,
+            ..view(w, home_rows(), 0)
+        }
+    }
+    fn mockup_13(w: u16) -> View {
+        View {
+            back: true,
+            ..mockup_1(w)
+        }
+    }
+    fn mockup_14(w: u16) -> View {
+        View {
+            header: Header {
+                host: "ds-dev".to_string(),
+                memory: None,
+            },
+            back: true,
+            down: Some("ssh: connect to host ds-dev port 2222: Connection refused".to_string()),
+            ..view(w, vec![], 0)
+        }
+    }
+    fn mockup_15(w: u16) -> View {
+        View {
+            screen: Screen::Keys,
+            ..mockup_12(w)
+        }
+    }
+
     /// Prints the screens the mockup files draw, for redrawing those files to width:
     /// `cargo test print_the_mockups -- --ignored --nocapture`. The files list and keys
     /// screens without the blank gap above the footer (see `compare`).
@@ -1104,7 +1352,7 @@ mod tests {
     fn print_the_mockups() {
         // Numbered as the files number them; mockup 8 is the refusal, not a View.
         type Build = fn(u16) -> View;
-        let builds: [(u8, Build); 10] = [
+        let builds: [(u8, Build); 14] = [
             (1, mockup_1),
             (2, mockup_2),
             (3, mockup_3),
@@ -1115,6 +1363,10 @@ mod tests {
             (9, mockup_9),
             (10, mockup_10),
             (11, mockup_11),
+            (12, mockup_12),
+            (13, mockup_13),
+            (14, mockup_14),
+            (15, mockup_15),
         ];
         for w in [40u16, 80] {
             for (n, b) in builds {
@@ -1322,6 +1574,74 @@ mod tests {
     #[test]
     fn mockup_11_closing_a_session_the_spinner_turning() {
         assert_mockup(11, mockup_11);
+    }
+
+    #[test]
+    fn mockup_12_every_container_the_hubs_home() {
+        assert_mockup(12, mockup_12);
+    }
+
+    #[test]
+    fn mockup_13_one_container_from_the_home() {
+        assert_mockup(13, mockup_13);
+    }
+
+    #[test]
+    fn mockup_14_a_container_not_answering() {
+        assert_mockup(14, mockup_14);
+    }
+
+    #[test]
+    fn mockup_15_the_keys_at_the_home() {
+        assert_mockup(15, mockup_15);
+    }
+
+    #[test]
+    fn the_home_tags_each_session_with_its_container_and_one_container_does_not() {
+        assert_eq!(tag("infra-dev"), "infra");
+        assert_eq!(tag("or3-dev"), "or3");
+        assert_eq!(
+            tag("-dev"),
+            "-dev",
+            "a name that is all suffix is kept whole"
+        );
+        assert_eq!(tag("local"), "local");
+        assert_eq!(tag("a-very-long-name"), "a-very-l", "cut to eight");
+        let home = render(&mockup_12(40)).unwrap().plain();
+        assert!(
+            home.contains("\ninfra permission: write hosts/one"),
+            "{home}"
+        );
+        assert!(
+            home.contains("\ndd    claude"),
+            "tags padded to one column: {home}"
+        );
+        let one = render(&mockup_13(40)).unwrap().plain();
+        assert!(
+            one.contains("\npermission: write hosts/one"),
+            "no tag on one: {one}"
+        );
+        // The tag is dim, as structure is; the title is not.
+        let f = render(&mockup_12(40)).unwrap();
+        assert!(style_at(&f, 3, 0).dim && !style_at(&f, 3, 6).dim);
+    }
+
+    #[test]
+    fn a_containers_row_is_never_counted_open_and_its_words_fit_however_long() {
+        let rows = vec![container("infra-dev", "not answering")];
+        let v = View {
+            home: true,
+            ..view(20, rows, 0)
+        };
+        let plain = render(&v).unwrap().plain();
+        assert!(
+            plain.contains("· nothing"),
+            "the header counts sessions: {plain}"
+        );
+        assert!(
+            plain.contains("\ninfra- not answering"),
+            "the name gives way to what it says: {plain}"
+        );
     }
 
     #[test]
@@ -1864,7 +2184,7 @@ mod tests {
                     cursor,
                     ..mockup_1(w)
                 };
-                let room = 24 - 3 - hints_len(w as usize);
+                let room = 24 - 3 - hint_line_count(w, false, false);
                 v.scroll = scroll_to(&items, cursor, 0, room);
                 let f = render(&v).unwrap();
                 let at = items.iter().position(|i| *i == Item::Row(cursor)).unwrap();

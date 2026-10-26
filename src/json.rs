@@ -104,6 +104,43 @@ pub fn to_string_pretty(v: &Value) -> String {
     out
 }
 
+/// One line, no newline: what goes over the wire between the hub and a container's agent, a
+/// message a line (`proto.rs`). `write_str` escapes every control character, so a value can
+/// never break a line.
+pub fn to_line(v: &Value) -> String {
+    let mut out = String::new();
+    write_compact(&mut out, v);
+    out
+}
+
+fn write_compact(out: &mut String, v: &Value) {
+    match v {
+        Value::Arr(a) => {
+            out.push('[');
+            for (i, item) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_compact(out, item);
+            }
+            out.push(']');
+        }
+        Value::Obj(m) => {
+            out.push('{');
+            for (i, (k, val)) in m.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_str(out, k);
+                out.push(':');
+                write_compact(out, val);
+            }
+            out.push('}');
+        }
+        scalar => write_value(out, scalar, 0),
+    }
+}
+
 fn write_value(out: &mut String, v: &Value, indent: usize) {
     match v {
         Value::Null => out.push_str("null"),

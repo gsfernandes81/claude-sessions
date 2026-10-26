@@ -40,12 +40,15 @@ macro_rules! warn {
 }
 
 mod activity;
+mod agent;
 mod archive;
 mod bind;
 mod clock;
 mod events;
 mod fmt;
 mod hooks_config;
+mod hub;
+mod install;
 mod json;
 mod keepalive;
 mod launch;
@@ -55,6 +58,7 @@ mod mem;
 mod menu;
 mod offload;
 mod procinfo;
+mod proto;
 mod registry;
 mod render;
 mod run;
@@ -159,10 +163,47 @@ fn main() -> ExitCode {
             say_nl!("{SKILL}");
             ExitCode::SUCCESS
         }
-        "offload" => match args.get(1).map(String::as_str) {
-            None => report(offload::run(false)),
-            Some("--dry-run") => report(offload::run(true)),
-            Some(other) => fail(&format!("offload takes only --dry-run, not {other:?}")),
+        "offload" => {
+            let dry = match args.get(1).map(String::as_str) {
+                None => false,
+                Some("--dry-run") => true,
+                Some(other) => {
+                    return fail(&format!("offload takes only --dry-run, not {other:?}"));
+                }
+            };
+            // A container whose owner has turned its offloader off says so and stops nothing,
+            // however the hub's timer reached it.
+            if !dry && std::env::var("CLAUDE_SESSIONS_OFFLOAD").as_deref() == Ok("0") {
+                say!("offloading is off here (CLAUDE_SESSIONS_OFFLOAD=0); nothing was looked at");
+                return ExitCode::SUCCESS;
+            }
+            report(offload::run(dry))
+        }
+        "offload-all" => match args.get(1).map(String::as_str) {
+            None => report(hub::offload_all(false)),
+            Some("--dry-run") => report(hub::offload_all(true)),
+            Some(other) => fail(&format!("offload-all takes only --dry-run, not {other:?}")),
+        },
+        // The container's half of the hub (`agent.rs`): never typed, always run over ssh.
+        "agent" => match args.get(1).map(String::as_str) {
+            None => report(agent::serve()),
+            Some("exec") => match args.get(2) {
+                Some(hex) => fail(&format!("could not run that: {}", agent::exec(hex))),
+                None => fail("agent exec needs the command the hub was sent"),
+            },
+            Some(other) => fail(&format!("agent takes only exec, not {other:?}")),
+        },
+        "install" => match args.get(1) {
+            Some(dir) => match install::run(std::path::Path::new(dir)) {
+                Ok(done) => {
+                    for path in done {
+                        say!("{path}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&format!("install: {e}")),
+            },
+            None => fail("install needs a directory: claude-sessions install /opt/claude-sessions"),
         },
         other => fail(&format!("unknown subcommand {other:?}\n\n{}", usage())),
     }
@@ -172,14 +213,22 @@ fn usage() -> String {
     format!(
         "claude-sessions {VERSION} — Claude Code sessions, per box
 
-  claude-sessions              the menu; the list below when not at a terminal
-  claude-sessions list         every slot, one line each
+  claude-sessions              the menu over every container (CLAUDE_SESSIONS_HOSTS, else
+                               ~/.config/claude-sessions/hosts, else this one); the list
+                               below when not at a terminal
+  claude-sessions offload-all  one offload pass in every container, over ssh; run from the
+                  [--dry-run]  hub's timer every three minutes
+  claude-sessions install DIR  put this binary, its hooks drop-in and its skill in DIR, for
+                               every container to mount
+  claude-sessions agent        a container's half of the hub, run over ssh by the hub
+  claude-sessions list         every slot here, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
-  claude-sessions offload      measure every slot, and stop each one quiet for 10 minutes,
-                               detached and not kept alive; run from a timer
+  claude-sessions offload      measure every slot here, and stop each one quiet for 10
+                               minutes, detached and not kept alive; run by offload-all
+                               (CLAUDE_SESSIONS_OFFLOAD=0 here makes it stop nothing)
                   [--dry-run]  say what it would stop, and stop nothing
   claude-sessions keepalive DURATION
                                keep the slot this runs in from being offloaded for DURATION

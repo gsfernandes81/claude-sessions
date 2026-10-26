@@ -119,7 +119,9 @@ impl Deps {
             memory: mem::read,
             oom_kills: mem::oom_kills,
             quick: QUICK_FAIL,
-            preset: |key| std::env::var_os(key).is_some(),
+            // The login is the hub's when this runs in a container's agent, and it sends
+            // what that login set (`agent::preset`).
+            preset: |key| std::env::var_os(key).is_some() || crate::agent::preset(key),
         }
     }
 }
@@ -184,7 +186,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         RowKey::Conversation { .. } => {
             return Outcome::Back(Some(format!("{n} was already closed")));
         }
-        RowKey::ArchiveFold => return no_row(index),
+        RowKey::ArchiveFold | RowKey::Container => return no_row(index),
     };
     let _lock = match lock_slot(slot, &n) {
         Ok(l) => l,
@@ -256,7 +258,7 @@ pub(crate) fn open_with(
             return resume_conversation(rows, (id, cwd, &row.title), &n, term, deps, check_room);
         }
         // A heading, not a session; the menu folds it rather than asking for it to be opened.
-        RowKey::ArchiveFold => return no_row(index),
+        RowKey::ArchiveFold | RowKey::Container => return no_row(index),
         RowKey::Slot(slot) => slot,
     };
     let rec = match registry::load(slot) {
@@ -898,11 +900,11 @@ fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
     }))
 }
 
-/// The slot the offloader would offload that has been idle longest, as its index in the rows,
-/// idle age and title as drawn. A suggestion only: accepting it decides again under the lock.
+/// The slot the offloader would offload that has been idle longest, as its key, idle age and
+/// title as drawn. A suggestion only: accepting it decides again under the lock.
 /// One the offloader would close instead — never prompted, nothing on disk — is not offered:
 /// the dialog promises the offered session is resumable from disk.
-fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
+fn offer(rows: &[Row]) -> Option<(RowKey, String, String)> {
     let now = clock::now();
     let measured = activity::load();
     registry::all()
@@ -920,7 +922,10 @@ fn offer(rows: &[Row]) -> Option<(usize, String, String)> {
             Some((idle, index))
         })
         .max_by_key(|(idle, _)| *idle)
-        .map(|(idle, index)| (index, fmt::age(idle), rows[index].title.clone()))
+        .map(|(idle, index)| {
+            let r = &rows[index];
+            (r.key.clone(), fmt::age(idle), r.title.clone())
+        })
 }
 
 // ── shell ───────────────────────────────────────────────────────────────────
@@ -1011,15 +1016,12 @@ fn start_slot(
 }
 
 /// Run a child with the terminal handed over, and take the terminal back whatever happened.
+///
+/// Through [`Terminal::run`], which in a container's agent runs the child at the hub's
+/// terminal, back into this container over `ssh -t` (`agent.rs`).
 fn run_child(cmd: &mut Command, term: &mut dyn Terminal) -> Result<ExitStatus, String> {
-    term.suspend()
-        .map_err(|e| format!("could not hand the terminal over: {e}"))?;
-    let status = cmd.status();
-    // A failure to take the terminal back is not reported. The menu repaints the whole
-    // screen on its next frame, which is the only repair on offer, and turning it into
-    // `Refused` would claim nothing was done when the child did run.
-    let _ = term.resume();
-    status.map_err(|e| format!("could not run {}: {e}", cmd.get_program().to_string_lossy()))
+    term.run(cmd)
+        .map_err(|e| format!("could not run {}: {e}", cmd.get_program().to_string_lossy()))
 }
 
 /// What a slot looks like once the child that had it on screen has returned.
@@ -1476,6 +1478,7 @@ exit 1"#,
 
     fn row(slot: &str, title: &str) -> Row {
         Row {
+            host: String::new(),
             key: RowKey::Slot(slot.into()),
             wants_you: false,
             unread: false,
@@ -1486,6 +1489,7 @@ exit 1"#,
             archived: false,
             title: title.into(),
             age: "now".into(),
+            at: 0,
         }
     }
 
@@ -2010,7 +2014,11 @@ exit 1"#,
                 used: (1 << 30) - (100 << 20),
                 limit: 1 << 30,
                 want: mem::SESSION_COST,
-                offer: Some((1, "11m".into(), "mount guards on one".into())),
+                offer: Some((
+                    RowKey::Slot("claude-2".into()),
+                    "11m".into(),
+                    "mount guards on one".into()
+                )),
             })
         );
         assert!(f.calls().is_empty() && term.events.is_empty());
