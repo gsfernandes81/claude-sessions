@@ -158,28 +158,36 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     // Let the first frame finish arriving.
     let rest = term.read_for(Duration::from_millis(500));
     let frame = String::from_utf8_lossy(&[first.clone(), rest].concat()).into_owned();
-    assert!(frame.contains("Closed"), "no Closed group: {frame:?}");
+    // Everything closed is behind the Archived heading, shut when the menu starts: the
+    // workspace's conversation run by hand and the one unused for two months, two of them.
     assert!(
-        frame.contains("a conversation run by hand"),
-        "the workspace's stored conversation is listed: {frame:?}"
-    );
-    assert!(
-        !frame.contains("somewhere else"),
-        "one started outside the workspace is not: {frame:?}"
-    );
-    assert!(
-        !frame.contains("still running"),
-        "a running conversation is not: {frame:?}"
-    );
-    // Unused for more than 30 days, it is archived on its own (owner, 2026-10-03): behind
-    // the Archived heading, which is shut when the menu starts.
-    assert!(
-        frame.contains("Archived · 1"),
+        frame.contains("Archived · 2 · Enter shows"),
         "the archive's heading: {frame:?}"
     );
     assert!(
-        !frame.contains("two months ago"),
-        "an archived conversation is behind the shut heading: {frame:?}"
+        !frame.contains("a conversation run by hand"),
+        "closed conversations are behind the shut heading: {frame:?}"
+    );
+    // Opened — End is its line, the last — it lists exactly those two.
+    term.write(b"\x1b[F\r");
+    let open = term.read_until(b"Enter hides", Duration::from_secs(5));
+    let open = String::from_utf8_lossy(&[open, term.read_for(Duration::from_millis(500))].concat())
+        .into_owned();
+    assert!(
+        open.contains("a conversation run by hand"),
+        "the workspace's stored conversation is listed: {open:?}"
+    );
+    assert!(
+        open.contains("two months ago"),
+        "and the one unused for thirty days and more: {open:?}"
+    );
+    assert!(
+        !open.contains("somewhere else"),
+        "one started outside the workspace is not: {open:?}"
+    );
+    assert!(
+        !open.contains("still running"),
+        "a running conversation is not: {open:?}"
     );
 
     // The property: two registry polls' worth of nothing happening, and nothing written.

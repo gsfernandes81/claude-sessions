@@ -410,8 +410,6 @@ fn act(
         Action::Shell(_) => (None, "starting shell"),
         Action::Close(i) => (Some(*i), "closing session"),
         Action::OffloadThenOpen { victim, .. } => (Some(*victim), "offloading session for room"),
-        Action::Archive(i) => (Some(*i), "archiving session"),
-        Action::Unarchive(i) => (Some(*i), "unarchiving session"),
     };
     let then = match &action {
         Action::Open(i) => Some(*i),
@@ -434,8 +432,6 @@ fn act(
         Action::New(h) => (Some(h.clone()), op("new", vec![])),
         Action::Shell(h) => (Some(h.clone()), op("shell", vec![])),
         Action::Close(i) => (host_of(*i), op("close", vec![("key", key_of(*i))])),
-        Action::Archive(i) => (host_of(*i), op("archive", vec![("key", key_of(*i))])),
-        Action::Unarchive(i) => (host_of(*i), op("unarchive", vec![("key", key_of(*i))])),
         Action::OffloadThenOpen { victim, then } => (
             host_of(*victim),
             op(

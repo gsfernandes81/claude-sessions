@@ -55,10 +55,12 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   exception is the spinner's braille (`⠋⠙⠹…`): in none of those faces, used on the owner's
   word that it draws on Termux and Windows Terminal (2026-10-04), and only ever alone in a
   cell.
-- **Nothing is colour-only.** A session's state is said in words — the group heading it is
-  under — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for
+- **Nothing is colour-only.** A session's state is said in words or an ASCII mark — the group
+  heading it is under, Loaded, Offloaded or Archived, and `!` before the title of one waiting
+  for you — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for
   unread and dim for attached are emphasis on top, the owner's choice over glyph marks
-  (2026-10-03). Amber means *this one is waiting for you* — the Needs-you heading — and is
+  (2026-10-03). Amber means *this one is waiting for you* — the `!` and its title, a
+  session's or a container's (owner, 2026-10-26, replacing the Needs-you heading) — and is
   used for nothing else in the menu. (The status line's yellow and red for high RAM and load
   are the owner's, 2026-10-06, outside the menu.)
 - **Never resume a conversation that is already running.** Two processes on one conversation

@@ -55,11 +55,6 @@ pub enum Action {
         victim: usize,
         then: Option<usize>,
     },
-    /// `c` on a closed conversation: put it in the archive. No question asked (owner,
-    /// 2026-10-03): nothing is lost, and `c` on it under Archived brings it back.
-    Archive(usize),
-    /// `c` on an archived conversation: take it out again.
-    Unarchive(usize),
 }
 
 /// A row named the way a question remembers it: its container and its key, never its index,
@@ -132,8 +127,7 @@ pub struct Menu {
     all: Vec<Row>,
     /// What is drawn and what the cursor moves over: `all`, cut to what the screen shows —
     /// one container's rows with the archived ones behind the Archived heading's row, shown
-    /// only while it is open; or, at home, every container's open rows and a row for each
-    /// container.
+    /// only while it is open; or, at home, a row for each container.
     rows: Vec<Row>,
     /// The Archived group is open. Shut whenever the menu starts (owner, 2026-10-03), and
     /// whenever the focus moves.
@@ -245,8 +239,9 @@ impl Menu {
     pub fn replace_rows(&mut self, fresh: Vec<Row>, first: bool) {
         let next: Vec<Row> = if first {
             let mut next = fresh;
-            // Stable, so the reading's recency order survives within each group.
-            next.sort_by_key(|r| (r.group(), r.group() == Group::Idle && !r.unread));
+            // Stable, so the reading's recency order survives within each group: what waits
+            // for the owner first, then what is unread.
+            next.sort_by_key(|r| (r.group(), !r.wants_you, !r.unread));
             next
         } else {
             let mut next = Vec::with_capacity(fresh.len());
@@ -271,7 +266,7 @@ impl Menu {
     fn refresh(&mut self) {
         let under_cursor = self.rows.get(self.cursor).map(id);
         // An archive emptied is shut again, so the group shows shut whenever it reappears.
-        if !self.in_scope().any(|r| r.archived) {
+        if !self.in_scope().any(|r| r.group() == Group::Archived) {
             self.archive_open = false;
         }
         self.rows = self.visible();
@@ -296,26 +291,27 @@ impl Menu {
         self.keep_cursor_visible();
     }
 
-    /// The rows the screen is about: the focused container's, or at home every container's
-    /// open rows — not closed, not archived; those belong to one container's screen.
+    /// The rows the screen is about: the focused container's; none at home, where each
+    /// container is one row of its own.
     fn in_scope(&self) -> impl Iterator<Item = &Row> {
         let focus = self.focus.clone();
-        self.all.iter().filter(move |r| match &focus {
-            Some(h) => r.host == *h,
-            None => !r.closed && !r.archived,
-        })
+        self.all
+            .iter()
+            .filter(move |r| focus.as_ref().is_some_and(|h| r.host == *h))
     }
 
     /// The rows as drawn. For one container: every row not archived, then — when anything is
     /// archived — the Archived heading's row, counting them, then the archived rows if the
-    /// group is open. At home: every container's open rows, then a row per container.
+    /// group is open. At home: a row per container, in the order the hub was given them —
+    /// one waiting for the owner is marked, not moved, so the list never reorders itself.
     fn visible(&self) -> Vec<Row> {
-        let (archived, mut out): (Vec<Row>, Vec<Row>) =
-            self.in_scope().cloned().partition(|r| r.archived);
         if self.focus.is_none() {
-            out.extend(self.places.iter().map(|p| self.container_row(p)));
-            return out;
+            return self.places.iter().map(|p| self.container_row(p)).collect();
         }
+        let (archived, mut out): (Vec<Row>, Vec<Row>) = self
+            .in_scope()
+            .cloned()
+            .partition(|r| r.group() == Group::Archived);
         if archived.is_empty() {
             return out;
         }
@@ -340,26 +336,40 @@ impl Menu {
         out
     }
 
-    /// A container on the home screen: its name, and how many sessions it has open — or that
-    /// it is not answering, which says so in words, never by colour.
+    /// A container on the home screen: its name, and what is in it — how many sessions are
+    /// running and how many offloaded — or that it is not answering, which says so in words,
+    /// never by colour. Waiting for you if any of its sessions is, and bold if any is unread.
     fn container_row(&self, p: &Place) -> Row {
-        let open = self
+        let mine: Vec<&Row> = self
             .all
             .iter()
-            .filter(|r| r.host == p.name && !r.closed && !r.archived)
-            .count();
+            .filter(|r| r.host == p.name && r.group() != Group::Archived)
+            .collect();
+        let loaded = mine.iter().filter(|r| r.group() == Group::Loaded).count();
+        let offloaded = mine.iter().filter(|r| r.offloaded).count();
+        let mut parts = Vec::new();
+        if loaded > 0 {
+            parts.push(format!("{loaded} loaded"));
+        }
+        if offloaded > 0 {
+            parts.push(format!("{offloaded} offloaded"));
+        }
         let age = match &p.reach {
             Reach::Connecting => "connecting".to_string(),
             Reach::Down(_) => "not answering".to_string(),
-            Reach::Up if open == 0 => "nothing open".to_string(),
-            Reach::Up => format!("{open} open"),
+            Reach::Up if parts.is_empty() => "nothing open".to_string(),
+            Reach::Up => parts.join(" · "),
         };
+        let up = p.reach == Reach::Up;
         Row {
             host: p.name.clone(),
             key: RowKey::Container,
-            wants_you: false,
+            wants_you: up
+                && mine
+                    .iter()
+                    .any(|r| r.group() == Group::Loaded && r.wants_you),
             busy: false,
-            unread: false,
+            unread: up && mine.iter().any(|r| r.unread),
             attached: false,
             offloaded: false,
             closed: false,
@@ -431,7 +441,12 @@ impl Menu {
 
     /// How many lines the hint takes at this width, counted by the renderer that draws it.
     fn hint_lines(&self) -> usize {
-        crate::render::hint_line_count(self.width, self.rows.is_empty(), self.back())
+        crate::render::hint_line_count(
+            self.width,
+            self.rows.is_empty(),
+            self.back(),
+            self.focus.is_none(),
+        )
     }
 
     /// One container's screen, with a home to go back to.
@@ -586,7 +601,12 @@ impl Menu {
             Key::PageDown => self.move_to(self.cursor + page),
             Key::Home => self.move_to(0),
             Key::End => self.move_to(usize::MAX),
+            // A click on the Archived heading opens or shuts it, as Enter does there.
             Key::Click { row, .. } => match self.row_at(row) {
+                Some(i) if self.rows[i].key == RowKey::ArchiveFold => {
+                    self.cursor = i;
+                    self.toggle_archive()
+                }
                 Some(i) => self.move_to(i),
                 None => Action::None,
             },
@@ -600,16 +620,10 @@ impl Menu {
             Key::Char('s') => self.target().map_or(Action::None, Action::Shell),
             Key::Char('c') if self.on(|r| r.key == RowKey::ArchiveFold) => Action::None,
             Key::Char('c') if self.on(|r| r.key == RowKey::Container) => {
-                self.status = Some("c closes a session; Enter shows this container's".into());
+                self.status = Some("c closes a session — Enter shows this container's".into());
                 Action::Redraw
             }
-            Key::Char('c') if self.on(|r| r.archived) => Action::Unarchive(self.cursor),
-            Key::Char('c')
-                if self.on(|r| r.closed && matches!(r.key, RowKey::Conversation { .. })) =>
-            {
-                Action::Archive(self.cursor)
-            }
-            Key::Char('c') if self.on(|r| r.closed) => {
+            Key::Char('c') if self.on(|r| r.group() == Group::Archived) => {
                 self.status = Some("that session is already closed".to_string());
                 Action::Redraw
             }
@@ -897,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_reading_groups_and_puts_unread_first_in_idle() {
+    fn the_first_reading_groups_and_puts_what_waits_then_what_is_unread_first() {
         let mut a = row("a");
         let mut b = row("b");
         b.unread = true;
@@ -923,11 +937,11 @@ mod tests {
         assert_eq!(
             groups,
             [
-                Group::NeedsYou,
-                Group::Working,
-                Group::Idle,
-                Group::Idle,
-                Group::Idle,
+                Group::Loaded,
+                Group::Loaded,
+                Group::Loaded,
+                Group::Loaded,
+                Group::Loaded,
                 Group::Offloaded
             ]
         );
@@ -951,84 +965,56 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_starts_shut_behind_one_heading_and_enter_opens_and_shuts_it() {
+    fn everything_closed_starts_shut_behind_the_archived_heading_and_enter_toggles_it() {
         let mut m = menu(vec![
             row("live"),
             stored("closed", false),
             stored("old-1", true),
             stored("old-2", true),
         ]);
-        assert_eq!(names(&m), ["live", "closed", "Archived"], "shut at start");
-        assert_eq!(m.rows()[2].key, RowKey::ArchiveFold);
-        assert_eq!(m.rows()[2].age, "2", "it counts what it holds");
+        assert_eq!(names(&m), ["live", "Archived"], "shut at start");
+        assert_eq!(m.rows()[1].key, RowKey::ArchiveFold);
+        assert_eq!(
+            m.rows()[1].age,
+            "3",
+            "it counts what it holds, closed and archived"
+        );
         // The cursor reaches it like a row, and Enter opens it rather than opening anything.
         m.key(Key::End);
         assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
         assert_eq!(m.key(Key::Enter), Action::Redraw);
-        assert_eq!(names(&m), ["live", "closed", "Archived", "old-1", "old-2"]);
+        assert_eq!(names(&m), ["live", "Archived", "closed", "old-1", "old-2"]);
         assert_eq!(
             m.rows()[m.view().cursor].key,
             RowKey::ArchiveFold,
             "the cursor stays on the heading"
         );
-        // An archived row opens like any closed one.
+        // A row in it opens like any closed one, and c on it only says so.
         m.key(Key::Down);
-        assert_eq!(m.key(Key::Enter), Action::Open(3));
-        // And Enter on the heading again shuts it.
-        m.key(Key::Up);
-        m.key(Key::Enter);
-        assert_eq!(names(&m), ["live", "closed", "Archived"]);
-        // Calibration: with nothing archived there is no heading at all.
-        let m = menu(vec![row("live"), stored("closed", false)]);
-        assert_eq!(names(&m), ["live", "closed"]);
-    }
-
-    #[test]
-    fn c_archives_a_closed_conversation_without_asking_and_unarchives_an_archived_one() {
-        let mut m = menu(vec![
-            row("live"),
-            stored("closed", false),
-            stored("old", true),
-        ]);
-        m.key(Key::Down);
-        assert_eq!(
-            m.key(Key::Char('c')),
-            Action::Archive(1),
-            "no question asked"
-        );
+        assert_eq!(m.key(Key::Enter), Action::Open(2));
+        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
         assert_eq!(m.view().dialog, None);
-        // On the heading, c does nothing.
-        m.key(Key::Down);
-        assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
+        // On the heading, c does nothing; Enter shuts it again.
+        m.key(Key::Up);
         assert_eq!(m.key(Key::Char('c')), Action::None);
         m.key(Key::Enter);
-        m.key(Key::Down);
-        assert_eq!(m.key(Key::Char('c')), Action::Unarchive(3));
-        // Calibration: on a live row, c still asks before closing.
-        m.key(Key::Home);
-        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
-        assert!(matches!(m.view().dialog, Some(Dialog::Close { .. })));
+        assert_eq!(names(&m), ["live", "Archived"]);
+        // Calibration: with nothing closed there is no heading at all.
+        let m = menu(vec![row("live")]);
+        assert_eq!(names(&m), ["live"]);
     }
 
     #[test]
-    fn a_click_on_the_archived_heading_selects_it() {
+    fn a_click_on_the_archived_heading_opens_it() {
         let mut m = menu(vec![row("a"), stored("old", true)]);
-        // Header, rule, then: Idle heading, a, blank, the Archived heading on line 5.
+        // Header, rule, then: Loaded heading, a, blank, the Archived heading on line 5.
         assert_eq!(m.key(Key::Click { row: 5, col: 4 }), Action::Redraw);
         assert_eq!(m.rows()[m.view().cursor].key, RowKey::ArchiveFold);
-        // Calibration: the Idle heading on line 2 is not selectable.
+        assert_eq!(names(&m), ["a", "Archived", "old"], "opened by the click");
+        assert_eq!(m.key(Key::Click { row: 5, col: 4 }), Action::Redraw);
+        assert_eq!(names(&m), ["a", "Archived"], "and shut by the next");
+        // Calibration: the Loaded heading on line 2 is not selectable.
         assert_eq!(m.key(Key::Click { row: 2, col: 4 }), Action::None);
-    }
-
-    #[test]
-    fn a_row_archived_in_a_reading_leaves_closed_and_joins_the_archive() {
-        let mut m = menu(vec![row("live"), stored("closed", false)]);
-        assert_eq!(names(&m), ["live", "closed"]);
-        m.replace_rows(vec![row("live"), stored("closed", true)], false);
-        assert_eq!(names(&m), ["live", "Archived"]);
-        m.key(Key::End);
-        m.key(Key::Enter);
-        assert_eq!(names(&m), ["live", "Archived", "closed"]);
     }
 
     #[test]
@@ -1037,14 +1023,14 @@ mod tests {
         m.key(Key::End);
         m.key(Key::Enter);
         assert_eq!(names(&m), ["live", "Archived", "old"], "opened");
-        m.replace_rows(vec![row("live"), stored("old", false)], false);
-        assert_eq!(names(&m), ["live", "old"], "unarchived: no heading");
+        m.replace_rows(vec![row("live")], false);
+        assert_eq!(names(&m), ["live"], "resumed elsewhere: no heading");
         m.replace_rows(vec![row("live"), stored("old", true)], false);
-        assert_eq!(names(&m), ["live", "Archived"], "archived again: shut");
+        assert_eq!(names(&m), ["live", "Archived"], "closed again: shut");
     }
 
     #[test]
-    fn closed_rows_go_last_and_c_on_one_only_says_so() {
+    fn closed_rows_go_last_behind_the_fold_and_c_on_one_only_says_so() {
         let mut old = row("old");
         old.closed = true;
         let mut waiting = row("waiting");
@@ -1053,10 +1039,12 @@ mod tests {
         let mut m = menu(vec![old, row("a"), waiting]);
         assert_eq!(
             names(&m),
-            ["waiting", "a", "old"],
-            "closed is history: last"
+            ["waiting", "a", "Archived"],
+            "closed is history: last, and shut"
         );
         m.key(Key::End);
+        m.key(Key::Enter);
+        m.key(Key::Down);
         assert_eq!(m.key(Key::Char('c')), Action::Redraw);
         assert_eq!(
             m.view().dialog,
@@ -1067,7 +1055,7 @@ mod tests {
             m.view().status.as_deref(),
             Some("that session is already closed")
         );
-        assert_eq!(m.key(Key::Enter), Action::Open(2), "Enter resumes it");
+        assert_eq!(m.key(Key::Enter), Action::Open(3), "Enter resumes it");
     }
 
     #[test]
@@ -1089,17 +1077,18 @@ mod tests {
 
     #[test]
     fn a_row_that_changes_group_joins_the_top_of_its_new_group_and_the_cursor_follows() {
-        let mut busy = row("busy");
-        busy.busy = true;
-        let mut m = menu(vec![busy.clone(), row("a"), row("b"), row("c")]);
-        assert_eq!(names(&m), ["busy", "a", "b", "c"]);
-        m.key(Key::End);
+        let mut gone = row("gone");
+        gone.offloaded = true;
+        let mut m = menu(vec![row("a"), row("b"), row("c"), gone]);
+        assert_eq!(names(&m), ["a", "b", "c", "gone"]);
+        m.key(Key::Down);
+        m.key(Key::Down);
         assert_eq!(m.rows()[m.view().cursor].title, "c");
-        // "c" starts a turn and "busy" finishes one.
+        // "c" is offloaded and "gone" resumed.
         let mut c = row("c");
-        c.busy = true;
-        m.replace_rows(vec![row("busy"), row("a"), row("b"), c], false);
-        assert_eq!(names(&m), ["c", "busy", "a", "b"]);
+        c.offloaded = true;
+        m.replace_rows(vec![row("gone"), row("a"), row("b"), c], false);
+        assert_eq!(names(&m), ["gone", "a", "b", "c"]);
         assert_eq!(
             m.rows()[m.view().cursor].title,
             "c",
@@ -1117,13 +1106,13 @@ mod tests {
         let mut m = menu(vec![row("a"), row("b")]);
         m.key(Key::Down);
         m.key(Key::Char('c'));
-        // "a" starts a turn and moves above "b" into Working: the question is still about b.
+        // "a" is offloaded and moves below "b": the question is still about b.
         let mut a = row("a");
-        a.busy = true;
+        a.offloaded = true;
         m.replace_rows(vec![a, row("b")], false);
-        assert_eq!(names(&m), ["a", "b"]);
-        assert_eq!(m.view().about, Some(1));
-        assert_eq!(m.key(Key::Char('y')), Action::Close(1));
+        assert_eq!(names(&m), ["b", "a"]);
+        assert_eq!(m.view().about, Some(0));
+        assert_eq!(m.key(Key::Char('y')), Action::Close(0));
         // And a dialog about a row that has gone goes with it.
         m.key(Key::Char('c'));
         m.replace_rows(vec![row("a")], false);
@@ -1156,15 +1145,17 @@ mod tests {
     fn a_click_on_a_row_moves_the_cursor_there_and_anywhere_else_does_nothing() {
         let mut w = row("w");
         w.wants_you = true;
-        let mut m = menu(vec![w, row("a"), row("b")]);
-        // Header, rule, then: Needs you, w, blank, Idle, a, b.
-        assert_eq!(m.key(Key::Click { row: 7, col: 10 }), Action::Redraw);
+        let mut off = row("o");
+        off.offloaded = true;
+        let mut m = menu(vec![w, row("a"), row("b"), off]);
+        // Header, rule, then: Loaded, w, a, b, blank, Offloaded, o.
+        assert_eq!(m.key(Key::Click { row: 5, col: 10 }), Action::Redraw);
         assert_eq!(m.rows()[m.view().cursor].title, "b");
         for (line, what) in [
             (0, "the header"),
             (2, "a heading"),
-            (4, "a blank"),
-            (5, "a heading"),
+            (6, "a blank"),
+            (7, "a heading"),
             (9, "below the list"),
         ] {
             assert_eq!(
@@ -1438,23 +1429,30 @@ mod tests {
     }
 
     #[test]
-    fn the_home_shows_every_containers_open_sessions_then_the_containers() {
+    fn the_home_is_the_containers_in_order_each_saying_whats_in_it() {
         let mut closed = in_("infra-dev", "old");
         closed.closed = true;
-        closed.key = RowKey::Conversation {
-            id: "old".into(),
-            cwd: "/workspace".into(),
-        };
-        let m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b"), closed]);
-        assert_eq!(names(&m), ["a", "b", "infra-dev", "or3-dev", "ds-dev"]);
+        let mut off = in_("infra-dev", "c");
+        off.offloaded = true;
+        let mut waiting = in_("or3-dev", "b");
+        waiting.wants_you = true;
+        let m = hub_menu(vec![in_("infra-dev", "a"), off, waiting, closed]);
+        assert_eq!(
+            names(&m),
+            ["infra-dev", "or3-dev", "ds-dev"],
+            "the hub's order, waiting or not"
+        );
         let v = m.view();
         assert!(v.home && !v.back && v.down.is_none());
-        let says: Vec<&str> = m.rows()[2..].iter().map(|r| r.age.as_str()).collect();
+        let says: Vec<&str> = m.rows().iter().map(|r| r.age.as_str()).collect();
         assert_eq!(
             says,
-            ["1 open", "1 open", "not answering"],
-            "closed is not open"
+            ["1 loaded · 1 offloaded", "1 loaded", "not answering"],
+            "a closed session is not counted"
         );
+        assert!(m.rows()[1].wants_you, "or3-dev is marked, not moved");
+        assert!(!m.rows()[0].wants_you);
+        assert!(m.rows().iter().all(|r| r.group() == Group::Containers));
     }
 
     #[test]
@@ -1462,12 +1460,13 @@ mod tests {
         let mut closed = in_("infra-dev", "old");
         closed.closed = true;
         let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b"), closed]);
-        m.key(Key::End);
-        m.key(Key::Up);
-        m.key(Key::Up);
         assert_eq!(m.rows()[m.view().cursor].title, "infra-dev");
         assert_eq!(m.key(Key::Enter), Action::Redraw);
-        assert_eq!(names(&m), ["a", "old"], "its sessions, closed ones too");
+        assert_eq!(
+            names(&m),
+            ["a", "Archived"],
+            "its sessions, closed ones behind the fold"
+        );
         let v = m.view();
         assert!(!v.home && v.back, "one container, with a way back");
         assert_eq!(v.cursor, 0, "from its top");
@@ -1486,6 +1485,7 @@ mod tests {
     fn at_home_n_and_s_act_in_the_cursors_container_and_c_on_a_container_explains() {
         let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
         m.key(Key::Down);
+        assert_eq!(m.rows()[m.view().cursor].title, "or3-dev");
         assert_eq!(m.key(Key::Char('n')), Action::New("or3-dev".into()));
         assert_eq!(m.key(Key::Char('s')), Action::Shell("or3-dev".into()));
         m.key(Key::End);
@@ -1524,15 +1524,21 @@ mod tests {
             in_("infra-dev", "claude-1"),
             in_("or3-dev", "claude-1"),
         ]);
-        assert_eq!(names(&m)[..2], ["claude-1", "claude-1"]);
         m.key(Key::Down);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["claude-1"], "or3-dev's alone");
         // A fresh reading in which only infra-dev's changed group keeps or3-dev's under the
         // cursor, by its container as well as its key.
         let mut busy = in_("infra-dev", "claude-1");
         busy.busy = true;
         m.replace_rows(vec![busy, in_("or3-dev", "claude-1")], false);
         let v = m.view();
+        assert_eq!(v.rows.len(), 1);
         assert_eq!(v.rows[v.cursor].host, "or3-dev");
+        assert!(
+            !v.rows[v.cursor].busy,
+            "infra-dev's change is not or3-dev's"
+        );
     }
 
     #[test]

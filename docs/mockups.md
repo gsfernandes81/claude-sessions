@@ -28,7 +28,13 @@ again for it, and mockup 9 is new. On 2026-10-04 the owner added **a spinner for
 that takes a while** — Docker Compose's, `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`, a little faster than Compose's
 100 ms per frame — standing in for the age of the session being worked on, with the status
 line saying what is happening and naming no session (`⠹ closing session`), and on the first
-frame where the list will go while it is read. Mockups 10 and 11 are new. **The braille is
+frame where the list will go while it is read. Mockups 10 and 11 are new. **On 2026-10-26 the
+owner changed the groups again**, with the hub: "make needs you just a yellow highlight or icon
+or something. Let's keep loaded / offloaded and a click to expand archived section." So one
+container's list is **Loaded, Offloaded and Archived** — Archived holding everything closed,
+folded shut, its heading saying what `Enter` or a click will do — and a session waiting for
+the owner is marked **`!` in amber** before its title instead of having a group. Every screen
+below was redrawn for it, from the renderer, at both widths. **The braille is
 the one glyph here outside the measured set**: it is in none of the six faces, and is used
 on the owner's word that it draws on the terminals this is driven from, which put a fallback
 glyph into one cell. It is only ever drawn alone, at the end of a row or the start of the
@@ -74,11 +80,12 @@ attempt: *"Too much yellow / orange. Use a less worrying colour at base."* The f
 put amber on every key in the hint line and on every dialog title, which broke the rule
 written beside it: amber is the colour that reads as a *problem*, and a screen covered in it
 reads as a screen full of problems. **The base accent is blue; amber is left to one thing**
-— the `!` mark until the 2026-10-03 redesign, the Needs-you heading since.
+— the `!` mark until the 2026-10-03 redesign, the Needs-you heading from then, and the `!`
+mark again, with its title, from 2026-10-26.
 
 | where | style | because |
 |---|---|---|
-| the `Needs you` heading, rule and name | amber, name bold | the only group that is a *request*, and the only amber anywhere |
+| the `!` before a session waiting for you, and its title — or a container's name, at the home | amber, the mark bold | the only row that is a *request*, and the only amber anywhere |
 | a key you can press — the hint line, the keys screen | blue | actionable, not alarming |
 | every other group heading | rule dim, name bold | a divider the eye can find, and a glyph, so a monochrome terminal keeps it |
 | the Archived heading under the cursor | reverse video, like a row | the one heading the cursor can rest on |
@@ -89,29 +96,25 @@ reads as a screen full of problems. **The base accent is blue; amber is left to 
 | title | foreground | the content |
 | the cursor | reverse video, across the row | visible on a monochrome terminal too |
 
-**In a full list there is one run of amber on the screen, and it means the one thing** —
-which is the test for whether amber is still worth having. On the keys screen the group
-names are drawn as their headings are, so that screen is also the key to the list.
+**Amber on the screen means one thing**, a session waiting for you — which is the test for
+whether amber is still worth having. On the keys screen the group names are drawn as their
+headings are and the `!` as it is on a row, so that screen is also the key to the list.
 
 Two rules come with it. **Nothing is colour-only**: what state a session is in is said in
-words, by the heading it is under, so a monochrome terminal, a pipe or a screen reader loses
-none of it. Bold for unread and dim for attached are emphasis on top of that, the owner's
-choice over glyphs (2026-10-03); `claude-sessions list` still prints them as marks. And
-**amber is spent once**: if the heading and anything else were both amber, neither would
-mean *this one*. The plain-text mockups below cannot show colour, which is the honest reason
+words, by the heading it is under, and waiting by the ASCII `!`, so a monochrome terminal, a
+pipe or a screen reader loses none of it. Bold for unread and dim for attached are emphasis on
+top of that, the owner's choice over glyphs (2026-10-03); `claude-sessions list` still prints
+them as marks. And **amber is spent once**: if a waiting row and anything else were both
+amber, neither would mean *this one*. The plain-text mockups below cannot show colour, which is the honest reason
 this table exists; the published page renders it.
 
 ### Mockup 1 — The list, in its groups
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-── Needs you · 1 ───────────────────────
-permission: write hosts/one           2m
-
-── Working · 1 ─────────────────────────
+── Loaded · 5 ──────────────────────────
+! permission: write hosts/one         2m
 loop: watch the base build           now
-
-── Idle · 3 ────────────────────────────
 retire the old tunnel                14m
 immich upgrade                        3m
 claude                                5h
@@ -119,11 +122,7 @@ claude                                5h
 ── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-── Closed · 7 ──────────────────────────
-fix the dns records                   3d
-tunnel cutover notes                  4d
-bcache register script                5d
-… 4 more
+── Archived · 7 · Enter shows ──────────
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
@@ -147,7 +146,7 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-── Idle · 3 ────────────────────────────
+── Loaded · 5 ──────────────────────────
 retire the old tunnel                14m
 ╭──────────────────────────────────────╮
 │ Close this session?                  │
@@ -164,7 +163,7 @@ retire the old tunnel                14m
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────
-── Idle · 3 ────────────────────────────
+── Loaded · 5 ──────────────────────────
 retire the old tunnel                14m
 ╭──────────────────────────────────────╮
 │ No room for another claude           │
@@ -210,13 +209,9 @@ the container's own OOM-kill count, wrapped like any other line.
 ```
 infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────
-── Needs you · 1 ───────────────────────
-permission: write hosts/one           2m
-
-── Working · 1 ─────────────────────────
+── Loaded · 5 ──────────────────────────
+! permission: write hosts/one         2m
 loop: watch the base build           now
-
-── Idle · 3 ────────────────────────────
 retire the old tunnel                now
 immich upgrade                       12m
 claude                                5h
@@ -224,10 +219,7 @@ claude                                5h
 ── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-── Closed · 7 ──────────────────────────
-fix the dns records                   3d
-tunnel cutover notes                  4d
-… 5 more
+── Archived · 7 · Enter shows ──────────
 ────────────────────────────────────────
 detached · it is still running
 Enter open   n new   c close   ? keys
@@ -241,20 +233,16 @@ infra-dev · keys
 Enter  open the session; resumes it
        if offloaded or closed
 n      new session in /workspace
-c      close the session, or
-       archive a closed one
+c      close the session
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
 
-Needs you  a prompt is waiting
-Working    claude is mid-turn
-Idle       at its prompt, waiting
+Loaded     claude is running
 Offloaded  stopped to save memory
-Closed     ended; still resumable
-Archived   put away with c, or after
-           30 days unused; Enter on it
-           opens or shuts it
+Archived   ended, still resumable; Enter
+           or a click on it opens it
+!          a prompt is waiting for you
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
@@ -309,15 +297,13 @@ at 6 columns, the right edge marked:
 ```
 infra-dev · 2 open · 812M of 1.0G
 ────────────────────────────────────────
-── Idle · 2 ────────────────────────────
+── Loaded · 2 ──────────────────────────
 retire the old tunnel                14m
 claude                                5h
 
-── Closed · 2 ──────────────────────────
+── Archived · 5 · Enter hides ──────────
 fix the dns records                   3d
 tunnel cutover notes                  4d
-
-── Archived · 3 ────────────────────────
 bcache register script               41d
 syncthing share rename               52d
 smartd on one                        63d
@@ -340,13 +326,9 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-── Needs you · 1 ───────────────────────
-permission: write hosts/one           2m
-
-── Working · 1 ─────────────────────────
+── Loaded · 5 ──────────────────────────
+! permission: write hosts/one         2m
 loop: watch the base build           now
-
-── Idle · 3 ────────────────────────────
 retire the old tunnel                  ⠋
 immich upgrade                        3m
 claude                                5h
@@ -354,10 +336,7 @@ claude                                5h
 ── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-── Closed · 7 ──────────────────────────
-fix the dns records                   3d
-tunnel cutover notes                  4d
-… 5 more
+── Archived · 7 · Enter shows ──────────
 ────────────────────────────────────────
 ⠋ closing session
 Enter open   n new   c close   ? keys
@@ -371,63 +350,45 @@ s shell
 
 **These four are that call, made here, and are binding as the rest are until the owner
 changes them.** The menu now runs in a hub over every dev container (`docs/design.md` § *The
-hub*), and it has two levels:
+hub*), and it is two levels deep, the container first (the owner, the same day: "the highest
+part of the hierarchy is the container, followed by loaded / offloaded / archived one level
+deeper"):
 
-- **The home** (mockup 12): every container's open sessions — Needs you, Working, Idle,
-  Offloaded, grouped as one container's are, newest first across containers — each row led
-  by its container's tag, dim: the name without its `-dev`. Then **Containers**, one row each,
-  saying how many sessions it has open, or `not answering`. Closed and archived sessions are
-  not here: there are dozens per repo, and they are one container's business.
-- **One container** (mockup 13): `Enter` on a container's row. Exactly the single
-  container's screens above — Closed and Archived included, every key as it was — with one
+- **The home** (mockup 12) is the containers, one row each, in the hub's order: its name, and
+  what is in it — `3 loaded · 1 offloaded`, `nothing open`, `not answering`, in words. A
+  container with a session waiting for the owner is marked `!` in amber, as such a session is,
+  and one with a session unread is bold; marked, never moved. No session is listed here.
+- **One container** (mockup 13) is `Enter` on its row: exactly the single container's screens
+  above — Loaded, Offloaded and the folded Archived, every key as it is there — with one
   addition to the hint line, `Esc back`, and `Esc` going back to the home with the cursor on
   that container. With only one container configured there is no home, and the screens are
   the ones above, `Esc` quitting.
 
-`n` and `s` at the home act in the container under the cursor; `c` on a container's row
-says what `c` is for. A container that does not answer (mockup 14) is asked again every 15
-seconds, which changes nothing on the screen until it answers — the idle hub still writes
-nothing. Its row reads `not answering`, never in a colour: amber is still the Needs-you
-heading's alone. The tag is dim because it is structure, like the age.
+`n` and `s` at the home act in the container under the cursor, and `c` there says what `c` is
+for; the home's hint line leaves it out. A container that does not answer (mockup 14) is asked
+again every 15 seconds, which changes nothing on the screen until it answers — the idle hub
+still writes nothing.
 
 ### Mockup 12 — Every container, the hub's home
 ```
-dev · 5 open · 1.9G of 3.0G
+dev · 4 containers · 1.9G of 3.0G
 ────────────────────────────────────────
-── Needs you · 1 ───────────────────────
-infra permission: write hosts/one     2m
-
-── Working · 1 ─────────────────────────
-or3   loop: watch the base build     now
-
-── Idle · 2 ────────────────────────────
-infra retire the old tunnel          14m
-dd    claude                          5h
-
-── Offloaded · 1 ───────────────────────
-infra mount guards on one             2d
-
 ── Containers · 4 ──────────────────────
-infra-dev                         3 open
-or3-dev                           1 open
-dd-dev                            1 open
+! infra-dev       3 loaded · 1 offloaded
+or3-dev                         1 loaded
+dd-dev                       2 offloaded
 ds-dev                     not answering
 ────────────────────────────────────────
-Enter open   n new   c close   ? keys
-s shell
+Enter open   n new   ? keys   s shell
 ```
 
 ### Mockup 13 — One container, from the home
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
-── Needs you · 1 ───────────────────────
-permission: write hosts/one           2m
-
-── Working · 1 ─────────────────────────
+── Loaded · 5 ──────────────────────────
+! permission: write hosts/one         2m
 loop: watch the base build           now
-
-── Idle · 3 ────────────────────────────
 retire the old tunnel                14m
 immich upgrade                        3m
 claude                                5h
@@ -435,11 +396,7 @@ claude                                5h
 ── Offloaded · 1 ───────────────────────
 mount guards on one                   2d
 
-── Closed · 7 ──────────────────────────
-fix the dns records                   3d
-tunnel cutover notes                  4d
-bcache register script                5d
-… 4 more
+── Archived · 7 · Enter shows ──────────
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   Esc back
@@ -465,25 +422,15 @@ ds-dev · not answering
 ```
 dev · keys
 ────────────────────────────────────────
-Enter  open the session; resumes it
-       if offloaded; on a container,
-       show only its sessions
-n      new session in the cursor's
-       container
-c      close the session
-s      a shell in the cursor's container
-Esc    quit the launcher; from one
-       container, back to all of them
+Enter  show the container's sessions
+n      new session in the container
+s      a shell in the container
+Esc    quit the launcher; from a
+       container, back to this list
 ?      this
 
-Needs you  a prompt is waiting
-Working    claude is mid-turn
-Idle       at its prompt, waiting
-Offloaded  stopped to save memory
-Containers every container the hub
-           reaches; Enter on one shows
-           its sessions, closed ones too
+Containers every one the hub reaches
+!          a session in it is waiting
 ────────────────────────────────────────
-Enter open   n new   c close   ? keys
-s shell
+Enter open   n new   ? keys   s shell
 ```

@@ -215,18 +215,20 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     let first = term.read_until(b"not answering", Duration::from_secs(10));
     let first = text(&[first, term.read_for(Duration::from_millis(500))].concat());
     for want in [
+        "3 containers",
         "Containers · 3",
-        "Offloaded · 2",
-        "infra",
-        "retire the old tunnel",
-        "or3",
-        "loop on the base build",
+        "infra-dev",
+        "or3-dev",
+        "1 offloaded",
         "down-dev",
         "not answering",
-        "2 open",
     ] {
         assert!(first.contains(want), "{want:?} not on the home: {first:?}");
     }
+    assert!(
+        !first.contains("retire the old tunnel"),
+        "the home lists containers, not sessions: {first:?}"
+    );
 
     // The property, through two retries of the container that is not answering.
     let window = Duration::from_secs(4);
@@ -240,13 +242,9 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     );
 
     // Calibration: one container's change is seen, through its own agent.
-    root.offloaded(&or3, "claude-1", "loop on the new build", old - 1000);
-    let seen = term.read_until(b"loop on the new build", Duration::from_secs(10));
-    assert!(
-        text(&seen).contains("loop on the new build"),
-        "{:?}",
-        text(&seen)
-    );
+    root.offloaded(&or3, "claude-2", "loop on the new build", old - 2000);
+    let seen = term.read_until(b"2 offloaded", Duration::from_secs(10));
+    assert!(text(&seen).contains("2 offloaded"), "{:?}", text(&seen));
 
     // Into the dead container, and back. End is its row, the last.
     term.write(b"\x1b[F\r");
@@ -261,16 +259,16 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     let home = term.read_until(b"Containers", Duration::from_secs(5));
     assert!(text(&home).contains("Containers"), "{:?}", text(&home));
 
-    // Into or3-dev, one row up: its sessions alone, and no tags.
+    // Into or3-dev, one row up: its sessions, one level down, and none of infra-dev's.
     term.write(b"\x1b[A\r");
     let focused = term.read_until(b"back", Duration::from_secs(5));
     let focused = text(&[focused, term.read_for(Duration::from_millis(300))].concat());
     assert!(focused.contains("loop on the new build"), "{focused:?}");
+    assert!(focused.contains("Offloaded · 2"), "{focused:?}");
     assert!(
         !focused.contains("retire the old tunnel"),
         "another container's session on or3-dev's screen: {focused:?}"
     );
-    assert!(focused.contains("1 open"), "its own header: {focused:?}");
 
     term.write(b"q");
     assert!(
@@ -289,17 +287,21 @@ fn a_resume_runs_in_its_container_with_the_child_at_the_hubs_terminal() {
     root.offloaded(&or3, "claude-1", "loop on the base build", old - 1000);
 
     let mut term = pty::Pty::spawn(root.hub("infra-dev or3-dev"), 80, 24).unwrap();
-    let first = term.read_until(b"loop on the base build", Duration::from_secs(10));
-    assert!(
-        text(&first).contains("retire the old tunnel"),
-        "{:?}",
-        text(&first)
-    );
+    let first = term.read_until(b"or3-dev", Duration::from_secs(10));
+    assert!(text(&first).contains("infra-dev"), "{:?}", text(&first));
     term.read_for(Duration::from_millis(500));
 
-    // The first row is infra-dev's, the newer of the two. Enter resumes it: the container
-    // decides, the hub runs `zmx attach … claude --resume s-claude-1` back in it, and the
-    // container reads what came of it.
+    // Into infra-dev, the first container; then Enter on its one session resumes it: the
+    // container decides, the hub runs `zmx attach … claude --resume s-claude-1` back in it,
+    // and the container reads what came of it.
+    term.write(b"\r");
+    let inside = term.read_until(b"retire the old tunnel", Duration::from_secs(5));
+    assert!(
+        text(&inside).contains("retire the old tunnel"),
+        "{:?}",
+        text(&inside)
+    );
+    term.read_for(Duration::from_millis(300));
     term.write(b"\r");
     let back = term.read_until(b"detached", Duration::from_secs(15));
     assert!(
@@ -318,9 +320,6 @@ fn a_resume_runs_in_its_container_with_the_child_at_the_hubs_terminal() {
         other.contains(r#""state":"offloaded""#) || other.contains(r#""state": "offloaded""#),
         "or3-dev's slot of the same name untouched: {other}"
     );
-    // And the row has moved out of Offloaded on the hub, from infra-dev's own snapshot.
-    let screen = text(&term.read_for(Duration::from_millis(1500)));
-    let _ = screen;
     term.write(b"q");
     assert!(term.wait(Duration::from_secs(5)).is_some());
 }

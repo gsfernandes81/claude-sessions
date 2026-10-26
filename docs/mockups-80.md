@@ -12,13 +12,9 @@ filling the terminal.
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Needs you · 1 ───────────────────────────────────────────────────────────────
-  permission: write hosts/one                                                 2m
-
-── Working · 1 ─────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
+  ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
-
-── Idle · 3 ────────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      14m
   immich upgrade                                                              3m
   claude                                                                      5h
@@ -26,12 +22,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
   mount guards on one                                                         2d
 
-── Closed · 7 ──────────────────────────────────────────────────────────────────
-  fix the dns records                                                         3d
-  tunnel cutover notes                                                        4d
-  bcache register script                                                      5d
-  syncthing share rename                                                      6d
-  … 3 more
+── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
@@ -54,7 +45,7 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Idle · 3 ────────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      14m
                     ╭──────────────────────────────────────╮
                     │ Close this session?                  │
@@ -71,7 +62,7 @@ infra-dev · 6 open · 812M of 1.0G
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Idle · 3 ────────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      14m
                     ╭──────────────────────────────────────╮
                     │ No room for another claude           │
@@ -112,13 +103,9 @@ infra-dev · 6 open · 812M of 1.0G
 ```
 infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Needs you · 1 ───────────────────────────────────────────────────────────────
-  permission: write hosts/one                                                 2m
-
-── Working · 1 ─────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
+  ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
-
-── Idle · 3 ────────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      now
   immich upgrade                                                             12m
   claude                                                                      5h
@@ -126,11 +113,7 @@ infra-dev · 6 open · 1.0G of 1.0G
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
   mount guards on one                                                         2d
 
-── Closed · 7 ──────────────────────────────────────────────────────────────────
-  fix the dns records                                                         3d
-  tunnel cutover notes                                                        4d
-  bcache register script                                                      5d
-  … 4 more
+── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 detached · it is still running
 Enter open   n new   c close   ? keys   s shell
@@ -143,20 +126,16 @@ infra-dev · keys
 Enter  open the session; resumes it
        if offloaded or closed
 n      new session in /workspace
-c      close the session, or
-       archive a closed one
+c      close the session
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
 
-Needs you  a prompt is waiting
-Working    claude is mid-turn
-Idle       at its prompt, waiting
+Loaded     claude is running
 Offloaded  stopped to save memory
-Closed     ended; still resumable
-Archived   put away with c, or after
-           30 days unused; Enter on it
-           opens or shuts it
+Archived   ended, still resumable; Enter
+           or a click on it opens it
+!          a prompt is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell
 ```
@@ -210,15 +189,13 @@ at 6 columns, the right edge marked:
 ```
 infra-dev · 2 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Idle · 2 ────────────────────────────────────────────────────────────────────
+── Loaded · 2 ──────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      14m
   claude                                                                      5h
 
-── Closed · 2 ──────────────────────────────────────────────────────────────────
+── Archived · 5 · Enter hides ──────────────────────────────────────────────────
   fix the dns records                                                         3d
   tunnel cutover notes                                                        4d
-
-── Archived · 3 ────────────────────────────────────────────────────────────────
   bcache register script                                                     41d
   syncthing share rename                                                     52d
   smartd on one                                                              63d
@@ -240,13 +217,9 @@ n new   ? keys   s shell
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Needs you · 1 ───────────────────────────────────────────────────────────────
-  permission: write hosts/one                                                 2m
-
-── Working · 1 ─────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
+  ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
-
-── Idle · 3 ────────────────────────────────────────────────────────────────────
   retire the old tunnel                                                        ⠋
   immich upgrade                                                              3m
   claude                                                                      5h
@@ -254,11 +227,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
   mount guards on one                                                         2d
 
-── Closed · 7 ──────────────────────────────────────────────────────────────────
-  fix the dns records                                                         3d
-  tunnel cutover notes                                                        4d
-  bcache register script                                                      5d
-  … 4 more
+── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 ⠋ closing session
 Enter open   n new   c close   ? keys   s shell
@@ -267,45 +236,28 @@ Enter open   n new   c close   ? keys   s shell
 ## The hub (2026-10-26)
 
 The four screens of [`mockups.md`](mockups.md) § *The hub*, at 80 columns. Rows are indented
-under their headings here, the tag column with them.
+under their headings here, as everywhere at this width.
 
 ### Mockup 12 — Every container, the hub's home
 ```
-dev · 5 open · 1.9G of 3.0G
+dev · 4 containers · 1.9G of 3.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Needs you · 1 ───────────────────────────────────────────────────────────────
-  infra permission: write hosts/one                                           2m
-
-── Working · 1 ─────────────────────────────────────────────────────────────────
-  or3   loop: watch the base build                                           now
-
-── Idle · 2 ────────────────────────────────────────────────────────────────────
-  infra retire the old tunnel                                                14m
-  dd    claude                                                                5h
-
-── Offloaded · 1 ───────────────────────────────────────────────────────────────
-  infra mount guards on one                                                   2d
-
 ── Containers · 4 ──────────────────────────────────────────────────────────────
-  infra-dev                                                               3 open
-  or3-dev                                                                 1 open
-  dd-dev                                                                  1 open
+  ! infra-dev                                             3 loaded · 1 offloaded
+  or3-dev                                                               1 loaded
+  dd-dev                                                             2 offloaded
   ds-dev                                                           not answering
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   ? keys   s shell
 ```
 
 ### Mockup 13 — One container, from the home
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Needs you · 1 ───────────────────────────────────────────────────────────────
-  permission: write hosts/one                                                 2m
-
-── Working · 1 ─────────────────────────────────────────────────────────────────
+── Loaded · 5 ──────────────────────────────────────────────────────────────────
+  ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
-
-── Idle · 3 ────────────────────────────────────────────────────────────────────
   retire the old tunnel                                                      14m
   immich upgrade                                                              3m
   claude                                                                      5h
@@ -313,12 +265,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
   mount guards on one                                                         2d
 
-── Closed · 7 ──────────────────────────────────────────────────────────────────
-  fix the dns records                                                         3d
-  tunnel cutover notes                                                        4d
-  bcache register script                                                      5d
-  syncthing share rename                                                      6d
-  … 3 more
+── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   Esc back
 ```
@@ -342,24 +289,15 @@ ds-dev · not answering
 ```
 dev · keys
 ────────────────────────────────────────────────────────────────────────────────
-Enter  open the session; resumes it
-       if offloaded; on a container,
-       show only its sessions
-n      new session in the cursor's
-       container
-c      close the session
-s      a shell in the cursor's container
-Esc    quit the launcher; from one
-       container, back to all of them
+Enter  show the container's sessions
+n      new session in the container
+s      a shell in the container
+Esc    quit the launcher; from a
+       container, back to this list
 ?      this
 
-Needs you  a prompt is waiting
-Working    claude is mid-turn
-Idle       at its prompt, waiting
-Offloaded  stopped to save memory
-Containers every container the hub
-           reaches; Enter on one shows
-           its sessions, closed ones too
+Containers every one the hub reaches
+!          a session in it is waiting
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   ? keys   s shell
 ```

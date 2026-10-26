@@ -91,8 +91,9 @@ left off the slot's command line, and given to the child with the login's value.
 
 **Rows are a container and a key.** Two containers can each have a `claude-1`, so a row's
 identity is the pair (`Row::same`), and every question the menu keeps — a dialog's session, the
-cursor across a fresh reading — names the pair. Rows from several containers are interleaved by
-when each was last active, newest first, without reordering any container's own (`hub::merge`).
+cursor across a fresh reading — names the pair. The menu holds every container's rows in one
+list, interleaved by when each was last active without reordering any container's own
+(`hub::merge`), and shows one container's at a time.
 
 **A container that does not answer** is drawn as such (mockup 14) and asked again every 15
 seconds. Not shown as `connecting` meanwhile: a retry that fails must change nothing on the
@@ -231,7 +232,7 @@ terminal.
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | activity, idle since it fired |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` | `needs_you` |
-| `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would put every unanswered session under Needs you |
+| `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would mark every unanswered session as waiting |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
 
@@ -313,7 +314,7 @@ if the Esc dismissed a permission prompt, waiting for you) until the next turn e
 the interrupt does write is a `user` entry whose text begins `[Request interrupted by user`,
 timestamped at the Esc. So when the hooks left a slot busy or waiting and its transcript's
 last conversational entry is that marker, newer than the latest activity the hooks recorded,
-the menu draws the row under Idle (`SlotRecord::esc_ended`). Only the tail is read; a last
+the menu draws the row without the waiting mark (`SlotRecord::esc_ended`). Only the tail is read; a last
 line that cannot be read whole is no answer. **Only the marker itself counts** (issue #10): a
 list of exactly one text part that says exactly `[Request interrupted by user]` or
 `[Request interrupted by user for tool use]`; a prompt the owner types arrives as a string,
@@ -583,44 +584,45 @@ at most a moment's quiet, so a pipe whose writer stays open cannot hold it.
 
 ## The menu
 
-**Two levels at the hub** (2026-10-26; mockups 12 to 15, the owner's "focus on one container /
-repo if we wish", the design left to this repo). **The home** lists every container's open
-sessions in the groups below — Closed and Archived are one container's, and not shown there —
-each row led by its container's tag, the name without `-dev`, dim; then a **Containers** group,
-one row each, saying how many sessions it has open or that it is not answering. `Enter` on a
-container shows **that container alone**: the screens and keys below, exactly, with `Esc back`
-on the hint line, and `Esc` returning to the home with the cursor on that container. At the
-home `n` and `s` act in the cursor's container, `c` on a container's row says what `c` is for,
-and `Esc` quits. With one container there is no home and `Esc` quits from its screen.
+**Two levels at the hub, the container first** (2026-10-26; mockups 12 to 15, the owner's
+"focus on one container / repo", then "the highest part of the hierarchy is the container,
+followed by loaded / offloaded / archived one level deeper", then "make needs you just a yellow
+highlight or icon … keep loaded / offloaded and a click to expand archived section"). **The
+home** is the containers, one row each in the hub's order, saying what is in it — `3 loaded ·
+1 offloaded`, `nothing open`, `not answering` — marked `!` in amber when a session in it is
+waiting for the owner, and bold when one is unread. Marked, never moved: the home keeps its
+order. `Enter` on a container shows **that container**: the screens and keys below, with `Esc
+back` on the hint line, and `Esc` returning to the home with the cursor on that container. At
+the home `n` and `s` act in the cursor's container, `c` says what it is for, and `Esc` quits.
+With one container there is no home and `Esc` quits from its screen.
 
 - **One container's screen lists every live and offloaded slot, every unregistered `zmx`
-  session, and every conversation on disk started in the workspace that is not running**,
-  **grouped by state**
-  (owner, 2026-10-03): `Needs you`, `Working`, `Idle`, `Offloaded`, `Closed`, `Archived`, an
-  empty group not drawn, one blank line between groups. **A heading is a labelled rule with a
-  count**, `── Closed · 7 ────` (owner, 2026-10-03, chosen from three drawn options): the rule
-  dim and the name bold, the whole Needs-you line amber. A rule is a glyph, so it divides the
-  list on a monochrome terminal too, and the count says how many sit behind `… N more`. **From
-  60 columns up the rows are indented two columns** under their headings; at 40 the two
-  columns stay with the titles.
-  A row's group is the first that fits: closed, offloaded, a prompt waiting, mid-turn, else
-  idle; an unregistered session, which nothing describes, is idle. Within a group, most recent
-  activity first, except Idle, where unread rows come first. A row is its title and its age —
-  **no marks and no numbers**: an unread title is bold, a session attached somewhere else is
-  drawn dim, and amber is the Needs-you heading. Closed rows are not counted as open in the
-  header.
-- **The archive** (owner, 2026-10-03) hides a closed conversation in the menu and changes
-  nothing of Claude Code's: `claude --resume` and `/resume` still find it. It is one small file
-  per conversation id in `archive/` beside the registry (`src/archive.rs`), saying `archived`
-  or `kept` and when. A conversation is archived when it has gone 30 days unused, worked out
-  as the list is read, or when `c` on its Closed row put it there — **with no question
-  asked**, since nothing is lost — and it has not been used since: one resumed by hand after
-  it was archived is in use again. `c` on an archived row takes it out, and `Enter` on one
-  resumes it and does the same; either way it is marked kept, which gives it 30 days from
-  then before age archives it again, so an old one does not fold straight back. **The
-  Archived group is shut whenever the menu starts**, and again whenever it empties: one
-  heading, `── Archived · 12 ──`, and `Enter` on it opens or shuts it.
-- **The Closed group is read from Claude Code's own store**, `$CLAUDE_CONFIG_DIR/projects`
+  session, and every conversation on disk started in the workspace that is not running**, in
+  **three groups** (owner, 2026-10-26; six from 2026-10-03 until then): `Loaded` — a claude
+  is there, mid-turn, at its prompt or waiting for the owner — then `Offloaded`, then
+  `Archived`, everything closed, folded shut. An empty group is not drawn, one blank line
+  between groups. **A heading is a labelled rule with a count**, `── Offloaded · 1 ────`
+  (owner, 2026-10-03, chosen from three drawn options): the rule dim and the name bold. A rule
+  is a glyph, so it divides the list on a monochrome terminal too, and the count says how
+  many sit behind `… N more`. **From 60 columns up the rows are indented two columns** under
+  their headings; at 40 the two columns stay with the titles.
+  A row's group is the first that fits: closed, offloaded, else loaded; an unregistered
+  session, which nothing describes, is loaded. Within a group, most recent activity first,
+  except that rows waiting for the owner come first and unread ones next. A row is its title
+  and its age — **no numbers, and one mark**: `! ` before the title of a session with a prompt
+  waiting, the mark bold and the title amber (owner, 2026-10-26: "just a yellow highlight or
+  icon"), ASCII so it survives a monochrome terminal; an unread title is bold, a session
+  attached somewhere else is drawn dim. Mid-turn and at-its-prompt are no longer told apart on
+  the list: both are loaded. Archived rows are not counted as open in the header.
+- **The Archived group is everything closed** (owner, 2026-10-26: "a click to expand archived
+  section"), one heading that says what `Enter` or a click on it will do —
+  `── Archived · 12 · Enter shows ──`, `… · Enter hides` once open — **shut whenever the menu
+  starts**, and again whenever it empties. Opened, it lists the closed conversations newest
+  first; `Enter` on one resumes it, and `c` on one only says it is closed already. Until
+  2026-10-26 it was a second fold below a Closed group, filled by `c` on a closed row and by
+  30 days unused; the marks `src/archive.rs` keeps from then are still read — a resume marks
+  its conversation kept — but no longer divide the list.
+- **The Archived group is read from Claude Code's own store**, `$CLAUDE_CONFIG_DIR/projects`
   (owner, 2026-10-03; `src/store.rs`), not from the registry: every conversation on disk,
   whoever started it — a slot of ours, a `claude` run by hand, the old `ssh` path, a
   conversation a slot held before a `/clear`. Until then Closed listed only slots of ours, and
@@ -719,9 +721,9 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   order they open it. `Enter` on an offloaded row resumes immediately with no confirmation
   (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
   for a *different* slot, which is accepted rather than designed around.
-- **Keys:** `Enter` open (on the Archived heading, open or shut it) · `n` new, in the
-  workspace · `c` close (on a closed row, archive; on an archived one, unarchive) · `s` a
-  shell · `Esc` quit ·
+- **Keys:** `Enter` open (on the Archived heading, open or shut it; a click does the same) ·
+  `n` new, in the workspace · `c` close · `s` a shell · `Esc` quit (back to the home, at the
+  hub) ·
   `?` the keys. **`q` also quits and is listed nowhere** (owner, 2026-10-01): it is the first
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
@@ -742,7 +744,7 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   evidence for staying put — back from a session, it is no longer unread and is the most
   recent, and is still where it was.
 - **What does not fit folds into `… N more`**, on the list's last line, counting the sessions
-  below it — not the Archived heading. Closed and Archived are last, so they fold first. The list scrolls to keep the cursor's
+  below it — not the Archived heading. Archived is last, so it folds first. The list scrolls to keep the cursor's
   session above the fold, and scrolling up to a group's first session brings its heading.
 - **Anything that takes a while shows a spinner** (owner, 2026-10-04; mockups 10 and 11):
   Docker Compose's ten braille frames, one every 80 ms, a little faster than Compose's 100.
@@ -784,7 +786,7 @@ sit in their group. The one close the offloader makes is of an idle slot with no
 conversation on disk, which has nothing to offload (*The offloader*).
 
 **Closing is not destructive and the dialog says so.** What a close stops is the process; the
-conversation stays on disk, and is listed under Closed to resume it from. The difference between close and offload is the group the row is in and that the offloader
+conversation stays on disk, and is listed under Archived to resume it from. The difference between close and offload is the group the row is in and that the offloader
 never stops a slot on its own initiative to close it — except one with no conversation to
 offload, whose row would not be listed either way.
 
@@ -861,11 +863,11 @@ Measured against the release binary here, and against its source:
 ## Unregistered sessions
 
 A `zmx attach work claude` somebody types is real work that nothing here started. The menu
-lists **zmx's sessions ∪ the registry**, under Idle, since nothing reports what they are
+lists **zmx's sessions ∪ the registry**, under Loaded, since nothing reports what they are
 doing. They cannot be named while they run — there is no session id to map to a transcript,
 so all there is to show is the zmx session name. Matching `cwd` and start time against transcripts would work and is
 guesswork. Once one ends, its conversation is in Claude Code's store like any other, and is
-listed under Closed, by its own title, to resume in a slot of ours.
+listed under Archived, by its own title, to resume in a slot of ours.
 
 ## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 

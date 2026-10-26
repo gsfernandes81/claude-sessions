@@ -31,35 +31,29 @@ pub enum RowKey {
     Container,
 }
 
-/// The groups the list is drawn in, top to bottom (owner, 2026-10-03). Every row is in
-/// exactly one, decided by [`Row::group`]; an empty group is not drawn.
+/// The groups the list is drawn in, top to bottom. Every row is in exactly one, decided by
+/// [`Row::group`]; an empty group is not drawn. Three in a container, since 2026-10-26 (the
+/// owner: "keep loaded / offloaded and a click to expand archived section"); before that six,
+/// Needs you, Working, Idle, Offloaded, Closed and Archived (owner, 2026-10-03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// A prompt is waiting. The only heading drawn in amber.
-    NeedsYou,
-    /// Claude is mid-turn.
-    Working,
-    /// At its prompt, waiting.
-    Idle,
+    /// A claude is running: mid-turn, at its prompt, or waiting for the owner — which is the
+    /// amber `!` on its row, not a group of its own (the owner, 2026-10-26).
+    Loaded,
     /// Stopped to save memory; `Enter` resumes it.
     Offloaded,
-    /// Ended, and still resumable; not counted as open (owner, 2026-10-03).
-    Closed,
-    /// Closed and put away — with `c`, or after 30 days unused — under one heading, folded
-    /// shut until the owner opens it (owner, 2026-10-03).
+    /// Ended, and still resumable, under one heading folded shut until the owner opens it —
+    /// `Enter` or a click on the heading. Not counted as open.
     Archived,
-    /// Every container the hub reaches, last on its home screen (2026-10-26): `Enter` on one
-    /// shows only its sessions.
+    /// Every container the hub reaches, on its home screen (2026-10-26): `Enter` on one shows
+    /// its sessions.
     Containers,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
-        Group::NeedsYou,
-        Group::Working,
-        Group::Idle,
+    pub const ALL: [Group; 4] = [
+        Group::Loaded,
         Group::Offloaded,
-        Group::Closed,
         Group::Archived,
         Group::Containers,
     ];
@@ -67,11 +61,8 @@ impl Group {
     /// The heading, as drawn.
     pub fn name(self) -> &'static str {
         match self {
-            Group::NeedsYou => "Needs you",
-            Group::Working => "Working",
-            Group::Idle => "Idle",
+            Group::Loaded => "Loaded",
             Group::Offloaded => "Offloaded",
-            Group::Closed => "Closed",
             Group::Archived => "Archived",
             Group::Containers => "Containers",
         }
@@ -85,9 +76,9 @@ pub struct Row {
     /// machine. Two containers can each have a `claude-1`, so a row is the pair.
     pub host: String,
     pub key: RowKey,
-    /// A prompt is waiting: the row is in Needs you.
+    /// A prompt is waiting: the row carries the amber `!`, and leads its group.
     pub wants_you: bool,
-    /// Mid-turn: the row is in Working.
+    /// Mid-turn.
     pub busy: bool,
     /// It finished something since the owner last looked: the title is bold.
     pub unread: bool,
@@ -97,7 +88,8 @@ pub struct Row {
     pub offloaded: bool,
     /// Closed; `Enter` resumes it.
     pub closed: bool,
-    /// Archived (`archive.rs`); listed under Archived when that group is open.
+    /// Archived (`archive.rs`): put away with `c` before 2026-10-26, or 30 days unused. Under
+    /// Archived like every closed row.
     pub archived: bool,
     pub title: String,
     /// Already formatted: `now`, `14m`, `5h`, `2d`. On the Archived heading's row, how many
@@ -115,22 +107,16 @@ impl Row {
     }
 
     /// Which group the row is drawn in. Being stopped outranks anything the record last said
-    /// about the process, and a prompt waiting outranks being mid-turn.
+    /// about the process.
     pub fn group(&self) -> Group {
         if self.key == RowKey::Container {
             Group::Containers
-        } else if self.archived || self.key == RowKey::ArchiveFold {
+        } else if self.archived || self.closed || self.key == RowKey::ArchiveFold {
             Group::Archived
-        } else if self.closed {
-            Group::Closed
         } else if self.offloaded {
             Group::Offloaded
-        } else if self.wants_you {
-            Group::NeedsYou
-        } else if self.busy {
-            Group::Working
         } else {
-            Group::Idle
+            Group::Loaded
         }
     }
 }
@@ -187,8 +173,8 @@ pub struct View {
     pub width: u16,
     pub height: u16,
     pub header: Header,
-    /// The hub's home: every container's open sessions, each row tagged with its container,
-    /// and the containers themselves last (mockup 12).
+    /// The hub's home: every container, one row each, the ones with a session waiting under
+    /// Needs you (mockup 12).
     pub home: bool,
     /// One container's sessions, reached from the home: `Esc` goes back to it (mockup 13).
     pub back: bool,
