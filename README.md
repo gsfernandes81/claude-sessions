@@ -61,7 +61,7 @@ Released as GitHub releases, which infra's hub image pins. Where the work stands
 ## How it gets to a box
 
 A GitHub release carries static musl binaries, cross-compiled. The consumer is the hub's
-Dockerfile in a private config repo, which downloads a **pinned** tag and checks a
+Dockerfile in the (public) `infra` config repo, which downloads a **pinned** tag and checks a
 per-architecture SHA-256 — so this repo must stay public (that build runs on a public runner
 with no token) and a published release must never be re-cut under the same tag.
 

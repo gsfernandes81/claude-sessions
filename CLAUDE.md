@@ -1,7 +1,7 @@
 # claude-sessions — Project Rules
 
 **This repo is source.** One Rust binary, no deployment config, no secrets, no host state.
-The fleet's configuration lives in a separate private `infra` repo, which consumes this one
+The fleet's configuration lives in a separate public `infra` repo, which consumes this one
 as a **pinned, checksummed GitHub release** — never as a git dependency and never built in
 place.
 
