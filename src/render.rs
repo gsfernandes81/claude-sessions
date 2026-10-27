@@ -818,7 +818,8 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     let shell = format!("a shell in {ws}");
     // `Enter`'s line breaks after "it" at 80 columns as well as at 40: the approved screens
     // break it there, so it is two segments rather than one wrapped sentence. The home's own
-    // keys (mockup 15) act in the container under the cursor.
+    // keys (mockup 15) act in the container under the cursor. `c` is one step down the list,
+    // never a question (owner, 2026-10-27).
     let keys: [(&str, &[&str]); 6] = if view.home {
         [
             ("Enter", &["show the container's sessions"]),
@@ -835,10 +836,13 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
         [
             (
                 "Enter",
-                &["open the session; resumes it", "if offloaded or closed"],
+                &["open the session; resumes it", "if offloaded or archived"],
             ),
             ("n", &[&new]),
-            ("c", &["close the session"]),
+            (
+                "c",
+                &["offload the session, or", "archive an offloaded one"],
+            ),
             ("s", &[&shell]),
             if view.back {
                 ("Esc", &["back to every container"])
@@ -884,7 +888,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     (out, footer)
 }
 
-/// Mockups 3 to 5: header, rule, the session the dialog is about under its group's heading,
+/// Mockups 4 and 5: header, rule, the session the dialog is about under its group's heading,
 /// the box, and nothing after it — no closing rule and no hint line, because the box carries
 /// its own keys.
 fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> {
@@ -911,22 +915,6 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
 fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
     let mut out = Vec::new();
     match dialog {
-        Dialog::Close { title, running } => {
-            paragraph(&mut out, "Close this session?", 0, tw, BOLD);
-            paragraph(&mut out, title, 2, tw, FG);
-            out.push(blank());
-            // Closing is never destructive, and the dialog says so either way: a live slot's
-            // process is stopped, an offloaded one has no process and is only hidden.
-            let what = if *running {
-                "Running. Stops the process, not the conversation — resumable from disk."
-            } else {
-                "Offloaded. Hides the row, not the conversation — claude --resume still finds it."
-            };
-            paragraph(&mut out, what, 0, tw, FG);
-            out.push(blank());
-            // Four spaces between these two, three in mockup 5: as drawn.
-            out.extend(hint_lines(&[("y", "close"), ("n", "keep")], "    ", tw));
-        }
         Dialog::NoRoom {
             used,
             limit,
@@ -954,9 +942,10 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
                     out.extend(hint_lines(&buttons, "    ", tw));
                 }
                 // Nothing to offer, so nothing to accept: the dialog can only say so and go
-                // back. Closing a live slot is what frees memory, so that is the advice.
+                // back. `c` offloads whichever session the owner picks, so that is the advice.
                 None => {
-                    let none = "Nothing can be offloaded right now. Close a session to make room.";
+                    let none = "Nothing is idle enough to offload. c on a loaded session \
+                                offloads it to make room.";
                     paragraph(&mut out, none, 0, tw, FG);
                     out.push(blank());
                     out.extend(hint_lines(&[("Esc", "back")], GAP, tw));
@@ -993,13 +982,13 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             }
             let mut tail = vec![blank()];
             let left = if *closed {
-                "Left closed. Nothing was deleted; the transcript may be gone."
+                "Left archived. Nothing was deleted; the transcript may be gone."
             } else {
                 "Left offloaded. Nothing was deleted; the transcript may be gone."
             };
             paragraph(&mut tail, left, 0, tw, FG);
             tail.push(blank());
-            let buttons = [("r", "retry"), ("c", "close it"), ("Esc", "back")];
+            let buttons = [("r", "retry"), ("c", "archive it"), ("Esc", "back")];
             tail.extend(hint_lines(&buttons, GAP, tw));
             // stderr is the one part of unbounded length. When it cannot all fit, its last
             // lines are the ones kept — that is where the error is — and the keys always are.
@@ -1136,17 +1125,6 @@ mod tests {
     fn mockup_2(w: u16) -> View {
         view(w, vec![], 812)
     }
-    fn mockup_3(w: u16) -> View {
-        View {
-            cursor: RETIRE,
-            about: Some(RETIRE),
-            dialog: Some(Dialog::Close {
-                title: "retire the old tunnel".to_string(),
-                running: true,
-            }),
-            ..view(w, listed(), 812)
-        }
-    }
     fn mockup_4(w: u16) -> View {
         View {
             about: Some(RETIRE),
@@ -1232,14 +1210,15 @@ mod tests {
         }
     }
 
-    /// Mockup 11: closing a running session, the spinner in its age and on the status line.
+    /// Mockup 11: offloading a running session with `c`, the spinner in its age and on the
+    /// status line.
     fn mockup_11(w: u16) -> View {
         View {
             cursor: RETIRE,
             busy: Some(Busy {
                 frame: 0,
                 row: Some(RETIRE),
-                what: "closing session".to_string(),
+                what: "offloading session".to_string(),
                 loading: false,
             }),
             ..view(w, listed(), 812)
@@ -1311,10 +1290,9 @@ mod tests {
     fn print_the_mockups() {
         // Numbered as the files number them; mockup 8 is the refusal, not a View.
         type Build = fn(u16) -> View;
-        let builds: [(u8, Build); 14] = [
+        let builds: [(u8, Build); 13] = [
             (1, mockup_1),
             (2, mockup_2),
-            (3, mockup_3),
             (4, mockup_4),
             (5, mockup_5),
             (6, mockup_6),
@@ -1449,11 +1427,6 @@ mod tests {
     }
 
     #[test]
-    fn mockup_3_closing_a_live_session() {
-        assert_mockup(3, mockup_3);
-    }
-
-    #[test]
     fn mockup_4_no_room_to_open_another() {
         assert_mockup(4, mockup_4);
     }
@@ -1489,7 +1462,7 @@ mod tests {
         assert_eq!(p[5], format!("{:<35}{:>5}", "retire the old tunnel", "⠋"));
         assert_eq!(style_at(&f, 5, 39), FG);
         // The status line says what is happening, in place of any status.
-        assert!(p.contains(&"⠋ closing session".to_string()), "{p:?}");
+        assert!(p.contains(&"⠋ offloading session".to_string()), "{p:?}");
         assert!(!p.iter().any(|l| l.contains("earlier status")));
         // Every other row keeps its age.
         assert!(p[6].ends_with("3m"));
@@ -1710,7 +1683,7 @@ mod tests {
             }
         }
         // A dialog draws no footer: its last line is the box's bottom, not a hint.
-        for build in [mockup_3, mockup_4, mockup_5] {
+        for build in [mockup_4, mockup_5] {
             assert_eq!(last_hint_line(&render(&build(40)).unwrap()), None);
         }
     }
@@ -1918,7 +1891,7 @@ mod tests {
     #[test]
     fn too_narrow_holds_for_every_screen_and_seven_draws_them_all() {
         for build in [
-            mockup_1, mockup_2, mockup_3, mockup_4, mockup_5, mockup_6, mockup_7,
+            mockup_1, mockup_2, mockup_4, mockup_5, mockup_6, mockup_7, mockup_12,
         ] {
             for w in 0..7 {
                 assert_eq!(render(&build(w)), Err(TooNarrow { width: w, need: 7 }));
@@ -1949,7 +1922,7 @@ mod tests {
     fn the_mockup_comparison_fails_on_a_wrong_view() {
         // The parse finds real screens, not empty ones that would match anything.
         assert_eq!(mockup(MOCKUPS_40, 1).len(), 16);
-        assert_eq!(mockup(MOCKUPS_80, 7).len(), 17);
+        assert_eq!(mockup(MOCKUPS_80, 7).len(), 18);
         assert!(mockup(MOCKUPS_40, 5)[0].starts_with("infra-dev · 6 open"));
 
         let wrong_title = {
@@ -1982,11 +1955,14 @@ mod tests {
             ..mockup_4(40)
         };
         let wrong_dialog = View {
-            dialog: Some(Dialog::Close {
-                title: "retire the old tunnel".to_string(),
-                running: false,
+            dialog: Some(Dialog::ResumeFailed {
+                title: "mount guards on one".to_string(),
+                session: "0f9c4a1e".to_string(),
+                killed_for_memory: false,
+                output: vec!["No conversation found with that session id".to_string()],
+                closed: true,
             }),
-            ..mockup_3(40)
+            ..mockup_5(40)
         };
         let wrong_workspace = View {
             workspace: "/work".to_string(),
@@ -2005,7 +1981,7 @@ mod tests {
             (1, wrong_memory),
             (6, wrong_status),
             (4, wrong_about),
-            (3, wrong_dialog),
+            (5, wrong_dialog),
             (7, wrong_workspace),
             (1, short),
             (1, mockup_1(80)),
@@ -2028,8 +2004,8 @@ mod tests {
         let mut out = Vec::new();
         for (_, w) in SETS {
             for build in [
-                mockup_1, mockup_2, mockup_3, mockup_4, mockup_5, mockup_6, mockup_7, mockup_9,
-                mockup_10, mockup_11,
+                mockup_1, mockup_2, mockup_4, mockup_5, mockup_6, mockup_7, mockup_9, mockup_10,
+                mockup_11, mockup_12,
             ] {
                 let v = build(w);
                 let f = render(&v).unwrap();
@@ -2117,15 +2093,15 @@ mod tests {
         assert_eq!(blue, ["Enter", "n", "c", "?"]);
         let k = render(&mockup_7(40)).unwrap();
         let first = |i: usize| k.lines[i][0].clone();
-        for i in [2, 4, 5, 6, 7, 8] {
+        for i in [2, 4, 5, 7, 8, 9] {
             assert_eq!(first(i).style, BLUE, "key on line {i}");
         }
-        for i in 10..13 {
+        for i in 11..14 {
             assert_eq!(first(i).style, BOLD, "group on line {i}");
         }
-        assert_eq!(first(12).text, "Archived");
-        assert_eq!(first(14).text, "!");
-        assert_eq!(first(14).style, AMBER_BOLD, "the mark, as it is drawn");
+        assert_eq!(first(13).text, "Archived");
+        assert_eq!(first(15).text, "!");
+        assert_eq!(first(15).style, AMBER_BOLD, "the mark, as it is drawn");
     }
 
     #[test]
@@ -2224,7 +2200,7 @@ mod tests {
                 }
             }
         }
-        for build in [mockup_3, mockup_4, mockup_5] {
+        for build in [mockup_4, mockup_5] {
             for w in [40u16, 80] {
                 let f = render(&build(w)).unwrap();
                 // The box's first body line: header, rule, heading, row, top border, then it.
@@ -2403,34 +2379,6 @@ mod tests {
     }
 
     #[test]
-    fn closing_an_offloaded_session_says_it_is_only_hidden() {
-        let v = View {
-            cursor: MOUNT,
-            about: Some(MOUNT),
-            dialog: Some(Dialog::Close {
-                title: "mount guards on one".to_string(),
-                running: false,
-            }),
-            ..mockup_1(40)
-        };
-        let f = render(&v).unwrap();
-        check_shape(&f, &v).unwrap();
-        assert_eq!(
-            box_text(&f),
-            [
-                " Close this session?",
-                "   mount guards on one",
-                "",
-                " Offloaded. Hides the row, not the",
-                " conversation — claude --resume still",
-                " finds it.",
-                "",
-                " y close    n keep",
-            ]
-        );
-    }
-
-    #[test]
     fn no_room_with_nothing_to_offload_can_only_go_back() {
         let v = View {
             dialog: Some(Dialog::NoRoom {
@@ -2450,8 +2398,9 @@ mod tests {
                 " 1000M of 1.0G used. A new one wants",
                 " about 250M.",
                 "",
-                " Nothing can be offloaded right now.",
-                " Close a session to make room.",
+                " Nothing is idle enough to offload. c",
+                " on a loaded session offloads it to",
+                " make room.",
                 "",
                 " Esc back",
             ]
@@ -2459,7 +2408,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_that_says_nothing_says_so_and_a_closed_one_is_left_closed() {
+    fn a_resume_that_says_nothing_says_so_and_an_archived_one_is_left_archived() {
         let v = View {
             dialog: Some(Dialog::ResumeFailed {
                 title: "fix the dns records".to_string(),
@@ -2482,10 +2431,10 @@ mod tests {
                 " claude --resume 5b2d0c77 ended",
                 "   and wrote nothing to stderr",
                 "",
-                " Left closed. Nothing was deleted;",
+                " Left archived. Nothing was deleted;",
                 " the transcript may be gone.",
                 "",
-                " r retry   c close it   Esc back",
+                " r retry   c archive it   Esc back",
             ]
         );
     }
@@ -2508,7 +2457,7 @@ mod tests {
         check_shape(&f, &v).unwrap();
         let p = lines(&f);
         assert!(p[15].starts_with('╰'), "the box closes on the last line");
-        assert!(p[14].contains("r retry   c close it   Esc back"));
+        assert!(p[14].contains("r retry   c archive it   Esc back"));
         assert!(p.iter().any(|l| l.contains("  line 40")));
         assert!(!p.iter().any(|l| l.contains("line 1 ")));
         assert_eq!(p[2].chars().next(), Some('╭'), "the context goes first");
@@ -2563,7 +2512,7 @@ mod tests {
         let builds: Vec<Box<dyn Fn(u16) -> View>> = vec![
             Box::new(mockup_1),
             Box::new(mockup_2),
-            Box::new(mockup_3),
+            Box::new(mockup_12),
             Box::new(mockup_4),
             Box::new(mockup_5),
             Box::new(mockup_6),

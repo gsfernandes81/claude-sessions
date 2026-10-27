@@ -618,7 +618,7 @@ With one container there is no home and `Esc` quits from its screen.
   section"), one heading that says what `Enter` or a click on it will do —
   `── Archived · 12 · Enter shows ──`, `… · Enter hides` once open — **shut whenever the menu
   starts**, and again whenever it empties. Opened, it lists the closed conversations newest
-  first; `Enter` on one resumes it, and `c` on one only says it is closed already. Until
+  first; `Enter` on one resumes it, and `c` on one only says it is archived already. Until
   2026-10-26 it was a second fold below a Closed group, filled by `c` on a closed row and by
   30 days unused; the marks `src/archive.rs` keeps from then are still read — a resume marks
   its conversation kept — but no longer divide the list.
@@ -698,9 +698,17 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   the cgroup again: what the stopped claude read stays charged as active page cache for a
   while, which the working set still counts, and a second check could refuse the room just
   made.
-- **`c` on a live slot stops it** with the offloader's own `TERM` → `KILL` path and zmx
-  teardown, pid and start time checked at each step, then marks it closed. A row with no record
-  at all is refused: there is nothing to identify its process by safely.
+- **`c` is one step down the list, and asks nothing** (owner, 2026-10-27; until then it asked
+  "Close this session?", mockup 3, now retired). On a loaded slot it **offloads** it: the
+  offloader's own stop (`offload::stop_quiet`) — the record marked `offloading` before the
+  signal, `TERM` → `KILL` and zmx teardown, pid and start time checked at each step — but on
+  the owner's word, so no measured rule holds it. One with no conversation on disk is closed
+  instead, as the offloader would close it. On an offloaded slot it **archives** it: the record
+  marked closed, so its conversation is listed under Archived from the store. On an archived
+  row it only says so. A row with no record at all is refused: there is nothing to identify
+  its process by safely. The agent's wire op for the first is `offload`, new with this; the
+  second is `close`, which every agent knows, and which still stops a live slot for an older
+  hub that sends it after its own dialog.
 - **The programs are overridable** for tests and odd installs: `CLAUDE_SESSIONS_ZMX` and
   `CLAUDE_SESSIONS_CLAUDE` name `zmx` and `claude`; `CLAUDE_SESSIONS_WORKSPACE` names where
   `n` and `s` start (default `/workspace` where it exists, else home).
@@ -710,10 +718,10 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
 - **A status line that does not fit wraps** rather than being cut: it is usually the reason
   something was refused.
 - **Wording the mockups did not draw**, written in their voice and the owner's to change:
-  closing an offloaded slot says "Offloaded. Hides the row, not the conversation — claude
-  --resume still finds it."; no room with nothing offloadable says "Nothing can be offloaded
-  right now. Close a session to make room." with only `Esc back`; a failed resume of a closed
-  row says "Left closed." where mockup 5 says "Left offloaded.".
+  no room with nothing offloadable says "Nothing is idle enough to offload. c on a loaded
+  session offloads it to make room." with only `Esc back`; a failed resume of an archived row
+  says "Left archived." where mockup 5 says "Left offloaded."; `c` says what it did on the
+  status line — `offloaded · resumable from disk`, `archived · resumable from disk`.
 - **Nothing on the screen is numbered, so messages name a session by its title**, quoted and
   cut to 24 characters: `"retire the old tunnel" ran in /gone, which is gone …`. Mockup 6's
   `detached · it is still running` names none, because the cursor is still on it.
@@ -722,14 +730,15 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
   for a *different* slot, which is accepted rather than designed around.
 - **Keys:** `Enter` open (on the Archived heading, open or shut it; a click does the same) ·
-  `n` new, in the workspace · `c` close · `s` a shell · `Esc` quit (back to the home, at the
+  `n` new, in the workspace · `c` offload, or archive what is offloaded (the hint line says
+  `c close`, the same seven columns as ever) · `s` a shell · `Esc` quit (back to the home, at the
   hub) ·
   `?` the keys. **`q` also quits and is listed nowhere** (owner, 2026-10-01): it is the first
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
 - **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys or the
-  mouse; `Enter` opens the highlighted row, and `c` closes it. **It only ever selects a
-  session, or the Archived heading** (owner, 2026-10-03): it is an index into the rows, never a
+  mouse; `Enter` opens the highlighted row, and `c` puts it a step away. **It only ever selects
+  a session, or the Archived heading** — or, at the home, a container (owner, 2026-10-03): it is an index into the rows, never a
   screen line, and the Archived heading is a row of its own so that `Enter` can open it, so
   the arrows step over every other heading and the blank lines, and a click on one of those or
   on the fold does nothing. The mockups draw no
@@ -749,8 +758,8 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
 - **Anything that takes a while shows a spinner** (owner, 2026-10-04; mockups 10 and 11):
   Docker Compose's ten braille frames, one every 80 ms, a little faster than Compose's 100.
   It stands in for the age of the session being worked on, and the status line says what is
-  happening without naming the session — `closing session`, `resuming session`, `offloading
-  session for room`, `archiving session` — or, for a new session or a shell, on the status
+  happening without naming the session — `offloading session`, `archiving session`, `resuming
+  session`, `offloading session for room` — or, for a new session or a shell, on the status
   line alone. **It shows only after a quarter of a second**, so quick actions never flash it.
   **It steps one frame at a time on a fixed cadence**, each deadline set from the last rather
   than from when the frame was drawn, so it never skips a frame and never stutters (the owner
@@ -766,7 +775,7 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   minute, so rows that went idle at different seconds roll over in the same redraw rather
   than one redraw each.
 - **A dialog draws the session it is about above itself, under its group's heading**, and
-  names it by title in the box (mockups 3 to 5). A reading taken while the question is up
+  names it by title in the box (mockups 4 and 5). A reading taken while the question is up
   cannot redirect it: the dialog remembers its session, not a position, and goes if the
   session does.
 - **The footer sits at the bottom of the terminal** (owner, 2026-10-03): the closing rule,
@@ -780,13 +789,15 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
 
 `/exit` ends it — the process exits, zmx drops the session, `SessionEnd` marks the slot
 closed. **`/clear` does not**: it starts a new conversation in the same process, which is
-right for *same session, new task* and wrong for *done*. `c` in the menu closes without
-opening, for something offloaded last week. Stale slots are never closed automatically; they
-sit in their group. The one close the offloader makes is of an idle slot with no
-conversation on disk, which has nothing to offload (*The offloader*).
+right for *same session, new task* and wrong for *done*. `c` in the menu, twice, closes
+without opening — once to offload, again to archive — for something offloaded last week. Stale
+slots are never closed automatically; they sit in their group. The one close the offloader
+makes is of an idle slot with no conversation on disk, which has nothing to offload (*The
+offloader*).
 
-**Closing is not destructive and the dialog says so.** What a close stops is the process; the
-conversation stays on disk, and is listed under Archived to resume it from. The difference between close and offload is the group the row is in and that the offloader
+**Closing is not destructive, which is why `c` asks nothing** (owner, 2026-10-27). What a
+close stops is the process; the conversation stays on disk, and is listed under Archived to
+resume it from. The difference between close and offload is the group the row is in and that the offloader
 never stops a slot on its own initiative to close it — except one with no conversation to
 offload, whose row would not be listed either way.
 

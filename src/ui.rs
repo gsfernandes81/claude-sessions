@@ -133,10 +133,11 @@ pub struct Header {
 /// A question in a frame over the list. It names the session by its title: nothing on the
 /// screen is numbered (owner, 2026-10-03).
 #[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `c` asks nothing (owner, 2026-10-27): it offloads a loaded session and archives an
+/// offloaded one, neither of which loses the conversation. Mockup 3, the question it asked
+/// until then, is retired.
 pub enum Dialog {
-    /// Mockup 3. `running` picks the explanation: a live slot's process is stopped, an
-    /// offloaded one is only hidden; either way the conversation stays on disk.
-    Close { title: String, running: bool },
     /// Mockup 4. `offer` is the slot that could make room — its key, in the same container as
     /// the session being opened, its idle age and its title — or `None` when nothing is
     /// offloadable, and then the dialog can only say so.
@@ -227,7 +228,7 @@ impl Busy {
 }
 
 /// A colour from the approved table in `docs/mockups.md`. Two, and only two: amber is spent
-/// on the Needs-you heading and nothing else; blue is the keys.
+/// on the `!` of a session waiting for the owner and nothing else; blue is the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colour {
     Amber,

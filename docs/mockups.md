@@ -38,7 +38,13 @@ below was redrawn for it, from the renderer, at both widths. **The braille is
 the one glyph here outside the measured set**: it is in none of the six faces, and is used
 on the owner's word that it draws on the terminals this is driven from, which put a fallback
 glyph into one cell. It is only ever drawn alone, at the end of a row or the start of the
-status line, so a fallback cannot drag a line out of true.
+status line, so a fallback cannot drag a line out of true. **On 2026-10-27 the owner took the
+question out of `c`**: "Remove the confirmation on session close … make the first c offload
+and c on an offloaded session archive it." So `c` is one step down the list — Loaded to
+Offloaded, Offloaded to Archived — asking nothing, and mockup 3, its question, is retired;
+mockup 11's spinner says `offloading session`, mockup 5's way out is `c archive it`, and the
+keys screen says what `c` does. The hint line keeps `c close`: it is the same seven columns,
+so mockup 8 stands.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -142,22 +148,11 @@ infra-dev · nothing open · 812M of 1.0G
 n new   ? keys   s shell
 ```
 
-### Mockup 3 — Closing a live session
-```
-infra-dev · 6 open · 812M of 1.0G
-────────────────────────────────────────
-── Loaded · 5 ──────────────────────────
-retire the old tunnel                14m
-╭──────────────────────────────────────╮
-│ Close this session?                  │
-│   retire the old tunnel              │
-│                                      │
-│ Running. Stops the process, not the  │
-│ conversation — resumable from disk.  │
-│                                      │
-│ y close    n keep                    │
-╰──────────────────────────────────────╯
-```
+### Mockup 3 — retired 2026-10-27
+
+`c` asked "Close this session?" here until the owner took the question out (2026-10-27): `c`
+now offloads a loaded session and archives an offloaded one, at once, and neither loses the
+conversation. The number is kept so the rest keep theirs.
 
 ### Mockup 4 — No room to open another
 ```
@@ -196,7 +191,7 @@ mount guards on one                   2d
 │ Left offloaded. Nothing was deleted; │
 │ the transcript may be gone.          │
 │                                      │
-│ r retry   c close it   Esc back      │
+│ r retry   c archive it   Esc back    │
 ╰──────────────────────────────────────╯
 ```
 
@@ -231,9 +226,10 @@ s shell
 infra-dev · keys
 ────────────────────────────────────────
 Enter  open the session; resumes it
-       if offloaded or closed
+       if offloaded or archived
 n      new session in /workspace
-c      close the session
+c      offload the session, or
+       archive an offloaded one
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
@@ -322,7 +318,7 @@ infra-dev · 812M of 1.0G
 n new   ? keys   s shell
 ```
 
-### Mockup 11 — Closing a session, the spinner turning
+### Mockup 11 — Offloading a session with `c`, the spinner turning
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────
@@ -338,7 +334,7 @@ mount guards on one                   2d
 
 ── Archived · 7 · Enter shows ──────────
 ────────────────────────────────────────
-⠋ closing session
+⠋ offloading session
 Enter open   n new   c close   ? keys
 s shell
 ```

@@ -283,6 +283,12 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
         }
         "new" => launch::new_session(rows, ws, term),
         "shell" => launch::shell(ws, term),
+        // `c`: a loaded session is offloaded, an offloaded one closed — archived. An older hub
+        // sends `close` for either, once its dialog is answered.
+        "offload" => match index("key") {
+            Some(i) => launch::offload(rows, i),
+            None => refused(),
+        },
         "close" => match index("key") {
             Some(i) => launch::close(rows, i),
             None => refused(),

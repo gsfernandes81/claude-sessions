@@ -47,8 +47,11 @@ pub enum Action {
     New(String),
     /// A shell in this container.
     Shell(String),
-    /// Close the row at this index — the owner has said `y`.
-    Close(usize),
+    /// `c` on a loaded row: offload it, at once (owner, 2026-10-27: no question asked).
+    Offload(usize),
+    /// `c` on an offloaded row: archive it — mark the slot closed, so its conversation is
+    /// listed under Archived — at once.
+    Archive(usize),
     /// Mockup 4's `y`: offload `victim`, then open `then` (or start a new slot in the
     /// victim's container when `None`).
     OffloadThenOpen {
@@ -64,9 +67,6 @@ type Id = (String, RowKey);
 /// A dialog, plus what answering it needs that the drawing does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
-    Close {
-        key: Id,
-    },
     NoRoom {
         then: Option<Id>,
         victim: Option<Id>,
@@ -276,9 +276,7 @@ impl Menu {
             .min(self.rows.len().saturating_sub(1));
         // A dialog about a row that has gone is a question about nothing.
         let gone = match &self.ask {
-            Some((Ask::Close { key } | Ask::ResumeFailed { key }, _)) => {
-                self.index_of(key).is_none()
-            }
+            Some((Ask::ResumeFailed { key }, _)) => self.index_of(key).is_none(),
             Some((Ask::NoRoom { victim, then }, _)) => [victim, then]
                 .into_iter()
                 .flatten()
@@ -479,7 +477,7 @@ impl Menu {
         let (dialog, about) = match &self.ask {
             Some((ask, dialog)) => {
                 let key = match ask {
-                    Ask::Close { key } | Ask::ResumeFailed { key } => Some(key),
+                    Ask::ResumeFailed { key } => Some(key),
                     Ask::NoRoom { victim, then } => victim.as_ref().or(then.as_ref()),
                 };
                 let about = key.and_then(|k| self.index_of(k));
@@ -547,17 +545,26 @@ impl Menu {
         Action::Redraw
     }
 
-    fn ask_close(&mut self, index: usize) -> Action {
+    /// `c` on a session: one step down the list, with no question asked (owner, 2026-10-27)
+    /// — a loaded session is offloaded, an offloaded one archived. Neither loses the
+    /// conversation, and either is undone by `Enter`, which resumes it.
+    fn put_away(&mut self, index: usize) -> Action {
         let Some(row) = self.rows.get(index) else {
             return Action::None;
         };
-        let dialog = Dialog::Close {
-            title: row.title.clone(),
-            running: !row.offloaded,
-        };
-        let key = id(row);
-        self.ask = Some((Ask::Close { key }, dialog));
-        Action::Redraw
+        match row.group() {
+            Group::Loaded => Action::Offload(index),
+            Group::Offloaded => Action::Archive(index),
+            Group::Archived if row.key == RowKey::ArchiveFold => Action::None,
+            Group::Archived => {
+                self.status = Some("that session is already archived".to_string());
+                Action::Redraw
+            }
+            Group::Containers => {
+                self.status = Some("c puts a session away — Enter shows this container's".into());
+                Action::Redraw
+            }
+        }
     }
 
     /// What a key does. Every key the design lists, and nothing else: an unknown key does
@@ -618,16 +625,7 @@ impl Menu {
             Key::Enter if !self.rows.is_empty() => Action::Open(self.cursor),
             Key::Char('n') => self.target().map_or(Action::None, Action::New),
             Key::Char('s') => self.target().map_or(Action::None, Action::Shell),
-            Key::Char('c') if self.on(|r| r.key == RowKey::ArchiveFold) => Action::None,
-            Key::Char('c') if self.on(|r| r.key == RowKey::Container) => {
-                self.status = Some("c closes a session — Enter shows this container's".into());
-                Action::Redraw
-            }
-            Key::Char('c') if self.on(|r| r.group() == Group::Archived) => {
-                self.status = Some("that session is already closed".to_string());
-                Action::Redraw
-            }
-            Key::Char('c') if !self.rows.is_empty() => self.ask_close(self.cursor),
+            Key::Char('c') => self.put_away(self.cursor),
             Key::Char('?') => {
                 self.screen = Screen::Keys;
                 Action::Redraw
@@ -664,11 +662,6 @@ impl Menu {
         let at = |m: &Menu, k: &Id| m.index_of(k).unwrap_or(m.cursor);
         match (ask, key) {
             (_, Key::Resize) => Action::Redraw,
-            (Ask::Close { key }, Key::Char('y')) => {
-                self.ask = None;
-                Action::Close(at(self, &key))
-            }
-            (Ask::Close { .. }, Key::Char('n') | Key::Esc) => dismiss(self),
             (
                 Ask::NoRoom {
                     then,
@@ -687,7 +680,12 @@ impl Menu {
                 self.ask = None;
                 Action::Open(at(self, &key))
             }
-            (Ask::ResumeFailed { key }, Key::Char('c')) => self.ask_close(at(self, &key)),
+            // As `c` on its row: a resume that failed left it offloaded, which `c` archives, or
+            // archived, which it only says.
+            (Ask::ResumeFailed { key }, Key::Char('c')) => {
+                self.ask = None;
+                self.put_away(at(self, &key))
+            }
             (Ask::ResumeFailed { .. }, Key::Esc) => dismiss(self),
             _ => Action::None,
         }
@@ -994,6 +992,10 @@ mod tests {
         assert_eq!(m.key(Key::Enter), Action::Open(2));
         assert_eq!(m.key(Key::Char('c')), Action::Redraw);
         assert_eq!(m.view().dialog, None);
+        assert_eq!(
+            m.view().status.as_deref(),
+            Some("that session is already archived")
+        );
         // On the heading, c does nothing; Enter shuts it again.
         m.key(Key::Up);
         assert_eq!(m.key(Key::Char('c')), Action::None);
@@ -1049,11 +1051,11 @@ mod tests {
         assert_eq!(
             m.view().dialog,
             None,
-            "nothing to ask: it is already closed"
+            "nothing to do: it is already archived"
         );
         assert_eq!(
             m.view().status.as_deref(),
-            Some("that session is already closed")
+            Some("that session is already archived")
         );
         assert_eq!(m.key(Key::Enter), Action::Open(3), "Enter resumes it");
     }
@@ -1104,17 +1106,23 @@ mod tests {
     #[test]
     fn a_dialog_follows_its_row_through_a_regroup() {
         let mut m = menu(vec![row("a"), row("b")]);
-        m.key(Key::Down);
-        m.key(Key::Char('c'));
+        let failed = Dialog::ResumeFailed {
+            title: "b".into(),
+            session: "0f9c4a1e".into(),
+            killed_for_memory: false,
+            output: vec![],
+            closed: false,
+        };
+        m.ask_resume_failed(failed.clone(), 1);
         // "a" is offloaded and moves below "b": the question is still about b.
         let mut a = row("a");
         a.offloaded = true;
         m.replace_rows(vec![a, row("b")], false);
         assert_eq!(names(&m), ["b", "a"]);
         assert_eq!(m.view().about, Some(0));
-        assert_eq!(m.key(Key::Char('y')), Action::Close(0));
+        assert_eq!(m.key(Key::Char('r')), Action::Open(0));
         // And a dialog about a row that has gone goes with it.
-        m.key(Key::Char('c'));
+        m.ask_resume_failed(failed, 0);
         m.replace_rows(vec![row("a")], false);
         assert_eq!(m.view().dialog, None);
     }
@@ -1262,35 +1270,27 @@ mod tests {
     }
 
     #[test]
-    fn closing_asks_first_and_only_y_closes() {
-        let mut m = menu(vec![row("a"), row("b")]);
-        m.key(Key::Down);
-        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
-        assert_eq!(
-            m.view().dialog,
-            Some(Dialog::Close {
-                title: "b".into(),
-                running: true,
-            })
-        );
-        assert_eq!(m.key(Key::Enter), Action::None, "only y or n answer it");
-        assert_eq!(m.key(Key::Char('n')), Action::Redraw);
-        assert_eq!(m.view().dialog, None, "n keeps it");
-        m.key(Key::Char('c'));
-        assert_eq!(m.key(Key::Char('y')), Action::Close(1));
-        assert_eq!(m.view().dialog, None);
-    }
-
-    #[test]
-    fn closing_an_offloaded_row_says_it_is_not_running() {
+    fn c_offloads_a_loaded_session_and_archives_an_offloaded_one_asking_nothing() {
         let mut z = row("z");
         z.offloaded = true;
-        let mut m = menu(vec![z]);
-        m.key(Key::Char('c'));
-        assert!(matches!(
-            m.view().dialog,
-            Some(Dialog::Close { running: false, .. })
-        ));
+        let mut m = menu(vec![row("a"), row("b"), z]);
+        m.key(Key::Down);
+        assert_eq!(
+            m.key(Key::Char('c')),
+            Action::Offload(1),
+            "loaded: offloaded"
+        );
+        assert_eq!(m.view().dialog, None, "no question asked");
+        m.key(Key::End);
+        assert_eq!(m.rows()[m.view().cursor].title, "z");
+        assert_eq!(
+            m.key(Key::Char('c')),
+            Action::Archive(2),
+            "offloaded: archived"
+        );
+        assert_eq!(m.view().dialog, None);
+        // Calibration: Enter on the same rows still opens them.
+        assert_eq!(m.key(Key::Enter), Action::Open(2));
     }
 
     #[test]
@@ -1343,10 +1343,13 @@ mod tests {
         };
         m.ask_resume_failed(failed.clone(), 1);
         assert_eq!(m.key(Key::Char('r')), Action::Open(1));
+        // Left offloaded, so c archives it, at once.
+        let mut b = row("b");
+        b.offloaded = true;
+        m.replace_rows(vec![row("a"), b], false);
         m.ask_resume_failed(failed.clone(), 1);
-        assert_eq!(m.key(Key::Char('c')), Action::Redraw);
-        assert!(matches!(m.view().dialog, Some(Dialog::Close { ref title, .. }) if title == "b"));
-        m.key(Key::Esc);
+        assert_eq!(m.key(Key::Char('c')), Action::Archive(1));
+        assert_eq!(m.view().dialog, None);
         m.ask_resume_failed(failed, 1);
         assert_eq!(m.key(Key::Esc), Action::Redraw);
         assert_eq!(m.view().dialog, None);
@@ -1494,7 +1497,7 @@ mod tests {
         assert!(
             m.view()
                 .status
-                .is_some_and(|s| s.contains("c closes a session"))
+                .is_some_and(|s| s.contains("c puts a session away"))
         );
     }
 

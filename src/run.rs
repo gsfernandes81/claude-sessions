@@ -408,7 +408,8 @@ fn act(
         Action::Open(i) => (Some(*i), "opening session"),
         Action::New(_) => (None, "starting new session"),
         Action::Shell(_) => (None, "starting shell"),
-        Action::Close(i) => (Some(*i), "closing session"),
+        Action::Offload(i) => (Some(*i), "offloading session"),
+        Action::Archive(i) => (Some(*i), "archiving session"),
         Action::OffloadThenOpen { victim, .. } => (Some(*victim), "offloading session for room"),
     };
     let then = match &action {
@@ -431,7 +432,9 @@ fn act(
         Action::Open(i) => (host_of(*i), op("open", vec![("key", key_of(*i))])),
         Action::New(h) => (Some(h.clone()), op("new", vec![])),
         Action::Shell(h) => (Some(h.clone()), op("shell", vec![])),
-        Action::Close(i) => (host_of(*i), op("close", vec![("key", key_of(*i))])),
+        Action::Offload(i) => (host_of(*i), op("offload", vec![("key", key_of(*i))])),
+        // Archiving is the agent's `close`, which an agent of any version understands.
+        Action::Archive(i) => (host_of(*i), op("close", vec![("key", key_of(*i))])),
         Action::OffloadThenOpen { victim, then } => (
             host_of(*victim),
             op(

@@ -41,22 +41,11 @@ infra-dev · nothing open · 812M of 1.0G
 n new   ? keys   s shell
 ```
 
-### Mockup 3 — Closing a live session
-```
-infra-dev · 6 open · 812M of 1.0G
-────────────────────────────────────────────────────────────────────────────────
-── Loaded · 5 ──────────────────────────────────────────────────────────────────
-  retire the old tunnel                                                      14m
-                    ╭──────────────────────────────────────╮
-                    │ Close this session?                  │
-                    │   retire the old tunnel              │
-                    │                                      │
-                    │ Running. Stops the process, not the  │
-                    │ conversation — resumable from disk.  │
-                    │                                      │
-                    │ y close    n keep                    │
-                    ╰──────────────────────────────────────╯
-```
+### Mockup 3 — retired 2026-10-27
+
+`c` asked "Close this session?" here until the owner took the question out (2026-10-27): `c`
+now offloads a loaded session and archives an offloaded one, at once, and neither loses the
+conversation. The number is kept so the rest keep theirs; the 40-column file says why.
 
 ### Mockup 4 — No room to open another
 ```
@@ -95,7 +84,7 @@ infra-dev · 6 open · 812M of 1.0G
                     │ Left offloaded. Nothing was deleted; │
                     │ the transcript may be gone.          │
                     │                                      │
-                    │ r retry   c close it   Esc back      │
+                    │ r retry   c archive it   Esc back    │
                     ╰──────────────────────────────────────╯
 ```
 
@@ -124,9 +113,10 @@ Enter open   n new   c close   ? keys   s shell
 infra-dev · keys
 ────────────────────────────────────────────────────────────────────────────────
 Enter  open the session; resumes it
-       if offloaded or closed
+       if offloaded or archived
 n      new session in /workspace
-c      close the session
+c      offload the session, or
+       archive an offloaded one
 s      a shell in /workspace
 Esc    quit the launcher
 ?      this
@@ -213,7 +203,7 @@ infra-dev · 812M of 1.0G
 n new   ? keys   s shell
 ```
 
-### Mockup 11 — Closing a session, the spinner turning
+### Mockup 11 — Offloading a session with `c`, the spinner turning
 ```
 infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
@@ -229,7 +219,7 @@ infra-dev · 6 open · 812M of 1.0G
 
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
-⠋ closing session
+⠋ offloading session
 Enter open   n new   c close   ? keys   s shell
 ```
 

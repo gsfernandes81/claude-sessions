@@ -14,9 +14,11 @@
 //!
 //! **The hub to the agent:**
 //!
-//! - `{"id":N,"op":"open","key":…}` and its siblings `new`, `shell`, `close`, `archive`,
-//!   `unarchive` and `offload_then_open` (`victim`, and `then` when there is one), each with
-//!   `env`: the scrollback variables the owner's login brought (`launch::SCROLLBACK`).
+//! - `{"id":N,"op":"open","key":…}` and its siblings `new`, `shell`, `offload`, `close`,
+//!   `archive`, `unarchive` and `offload_then_open` (`victim`, and `then` when there is one),
+//!   each with `env`: the scrollback variables the owner's login brought
+//!   (`launch::SCROLLBACK`). An agent too old to know `offload` answers that it does not, and
+//!   does nothing.
 //! - `{"id":N,"ran":{"code":C}}`, or `{"id":N,"ran":{"error":"…"}}` when the child could not
 //!   be run at all.
 //!
@@ -231,10 +233,6 @@ pub fn outcome_from(v: &Value) -> Option<Outcome> {
 
 fn dialog_to(d: &Dialog) -> Value {
     match d {
-        Dialog::Close { title, running } => obj(vec![
-            ("close", Value::string(title)),
-            ("running", Value::Bool(*running)),
-        ]),
         Dialog::NoRoom {
             used,
             limit,
@@ -275,12 +273,6 @@ fn dialog_to(d: &Dialog) -> Value {
 }
 
 fn dialog_from(v: &Value) -> Option<Dialog> {
-    if let Some(title) = s(v, "close") {
-        return Some(Dialog::Close {
-            title,
-            running: b(v, "running"),
-        });
-    }
     if let Some(used) = v.get("used").and_then(Value::as_u64) {
         let offer = v.get("offer").and_then(|o| {
             Some((

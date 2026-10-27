@@ -165,7 +165,92 @@ pub fn shell(workspace: &str, term: &mut dyn Terminal) -> Outcome {
     shell_with(workspace, term, &Deps::from_env())
 }
 
-/// `c`, once confirmed: stop a running slot and mark it closed, or just mark an offloaded one.
+/// `c` on a loaded session (owner, 2026-10-27: at once, no question asked): stop it the way
+/// the offloader does and mark it offloaded, to be resumed from its row — or closed, when it
+/// has no conversation on disk to resume, as the offloader would. The owner's word replaces
+/// the offloader's rule, so nothing measured holds it; everything else is the offloader's own
+/// path — the record marked `offloading` before the signal, so the `SessionEnd` it provokes
+/// reads as an offload, and pid and start time checked at each step.
+pub fn offload(rows: &[Row], index: usize) -> Outcome {
+    let Some(row) = rows.get(index) else {
+        return no_row(index);
+    };
+    let n = label(row);
+    let slot = match &row.key {
+        RowKey::Slot(slot) => slot,
+        // As for a close: no record, no pid and start time to stop it by safely.
+        RowKey::Socket(_) => {
+            return Outcome::Refused(format!(
+                "{n} was not started here, so there is no record of its process to stop it by \
+                 safely — open it and /exit"
+            ));
+        }
+        RowKey::Conversation { .. } => {
+            return Outcome::Back(Some(format!("{n} is already archived")));
+        }
+        RowKey::ArchiveFold | RowKey::Container => return no_row(index),
+    };
+    let _lock = match lock_slot(slot, &n) {
+        Ok(l) => l,
+        Err(why) => return Outcome::Refused(why),
+    };
+    let mut rec = match registry::load(slot) {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return Outcome::Refused(format!("{n} has no record any more")),
+        Err(e) => return Outcome::Refused(format!("{n}: {e}")),
+    };
+    match rec.state {
+        State::Closed => return Outcome::Back(Some(format!("{n} is already archived"))),
+        State::Offloaded => return Outcome::Back(Some(format!("{n} is already offloaded"))),
+        State::Live | State::Offloading => {}
+    }
+    let keep = rec.has_conversation();
+    let idle = clock::now().saturating_sub(rec.last_activity_ms);
+    match (rec.pid, rec.proc_start) {
+        (Some(pid), Some(start)) if procinfo::is_alive(pid, start) => {
+            let verdict = if keep {
+                offload::Verdict::Offload { idle }
+            } else {
+                offload::Verdict::Close { idle }
+            };
+            let table = procinfo::table();
+            match offload::stop_quiet(&mut rec, verdict, table.as_deref()) {
+                Ok(Ok(_)) => {}
+                Ok(Err(why)) => return Outcome::Refused(why),
+                Err(e) => return Outcome::Refused(format!("{n}: {e}")),
+            }
+        }
+        // Recorded, and already gone: nothing to stop, only the record to catch up.
+        (Some(_), Some(_)) => {
+            rec.state = if keep {
+                State::Offloaded
+            } else {
+                State::Closed
+            };
+            rec.busy = false;
+            rec.updated_ms = clock::now();
+            if let Err(e) = registry::store(&rec) {
+                return Outcome::Refused(format!("{n}: {e}"));
+            }
+        }
+        _ => {
+            return Outcome::Refused(format!(
+                "{n} is running but no process is recorded for it yet, so there is nothing to \
+                 stop it by safely — try again in a moment"
+            ));
+        }
+    }
+    Outcome::Back(Some(if keep {
+        "offloaded · resumable from disk".to_string()
+    } else {
+        "closed · it had no conversation to keep".to_string()
+    }))
+}
+
+/// `c` on an offloaded session (owner, 2026-10-27: at once): archive it — mark the slot
+/// closed, so its conversation is listed under Archived, from Claude Code's own store. A live
+/// slot is stopped first: the menu offloads one before archiving it, but an older hub sends
+/// this for `c` on a live slot once its owner has confirmed.
 pub fn close(rows: &[Row], index: usize) -> Outcome {
     let Some(row) = rows.get(index) else {
         return no_row(index);
@@ -184,7 +269,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         }
         // A conversation from the store is listed because nothing is running it.
         RowKey::Conversation { .. } => {
-            return Outcome::Back(Some(format!("{n} was already closed")));
+            return Outcome::Back(Some(format!("{n} is already archived")));
         }
         RowKey::ArchiveFold | RowKey::Container => return no_row(index),
     };
@@ -198,7 +283,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         Err(e) => return Outcome::Refused(format!("{n}: {e}")),
     };
     match rec.state {
-        State::Closed => return Outcome::Back(Some(format!("{n} was already closed"))),
+        State::Closed => return Outcome::Back(Some(format!("{n} is already archived"))),
         State::Offloaded => {}
         State::Live | State::Offloading => match (rec.pid, rec.proc_start) {
             (Some(pid), Some(start)) if procinfo::is_alive(pid, start) => {
@@ -233,7 +318,7 @@ pub fn close(rows: &[Row], index: usize) -> Outcome {
         return Outcome::Refused(format!("{n}: {e}"));
     }
     Outcome::Back(Some(if rec.has_conversation() {
-        "closed · resumable from disk".to_string()
+        "archived · resumable from disk".to_string()
     } else {
         "closed".to_string()
     }))
@@ -2205,7 +2290,83 @@ exit 1"#,
         assert_eq!(load("claude-1").state, State::Closed);
     }
 
-    // ── close and shell ─────────────────────────────────────────────────────
+    // ── offload, close and shell ────────────────────────────────────────────
+
+    /// A slot started by `n` and bound as the hook would bind it, its claude running, with a
+    /// conversation on disk when `prompted`.
+    fn running(f: &Fixture, prompted: bool) -> (u32, u64) {
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let mut term = Term::new(f);
+        new_session_with(&[], &f.work(), &mut term, &deps, true);
+        let started = wait_for("the stand-in claude", || f.claude_log().pop());
+        let pid: u32 = started.split_whitespace().next().unwrap().parse().unwrap();
+        let start = procinfo::start_time(pid).unwrap();
+        let mut rec = load("claude-1");
+        rec.pid = Some(pid);
+        rec.proc_start = Some(start);
+        rec.session_id = Some("conv-1".into());
+        if prompted {
+            let transcript = Path::new(&f.work()).join("conv-1.jsonl");
+            std::fs::write(&transcript, PROMPTED).unwrap();
+            rec.transcript_path = Some(transcript.display().to_string());
+        }
+        registry::store(&rec).unwrap();
+        assert!(procinfo::is_alive(pid, start), "calibration: it is running");
+        assert!(listed("claude-1") == Some(true));
+        (pid, start)
+    }
+
+    #[test]
+    fn c_on_a_running_slot_offloads_it_however_recently_it_was_used() {
+        let f = Fixture::new("offload");
+        let (pid, start) = running(&f, true);
+        // Just used, and never measured: the offloader's rule would keep it. The owner's word
+        // does not ask the rule.
+        let rows = [row("claude-1", "a")];
+        assert_eq!(
+            offload(&rows, 0),
+            Outcome::Back(Some("offloaded · resumable from disk".into()))
+        );
+        assert!(!procinfo::is_alive(pid, start), "the process is stopped");
+        assert_eq!(load("claude-1").state, State::Offloaded);
+        assert!(
+            listed("claude-1") == Some(false),
+            "and zmx dropped its session"
+        );
+        // A second c on the same row, by a menu that has not caught up, changes nothing.
+        assert_eq!(
+            offload(&rows, 0),
+            Outcome::Back(Some("\"a\" is already offloaded".into()))
+        );
+        assert_eq!(load("claude-1").state, State::Offloaded);
+        // And c on it as an offloaded row archives it.
+        assert_eq!(
+            close(&rows, 0),
+            Outcome::Back(Some("archived · resumable from disk".into()))
+        );
+        assert_eq!(load("claude-1").state, State::Closed);
+    }
+
+    #[test]
+    fn c_on_a_running_slot_with_nothing_on_disk_closes_it_as_the_offloader_would() {
+        let f = Fixture::new("offload-unprompted");
+        let (pid, start) = running(&f, false);
+        let rows = [row("claude-1", "a")];
+        assert_eq!(
+            offload(&rows, 0),
+            Outcome::Back(Some("closed · it had no conversation to keep".into()))
+        );
+        assert!(!procinfo::is_alive(pid, start));
+        assert_eq!(load("claude-1").state, State::Closed);
+        // A socket row has nothing to stop it by safely.
+        f.session("claude", false);
+        let socket = Row {
+            key: RowKey::Socket("claude".into()),
+            ..row("x", "claude")
+        };
+        assert!(matches!(offload(&[socket], 0), Outcome::Refused(_)));
+        assert!(listed("claude") == Some(true), "left alone");
+    }
 
     #[test]
     fn closing_a_running_slot_stops_it_and_marks_it_closed() {
@@ -2232,7 +2393,7 @@ exit 1"#,
         let out = close(&rows, 0);
         assert_eq!(
             out,
-            Outcome::Back(Some("closed · resumable from disk".into()))
+            Outcome::Back(Some("archived · resumable from disk".into()))
         );
         assert!(!procinfo::is_alive(pid, start), "the process is stopped");
         assert_eq!(load("claude-1").state, State::Closed);
@@ -2249,7 +2410,7 @@ exit 1"#,
         let mut rows = vec![row("claude-1", "a"), row("x", "claude")];
         assert_eq!(
             close(&rows, 0),
-            Outcome::Back(Some("closed · resumable from disk".into()))
+            Outcome::Back(Some("archived · resumable from disk".into()))
         );
         assert_eq!(load("claude-1").state, State::Closed);
 

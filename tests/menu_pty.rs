@@ -262,12 +262,12 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The spinner while a session closes (owner, 2026-10-04): it shows only after a quarter of a
-/// second, steps through Compose's frames one at a time with none skipped, at an even pace,
-/// writes a line or two per frame rather than the screen, and leaves the menu idle and silent
-/// once the close is done.
+/// The spinner while `c` puts a session away (owner, 2026-10-04): it shows only after a
+/// quarter of a second, steps through Compose's frames one at a time with none skipped, at an
+/// even pace, writes a line or two per frame rather than the screen, and leaves the menu idle
+/// and silent once the stop is done.
 #[test]
-fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
+fn putting_a_session_away_turns_the_spinner_smoothly_then_falls_silent() {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     let root = std::env::temp_dir().join(format!("cs-menu-spin-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -275,7 +275,7 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     std::fs::create_dir_all(&reg).unwrap();
     std::fs::create_dir_all(&abd).unwrap();
 
-    // A claude that ignores TERM, so the close waits out its five-second grace and the
+    // A claude that ignores TERM, so the stop waits out its five-second grace and the
     // spinner has time to turn. The ignore is inherited across the exec.
     let mut stubborn = Command::new("sh")
         .args(["-c", "trap '' TERM; exec sleep 60"])
@@ -310,10 +310,8 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     assert!(String::from_utf8_lossy(&first).contains("a stubborn session"));
     term.read_for(Duration::from_millis(300));
 
-    // c asks; y closes.
+    // c asks nothing (owner, 2026-10-27): it offloads at once.
     term.write(b"c");
-    term.read_until(b"y close", Duration::from_secs(3));
-    term.write(b"y");
     let pressed = std::time::Instant::now();
     let chunks = term.read_timed(Duration::from_secs(7));
 
@@ -336,7 +334,7 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     let all = String::from_utf8_lossy(&chunks.iter().flat_map(|c| c.1.clone()).collect::<Vec<_>>())
         .into_owned();
     assert!(
-        all.contains("closing session"),
+        all.contains("offloading session"),
         "it says what it is doing: {all:?}"
     );
     assert!(
@@ -386,13 +384,15 @@ fn closing_a_session_turns_the_spinner_smoothly_then_falls_silent() {
     }
     assert!(
         stubborn.try_wait().unwrap().is_some(),
-        "the close stopped it"
+        "the offload stopped it"
     );
+    // Nothing of it was ever on disk, so it is closed, as the offloader would close it.
     assert!(all.contains("closed"), "{all:?}");
+    assert!(!all.contains("Close this session?"), "no question: {all:?}");
     let idle = term.read_for(Duration::from_secs(3));
     assert!(
         idle.is_empty(),
-        "an idle menu wrote {} bytes after the close",
+        "an idle menu wrote {} bytes after the stop",
         idle.len()
     );
 
