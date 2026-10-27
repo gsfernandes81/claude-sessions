@@ -230,11 +230,11 @@ terminal.
 |---|---|
 | `SessionStart` (`startup` / `resume` / `clear` / `compact` / `fork`) | bind `session_id`, `cwd`, pid + start time; state live. A **different** `session_id` also drops `title`, `ai_title`, `first_prompt` and the per-event times, so a new conversation never wears the old one's name or reads as prompted by the old one's prompt; then the titles are read from the transcript at `transcript_path`, as on every `Stop`. Every source but `compact` leaves claude at its prompt: not busy, `needs_you` cleared; `compact` changes neither. A **different** process drops the slot's keep-alive: it was the waiting process's |
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
-| `Stop` | activity, idle since it fired |
+| `Stop` | activity, idle since it fired, clear `needs_you`: answering a permission prompt or a dialog submits no prompt, so the turn it was asked in ends here, and claude back at its prompt is asking nothing |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` | `needs_you` |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would mark every unanswered session as waiting |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
-| `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded` |
+| `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded`; not busy, `needs_you` cleared |
 
 **Every hook but `SessionStart` and `SessionEnd` runs `async`** (0.4.6): Claude Code starts it
 and carries on, never waiting for it and never timing it out (`claude -p` kills any still

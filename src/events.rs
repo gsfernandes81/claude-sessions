@@ -233,6 +233,12 @@ pub fn apply(
                 rec.busy = false;
                 rec.last_stop_ms = Some(at);
             }
+            // Answering a permission prompt or a dialog submits no prompt: the turn carries on
+            // and ends here. Back at its prompt, claude is asking nothing; a question it asks
+            // later fires later and wins the stamp.
+            if rec.written.claim(Field::NeedsYou, tick) {
+                rec.needs_you = false;
+            }
             Outcome::Changed
         }
         "Notification" => match ev.notification_type() {
@@ -266,6 +272,10 @@ pub fn apply(
                 };
                 if rec.written.claim(Field::Busy, tick) {
                     rec.busy = false;
+                }
+                // A claude that has exited is asking nothing.
+                if rec.written.claim(Field::NeedsYou, tick) {
+                    rec.needs_you = false;
                 }
                 Outcome::Changed
             }
@@ -448,6 +458,45 @@ mod tests {
         let mut rec = slot();
         land(&mut rec, &[(ask, 3_000), (PROMPT, 2_000)]);
         assert!(rec.needs_you && rec.busy, "asked within its turn");
+    }
+
+    #[test]
+    fn answering_a_permission_prompt_clears_it_when_the_turn_ends() {
+        // Approving fires no UserPromptSubmit: the turn goes on and ends with a Stop.
+        let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let stop = r#"{"hook_event_name":"Stop"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 2_000), (ask, 3_000)]);
+        assert!(rec.needs_you, "calibration: waiting mid-turn");
+        land(&mut rec, &[(stop, 4_000)]);
+        assert!(
+            !rec.needs_you && !rec.busy,
+            "the turn it was asked in has ended"
+        );
+        // The ask's async hook landing after the Stop is older than it, and changes nothing.
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 2_000), (stop, 4_000), (ask, 3_000)]);
+        assert!(!rec.needs_you);
+        // An ask fired after the Stop (a background agent's) is newer and stands.
+        let mut rec = slot();
+        land(&mut rec, &[(stop, 4_000), (ask, 5_000)]);
+        assert!(rec.needs_you);
+    }
+
+    #[test]
+    fn an_exit_while_waiting_clears_it() {
+        let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let end = r#"{"hook_event_name":"SessionEnd","reason":"logout"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(ask, 2_000)]);
+        assert!(rec.needs_you, "calibration");
+        land(&mut rec, &[(end, 3_000)]);
+        assert!(!rec.needs_you);
+        // A /clear end is followed by a start in the same process, which clears it itself.
+        let clear = r#"{"hook_event_name":"SessionEnd","reason":"clear"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(ask, 2_000), (clear, 3_000)]);
+        assert!(rec.needs_you, "a clear end changes nothing");
     }
 
     #[test]
