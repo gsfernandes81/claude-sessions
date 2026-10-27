@@ -87,9 +87,15 @@ enum Load {
     Busy,
 }
 
-/// A slot `claude-1` doing `load`, measured quiet for eleven minutes 3 minutes ago. With
+/// A slot `offload-t1` doing `load`, measured quiet for eleven minutes 3 minutes ago. With
 /// `transcript`, its conversation is on disk; a slot opened and never prompted has none:
 /// Claude Code writes it at the first prompt (issue #5).
+///
+/// **Not `claude-<n>`, which is what a real slot is called.** The pass finds a slot's
+/// processes by `CLAUDE_SESSIONS_SLOT` in every process's environment, so a fixture named
+/// `offload-t1`, run from inside a real `offload-t1` — a claude developing this repo in a slot —
+/// measured that session's processes as its own, and a fixture whose claude was dead read
+/// active on them.
 fn slot(tag: &str, load: Load, attached: bool, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -198,7 +204,11 @@ done
     }
 
     let attached = u8::from(attached);
-    std::fs::write(root.join("zmx/claude-1"), format!("{claude} {attached}\n")).unwrap();
+    std::fs::write(
+        root.join("zmx/offload-t1"),
+        format!("{claude} {attached}\n"),
+    )
+    .unwrap();
 
     // The path is recorded either way, as the hooks record it from SessionStart on; only
     // whether the file is there differs.
@@ -207,11 +217,11 @@ done
         std::fs::write(&transcript_path, PROMPTED).unwrap();
     }
     let record = format!(
-        r#"{{"slot":"claude-1","state":"live","pid":{claude},"proc_start":{claude_start},
+        r#"{{"slot":"offload-t1","state":"live","pid":{claude},"proc_start":{claude_start},
             "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}"}}"#,
         transcript_path.display()
     );
-    std::fs::write(root.join("registry/claude-1.json"), record).unwrap();
+    std::fs::write(root.join("registry/offload-t1.json"), record).unwrap();
     measured_before(&s, -180_000);
     s
 }
@@ -239,7 +249,7 @@ fn offload(root: &Path, extra: &[&str]) -> (bool, String) {
 }
 
 fn state_of(root: &Path) -> String {
-    let body = std::fs::read_to_string(root.join("registry/claude-1.json")).unwrap();
+    let body = std::fs::read_to_string(root.join("registry/offload-t1.json")).unwrap();
     let at = body.find("\"state\"").expect("a state field");
     body[at..].split('"').nth(3).unwrap().to_string()
 }
@@ -253,7 +263,7 @@ fn an_idle_detached_slot_is_stopped_and_marked_offloaded() {
     );
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: offloaded"), "got: {out}");
+    assert!(out.contains("offload-t1: offloaded"), "got: {out}");
     assert!(out.contains("1 slot(s) offloaded, 0 closed"), "got: {out}");
     assert!(!alive(s.claude, s.claude_start), "the claude is gone");
     assert_eq!(state_of(&s.root), "offloaded");
@@ -262,7 +272,7 @@ fn an_idle_detached_slot_is_stopped_and_marked_offloaded() {
         "zmx dropped the session with its claude: {out}"
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
-    assert!(log.contains("claude-1: offloaded"), "logged: {log}");
+    assert!(log.contains("offload-t1: offloaded"), "logged: {log}");
 }
 
 #[test]
@@ -277,7 +287,7 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "offload failed: {out}");
     assert!(
-        out.contains("claude-1: would close, idle 11m"),
+        out.contains("offload-t1: would close, idle 11m"),
         "got: {out}"
     );
     assert!(alive(s.claude, s.claude_start), "a dry run stops nothing");
@@ -286,7 +296,7 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
     measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: closed"), "got: {out}");
+    assert!(out.contains("offload-t1: closed"), "got: {out}");
     assert!(out.contains("0 slot(s) offloaded, 1 closed"), "got: {out}");
     assert!(!alive(s.claude, s.claude_start), "the claude is gone");
     assert_eq!(state_of(&s.root), "closed");
@@ -295,7 +305,7 @@ fn an_idle_slot_with_no_transcript_is_stopped_and_marked_closed() {
         "torn down exactly as an offload is: {out}"
     );
     let log = std::fs::read_to_string(s.root.join("registry/offload.log")).unwrap();
-    assert!(log.contains("claude-1: closed"), "logged: {log}");
+    assert!(log.contains("offload-t1: closed"), "logged: {log}");
 }
 
 /// Every pass measures before it decides. A slot never measured has no window yet and is
@@ -308,16 +318,16 @@ fn every_pass_measures_and_a_short_window_waits_for_the_next() {
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("claude-1: measured — ") && out.contains("a first reading"),
+        out.contains("offload-t1: measured — ") && out.contains("a first reading"),
         "got: {out}"
     );
     assert!(
-        out.contains("claude-1: kept — not quiet long enough"),
+        out.contains("offload-t1: kept — not quiet long enough"),
         "a first reading counts as active: {out}"
     );
     let state =
         std::fs::read_to_string(s.root.join("registry/activity.state")).expect("state written");
-    assert!(state.contains("\"claude-1\""), "{state}");
+    assert!(state.contains("\"offload-t1\""), "{state}");
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
@@ -343,7 +353,7 @@ fn measured_before(s: &Slot, at_offset_ms: i64) {
     std::fs::write(
         s.root.join("registry/activity.state"),
         format!(
-            r#"{{"claude-1":{{"at":{},"last_active":{},"procs":[[{},{},0,0]],"minima":[[{},87.5]]}}}}"#,
+            r#"{{"offload-t1":{{"at":{},"last_active":{},"procs":[[{},{},0,0]],"minima":[[{},87.5]]}}}}"#,
             now + at_offset_ms,
             now - 11 * 60_000,
             s.claude,
@@ -354,7 +364,7 @@ fn measured_before(s: &Slot, at_offset_ms: i64) {
     .unwrap();
 }
 
-/// The floor the state file holds for claude-1, as written.
+/// The floor the state file holds for offload-t1, as written.
 fn floor_kept(s: &Slot) -> bool {
     std::fs::read_to_string(s.root.join("registry/activity.state"))
         .unwrap()
@@ -369,14 +379,15 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("claude-1: measured — ") && out.contains("claude-1: would offload, idle 11m"),
+        out.contains("offload-t1: measured — ")
+            && out.contains("offload-t1: would offload, idle 11m"),
         "got: {out}"
     );
 
     let s = idle_slot("activity-attached", true);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
-    assert!(out.contains("claude-1: kept — attached"), "got: {out}");
+    assert!(out.contains("offload-t1: kept — attached"), "got: {out}");
 
     let s = idle_slot("activity-future", false);
     measured_before(&s, 60 * 60_000);
@@ -395,7 +406,7 @@ fn a_measured_pass_reads_attachment_and_ignores_a_future_reading() {
 fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
     let s = idle_slot("activity-dead", false);
     measured_before(&s, -180_000);
-    let path = s.root.join("registry/claude-1.json");
+    let path = s.root.join("registry/offload-t1.json");
     let body = std::fs::read_to_string(&path).unwrap();
     let dead = body.replacen(&format!("\"pid\":{}", s.claude), "\"pid\":4000000", 1);
     assert_ne!(body, dead, "calibration: the fixture took the pid");
@@ -404,7 +415,7 @@ fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
     assert!(ok, "{out}");
     assert!(floor_kept(&s), "{out}");
     assert!(
-        !out.contains("claude-1: measured"),
+        !out.contains("offload-t1: measured"),
         "nothing to read and nothing held, so nothing to say: {out}"
     );
 }
@@ -416,7 +427,7 @@ fn a_live_slot_with_nothing_to_read_keeps_its_floor() {
 fn an_offloaded_slot_keeps_its_floor() {
     let s = idle_slot("activity-offloaded", false);
     measured_before(&s, -180_000);
-    let path = s.root.join("registry/claude-1.json");
+    let path = s.root.join("registry/offload-t1.json");
     let body = std::fs::read_to_string(&path).unwrap();
     let offloaded = body.replacen("\"state\":\"live\"", "\"state\":\"offloaded\"", 1);
     assert_ne!(body, offloaded, "calibration: the fixture took the state");
@@ -435,7 +446,7 @@ fn the_same_slot_attached_is_left_alone() {
     let s = idle_slot("attached", true);
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: kept — attached"), "got: {out}");
+    assert!(out.contains("offload-t1: kept — attached"), "got: {out}");
     assert!(alive(s.claude, s.claude_start));
     assert_eq!(state_of(&s.root), "live");
 }
@@ -447,11 +458,11 @@ fn the_same_slot_attached_is_left_alone() {
 fn a_pass_too_soon_after_the_last_decides_nothing() {
     let s = idle_slot("too-soon", false);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok && out.contains("claude-1: would offload"), "{out}");
+    assert!(ok && out.contains("offload-t1: would offload"), "{out}");
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "{out}");
     assert!(out.contains("too short; the next pass counts it"), "{out}");
-    assert!(out.contains("claude-1: kept — not measured yet"), "{out}");
+    assert!(out.contains("offload-t1: kept — not measured yet"), "{out}");
     assert!(alive(s.claude, s.claude_start));
 }
 
@@ -460,15 +471,15 @@ fn a_pass_too_soon_after_the_last_decides_nothing() {
 #[test]
 fn a_slot_left_offloading_is_measured_and_decided_again() {
     let s = idle_slot("left-offloading", false);
-    let path = s.root.join("registry/claude-1.json");
+    let path = s.root.join("registry/offload-t1.json");
     let body = std::fs::read_to_string(&path).unwrap();
     let left = body.replacen("\"state\":\"live\"", "\"state\":\"offloading\"", 1);
     assert_ne!(body, left, "calibration: the fixture took the state");
     std::fs::write(&path, left).unwrap();
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "{out}");
-    assert!(out.contains("claude-1: measured — "), "{out}");
-    assert!(out.contains("claude-1: would offload, idle 11m"), "{out}");
+    assert!(out.contains("offload-t1: measured — "), "{out}");
+    assert!(out.contains("offload-t1: would offload, idle 11m"), "{out}");
 }
 
 #[test]
@@ -476,7 +487,7 @@ fn a_dry_run_stops_nothing() {
     let s = idle_slot("dry", false);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: would offload"), "got: {out}");
+    assert!(out.contains("offload-t1: would offload"), "got: {out}");
     assert!(alive(s.claude, s.claude_start));
     assert_eq!(state_of(&s.root), "live");
 }
@@ -489,7 +500,7 @@ fn a_slot_doing_work_is_kept_and_an_idle_child_holds_nothing() {
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
     assert!(
-        out.contains("claude-1: kept — not quiet long enough"),
+        out.contains("offload-t1: kept — not quiet long enough"),
         "its reading loop should hold it: {out}"
     );
     assert!(alive(s.claude, s.claude_start));
@@ -500,7 +511,7 @@ fn a_slot_doing_work_is_kept_and_an_idle_child_holds_nothing() {
     // teardown ends it on a real slot, and the fixture's drop here.
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: offloaded"), "got: {out}");
+    assert!(out.contains("offload-t1: offloaded"), "got: {out}");
 }
 
 fn keepalive(root: &Path, slot: Option<&str>, asked: &str) -> (bool, String) {
@@ -526,34 +537,34 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
     let s = idle_slot("keepalive", false);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(
-        ok && out.contains("claude-1: would offload"),
+        ok && out.contains("offload-t1: would offload"),
         "calibration: {out}"
     );
 
-    let (ok, out) = keepalive(&s.root, Some("claude-1"), "25m");
+    let (ok, out) = keepalive(&s.root, Some("offload-t1"), "25m");
     assert!(ok, "{out}");
-    assert!(out.contains("claude-1: kept alive for 25m"), "{out}");
+    assert!(out.contains("offload-t1: kept alive for 25m"), "{out}");
     measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("claude-1: kept — kept alive for 25m more"),
+        out.contains("offload-t1: kept — kept alive for 25m more"),
         "{out}"
     );
     assert!(alive(s.claude, s.claude_start));
 
-    let (ok, out) = keepalive(&s.root, Some("claude-1"), "0");
+    let (ok, out) = keepalive(&s.root, Some("offload-t1"), "0");
     assert!(ok && out.contains("keep-alive ended"), "{out}");
     measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
-    assert!(ok && out.contains("claude-1: would offload"), "{out}");
+    assert!(ok && out.contains("offload-t1: would offload"), "{out}");
 
     let (ok, out) = keepalive(&s.root, None, "25m");
     assert!(
         !ok && out.contains("not inside a claude-sessions slot"),
         "{out}"
     );
-    let (ok, out) = keepalive(&s.root, Some("claude-1"), "13h");
+    let (ok, out) = keepalive(&s.root, Some("offload-t1"), "13h");
     assert!(!ok && out.contains("longer than the 12h"), "{out}");
 }
 
@@ -588,14 +599,14 @@ fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
     // The variable alone is not a session. Not checkable from inside a real one, whose daemon
     // is above this test too.
     if std::env::var_os("ZMX_SESSION").is_none() {
-        let out = ask(Some("claude-1"), false);
+        let out = ask(Some("offload-t1"), false);
         assert!(out.contains("not inside a claude-sessions slot"), "{out}");
     }
-    let out = ask(Some("claude-1"), true);
-    assert!(out.contains("claude-1: kept alive for 25m"), "{out}");
+    let out = ask(Some("offload-t1"), true);
+    assert!(out.contains("offload-t1: kept alive for 25m"), "{out}");
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(
-        ok && out.contains("claude-1: kept — kept alive for 25m more"),
+        ok && out.contains("offload-t1: kept — kept alive for 25m more"),
         "{out}"
     );
 }
@@ -618,12 +629,12 @@ fn a_dry_run_takes_no_lock_but_a_live_pass_does() {
     // Issue #1: a pass held each slot's lock while it read /proc, and a hook arriving then
     // was dropped. A dry run writes nothing, so it must not take the lock at all.
     let s = idle_slot("drylock", false);
-    let lock = s.root.join("registry/claude-1.lock");
+    let lock = s.root.join("registry/offload-t1.lock");
     let mut holder = hold_lock(&lock, 3.0);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "offload failed: {out}");
     assert!(
-        out.contains("claude-1: would offload"),
+        out.contains("offload-t1: would offload"),
         "a dry run must decide without the lock: {out}"
     );
     // Calibration: the lock really is held — a live pass, which must take it, is kept off.
@@ -641,11 +652,11 @@ fn a_kept_slot_never_waits_for_its_lock() {
     // The common case — a slot that is not idle — is decided from the snapshot and the
     // record alone, so a held lock does not even slow it down.
     let s = idle_slot("keptlock", true);
-    let mut holder = hold_lock(&s.root.join("registry/claude-1.lock"), 3.0);
+    let mut holder = hold_lock(&s.root.join("registry/offload-t1.lock"), 3.0);
     let started = Instant::now();
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
-    assert!(out.contains("claude-1: kept — attached"), "got: {out}");
+    assert!(out.contains("offload-t1: kept — attached"), "got: {out}");
     assert!(
         started.elapsed() < Duration::from_millis(1500),
         "it waited for a lock it had no need of: {:?}",
