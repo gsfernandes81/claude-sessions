@@ -71,17 +71,19 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
 
 ## Building, and why there are no dependencies
 
-**This crate has no dependencies and that is load-bearing, not minimalism for its own sake.**
-The container it is developed in has **no C linker** — no `cc`, no libc-dev, no way to install
-either, and no `sudo` at all — so any crate with a build script or a proc macro cannot be
-compiled there. With nothing but `std`, the whole crate builds and its tests *run* against
-`aarch64-unknown-linux-musl` using the toolchain's own `rust-lld` and the bundled musl CRT.
-A dependency on `serde` would mean the tests could only ever run in CI, and the tests are the
-product.
+**This crate has no dependencies.** It was load-bearing: until 2026-10-27 the container it is
+developed in had **no C linker** — no `cc`, no libc-dev, and no `sudo` to install either — so
+a crate with a build script or a proc macro could not be compiled there, and a dependency on
+`serde` would have meant the tests could only ever run in CI. With nothing but `std`, the
+whole crate builds and its tests *run* against `aarch64-unknown-linux-musl` using the
+toolchain's own `rust-lld` and the bundled musl CRT. **The owner has since let a C toolchain
+into the image** (2026-10-27), so that reason no longer binds; whether the crate now takes
+dependencies is the owner's decision, not one to make in passing — until then, still none.
 
 That container is `claude-sessions`, in infra's dev Compose project, built from
-`Dockerfile.dev` here: the shared base plus a pinned Rust toolchain, and nothing that could
-link C. Bump the toolchain there, not with `rustup` in a running container.
+`Dockerfile.dev` here: the shared base plus a pinned Rust toolchain, `gcc` and `libc6-dev` to
+link host tools, and a pinned `cargo-mutants`. Bump the toolchain and tools there, not with
+`rustup` or `cargo install` in a running container, which a rebuild would lose.
 
 `.cargo/config.toml` pins that target for the same reason, and it is also what ships: the
 release is a static musl build, so the thing under test is the thing published. CI names the

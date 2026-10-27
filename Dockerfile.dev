@@ -5,7 +5,8 @@
 # git, gh, Claude Code, fish, zmx, sshd, the `dev` user, the entrypoint that clones this repo
 # into /workspace and starts the lot, and the released claude-sessions itself, mounted
 # read-only from the hub at /opt/claude-sessions. What is left here is only what makes this
-# container claude-sessions': a pinned Rust toolchain.
+# container claude-sessions': a pinned Rust toolchain, a C toolchain for it to link host tools
+# with, and cargo-mutants.
 #
 # infra builds it, as the `claude-sessions` service in its dev Compose project, straight from
 # this repo's `main` on GitHub, and passes BASE_TAG from its own pin. So a change here reaches
@@ -15,11 +16,12 @@
 #
 # Nothing here is a release: changing this file is never a version bump.
 #
-# NO C TOOLCHAIN, ON PURPOSE. The base has no `cc` and no libc-dev, and this adds neither:
-# .cargo/config.toml builds for aarch64-unknown-linux-musl with the toolchain's own rust-lld,
-# which is also what the release ships, so the binary under test is the binary published. A
-# crate with a build script or a proc macro would need `cc` for the host and fail to build
-# here — the same constraint that keeps this crate at zero dependencies.
+# A C TOOLCHAIN, SINCE 2026-10-27 (owner: "We don't need to avoid that for our image unless
+# you have a good justification"). Until then there was none, on purpose, and nothing that
+# needs one — a proc macro, a build script, `cargo install` of any tool — could be built here.
+# The crate itself does not use it: .cargo/config.toml still builds aarch64-unknown-linux-musl
+# with the toolchain's own rust-lld, which is what the release ships, so the binary under test
+# is still the binary published.
 ARG BASE_TAG=2026.10.26
 
 # rustup-init 1.29.2, fetched and checked in a stage of its own and bind-mounted into the
@@ -73,6 +75,23 @@ RUN --mount=type=bind,from=rustup,source=/rustup-init,target=/tmp/rustup-init \
         --component clippy,rustfmt,rust-analyzer \
         --target aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
     && rustc --version && cargo --version
+
+# gcc and libc6-dev: the host's linker and C runtime, which every Rust tool with a proc macro
+# needs to build. As root, then back to the base's user.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+USER dev
+
+# cargo-mutants, pinned and built from its lockfile: upstream publishes no aarch64 binary, and
+# zero is arm64. Built outside /workspace so this repo's .cargo/config.toml, which pins the
+# musl target, does not apply; the registry cache it leaves is dropped from the layer.
+ARG CARGO_MUTANTS=27.1.0
+RUN cd /tmp \
+    && cargo install --locked "cargo-mutants@${CARGO_MUTANTS}" \
+    && rm -rf "${CARGO_HOME}/registry" "${CARGO_HOME}/git" \
+    && cargo mutants --version
 
 # No child-init.sh: nothing needs doing at start, since /workspace/target is built on demand.
 # No ssh_config and no secrets: this repo needs no host and no identity beyond the hub's
