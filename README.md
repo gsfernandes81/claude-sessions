@@ -51,8 +51,8 @@ they all mount ([`docs/design.md`](docs/design.md) § *The hub*):
 
 ## Status
 
-Released as GitHub releases, which infra's hub image pins. Where the work stands is
-[`docs/handoff/2026-10-26-hub.md`](docs/handoff/2026-10-26-hub.md).
+Released as GitHub releases, which infra's hub image pins; 0.5.0 runs on the fleet from
+2026-10-27. What is still open is [`docs/handoff/2026-10-02-menu.md`](docs/handoff/2026-10-02-menu.md).
 
 - [`docs/design.md`](docs/design.md) — what it does and why, in enough detail to build from
 - [`docs/mockups.md`](docs/mockups.md) — the screens, approved and binding

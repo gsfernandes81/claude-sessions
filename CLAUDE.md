@@ -5,11 +5,9 @@ The fleet's configuration lives in a separate public `infra` repo, which consume
 as a **pinned, checksummed GitHub release** — never as a git dependency and never built in
 place.
 
-**It runs on the fleet.** Until infra's hub is brought up, `infra` pins a release into the base
-of its dev containers on `zero`, which run the menu, the hook and an offload pass every 3
-minutes (since base 2026.10.06). From 0.5.0 the release is pinned in the **hub's** image
-instead, and the hub installs the binary into a volume every dev container mounts (`install`,
-design § *The hub*): the menu and the offload timer run in the hub, everything else in each
+**It runs on the fleet.** `infra` pins a release in its **hub's** image (since 0.5.0, live on
+`zero` from 2026-10-27), and the hub installs the binary into a volume every dev container
+mounts (`install`, design § *The hub*): the menu and the offload timer run in the hub, everything else in each
 container. A release reaches them at infra's next pin bump, so a change to what the registry
 or `activity.state` holds must still read what the last release wrote — and read it the safe
 way: what it cannot read is unknown, and unknown keeps a slot. The hub and its containers run
