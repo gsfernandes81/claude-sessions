@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+
+# claude-sessions' dev container: a thin child of gsrpi-dev-base, the image every dev container
+# in the owner's infra repo is built on. The base carries everything the containers share:
+# git, gh, Claude Code, fish, zmx, sshd, the `dev` user, the entrypoint that clones this repo
+# into /workspace and starts the lot, and the released claude-sessions itself, mounted
+# read-only from the hub at /opt/claude-sessions. What is left here is only what makes this
+# container claude-sessions': a pinned Rust toolchain.
+#
+# infra builds it, as the `claude-sessions` service in its dev Compose project, straight from
+# this repo's `main` on GitHub, and passes BASE_TAG from its own pin. So a change here reaches
+# the container only once it is on `main` and infra rebuilds it; the ARG default is a
+# fallback for a build outside infra. The container's name, volumes and environment are that
+# service's. infra's dev/README.md is the lifecycle.
+#
+# Nothing here is a release: changing this file is never a version bump.
+#
+# NO C TOOLCHAIN, ON PURPOSE. The base has no `cc` and no libc-dev, and this adds neither:
+# .cargo/config.toml builds for aarch64-unknown-linux-musl with the toolchain's own rust-lld,
+# which is also what the release ships, so the binary under test is the binary published. A
+# crate with a build script or a proc macro would need `cc` for the host and fail to build
+# here — the same constraint that keeps this crate at zero dependencies.
+ARG BASE_TAG=2026.10.26
+
+# rustup-init 1.29.2, fetched and checked in a stage of its own and bind-mounted into the
+# install below, so the installer is not left in a layer of the image. One stage per arch:
+# zero is arm64, and infra's smoke test builds this on an amd64 runner. The hashes are
+# static.rust-lang.org's published ones, checked against the downloaded bytes on 2026-10-27;
+# a rustup bump changes the version in both URLs and both hashes.
+FROM scratch AS rustup-arm64
+ADD --chmod=755 \
+    --checksum=sha256:a9c168dbea81a84671c6b7a5c1795cb0eb699020110d107ddfca427bd797e697 \
+    https://static.rust-lang.org/rustup/archive/1.29.2/aarch64-unknown-linux-gnu/rustup-init \
+    /rustup-init
+
+FROM scratch AS rustup-amd64
+ADD --chmod=755 \
+    --checksum=sha256:5be191e8c70a5007074254cb74d78dbfdd25cd5a61c27de7b8e5410122ec24f4 \
+    https://static.rust-lang.org/rustup/archive/1.29.2/x86_64-unknown-linux-gnu/rustup-init \
+    /rustup-init
+
+# TARGETARCH is BuildKit's own, set per platform and in scope for FROM lines without an ARG.
+FROM rustup-${TARGETARCH} AS rustup
+
+FROM ghcr.io/gsfernandes81/gsrpi-dev-base:${BASE_TAG}
+
+# Re-declared, since an ARG before FROM is out of scope after it, and recorded as a label so
+# which base a running container is on can be read off it with `docker inspect`.
+ARG BASE_TAG
+LABEL uk.gsrpi.base-tag="${BASE_TAG}"
+
+# THE TOOLCHAIN IS PINNED, never `stable`, so a rebuild does not change the compiler under a
+# session; CI follows stable and is where a new release shows up first. Bump it as a commit
+# of its own; rustup itself rarely needs to move with it.
+#
+# Installed as dev, in dev's home, at rustup's own default paths: the toolchain and cargo's
+# cache are dev's to write, and no part of /home/dev below is a volume in infra's service, so
+# the image's copy is the one every start sees. ENV, not a shell profile, because the base's
+# entrypoint publishes the environment to ~/.ssh/environment, which is how it reaches an ssh
+# session from the hub.
+#
+# Components: clippy and rustfmt, which CI runs; rust-analyzer, for Claude Code's and Helix's
+# language server. Targets: aarch64 musl, which config.toml pins, and x86_64 musl, so CI's
+# x86_64 clippy job can be run here before a push (it builds with rust-lld too; its tests
+# cannot run on this arm64 box).
+ARG RUST_TOOLCHAIN=1.99.1
+ENV RUSTUP_HOME=/home/dev/.rustup \
+    CARGO_HOME=/home/dev/.cargo \
+    PATH=/home/dev/.cargo/bin:$PATH
+RUN --mount=type=bind,from=rustup,source=/rustup-init,target=/tmp/rustup-init \
+    /tmp/rustup-init -y --no-modify-path --profile minimal \
+        --default-toolchain "${RUST_TOOLCHAIN}" \
+        --component clippy,rustfmt,rust-analyzer \
+        --target aarch64-unknown-linux-musl,x86_64-unknown-linux-musl \
+    && rustc --version && cargo --version
+
+# No child-init.sh: nothing needs doing at start, since /workspace/target is built on demand.
+# No ssh_config and no secrets: this repo needs no host and no identity beyond the hub's
+# GitHub token. No login.sh: the base's walkthrough is generic.
+
+# WORKDIR, EXPOSE and CMD are inherited, as is USER dev.
