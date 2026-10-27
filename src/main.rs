@@ -171,12 +171,6 @@ fn main() -> ExitCode {
                     return fail(&format!("offload takes only --dry-run, not {other:?}"));
                 }
             };
-            // A container whose owner has turned its offloader off says so and stops nothing,
-            // however the hub's timer reached it.
-            if !dry && std::env::var("CLAUDE_SESSIONS_OFFLOAD").as_deref() == Ok("0") {
-                say!("offloading is off here (CLAUDE_SESSIONS_OFFLOAD=0); nothing was looked at");
-                return ExitCode::SUCCESS;
-            }
             report(offload::run(dry))
         }
         "offload-all" => match args.get(1).map(String::as_str) {
@@ -214,8 +208,7 @@ fn usage() -> String {
         "claude-sessions {VERSION} — Claude Code sessions, per box
 
   claude-sessions              the menu over every container (CLAUDE_SESSIONS_HOSTS, else
-                               ~/.config/claude-sessions/hosts, else this one); the list
-                               below when not at a terminal
+                               this one); the list below when not at a terminal
   claude-sessions offload-all  one offload pass in every container, over ssh; run from the
                   [--dry-run]  hub's timer every three minutes
   claude-sessions install DIR  put this binary, its hooks drop-in and its skill in DIR, for
@@ -228,7 +221,6 @@ fn usage() -> String {
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
   claude-sessions offload      measure every slot here, and stop each one quiet for 10
                                minutes, detached and not kept alive; run by offload-all
-                               (CLAUDE_SESSIONS_OFFLOAD=0 here makes it stop nothing)
                   [--dry-run]  say what it would stop, and stop nothing
   claude-sessions keepalive DURATION
                                keep the slot this runs in from being offloaded for DURATION

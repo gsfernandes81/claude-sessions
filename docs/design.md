@@ -99,8 +99,7 @@ list, interleaved by when each was last active without reordering any container'
 seconds. Not shown as `connecting` meanwhile: a retry that fails must change nothing on the
 screen, or a dead container would make an idle hub talk four times a minute; the hub test holds
 that through two retries. `s` on it still tries `ssh -t <c>`, which may answer where the agent
-did not. **Which containers** is `CLAUDE_SESSIONS_HOSTS`, else `~/.config/claude-sessions/hosts`
-(one ssh alias a line), else `local` — this machine, with the agent a child process and no ssh,
+did not. **Which containers** is `CLAUDE_SESSIONS_HOSTS`, else `local` — this machine, with the agent a child process and no ssh,
 which is how the old single-container menu and the tests run. What reaching a container takes
 (user, port, key, multiplexing) is the hub's own `~/.ssh/config`; `CLAUDE_SESSIONS_REMOTE` names
 the program in the containers when it is not on their `PATH`.
@@ -109,9 +108,10 @@ the program in the containers when it is not on their `PATH`.
 container's pass at once and waits for all, so each container is still measured every three
 minutes, which the CPU budget depends on (*How `claude-sessions offload` reads those rules*). A
 container that does not answer, or whose pass fails, is one line of the run and makes it exit
-non-zero after the others have finished; it never stops another container's pass. A container
-whose owner wants nothing stopped sets `CLAUDE_SESSIONS_OFFLOAD=0` in its environment, and its
-pass says so and looks at nothing.
+non-zero after the others have finished; it never stops another container's pass. There is one
+switch, the hub's: infra's `HUB_OFFLOAD=0` stops the timer for every container, and a slot that
+must stay loaded holds itself with `claude-sessions keepalive` (until 0.5.0 a per-container
+`CLAUDE_SESSIONS_OFFLOAD=0` also existed; it went with the hub, as a second switch for one job).
 
 **Room is still a container's own**: each container keeps its own memory ceiling inside the
 pool (infra's `cgroup_parent`), and the no-room offer is from the same container as the session

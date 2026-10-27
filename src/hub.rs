@@ -5,9 +5,8 @@
 //! snapshots arriving on their own and every action sent down it. The hub reads no registry,
 //! no `/proc` and no zmx of its own; the containers' are theirs to read, under their own locks.
 //!
-//! **Which containers.** `CLAUDE_SESSIONS_HOSTS` — names separated by spaces or commas —
-//! else one name a line in `~/.config/claude-sessions/hosts` (`#` starts a comment), else the
-//! one name `local`. A name is an ssh alias: what reaching it takes — user, port, key,
+//! **Which containers.** `CLAUDE_SESSIONS_HOSTS` — names separated by spaces or commas — else
+//! the one name `local`. One source: infra's hub sets it, derived from its own repo map. A name is an ssh alias: what reaching it takes — user, port, key,
 //! multiplexing — is the hub's `~/.ssh/config`, which infra writes. `local` is this machine,
 //! run as a child with no ssh at all: a single container's own menu, and the tests.
 //!
@@ -42,17 +41,6 @@ pub fn hosts() -> Vec<String> {
     };
     if let Ok(v) = std::env::var("CLAUDE_SESSIONS_HOSTS") {
         let names = split(&v);
-        if !names.is_empty() {
-            return dedup(names);
-        }
-    }
-    let file = std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".config/claude-sessions/hosts"));
-    if let Some(text) = file.and_then(|f| std::fs::read_to_string(f).ok()) {
-        let names: Vec<String> = text
-            .lines()
-            .flat_map(|l| split(l.split('#').next().unwrap_or("")))
-            .collect();
         if !names.is_empty() {
             return dedup(names);
         }
