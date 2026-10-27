@@ -76,6 +76,10 @@ compiled there. With nothing but `std`, the whole crate builds and its tests *ru
 A dependency on `serde` would mean the tests could only ever run in CI, and the tests are the
 product.
 
+That container is `claude-sessions`, in infra's dev Compose project, built from
+`Dockerfile.dev` here: the shared base plus a pinned Rust toolchain, and nothing that could
+link C. Bump the toolchain there, not with `rustup` in a running container.
+
 `.cargo/config.toml` pins that target for the same reason, and it is also what ships: the
 release is a static musl build, so the thing under test is the thing published. CI names the
 target explicitly per job because the runner is x86_64.
