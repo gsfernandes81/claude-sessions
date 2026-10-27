@@ -120,14 +120,15 @@ pub struct Menu {
     /// pool's memory.
     home: Header,
     /// Showing one container's sessions — always, when there is only one container. `None`
-    /// is the home: every container's open sessions, then the containers.
+    /// is the home: every container, each with its loaded sessions under it.
     focus: Option<String>,
     /// Every row, in the order the owner has been looking at, archived ones included, from
     /// every container.
     all: Vec<Row>,
     /// What is drawn and what the cursor moves over: `all`, cut to what the screen shows —
     /// one container's rows with the archived ones behind the Archived heading's row, shown
-    /// only while it is open; or, at home, a row for each container.
+    /// only while it is open; or, at home, a row for each container with its loaded sessions
+    /// under it.
     rows: Vec<Row>,
     /// The Archived group is open. Shut whenever the menu starts (owner, 2026-10-03), and
     /// whenever the focus moves.
@@ -300,11 +301,25 @@ impl Menu {
 
     /// The rows as drawn. For one container: every row not archived, then — when anything is
     /// archived — the Archived heading's row, counting them, then the archived rows if the
-    /// group is open. At home: a row per container, in the order the hub was given them —
-    /// one waiting for the owner is marked, not moved, so the list never reorders itself.
+    /// group is open. At home, a tree (owner, 2026-10-27): a row per container, in the order
+    /// the hub was given them — one waiting for the owner is marked, not moved, so the list
+    /// never reorders itself — each followed by its loaded sessions, nested under it, in the
+    /// container's own order. Offloaded and archived sessions are on the container's screen.
     fn visible(&self) -> Vec<Row> {
         if self.focus.is_none() {
-            return self.places.iter().map(|p| self.container_row(p)).collect();
+            let mut out = Vec::new();
+            for p in &self.places {
+                out.push(self.container_row(p));
+                let loaded = self
+                    .all
+                    .iter()
+                    .filter(|r| r.host == p.name && r.group() == Group::Loaded);
+                out.extend(loaded.map(|r| Row {
+                    nested: true,
+                    ..r.clone()
+                }));
+            }
+            return out;
         }
         let (archived, mut out): (Vec<Row>, Vec<Row>) = self
             .in_scope()
@@ -327,6 +342,7 @@ impl Menu {
             title: Group::Archived.name().to_string(),
             age: archived.len().to_string(),
             at: 0,
+            nested: false,
         });
         if self.archive_open {
             out.extend(archived);
@@ -375,6 +391,7 @@ impl Menu {
             title: p.name.clone(),
             age,
             at: 0,
+            nested: false,
         }
     }
 
@@ -439,12 +456,7 @@ impl Menu {
 
     /// How many lines the hint takes at this width, counted by the renderer that draws it.
     fn hint_lines(&self) -> usize {
-        crate::render::hint_line_count(
-            self.width,
-            self.rows.is_empty(),
-            self.back(),
-            self.focus.is_none(),
-        )
+        crate::render::hint_line_count(self.width, self.rows.is_empty(), self.back())
     }
 
     /// One container's screen, with a home to go back to.
@@ -758,6 +770,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             title: c.title,
             age: fmt::age(clock.saturating_sub(c.last_ms)),
             at: c.last_ms,
+            nested: false,
         };
         dated.push((c.last_ms, row));
     }
@@ -783,6 +796,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             title: sess.name.clone(),
             age: fmt::age(clock.saturating_sub(since)),
             at: since,
+            nested: false,
         });
     }
     rows
@@ -819,6 +833,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         title: r.display_title(),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
+        nested: false,
     }
 }
 
@@ -890,6 +905,7 @@ mod tests {
             title: name.into(),
             age: "1m".into(),
             at: 0,
+            nested: false,
         }
     }
 
@@ -1432,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn the_home_is_the_containers_in_order_each_saying_whats_in_it() {
+    fn the_home_is_a_tree_of_the_containers_in_order_each_with_its_loaded_sessions() {
         let mut closed = in_("infra-dev", "old");
         closed.closed = true;
         let mut off = in_("infra-dev", "c");
@@ -1442,20 +1458,52 @@ mod tests {
         let m = hub_menu(vec![in_("infra-dev", "a"), off, waiting, closed]);
         assert_eq!(
             names(&m),
-            ["infra-dev", "or3-dev", "ds-dev"],
-            "the hub's order, waiting or not"
+            ["infra-dev", "a", "or3-dev", "b", "ds-dev"],
+            "the hub's order, each container's loaded sessions under it, and nothing else"
         );
         let v = m.view();
         assert!(v.home && !v.back && v.down.is_none());
-        let says: Vec<&str> = m.rows().iter().map(|r| r.age.as_str()).collect();
+        let containers: Vec<&Row> = m
+            .rows()
+            .iter()
+            .filter(|r| r.key == RowKey::Container)
+            .collect();
+        let says: Vec<&str> = containers.iter().map(|r| r.age.as_str()).collect();
         assert_eq!(
             says,
             ["1 loaded · 1 offloaded", "1 loaded", "not answering"],
             "a closed session is not counted"
         );
-        assert!(m.rows()[1].wants_you, "or3-dev is marked, not moved");
-        assert!(!m.rows()[0].wants_you);
-        assert!(m.rows().iter().all(|r| r.group() == Group::Containers));
+        assert!(containers[1].wants_you, "or3-dev is marked, not moved");
+        assert!(!containers[0].wants_you);
+        assert!(containers.iter().all(|r| r.group() == Group::Containers));
+        let nested: Vec<bool> = m.rows().iter().map(|r| r.nested).collect();
+        assert_eq!(nested, [false, true, false, true, false]);
+        // Laid out as one group: a heading, then the tree, with no heading of Loaded's.
+        let items = render::layout(m.rows());
+        assert_eq!(items[0], render::Item::Heading(Group::Containers));
+        assert_eq!(items.len(), 6, "{items:?}");
+    }
+
+    #[test]
+    fn at_home_enter_opens_a_session_and_c_offloads_it() {
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
+        m.key(Key::Down);
+        assert_eq!(m.rows()[m.view().cursor].title, "a");
+        assert_eq!(m.key(Key::Enter), Action::Open(1), "opened, not shown");
+        assert_eq!(m.key(Key::Char('c')), Action::Offload(1));
+        assert_eq!(m.key(Key::Char('n')), Action::New("infra-dev".into()));
+        // Offloaded, it leaves the home, and the cursor stays in its container.
+        let mut a = in_("infra-dev", "a");
+        a.offloaded = true;
+        m.replace_rows(vec![a, in_("or3-dev", "b")], false);
+        assert_eq!(names(&m), ["infra-dev", "or3-dev", "b", "ds-dev"]);
+        assert_eq!(m.rows()[0].age, "1 offloaded");
+        // And on the container's own screen it is under Offloaded.
+        m.key(Key::Home);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["a"]);
+        assert_eq!(m.rows()[0].group(), Group::Offloaded);
     }
 
     #[test]
@@ -1487,6 +1535,7 @@ mod tests {
     #[test]
     fn at_home_n_and_s_act_in_the_cursors_container_and_c_on_a_container_explains() {
         let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
+        m.key(Key::Down);
         m.key(Key::Down);
         assert_eq!(m.rows()[m.view().cursor].title, "or3-dev");
         assert_eq!(m.key(Key::Char('n')), Action::New("or3-dev".into()));
@@ -1528,6 +1577,8 @@ mod tests {
             in_("or3-dev", "claude-1"),
         ]);
         m.key(Key::Down);
+        m.key(Key::Down);
+        assert_eq!(m.rows()[m.view().cursor].title, "or3-dev");
         m.key(Key::Enter);
         assert_eq!(names(&m), ["claude-1"], "or3-dev's alone");
         // A fresh reading in which only infra-dev's changed group keeps or3-dev's under the

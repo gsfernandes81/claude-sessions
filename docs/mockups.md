@@ -39,12 +39,19 @@ the one glyph here outside the measured set**: it is in none of the six faces, a
 on the owner's word that it draws on the terminals this is driven from, which put a fallback
 glyph into one cell. It is only ever drawn alone, at the end of a row or the start of the
 status line, so a fallback cannot drag a line out of true. **On 2026-10-27 the owner took the
-question out of `c`**: "Remove the confirmation on session close … make the first c offload
-and c on an offloaded session archive it." So `c` is one step down the list — Loaded to
-Offloaded, Offloaded to Archived — asking nothing, and mockup 3, its question, is retired;
-mockup 11's spinner says `offloading session`, mockup 5's way out is `c archive it`, and the
-keys screen says what `c` does. The hint line keeps `c close`: it is the same seven columns,
-so mockup 8 stands.
+question out of `c` and made the hub's home a tree**: "Remove the confirmation on session
+close … make the first c offload and c on an offloaded session archive it … make the session
+presentation a tree view where clicking the container expands it to show offloaded and closed
+sessions in a new page (like it does now) but in the normal tree view only show loaded
+sessions." So `c` is one step down the list — Loaded to Offloaded, Offloaded to Archived —
+asking nothing, and mockup 3, its question, is retired; mockup 11's spinner says `offloading
+session`, mockup 5's way out is `c archive it`, and the keys screens say what `c` does. The
+home (mockup 12) lists each container's loaded sessions under it, each hanging from it on a
+dim `├─ ` branch, the last on a `└─ ` corner, and `Enter` on a session there opens it. **`├`
+and `└` are outside the measured set**, used on the owner's word (2026-10-27): every glyph
+Claude Code and charmbracelet's crush draw works on the terminals this is driven from, and
+crush draws its trees with these. The hint line keeps `c close`: it is the same seven columns, so
+mockup 8 stands.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -353,29 +360,37 @@ deeper"):
 - **The home** (mockup 12) is the containers, one row each, in the hub's order: its name, and
   what is in it — `3 loaded · 1 offloaded`, `nothing open`, `not answering`, in words. A
   container with a session waiting for the owner is marked `!` in amber, as such a session is,
-  and one with a session unread is bold; marked, never moved. No session is listed here.
+  and one with a session unread is bold; marked, never moved. **Under each container, its
+  loaded sessions** (owner, 2026-10-27), on a tree, in the container's own order and
+  drawn as they are on its screen; `Enter` opens one and `c` offloads it, which takes it off
+  the home. Offloaded and archived sessions are only on the container's screen.
 - **One container** (mockup 13) is `Enter` on its row: exactly the single container's screens
   above — Loaded, Offloaded and the folded Archived, every key as it is there — with one
   addition to the hint line, `Esc back`, and `Esc` going back to the home with the cursor on
   that container. With only one container configured there is no home, and the screens are
   the ones above, `Esc` quitting.
 
-`n` and `s` at the home act in the container under the cursor, and `c` there says what `c` is
-for; the home's hint line leaves it out. A container that does not answer (mockup 14) is asked
+`n` and `s` at the home act in the container of the row under the cursor; `c` on a container's
+own row says what `c` is for. A container that does not answer (mockup 14) is asked
 again every 15 seconds, which changes nothing on the screen until it answers — the idle hub
 still writes nothing.
 
-### Mockup 12 — Every container, the hub's home
+### Mockup 12 — Every container and its loaded sessions, the hub's home
 ```
 dev · 4 containers · 1.9G of 3.0G
 ────────────────────────────────────────
 ── Containers · 4 ──────────────────────
 ! infra-dev       3 loaded · 1 offloaded
+├─ ! permission: write hosts/one      2m
+├─ loop: watch the base build        now
+└─ immich upgrade                     3m
 or3-dev                         1 loaded
+└─ retire the old tunnel             14m
 dd-dev                       2 offloaded
 ds-dev                     not answering
 ────────────────────────────────────────
-Enter open   n new   ? keys   s shell
+Enter open   n new   c close   ? keys
+s shell
 ```
 
 ### Mockup 13 — One container, from the home
@@ -418,15 +433,19 @@ ds-dev · not answering
 ```
 dev · keys
 ────────────────────────────────────────
-Enter  show the container's sessions
+Enter  open the session; on a
+       container, every session in it
 n      new session in the container
+c      offload the session
 s      a shell in the container
 Esc    quit the launcher; from a
        container, back to this list
 ?      this
 
-Containers every one the hub reaches
-!          a session in it is waiting
+Containers every one the hub reaches,
+           its loaded sessions under it
+!          a session is waiting for you
 ────────────────────────────────────────
-Enter open   n new   ? keys   s shell
+Enter open   n new   c close   ? keys
+s shell
 ```

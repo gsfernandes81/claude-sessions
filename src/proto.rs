@@ -138,6 +138,7 @@ pub fn row_from(v: &Value, host: &str) -> Option<Row> {
         title: s(v, "title").unwrap_or_default(),
         age: s(v, "age").unwrap_or_default(),
         at: v.get("at").and_then(Value::as_u64).unwrap_or(0),
+        nested: false,
     })
 }
 
@@ -433,6 +434,7 @@ mod tests {
             title: "retire \"the\" old\ttunnel\u{1b}[2J".into(),
             age: "14m".into(),
             at: 1_759_000_000_123,
+            nested: false,
         }
     }
 

@@ -591,10 +591,14 @@ highlight or icon … keep loaded / offloaded and a click to expand archived sec
 home** is the containers, one row each in the hub's order, saying what is in it — `3 loaded ·
 1 offloaded`, `nothing open`, `not answering` — marked `!` in amber when a session in it is
 waiting for the owner, and bold when one is unread. Marked, never moved: the home keeps its
-order. `Enter` on a container shows **that container**: the screens and keys below, with `Esc
-back` on the hint line, and `Esc` returning to the home with the cursor on that container. At
-the home `n` and `s` act in the cursor's container, `c` says what it is for, and `Esc` quits.
-With one container there is no home and `Esc` quits from its screen.
+order. **The home is a tree** (owner, 2026-10-27: "in the normal tree view only show loaded
+sessions"): under each container, on a dim `├─ ` / `└─ ` tree, its loaded sessions, in the
+container's own order and drawn as on its screen; `Enter` on one opens it and `c` offloads it,
+which takes it off the home. `Enter` on a container shows **that container**: the screens and
+keys below — offloaded and archived sessions too — with `Esc back` on the hint line, and `Esc`
+returning to the home with the cursor on that container. At the home `n` and `s` act in the
+container of the cursor's row, `c` on a container's own row says what `c` is for, and `Esc`
+quits. With one container there is no home and `Esc` quits from its screen.
 
 - **One container's screen lists every live and offloaded slot, every unregistered `zmx`
   session, and every conversation on disk started in the workspace that is not running**, in

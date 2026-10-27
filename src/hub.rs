@@ -493,6 +493,7 @@ mod tests {
             title: title.into(),
             age: String::new(),
             at,
+            nested: false,
         }
     }
 

@@ -49,10 +49,13 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   Mono, Fira Mono and Space Mono were each downloaded and their cmaps read on 2026-10-01.
   It fell back to a face with a different advance and silently dragged every line it sat on
   out of alignment. The key is spelled `Enter`. Anything outside ASCII and the box-drawing
-  set used in the mockups gets the same treatment: check coverage, do not assume it. The one
+  set used in the mockups gets the same treatment: check coverage, do not assume it. One
   exception is the spinner's braille (`⠋⠙⠹…`): in none of those faces, used on the owner's
   word that it draws on Termux and Windows Terminal (2026-10-04), and only ever alone in a
-  cell.
+  cell. And the owner's word of 2026-10-27 covers more: **every glyph Claude Code and
+  charmbracelet's crush draw works** on the terminals this is driven from — which is why the
+  hub's home draws its tree with `├─ ` and `└─ `. A glyph neither of them draws still gets
+  measured.
 - **Nothing is colour-only.** A session's state is said in words or an ASCII mark — the group
   heading it is under, Loaded, Offloaded or Archived, and `!` before the title of one waiting
   for you — so a pipe, a monochrome terminal and a screen reader lose none of it. Bold for

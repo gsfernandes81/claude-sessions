@@ -227,7 +227,7 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     }
     assert!(
         !first.contains("retire the old tunnel"),
-        "the home lists containers, not sessions: {first:?}"
+        "the home lists only loaded sessions under its containers, not offloaded ones: {first:?}"
     );
 
     // The property, through two retries of the container that is not answering.

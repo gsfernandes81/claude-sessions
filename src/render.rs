@@ -73,14 +73,12 @@ const HINTS_EMPTY_BACK: [Hint; 4] = [("n", "new"), ("?", "keys"), WAY_OUT, BACK]
 /// A container that is not answering has nothing to open and nowhere to start one; a shell
 /// is still worth a try, since ssh may answer where the agent did not (mockup 14).
 const HINTS_DOWN: [Hint; 3] = [("?", "keys"), WAY_OUT, BACK];
-/// The home lists containers, which `c` does nothing to (mockup 12).
-const HINTS_HOME: [Hint; 4] = [("Enter", "open"), ("n", "new"), ("?", "keys"), WAY_OUT];
 
 /// The hint line for a screen: whether its list is empty, whether `Esc` goes back to the
-/// home, whether its container is not answering, and whether it is the home.
-fn hint_set(empty: bool, back: bool, down: bool, home: bool) -> &'static [Hint] {
+/// home, and whether its container is not answering. The home has the plain set: its loaded
+/// sessions are on it, to open and to put away (owner, 2026-10-27).
+fn hint_set(empty: bool, back: bool, down: bool) -> &'static [Hint] {
     match (empty, back, down) {
-        _ if home => &HINTS_HOME,
         (_, _, true) => &HINTS_DOWN,
         (true, false, _) => &HINTS_EMPTY,
         (true, true, _) => &HINTS_EMPTY_BACK,
@@ -90,12 +88,7 @@ fn hint_set(empty: bool, back: bool, down: bool, home: bool) -> &'static [Hint] 
 }
 
 fn view_hints(view: &View) -> &'static [Hint] {
-    hint_set(
-        view.rows.is_empty(),
-        view.back,
-        view.down.is_some(),
-        view.home,
-    )
+    hint_set(view.rows.is_empty(), view.back, view.down.is_some())
 }
 /// Between hint items, and between most dialog buttons: three spaces, as every mockup draws.
 const GAP: &str = "   ";
@@ -414,8 +407,8 @@ fn keyed(
 /// mockup 8, while the shorter items wrap one to a line.
 /// How many lines the hint takes at `width` — for `menu.rs`, which has to know how many rows
 /// fit above it, and must count them the way they are drawn.
-pub fn hint_line_count(width: u16, empty: bool, back: bool, home: bool) -> usize {
-    hint_lines(hint_set(empty, back, false, home), GAP, usize::from(width)).len()
+pub fn hint_line_count(width: u16, empty: bool, back: bool) -> usize {
+    hint_lines(hint_set(empty, back, false), GAP, usize::from(width)).len()
 }
 
 fn hint_lines(items: &[Hint], sep: &str, w: usize) -> Vec<Line> {
@@ -499,12 +492,17 @@ impl Item {
 
 /// The list's lines: each group's heading, then its rows, with a blank line between groups
 /// (owner, 2026-10-03). `rows` is in group order — `menu.rs` keeps it so — and a heading is
-/// drawn wherever the group changes, so an empty group has none.
+/// drawn wherever the group changes, so an empty group has none. A session nested under its
+/// container on the home's tree is in its container's group, not under a heading of its own.
 pub fn layout(rows: &[Row]) -> Vec<Item> {
     let mut out = Vec::new();
     let mut last: Option<Group> = None;
     for (i, r) in rows.iter().enumerate() {
-        let g = r.group();
+        let g = if r.nested {
+            Group::Containers
+        } else {
+            r.group()
+        };
         if last != Some(g) {
             if last.is_some() {
                 out.push(Item::Blank);
@@ -569,7 +567,14 @@ fn list_lines(view: &View, w: usize, room: usize) -> Vec<Line> {
         .iter()
         .map(|item| match *item {
             Item::Heading(g) => heading(g, &count(&view.rows, g), w, false),
-            Item::Row(i) => row(&view.rows[i], w, indent, i == view.cursor, spin_on(view, i)),
+            Item::Row(i) => row(
+                &view.rows[i],
+                w,
+                indent,
+                i == view.cursor,
+                spin_on(view, i),
+                branch(&view.rows, i),
+            ),
             Item::Fold(i) => {
                 // What Enter or a click on it will do, said on the heading itself.
                 let open = view.rows[i + 1..]
@@ -628,6 +633,24 @@ fn heading(g: Group, count: &str, w: usize, cursor: bool) -> Line {
     line
 }
 
+/// The home's tree (owner, 2026-10-27): a container's loaded sessions hang from it, each on a
+/// branch, the last on a corner. `├` and `└` are outside the set the fonts were measured for
+/// on 2026-10-01; they are used on the owner's word that what Claude Code and charmbracelet's
+/// crush draw, which includes these, draws on the terminals this is driven from. Dim, as
+/// structure, like the rules.
+const BRANCH: &str = "├─ ";
+const CORNER: &str = "└─ ";
+
+/// Row `i`'s branch on the home's tree, if it hangs from a container: the corner for its
+/// container's last session.
+fn branch(rows: &[Row], i: usize) -> Option<&'static str> {
+    if !rows.get(i)?.nested {
+        return None;
+    }
+    let last = !rows.get(i + 1).is_some_and(|r| r.nested);
+    Some(if last { CORNER } else { BRANCH })
+}
+
 /// What marks a row waiting for the owner (owner, 2026-10-26: "just a yellow highlight or
 /// icon"): an amber `!` before its title, and the title amber. The mark is ASCII, so a
 /// monochrome terminal, a pipe and a screen reader keep it — nothing is colour-only — and it
@@ -638,14 +661,31 @@ const WAITING: &str = "! ";
 /// marks and no number (owner, 2026-10-03): the group says what state it is in, an unread
 /// title is bold, and a session attached somewhere else is drawn dim. A container's row, at
 /// the home, is its name — bold when a session in it is unread — and what is in it,
-/// right-aligned in as many columns as that takes.
-fn row(r: &Row, w: usize, indent: usize, cursor: bool, spin: Option<&str>) -> Line {
+/// right-aligned in as many columns as that takes; the loaded sessions under it hang from it
+/// on a tree (`branch`).
+fn row(
+    r: &Row,
+    w: usize,
+    indent: usize,
+    cursor: bool,
+    spin: Option<&str>,
+    branch: Option<&str>,
+) -> Line {
     // The cursor is reverse video across the whole row (owner, 2026-10-02): a monochrome
     // terminal shows it too, and the styles inside it still read.
     let st = |s: Style| Style {
         reverse: cursor,
         dim: s.dim || r.attached,
         ..s
+    };
+    let mut line = Line::default();
+    line.pad(indent, st(FG));
+    let indent = match branch {
+        Some(b) => {
+            line.push(b, st(DIM));
+            indent + width(b)
+        }
+        None => indent,
     };
     let title_style = match (r.wants_you, r.unread) {
         (true, _) => Style {
@@ -655,8 +695,6 @@ fn row(r: &Row, w: usize, indent: usize, cursor: bool, spin: Option<&str>) -> Li
         (false, true) => BOLD,
         (false, false) => FG,
     };
-    let mut line = Line::default();
-    line.pad(indent, st(FG));
     let mut indent = indent;
     if r.wants_you {
         line.push(WAITING, st(AMBER_BOLD));
@@ -700,7 +738,7 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
         let mut line = Line::default();
         line.push(b.glyph(), FG).push(" ", FG).push(&b.what, DIM);
         out.push(line);
-        hint_lines(hint_set(true, view.back, false, view.home), GAP, w)
+        hint_lines(hint_set(true, view.back, false), GAP, w)
     } else if let Some(why) = &view.down {
         out.extend(down_body(view, why, w));
         hint_lines(&HINTS_DOWN, GAP, w)
@@ -822,15 +860,18 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     // never a question (owner, 2026-10-27).
     let keys: [(&str, &[&str]); 6] = if view.home {
         [
-            ("Enter", &["show the container's sessions"]),
+            (
+                "Enter",
+                &["open the session; on a", "container, every session in it"],
+            ),
             ("n", &["new session in the container"]),
+            ("c", &["offload the session"]),
             ("s", &["a shell in the container"]),
             (
                 "Esc",
                 &["quit the launcher; from a", "container, back to this list"],
             ),
             ("?", &["this"]),
-            ("", &[]),
         ]
     } else {
         [
@@ -866,12 +907,12 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
             Group::Loaded => &["claude is running"],
             Group::Offloaded => &["stopped to save memory"],
             Group::Archived => &["ended, still resumable; Enter", "or a click on it opens it"],
-            Group::Containers => &["every one the hub reaches"],
+            Group::Containers => &["every one the hub reaches,", "its loaded sessions under it"],
         };
         keyed(&mut out, 0, (g.name(), BOLD), 11, what, w);
     }
     let waiting: &[&str] = if view.home {
-        &["a session in it is waiting"]
+        &["a session is waiting for you"]
     } else {
         &["a prompt is waiting for you"]
     };
@@ -902,7 +943,14 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
         if room.saturating_sub(body.len()) >= 2 {
             let g = r.1.group();
             out.push(heading(g, &count(&view.rows, g), w, false));
-            out.push(row(r.1, w, indent(w), r.0 == view.cursor, None));
+            out.push(row(
+                r.1,
+                w,
+                indent(w),
+                r.0 == view.cursor,
+                None,
+                branch(&view.rows, r.0),
+            ));
         }
     }
     out.extend(boxed(body, w, box_w));
@@ -1064,6 +1112,7 @@ mod tests {
             title: title.to_string(),
             age: age.to_string(),
             at: 0,
+            nested: false,
         }
     }
 
@@ -1234,15 +1283,24 @@ mod tests {
     }
 
     /// The home of mockup 12: four containers, one with a session waiting for the owner, one
-    /// with a session unread, and one not answering.
+    /// with a session unread, and one not answering — each with its loaded sessions nested
+    /// under it, as `menu.rs` lays the tree out.
     fn home_rows() -> Vec<Row> {
         let mut infra = container("infra-dev", "3 loaded · 1 offloaded");
         infra.wants_you = true;
         let mut or3 = container("or3-dev", "1 loaded");
         or3.unread = true;
+        let nested = |flags: &str, title: &str, age: &str| Row {
+            nested: true,
+            ..row(flags, title, age)
+        };
         vec![
             infra,
+            nested("!", "permission: write hosts/one", "2m"),
+            nested("b", "loop: watch the base build", "now"),
+            nested("@", "immich upgrade", "3m"),
             or3,
+            nested("*", "retire the old tunnel", "14m"),
             container("dd-dev", "2 offloaded"),
             container("ds-dev", "not answering"),
         ]
@@ -1542,8 +1600,20 @@ mod tests {
         assert_eq!(at(3, 2).fg, Some(Colour::Amber), "its name");
         assert_eq!(style_at(&f, 3, 39).fg, None, "not what is in it");
         assert_eq!(style_at(&f, 2, 3).fg, None, "the heading is not amber");
-        assert!(style_at(&f, 4, 0).bold, "or3-dev has a session unread");
-        assert!(!style_at(&f, 5, 0).bold, "dd-dev does not");
+        // The waiting session nested under it hangs on a dim branch, and is marked as on its
+        // container's screen.
+        assert_eq!(style_at(&f, 4, 0), DIM, "the branch is structure");
+        assert_eq!(style_at(&f, 4, 3), AMBER_BOLD, "the session's own mark");
+        assert_eq!(style_at(&f, 4, 5).fg, Some(Colour::Amber), "and its title");
+        assert!(style_at(&f, 7, 0).bold, "or3-dev has a session unread");
+        assert!(style_at(&f, 8, 3).bold, "the unread session itself");
+        let p = lines(&f);
+        assert!(
+            p[6].starts_with("└─ immich"),
+            "a container's last on a corner"
+        );
+        assert!(p[5].starts_with("├─ loop"), "the others on a branch");
+        assert!(!style_at(&f, 9, 0).bold, "dd-dev does not");
     }
 
     #[test]
@@ -2154,7 +2224,7 @@ mod tests {
                     cursor,
                     ..mockup_1(w)
                 };
-                let room = 24 - 3 - hint_line_count(w, false, false, false);
+                let room = 24 - 3 - hint_line_count(w, false, false);
                 v.scroll = scroll_to(&items, cursor, 0, room);
                 let f = render(&v).unwrap();
                 let at = items

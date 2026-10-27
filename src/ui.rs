@@ -27,7 +27,8 @@ pub enum RowKey {
     /// that is not a session. `Enter` on it folds the archive open or shut.
     ArchiveFold,
     /// A container, on the list of every container (the hub's home): `Enter` on it shows that
-    /// container's sessions alone. Which container is the row's `host`.
+    /// container's sessions alone — offloaded and archived ones too. Which container is the
+    /// row's `host`.
     Container,
 }
 
@@ -45,8 +46,8 @@ pub enum Group {
     /// Ended, and still resumable, under one heading folded shut until the owner opens it —
     /// `Enter` or a click on the heading. Not counted as open.
     Archived,
-    /// Every container the hub reaches, on its home screen (2026-10-26): `Enter` on one shows
-    /// its sessions.
+    /// Every container the hub reaches, on its home screen (2026-10-26), each with its loaded
+    /// sessions under it (2026-10-27): `Enter` on a container shows all of its sessions.
     Containers,
 }
 
@@ -98,6 +99,10 @@ pub struct Row {
     /// When it was last active, in milliseconds: how rows from several containers are put in
     /// one recency order. Within one container the order is the container's own.
     pub at: u64,
+    /// Drawn under its container's row on the home's tree (owner, 2026-10-27), indented a
+    /// step, rather than under a heading of its own group. Set by the menu as it lays out the
+    /// home; never sent between hub and container.
+    pub nested: bool,
 }
 
 impl Row {

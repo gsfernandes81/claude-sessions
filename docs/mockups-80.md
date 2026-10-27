@@ -226,19 +226,24 @@ Enter open   n new   c close   ? keys   s shell
 ## The hub (2026-10-26)
 
 The four screens of [`mockups.md`](mockups.md) § *The hub*, at 80 columns. Rows are indented
-under their headings here, as everywhere at this width.
+under their headings here, as everywhere at this width, and a container's loaded sessions
+hang from it on the tree's branches.
 
-### Mockup 12 — Every container, the hub's home
+### Mockup 12 — Every container and its loaded sessions, the hub's home
 ```
 dev · 4 containers · 1.9G of 3.0G
 ────────────────────────────────────────────────────────────────────────────────
 ── Containers · 4 ──────────────────────────────────────────────────────────────
   ! infra-dev                                             3 loaded · 1 offloaded
+  ├─ ! permission: write hosts/one                                            2m
+  ├─ loop: watch the base build                                              now
+  └─ immich upgrade                                                           3m
   or3-dev                                                               1 loaded
+  └─ retire the old tunnel                                                   14m
   dd-dev                                                             2 offloaded
   ds-dev                                                           not answering
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell
 ```
 
 ### Mockup 13 — One container, from the home
@@ -279,15 +284,18 @@ ds-dev · not answering
 ```
 dev · keys
 ────────────────────────────────────────────────────────────────────────────────
-Enter  show the container's sessions
+Enter  open the session; on a
+       container, every session in it
 n      new session in the container
+c      offload the session
 s      a shell in the container
 Esc    quit the launcher; from a
        container, back to this list
 ?      this
 
-Containers every one the hub reaches
-!          a session in it is waiting
+Containers every one the hub reaches,
+           its loaded sessions under it
+!          a session is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell
 ```
