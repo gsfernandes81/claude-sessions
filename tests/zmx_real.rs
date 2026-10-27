@@ -1,5 +1,5 @@
 //! The menu driving the **real zmx**, on a real pseudo-terminal: start, bind, detach,
-//! re-attach, close — and the check v0.3.8 lacked, that nothing switches the terminal to the
+//! re-attach, offload and archive — and the check v0.3.8 lacked, that nothing switches the terminal to the
 //! alternate screen while a session has it.
 //!
 //! **Why this exists.** v0.3.8 turned claude's mouse reporting off so that swipes would scroll
@@ -124,7 +124,7 @@ fn the_check_for_the_alternate_screen_can_fail() {
 }
 
 #[test]
-fn the_menu_starts_attaches_and_closes_a_session_in_the_real_zmx() {
+fn the_menu_starts_attaches_offloads_and_archives_a_session_in_the_real_zmx() {
     let Some(zmx) = real_zmx() else { return };
     let root = std::env::temp_dir().join(format!("cs-zmx-real-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -245,15 +245,18 @@ exec sleep 600"#,
     let pids = std::fs::read_to_string(root.join("pids")).unwrap();
     assert_eq!(pids.lines().count(), 1, "attached, never started twice");
 
-    // c, y: the claude is stopped and zmx drops the session.
+    // c, asking nothing (owner, 2026-10-27): the claude is stopped, the slot offloaded, and
+    // zmx drops the session.
     term.write(b"c");
-    term.read_until(b"y close", Duration::from_secs(3));
-    term.write(b"y");
-    let closed = term.read_until(b"closed", Duration::from_secs(15));
+    let offloaded = term.read_until(b"offloaded \xc2\xb7 resumable", Duration::from_secs(15));
     assert!(
-        contains(&closed, b"closed"),
+        contains(&offloaded, b"offloaded \xc2\xb7 resumable"),
         "{:?}",
-        String::from_utf8_lossy(&closed)
+        String::from_utf8_lossy(&offloaded)
+    );
+    assert!(
+        !contains(&offloaded, b"Close this session?"),
+        "no question asked"
     );
     // Dead, or a zombie its daemon has not reaped yet — zmx's daemon lingers a couple of
     // seconds after its program, and the menu counts a zombie as dead too (procinfo.rs).
@@ -261,6 +264,20 @@ exec sleep 600"#,
     assert!(
         !zmx_list(&zmx, &dir).contains("name=claude-1"),
         "zmx dropped the session"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("registry/claude-1.json"))
+            .unwrap()
+            .contains("\"offloaded\""),
+        "marked offloaded"
+    );
+    // c again, on the offloaded row the cursor followed: archived.
+    term.write(b"c");
+    let archived = term.read_until(b"archived \xc2\xb7 resumable", Duration::from_secs(5));
+    assert!(
+        contains(&archived, b"archived \xc2\xb7 resumable"),
+        "{:?}",
+        String::from_utf8_lossy(&archived)
     );
 
     // A session somebody starts by hand appears without a keypress, well inside the menu's
