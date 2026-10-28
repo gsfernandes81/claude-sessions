@@ -23,9 +23,9 @@ name: dev-image
 # pins. `main` follows the latest build. The base is Dockerfile.dev's own BASE_TAG default,
 # since this build has no infra to pass one; moving the base is a commit here.
 #
-# THE PACKAGE STARTS PRIVATE. The first push creates ghcr.io/<owner>/claude-sessions-dev
-# private, as every new ghcr package is; the owner flips it public once (infra's base made the
-# same call, 2026-08-24: pure toolchain, so a public pull needs no token on the Pis).
+# THE PACKAGE IS PUBLIC, and needed no flip: the first push (2026-10-28) linked it to this
+# public repo, whose visibility it took. A public pull needs no token on the Pis, the same call
+# infra made for its base (2026-08-24): this is pure toolchain, the same as the Dockerfile.
 #
 # Runs on a push to main that touches the image's inputs, and by hand:
 #   gh workflow run dev-image.yml
