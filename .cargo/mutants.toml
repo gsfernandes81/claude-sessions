@@ -4,8 +4,9 @@
 #   cargo mutants -- --bins        # a fast first pass, unit tests only; then
 #   cargo mutants --iterate        # re-test only what that pass missed, with everything
 #
-# Serial on zero, which is cargo-mutants' default: never pass -j (owner, 2026-10-28; two jobs
-# took the shared Pi's load to 7).
+# On zero, always under `nice -n 19 ionice -c3`, so the run takes only what the shared Pi's
+# other containers leave, with -j and --jobserver-tasks sized to keep its load around 4, its
+# core count, not pinned (owner, 2026-10-28: un-niced, two jobs took its load to 7).
 
 # A build without debug info: each mutant is a fresh compile and link, and nothing reads a
 # backtrace from one.
