@@ -1399,31 +1399,90 @@ mod tests {
     #[test]
     #[ignore]
     fn print_the_mockups() {
-        // Numbered as the files number them; mockup 8 is the refusal, not a View.
-        type Build = fn(u16) -> View;
-        let builds: [(u8, Build); 13] = [
-            (1, mockup_1),
-            (2, mockup_2),
-            (4, mockup_4),
-            (5, mockup_5),
-            (6, mockup_6),
-            (7, mockup_7),
-            (9, mockup_9),
-            (10, mockup_10),
-            (11, mockup_11),
-            (12, mockup_12),
-            (13, mockup_13),
-            (14, mockup_14),
-            (15, mockup_15),
-        ];
         for w in [40u16, 80] {
-            for (n, b) in builds {
+            for (n, b) in BUILDS {
                 let p = render(&b(w)).unwrap().plain();
                 let p = p.trim_end_matches('\n');
                 println!("=== {n} {w}");
                 println!("{p}");
             }
         }
+    }
+
+    /// Every built mockup, numbered as the files number them; mockup 8 is the refusal, not a
+    /// View.
+    type Build = fn(u16) -> View;
+    const BUILDS: [(u8, Build); 13] = [
+        (1, mockup_1),
+        (2, mockup_2),
+        (4, mockup_4),
+        (5, mockup_5),
+        (6, mockup_6),
+        (7, mockup_7),
+        (9, mockup_9),
+        (10, mockup_10),
+        (11, mockup_11),
+        (12, mockup_12),
+        (13, mockup_13),
+        (14, mockup_14),
+        (15, mockup_15),
+    ];
+
+    const STYLED: &str = "docs/mockups.ansi";
+
+    /// Every mockup at both widths exactly as the terminal is sent it, each line as
+    /// `ansi_line` writes it: what [`STYLED`] holds.
+    fn styled_mockups() -> String {
+        let mut out = String::new();
+        for w in [40u16, 80] {
+            for (n, b) in BUILDS {
+                let frame = render(&b(w)).unwrap();
+                out.push_str(&format!("=== mockup {n} at {w}x24\n"));
+                for i in 0..frame.lines.len() {
+                    out.push_str(&frame.ansi_line(i));
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    /// Rewrites [`STYLED`] from the renderer; review the diff before committing it.
+    #[test]
+    #[ignore]
+    fn write_the_styled_mockups() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mockups.ansi"),
+            styled_mockups(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_mockups_styles_are_pinned_byte_for_byte() {
+        // The text is held to the approved mockups; this holds the colour table's styles to
+        // what was reviewed, which the plain comparison cannot see. `cat docs/mockups.ansi`
+        // in a terminal shows them. After a deliberate change:
+        //   cargo test --bins write_the_styled_mockups -- --ignored
+        let want = include_str!("../docs/mockups.ansi");
+        let got = styled_mockups();
+        for (i, (g, w)) in got.lines().zip(want.lines()).enumerate() {
+            assert_eq!(g, w, "{STYLED} line {}", i + 1);
+        }
+        assert_eq!(got.lines().count(), want.lines().count(), "{STYLED} length");
+    }
+
+    #[test]
+    fn words_wrap_at_spaces_and_a_word_too_long_is_cut() {
+        assert_eq!(wrap("ab c", 4), ["ab c"], "exactly the width fits");
+        assert_eq!(wrap("ab cd", 4), ["ab", "cd"]);
+        assert_eq!(wrap("abc", 3), ["abc"]);
+        assert_eq!(wrap("abcdefg", 3), ["abc", "def", "g"]);
+        assert_eq!(wrap("abcdef", 3), ["abc", "def"], "no empty line after");
+        assert_eq!(wrap("a bcdefg", 3), ["a", "bcd", "efg"]);
+        assert_eq!(wrap("  a   b ", 3), ["a b"]);
+        assert_eq!(wrap("", 3), [""]);
+        assert_eq!(wrap("abc", 0), ["abc"]);
     }
 
     fn lines(frame: &Frame) -> Vec<String> {

@@ -145,14 +145,10 @@ fn write_value(out: &mut String, v: &Value, indent: usize) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        // Rust's `Display` for f64 never uses exponent form and drops a `.0`, so a millisecond
+        // timestamp reads as a timestamp rather than as 1.7593e12 (pinned by a test).
         Value::Num(n) => {
-            // An integral f64 is written without a decimal point, so a millisecond timestamp
-            // reads as a timestamp rather than as 1.7593e12.
-            if n.fract() == 0.0 && n.abs() < 9e15 {
-                let _ = write!(out, "{}", *n as i64);
-            } else {
-                let _ = write!(out, "{n}");
-            }
+            let _ = write!(out, "{n}");
         }
         Value::Str(s) => write_str(out, s),
         Value::Arr(a) => {
@@ -432,6 +428,8 @@ mod tests {
         // person and that is most of what it is for.
         let v = Value::num(1_759_300_000_000_f64);
         assert_eq!(to_string_pretty(&v).trim(), "1759300000000");
+        assert_eq!(to_line(&Value::num(1e20)), "100000000000000000000");
+        assert_eq!(to_line(&Value::num(0.25)), "0.25");
     }
 
     #[test]
@@ -444,9 +442,36 @@ mod tests {
     }
 
     #[test]
+    fn writes_exactly_this_layout() {
+        // What a person reading the registry sees, pinned byte for byte: two-space indent,
+        // a comma after every member but the last, empty containers on one line, control
+        // bytes as \u escapes.
+        let v =
+            parse(r#"{"a":[1,[],{},[2],{"f":3}],"b":{"c":"x\u0001y","d":-2.5},"e":true}"#).unwrap();
+        assert_eq!(
+            to_string_pretty(&v),
+            "{\n  \"a\": [\n    1,\n    [],\n    {},\n    [\n      2\n    ],\n    {\n      \"f\": 3\n    }\n  ],\n  \"b\": {\n    \"c\": \"x\\u0001y\",\n    \"d\": -2.5\n  },\n  \"e\": true\n}\n"
+        );
+    }
+
+    #[test]
     fn reads_a_surrogate_pair_as_one_character() {
         let v = parse(r#"{"t":"😀"}"#).expect("parses");
         assert_eq!(v.get("t").and_then(|v| v.as_str()), Some("\u{1F600}"));
+        // As the escapes a JSON writer that keeps to ASCII sends it: 😀 and 𝄞, whose low
+        // halves differ, so both halves of the arithmetic are pinned; and a BMP escape.
+        let v = parse(r#"{"t":"\ud83d\ude00 \ud834\udd1e \u00e9"}"#).expect("parses");
+        assert_eq!(
+            v.get("t").and_then(|v| v.as_str()),
+            Some("\u{1F600} \u{1D11E} \u{e9}")
+        );
+    }
+
+    #[test]
+    fn a_negative_number_is_no_count() {
+        assert_eq!(Value::num(-1.0).as_u64(), None);
+        assert_eq!(Value::num(0.0).as_u64(), Some(0));
+        assert_eq!(Value::num(7.0).as_u64(), Some(7));
     }
 
     #[test]

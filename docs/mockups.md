@@ -129,7 +129,10 @@ pipe or a screen reader loses none of it. Bold for unread and dim for attached a
 top of that, the owner's choice over glyphs (2026-10-03); `claude-sessions list` still prints
 them as marks. And **amber is spent once**: if a waiting row and anything else were both
 amber, neither would mean *this one*. The plain-text mockups below cannot show colour, which is the honest reason
-this table exists; the published page renders it.
+this table exists; the published page renders it. What the renderer sends for each mockup,
+styles and all, is pinned byte for byte in [`mockups.ansi`](mockups.ansi) (2026-10-28):
+`cat` it in a terminal to see these screens in colour. It is derived, not approved — the
+text here and the table above are what bind — and a test holds the renderer to it.
 
 ### Mockup 1 — The list, in its groups
 ```

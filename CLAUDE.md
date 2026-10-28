@@ -118,7 +118,8 @@ The state machine is the product, so it is tested as one. Over the event table i
 two writers at once. Plus the always-exit-0 test above.
 
 Rendering is tested against a test backend at **40×24 and 80×24** — the two widths the
-mockups are drawn at — and the zero-idle-bytes property under a pty, for one container and for
+mockups are drawn at, as text against the mockups and with its styles against
+`docs/mockups.ansi` — and the zero-idle-bytes property under a pty, for one container and for
 the hub over a stand-in ssh (`tests/hub_pty.rs`), a container that does not answer included.
 
 **Calibrate a check against known-good state before trusting its verdict.** A check that can

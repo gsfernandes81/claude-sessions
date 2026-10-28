@@ -1,0 +1,650 @@
+=== mockup 1 at 40x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
+[2K[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m      [0m[2;7m   2m[0m
+[2Kloop: watch the base build         [2m  now[0m
+[2K[1mretire the old tunnel[0m              [2m  14m[0m
+[2K[2mimmich upgrade                        3m[0m
+[2Kclaude                             [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2Kmount guards on one                [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 2 at 40x24
+[2Kinfra-dev[2m · nothing open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K
+[2K  No claude session in this container.
+[2K
+[2K  [38;5;75mn[0m   start one in /workspace
+[2K  [38;5;75ms[0m   a shell instead
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 4 at 40x24
+[2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
+[2K[1mretire the old tunnel[0m              [2m  14m[0m
+[2K[2m╭──────────────────────────────────────╮[0m
+[2K[2m│[0m [1mNo room for another claude[0m           [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m 892M of 1.0G used. A new one wants   [2m│[0m
+[2K[2m│[0m about 250M.                          [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m Offload this session, idle 14m?      [2m│[0m
+[2K[2m│[0m   retire the old tunnel              [2m│[0m
+[2K[2m│[0m   resumable from disk                [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m [38;5;75my[0m offload, then open    [38;5;75mn[0m cancel     [2m│[0m
+[2K[2m╰──────────────────────────────────────╯[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+=== mockup 5 at 40x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2K[7mmount guards on one                [0m[2;7m   2d[0m
+[2K[2m╭──────────────────────────────────────╮[0m
+[2K[2m│[0m [1mThis session did not resume[0m          [2m│[0m
+[2K[2m│[0m   mount guards on one                [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m claude --resume 0f9c4a1e ended       [2m│[0m
+[2K[2m│[0m   No conversation found with that    [2m│[0m
+[2K[2m│[0m   session id                         [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m Left offloaded. Nothing was deleted; [2m│[0m
+[2K[2m│[0m the transcript may be gone.          [2m│[0m
+[2K[2m│[0m                                      [2m│[0m
+[2K[2m│[0m [38;5;75mr[0m retry   [38;5;75mc[0m archive it   [38;5;75mEsc[0m back    [2m│[0m
+[2K[2m╰──────────────────────────────────────╯[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+=== mockup 6 at 40x24
+[2Kinfra-dev[2m · 6 open · 1.0G of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
+[2K[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m      [2m   2m[0m
+[2Kloop: watch the base build         [2m  now[0m
+[2K[7mretire the old tunnel              [0m[2;7m  now[0m
+[2K[2mimmich upgrade                       12m[0m
+[2Kclaude                             [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2Kmount guards on one                [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2Kdetached · it is still running
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[31mRAM: 1.0G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 7 at 40x24
+[2Kinfra-dev[2m · keys[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m  open the session; resumes it
+[2K       if offloaded or archived
+[2K[38;5;75mn[0m      new session in /workspace
+[2K[38;5;75mc[0m      offload the session, or
+[2K       archive an offloaded one
+[2K[38;5;75ms[0m      a shell in /workspace
+[2K[38;5;75mEsc[0m    quit the launcher
+[2K[38;5;75m?[0m      this
+[2K
+[2K[1mLoaded[0m     claude is running
+[2K[1mOffloaded[0m  stopped to save memory
+[2K[1mArchived[0m   ended, still resumable; Enter
+[2K           or a click on it opens it
+[2K[1;38;5;214m![0m          a prompt is waiting for you
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 9 at 40x24
+[2Kinfra-dev[2m · 2 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 2[0m[2m ──────────────────────────[0m
+[2K[1mretire the old tunnel[0m              [2m  14m[0m
+[2Kclaude                             [2m   5h[0m
+[2K
+[2K[2;7m── [0m[1;7mArchived · 5 · Enter hides[0m[2;7m ──────────[0m
+[2Kfix the dns records                [2m   3d[0m
+[2Ktunnel cutover notes               [2m   4d[0m
+[2Kbcache register script             [2m  41d[0m
+[2Ksyncthing share rename             [2m  52d[0m
+[2Ksmartd on one                      [2m  63d[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 10 at 40x24
+[2Kinfra-dev[2m · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K
+[2K⠋ [2mreading sessions[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 11 at 40x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
+[2K[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m      [2m   2m[0m
+[2Kloop: watch the base build         [2m  now[0m
+[2K[1;7mretire the old tunnel[0m[7m                  ⠋[0m
+[2K[2mimmich upgrade                        3m[0m
+[2Kclaude                             [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2Kmount guards on one                [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K⠋ offloading session
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 12 at 40x24
+[2Kdev[2m · 4 containers · 1.9G of 3.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mContainers · 4[0m[2m ──────────────────────[0m
+[2K[1;7;38;5;214m! [0m[7;38;5;214minfra-dev[0m[7m       [0m[2;7m3 loaded · 1 offloaded[0m
+[2K[2m├─ [0m[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m   [2m   2m[0m
+[2K[2m├─ [0mloop: watch the base build      [2m  now[0m
+[2K[2m└─ immich upgrade                     3m[0m
+[2K[1mor3-dev[0m                         [2m1 loaded[0m
+[2K[2m└─ [0m[1mretire the old tunnel[0m           [2m  14m[0m
+[2Kdd-dev                       [2m2 offloaded[0m
+[2Kds-dev                     [2mnot answering[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 13 at 40x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
+[2K[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m      [0m[2;7m   2m[0m
+[2Kloop: watch the base build         [2m  now[0m
+[2K[1mretire the old tunnel[0m              [2m  14m[0m
+[2K[2mimmich upgrade                        3m[0m
+[2Kclaude                             [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2Kmount guards on one                [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 14 at 40x24
+[2Kds-dev[2m · not answering[0m
+[2K[2m────────────────────────────────────────[0m
+[2K
+[2K  ds-dev is not answering:
+[2K  [2mssh: connect to host ds-dev port 2222:[0m
+[2K  [2mConnection refused[0m
+[2K
+[2K  [38;5;75ms[0m   try a shell there anyway
+[2K  [38;5;75mEsc[0m back to every container
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 15 at 40x24
+[2Kdev[2m · keys[0m
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m  open the session; on a
+[2K       container, every session in it
+[2K[38;5;75mn[0m      new session in the container
+[2K[38;5;75mc[0m      offload the session
+[2K[38;5;75ms[0m      a shell in the container
+[2K[38;5;75mEsc[0m    quit the launcher; from a
+[2K       container, back to this list
+[2K[38;5;75m?[0m      this
+[2K
+[2K[1mContainers[0m every one the hub reaches,
+[2K           its loaded sessions under it
+[2K[1;38;5;214m![0m          a session is waiting for you
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
+[2K[38;5;75ms[0m shell
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 1 at 80x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m                                            [0m[2;7m   2m[0m
+[2K  loop: watch the base build                                               [2m  now[0m
+[2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
+[2K[2m  immich upgrade                                                              3m[0m
+[2K  claude                                                                   [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K  mount guards on one                                                      [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────────────────────────────────────────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 2 at 80x24
+[2Kinfra-dev[2m · nothing open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K
+[2K  No claude session in this container.
+[2K
+[2K  [38;5;75mn[0m   start one in /workspace
+[2K  [38;5;75ms[0m   a shell instead
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 4 at 80x24
+[2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
+[2K                    [2m╭──────────────────────────────────────╮[0m
+[2K                    [2m│[0m [1mNo room for another claude[0m           [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m 892M of 1.0G used. A new one wants   [2m│[0m
+[2K                    [2m│[0m about 250M.                          [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m Offload this session, idle 14m?      [2m│[0m
+[2K                    [2m│[0m   retire the old tunnel              [2m│[0m
+[2K                    [2m│[0m   resumable from disk                [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m [38;5;75my[0m offload, then open    [38;5;75mn[0m cancel     [2m│[0m
+[2K                    [2m╰──────────────────────────────────────╯[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+=== mockup 5 at 80x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K[7m  mount guards on one                                                      [0m[2;7m   2d[0m
+[2K                    [2m╭──────────────────────────────────────╮[0m
+[2K                    [2m│[0m [1mThis session did not resume[0m          [2m│[0m
+[2K                    [2m│[0m   mount guards on one                [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m claude --resume 0f9c4a1e ended       [2m│[0m
+[2K                    [2m│[0m   No conversation found with that    [2m│[0m
+[2K                    [2m│[0m   session id                         [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m Left offloaded. Nothing was deleted; [2m│[0m
+[2K                    [2m│[0m the transcript may be gone.          [2m│[0m
+[2K                    [2m│[0m                                      [2m│[0m
+[2K                    [2m│[0m [38;5;75mr[0m retry   [38;5;75mc[0m archive it   [38;5;75mEsc[0m back    [2m│[0m
+[2K                    [2m╰──────────────────────────────────────╯[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+=== mockup 6 at 80x24
+[2Kinfra-dev[2m · 6 open · 1.0G of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K  [1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                            [2m   2m[0m
+[2K  loop: watch the base build                                               [2m  now[0m
+[2K[7m  retire the old tunnel                                                    [0m[2;7m  now[0m
+[2K[2m  immich upgrade                                                             12m[0m
+[2K  claude                                                                   [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K  mount guards on one                                                      [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────────────────────────────────────────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2Kdetached · it is still running
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[31mRAM: 1.0G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 7 at 80x24
+[2Kinfra-dev[2m · keys[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m  open the session; resumes it
+[2K       if offloaded or archived
+[2K[38;5;75mn[0m      new session in /workspace
+[2K[38;5;75mc[0m      offload the session, or
+[2K       archive an offloaded one
+[2K[38;5;75ms[0m      a shell in /workspace
+[2K[38;5;75mEsc[0m    quit the launcher
+[2K[38;5;75m?[0m      this
+[2K
+[2K[1mLoaded[0m     claude is running
+[2K[1mOffloaded[0m  stopped to save memory
+[2K[1mArchived[0m   ended, still resumable; Enter
+[2K           or a click on it opens it
+[2K[1;38;5;214m![0m          a prompt is waiting for you
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 9 at 80x24
+[2Kinfra-dev[2m · 2 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 2[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
+[2K  claude                                                                   [2m   5h[0m
+[2K
+[2K[2;7m── [0m[1;7mArchived · 5 · Enter hides[0m[2;7m ──────────────────────────────────────────────────[0m
+[2K  fix the dns records                                                      [2m   3d[0m
+[2K  tunnel cutover notes                                                     [2m   4d[0m
+[2K  bcache register script                                                   [2m  41d[0m
+[2K  syncthing share rename                                                   [2m  52d[0m
+[2K  smartd on one                                                            [2m  63d[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 10 at 80x24
+[2Kinfra-dev[2m · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K
+[2K⠋ [2mreading sessions[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 11 at 80x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K  [1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                            [2m   2m[0m
+[2K  loop: watch the base build                                               [2m  now[0m
+[2K[7m  [0m[1;7mretire the old tunnel[0m[7m                                                        ⠋[0m
+[2K[2m  immich upgrade                                                              3m[0m
+[2K  claude                                                                   [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K  mount guards on one                                                      [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────────────────────────────────────────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K⠋ offloading session
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
+=== mockup 12 at 80x24
+[2Kdev[2m · 4 containers · 1.9G of 3.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mContainers · 4[0m[2m ──────────────────────────────────────────────────────────────[0m
+[2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214minfra-dev[0m[7m                                             [0m[2;7m3 loaded · 1 offloaded[0m
+[2K  [2m├─ [0m[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                         [2m   2m[0m
+[2K  [2m├─ [0mloop: watch the base build                                            [2m  now[0m
+[2K[2m  └─ immich upgrade                                                           3m[0m
+[2K  [1mor3-dev[0m                                                               [2m1 loaded[0m
+[2K  [2m└─ [0m[1mretire the old tunnel[0m                                                 [2m  14m[0m
+[2K  dd-dev                                                             [2m2 offloaded[0m
+[2K  ds-dev                                                           [2mnot answering[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 13 at 80x24
+[2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
+[2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m                                            [0m[2;7m   2m[0m
+[2K  loop: watch the base build                                               [2m  now[0m
+[2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
+[2K[2m  immich upgrade                                                              3m[0m
+[2K  claude                                                                   [2m   5h[0m
+[2K
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K  mount guards on one                                                      [2m   2d[0m
+[2K
+[2K[2m── [0m[1mArchived · 7 · Enter shows[0m[2m ──────────────────────────────────────────────────[0m
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 14 at 80x24
+[2Kds-dev[2m · not answering[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K
+[2K  ds-dev is not answering:
+[2K  [2mssh: connect to host ds-dev port 2222: Connection refused[0m
+[2K
+[2K  [38;5;75ms[0m   try a shell there anyway
+[2K  [38;5;75mEsc[0m back to every container
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
+=== mockup 15 at 80x24
+[2Kdev[2m · keys[0m
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m  open the session; on a
+[2K       container, every session in it
+[2K[38;5;75mn[0m      new session in the container
+[2K[38;5;75mc[0m      offload the session
+[2K[38;5;75ms[0m      a shell in the container
+[2K[38;5;75mEsc[0m    quit the launcher; from a
+[2K       container, back to this list
+[2K[38;5;75m?[0m      this
+[2K
+[2K[1mContainers[0m every one the hub reaches,
+[2K           its loaded sessions under it
+[2K[1;38;5;214m![0m          a session is waiting for you
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K
+[2K[2m────────────────────────────────────────────────────────────────────────────────[0m
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m

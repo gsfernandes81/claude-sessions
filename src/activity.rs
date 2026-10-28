@@ -555,14 +555,31 @@ pub fn members(table: &[Proc], env: Option<&Vec<u32>>, claude: Option<(u32, u64)
 pub fn read(pid: u32) -> Option<Reading> {
     let start = crate::procinfo::start_time(pid)?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // After `comm`, field 3 is the first; utime..cstime are fields 14–17.
-    let cpu: u64 = stat[stat.rfind(')')? + 1..]
-        .split_whitespace()
-        .skip(11)
-        .take(4)
-        .filter_map(|f| f.parse::<u64>().ok())
-        .sum();
     let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    Some(Reading {
+        pid,
+        start,
+        bytes: io_bytes(&io)?,
+        cpu: cpu_ticks(&stat)?,
+    })
+}
+
+/// utime, stime, cutime and cstime from a `/proc/<pid>/stat` line, in ticks. They are fields
+/// 14–17; counting starts after the last `)`, since `comm` may hold spaces and parentheses.
+fn cpu_ticks(stat: &str) -> Option<u64> {
+    Some(
+        stat[stat.rfind(')')? + 1..]
+            .split_whitespace()
+            .skip(11)
+            .take(4)
+            .filter_map(|f| f.parse::<u64>().ok())
+            .sum(),
+    )
+}
+
+/// Every byte read and written, from `/proc/<pid>/io`: `rchar` plus `wchar`, which count
+/// pipes, ttys and sockets as well as files — all of it is a session at work.
+fn io_bytes(io: &str) -> Option<u64> {
     let field = |k: &str| {
         io.lines().find_map(|l| {
             l.strip_prefix(k)?
@@ -572,13 +589,7 @@ pub fn read(pid: u32) -> Option<Reading> {
                 .ok()
         })
     };
-    let bytes = field("rchar")?.saturating_add(field("wchar")?);
-    Some(Reading {
-        pid,
-        start,
-        bytes,
-        cpu,
-    })
+    Some(field("rchar")?.saturating_add(field("wchar")?))
 }
 
 /// Where the state lives, beside the registry. Not `.json`: the registry reads every
@@ -753,6 +764,113 @@ mod tests {
     }
 
     const T0: Millis = 1_000 * HOUR_MS;
+
+    /// A slot read at `T0`, quiet for five minutes before, with these members.
+    fn quiet_since(procs: Vec<Reading>) -> SlotState {
+        SlotState {
+            at: T0,
+            procs,
+            last_active: T0 - 5 * 60_000,
+            minima: Vec::new(),
+            sockets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exactly_a_minutes_worth_at_the_line_is_still_quiet() {
+        // The budgets are ceilings, inclusive: with no floor the line is 512 B/s, so a
+        // one-minute window may carry 30720 bytes; and 3000 ms of CPU, which is 300 ticks.
+        // Calibration: one byte or one tick more is active.
+        let before = quiet_since(vec![r(1, 7, 0)]);
+        let window = |bytes, ticks| {
+            let now = Reading {
+                cpu: ticks,
+                ..r(1, 7, bytes)
+            };
+            step(Some(&before), T0 + 60_000, plain(vec![now], false)).1
+        };
+        assert_eq!(window(30_720, 0).quiet_ms, 6 * 60_000);
+        assert_eq!(window(30_721, 0).quiet_ms, 0);
+        assert_eq!(window(0, 300).quiet_ms, 6 * 60_000);
+        assert_eq!(window(0, 301).quiet_ms, 0);
+    }
+
+    #[test]
+    fn a_known_member_counts_what_it_did_since_it_was_last_read() {
+        let before = quiet_since(vec![r(1, 7, 1_000)]);
+        let (_, m) = step(
+            Some(&before),
+            T0 + 60_000,
+            plain(vec![r(1, 7, 7_000)], false),
+        );
+        assert_eq!(m.rate, Some(100.0));
+        // And its CPU the same way: 301 ticks since is over the budget, from wherever it was.
+        let ticks = |cpu| Reading { cpu, ..r(1, 7, 0) };
+        let before = quiet_since(vec![ticks(1_000)]);
+        let (_, m) = step(Some(&before), T0 + 60_000, plain(vec![ticks(1_301)], false));
+        assert_eq!((m.cpu_ms, m.quiet_ms), (3010.0, 0));
+    }
+
+    #[test]
+    fn a_pid_reused_by_a_new_process_is_one_that_left() {
+        // Same pid, another start time: the member read last time is gone.
+        let before = quiet_since(vec![r(1, 7, 0)]);
+        let (_, m) = step(Some(&before), T0 + 60_000, plain(vec![r(1, 8, 0)], false));
+        assert_eq!(m.unknown, Some("a process left"));
+        // Calibration: the same process is not.
+        let (_, m) = step(Some(&before), T0 + 60_000, plain(vec![r(1, 7, 0)], false));
+        assert_eq!(m.unknown, None);
+    }
+
+    #[test]
+    fn a_minimum_a_day_old_no_longer_sets_the_floor() {
+        let hour = (T0 + 60_000) / HOUR_MS;
+        let with = |age: u64| SlotState {
+            minima: vec![(hour - age, 100.0)],
+            ..quiet_since(vec![r(1, 7, 0)])
+        };
+        let floor = |age| {
+            step(
+                Some(&with(age)),
+                T0 + 60_000,
+                plain(vec![r(1, 7, 0)], false),
+            )
+            .1
+            .floor
+        };
+        assert_eq!(floor(FLOOR_HOURS - 1), Some(100.0));
+        assert_eq!(floor(FLOOR_HOURS), None);
+    }
+
+    #[test]
+    fn sockets_gone_since_the_last_reading_are_counted_closed() {
+        let s = |inode, bytes| Sock { inode, bytes };
+        let (_, tcp, _) = tcp_window(&[s(1, 0), s(2, 0), s(3, 0)], Ok(vec![s(3, 0)]), 60_000);
+        assert_eq!(tcp.map(|t| (t.sockets, t.closed)), Ok((1, 2)));
+    }
+
+    #[test]
+    fn counters_are_read_after_the_last_parenthesis() {
+        // A comm with a space and a `) ` in it, as a process may name itself: fields 14–17
+        // are 11, 12, 13 and 14 ticks.
+        let stat = "42 (a) b) S 1 42 42 0 -1 4194560 100 0 0 0 11 12 13 14 20 0 1 0 999 0 0";
+        assert_eq!(cpu_ticks(stat), Some(50));
+        assert_eq!(cpu_ticks("no parenthesis"), None);
+        let io = "rchar: 1000\nwchar: 234\nsyscr: 9\nread_bytes: 4096\n";
+        assert_eq!(io_bytes(io), Some(1234));
+        assert_eq!(io_bytes("rchar: 1\n"), None);
+    }
+
+    #[test]
+    fn a_member_gone_before_it_was_read_left() {
+        // No process has pid 0 in /proc, so it reads as one that left rather than as one that
+        // cannot be read, which would be unknown.
+        let snap = snapshot(&[0], Err("not read")).unwrap();
+        assert_eq!((snap.readings.len(), snap.left), (0, vec![0]));
+        // Calibration: this test's own process is there and readable.
+        let snap = snapshot(&[std::process::id()], Err("not read")).unwrap();
+        assert_eq!((snap.readings.len(), snap.left.len()), (1, 0));
+    }
 
     #[test]
     fn the_line_follows_the_floor_between_its_bounds() {

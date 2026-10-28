@@ -28,6 +28,7 @@
 
 use crate::ui::HostLoad;
 use std::io::IsTerminal as _;
+use std::path::Path;
 
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
@@ -196,7 +197,8 @@ fn cpu_count(list: &str) -> Option<usize> {
             }
         };
     }
-    (n > 0).then_some(n)
+    // Never 0: every part counts at least one or the whole list is refused.
+    Some(n)
 }
 
 /// `MemTotal` and `MemAvailable` from `/proc/meminfo`, in bytes.
@@ -219,11 +221,16 @@ fn loadavg_centi(text: &str) -> Option<u64> {
 /// This machine's load, as this container reads it. `None` without a load average or a
 /// `boot_id`: a reading that cannot say which machine it is could only be double-counted.
 pub fn host_load() -> Option<HostLoad> {
-    let read = |p: &str| std::fs::read_to_string(p).ok();
+    host_load_at(Path::new("/"))
+}
+
+/// [`host_load`] with `/proc` and `/sys` under `root`.
+fn host_load_at(root: &Path) -> Option<HostLoad> {
+    let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
     Some(HostLoad {
-        centi: loadavg_centi(&read("/proc/loadavg")?)?,
-        cores: read("/sys/devices/system/cpu/online").and_then(|s| cpu_count(&s)),
-        boot: read("/proc/sys/kernel/random/boot_id")?.trim().to_string(),
+        centi: loadavg_centi(&read("proc/loadavg")?)?,
+        cores: read("sys/devices/system/cpu/online").and_then(|s| cpu_count(&s)),
+        boot: read("proc/sys/kernel/random/boot_id")?.trim().to_string(),
     })
     .filter(|h| !h.boot.is_empty())
 }
@@ -231,26 +238,31 @@ pub fn host_load() -> Option<HostLoad> {
 /// The pool's working set and ceiling, where infra mounts it (`CLAUDE_SESSIONS_POOL`) and it
 /// has a ceiling.
 pub fn pool() -> Option<(u64, u64)> {
-    let dir = std::env::var("CLAUDE_SESSIONS_POOL")
-        .ok()
-        .filter(|d| !d.is_empty())?;
-    let m = crate::mem::read_at(&dir);
+    pool_at(&std::env::var("CLAUDE_SESSIONS_POOL").ok()?)
+}
+
+/// [`pool`] from the cgroup directory `dir`; an empty one is no pool.
+fn pool_at(dir: &str) -> Option<(u64, u64)> {
+    if dir.is_empty() {
+        return None;
+    }
+    let m = crate::mem::read_at(dir);
     m.limit.zip(m.used()).map(|(limit, used)| (used, limit))
 }
 
 /// What a session's line shows for memory: the pool, else this container against its limit,
-/// else the host's total and what it has available.
-fn memory() -> (Option<u64>, Option<u64>) {
-    if let Some((used, total)) = pool() {
+/// else the host's total and what it has available (`meminfo`, `/proc/meminfo`'s text).
+fn memory(
+    pool: Option<(u64, u64)>,
+    own: &crate::mem::Memory,
+    meminfo: Option<&str>,
+) -> (Option<u64>, Option<u64>) {
+    if let Some((used, total)) = pool {
         return (Some(used), Some(total));
     }
-    let m = crate::mem::read();
-    match m.limit {
-        Some(limit) => (m.used(), Some(limit)),
-        None => match std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|s| host_memory(&s))
-        {
+    match own.limit {
+        Some(limit) => (own.used(), Some(limit)),
+        None => match meminfo.and_then(host_memory) {
             Some((total, available)) => (Some(total.saturating_sub(available)), Some(total)),
             None => (None, None),
         },
@@ -271,7 +283,11 @@ pub fn run() {
             }
         }
     }
-    let (used, total) = memory();
+    let (used, total) = memory(
+        pool(),
+        &crate::mem::read(),
+        std::fs::read_to_string("/proc/meminfo").ok().as_deref(),
+    );
     let load = host_load();
     let figures = Figures {
         used,
@@ -383,6 +399,105 @@ mod tests {
         assert_eq!(loadavg_centi("0.00 0.00 0.00 1/1 1"), Some(0));
         assert_eq!(loadavg_centi(""), None);
         assert_eq!(loadavg_centi("nan 0 0"), None);
+        assert_eq!(loadavg_centi("inf 0 0"), None);
+        assert_eq!(loadavg_centi("-1.00 0 0"), None);
+    }
+
+    #[test]
+    fn a_ceiling_of_nothing_and_no_cores_judge_nothing() {
+        // A zero total is no figure, not a division; zero cores is no yardstick.
+        assert_eq!(
+            figures(Some(G), Some(0), Some(9.0), Some(0), "h").line(true),
+            "RAM: ?, Load: 9.0, h"
+        );
+        // Without colour a warning is as plain as an alarm.
+        assert_eq!(
+            figures(Some(70 * G), Some(100 * G), Some(2.8), Some(4), "h").line(false),
+            "RAM: 70.0G / 100.0G, Load: 2.8, h"
+        );
+    }
+
+    /// A directory standing in for `/`, or for a cgroup, removed when dropped.
+    struct Tree(std::path::PathBuf);
+    impl Tree {
+        fn new(tag: &str) -> Tree {
+            let d =
+                std::env::temp_dir().join(format!("cs-statusline-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tree(d)
+        }
+        fn put(&self, rel: &str, text: &str) -> &Tree {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+            self
+        }
+        fn dir(&self) -> String {
+            self.0.display().to_string()
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_machine_is_read_from_proc_and_sys_and_named_by_its_boot_id() {
+        let t = Tree::new("host");
+        t.put("proc/loadavg", "1.25 1 1 1/1 1\n")
+            .put("sys/devices/system/cpu/online", "0-3\n")
+            .put("proc/sys/kernel/random/boot_id", "b-1\n");
+        assert_eq!(
+            host_load_at(&t.0),
+            Some(HostLoad {
+                centi: 125,
+                cores: Some(4),
+                boot: "b-1".into()
+            })
+        );
+        // Cores are a nicety; the boot id is not, since without it the load cannot be told
+        // from another container's reading of the same machine.
+        t.put("sys/devices/system/cpu/online", "");
+        assert_eq!(host_load_at(&t.0).map(|h| h.cores), Some(None));
+        t.put("proc/sys/kernel/random/boot_id", "\n");
+        assert_eq!(host_load_at(&t.0), None);
+        let _ = std::fs::remove_file(t.0.join("proc/sys/kernel/random/boot_id"));
+        assert_eq!(host_load_at(&t.0), None);
+    }
+
+    #[test]
+    fn the_pool_is_its_working_set_against_its_ceiling() {
+        let t = Tree::new("pool");
+        t.put("memory.max", "4000\n")
+            .put("memory.current", "3000\n")
+            .put("memory.stat", "active_file 7\ninactive_file 500\n");
+        assert_eq!(pool_at(&t.dir()), Some((2500, 4000)));
+        // A pool without a ceiling is no pool to measure against, and no directory is none.
+        t.put("memory.max", "max\n");
+        assert_eq!(pool_at(&t.dir()), None);
+        assert_eq!(pool_at(""), None);
+    }
+
+    #[test]
+    fn memory_is_the_pool_else_the_container_else_the_host() {
+        let own = |limit| crate::mem::Memory {
+            limit,
+            current: Some(300),
+            reclaimable: Some(100),
+        };
+        let mi = "MemTotal: 4 kB\nMemAvailable: 1 kB\n";
+        assert_eq!(
+            memory(Some((5, 9)), &own(Some(1000)), Some(mi)),
+            (Some(5), Some(9))
+        );
+        assert_eq!(
+            memory(None, &own(Some(1000)), Some(mi)),
+            (Some(200), Some(1000))
+        );
+        assert_eq!(memory(None, &own(None), Some(mi)), (Some(3072), Some(4096)));
+        assert_eq!(memory(None, &own(None), None), (None, None));
     }
 
     fn on(boot: &str, centi: u64, cores: Option<usize>) -> HostLoad {
