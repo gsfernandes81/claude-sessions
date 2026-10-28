@@ -1472,6 +1472,106 @@ mod tests {
         assert_eq!(got.lines().count(), want.lines().count(), "{STYLED} length");
     }
 
+    fn span(text: &str, style: Style) -> Span {
+        Span {
+            text: text.into(),
+            style,
+        }
+    }
+
+    #[test]
+    fn a_line_sends_no_trailing_blanks_and_no_styles_around_blanks() {
+        let frame = Frame {
+            lines: vec![
+                // A styled gap in the middle is sent bare; the last span's trailing spaces
+                // are not sent at all, the clear having blanked them.
+                vec![span("a", BOLD), span("   ", DIM), span("b  ", FG)],
+                vec![span("a", BOLD), span("   ", DIM)],
+                // Reverse video is ink: the cursor's bar is sent to the end, styled.
+                vec![
+                    span("a", FG),
+                    span(
+                        "  ",
+                        Style {
+                            reverse: true,
+                            ..FG
+                        },
+                    ),
+                ],
+            ],
+        };
+        assert_eq!(
+            frame.ansi_line(0),
+            format!("{CLEAR_LINE}\x1b[1ma\x1b[0m   b")
+        );
+        assert_eq!(frame.ansi_line(1), format!("{CLEAR_LINE}\x1b[1ma\x1b[0m"));
+        assert_eq!(frame.ansi_line(2), format!("{CLEAR_LINE}a\x1b[7m  \x1b[0m"));
+    }
+
+    #[test]
+    fn a_waiting_title_is_amber_and_bold_too_when_unread() {
+        let style_of = |flags: &str| {
+            let r = row(flags, "title", "1m");
+            let line = super::row(&r, 40, 0, false, None, None);
+            let spans = line.spans;
+            spans
+                .iter()
+                .find(|s| s.text.contains("title"))
+                .unwrap_or_else(|| panic!("{spans:?}"))
+                .style
+        };
+        assert_eq!(
+            style_of("!*"),
+            Style {
+                bold: true,
+                ..AMBER
+            }
+        );
+        assert_eq!(style_of("!"), AMBER);
+        assert_eq!(style_of("*"), BOLD);
+        assert_eq!(style_of(""), FG);
+    }
+
+    #[test]
+    fn a_long_title_is_cut_so_the_age_keeps_its_place() {
+        let long = "x".repeat(100);
+        for (flags, branch) in [
+            ("", None),
+            ("!", None),
+            ("", Some(BRANCH)),
+            ("!", Some(CORNER)),
+        ] {
+            for indent in [0, 2] {
+                let r = row(flags, &long, "14m");
+                let line = super::row(&r, 40, indent, false, None, branch);
+                let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+                assert_eq!(width(&text), 40, "{flags:?} {branch:?} {indent}: {text:?}");
+                assert!(
+                    text.ends_with("  14m"),
+                    "{flags:?} {branch:?} {indent}: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_hint_exactly_as_wide_as_the_line_is_drawn() {
+        let lines = hint_lines(&[("n", "new")], " · ", 5);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width, 5);
+        assert!(hint_lines(&[("n", "new")], " · ", 4).is_empty());
+    }
+
+    #[test]
+    fn a_cursor_at_the_top_of_the_window_does_not_scroll_it() {
+        let rows: Vec<Row> = (0..5).map(|i| row("", &format!("r{i}"), "1m")).collect();
+        let items = layout(&rows);
+        // Scrolled past the heading, the first row on top: it is in view, so nothing moves.
+        assert_eq!(scroll_to(&items, 0, 1, 3), 1);
+        // Calibration: scrolled past it, the cursor brings its heading back.
+        assert_eq!(scroll_to(&items, 0, 2, 3), 0);
+    }
+
     #[test]
     fn words_wrap_at_spaces_and_a_word_too_long_is_cut() {
         assert_eq!(wrap("ab c", 4), ["ab c"], "exactly the width fits");

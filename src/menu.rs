@@ -857,10 +857,13 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
 
 /// The container's name, as the header shows it: its hostname.
 pub fn host() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-        .map(|s| s.trim().to_string())
-        .ok()
+    let read = |p: &str| std::fs::read_to_string(p).ok();
+    host_from(read("/proc/sys/kernel/hostname").or_else(|| read("/etc/hostname")))
+}
+
+/// [`host`] from what was read: trimmed, and something to call it when that is nothing.
+fn host_from(read: Option<String>) -> String {
+    read.map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "this container".into())
 }
@@ -868,15 +871,19 @@ pub fn host() -> String {
 /// Where `n` and `s` start: `CLAUDE_SESSIONS_WORKSPACE`, else `/workspace` where it exists
 /// (it does in every dev container this runs in), else home.
 pub fn workspace() -> String {
-    if let Ok(w) = std::env::var("CLAUDE_SESSIONS_WORKSPACE") {
-        if !w.is_empty() {
-            return w;
-        }
+    workspace_from(
+        std::env::var("CLAUDE_SESSIONS_WORKSPACE").ok(),
+        std::path::Path::new("/workspace").is_dir(),
+        std::env::var("HOME").ok(),
+    )
+}
+
+fn workspace_from(set: Option<String>, slash_workspace: bool, home: Option<String>) -> String {
+    match set.filter(|w| !w.is_empty()) {
+        Some(w) => w,
+        None if slash_workspace => "/workspace".into(),
+        None => home.unwrap_or_else(|| "/".into()),
     }
-    if std::path::Path::new("/workspace").is_dir() {
-        return "/workspace".into();
-    }
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
 }
 
 #[cfg(test)]
@@ -906,7 +913,79 @@ mod tests {
         std::fs::write(&transcript, format!("{prompted}\n{mark}\n")).unwrap();
         let row = slot_row(&r, r.last_activity_ms, &[]);
         assert!(!row.busy && !row.wants_you, "at its prompt, so Idle");
+        // Either flag alone is ended by the marker too: a working turn, or a dismissed prompt.
+        r.needs_you = false;
+        assert!(!slot_row(&r, r.last_activity_ms, &[]).busy);
+        r.needs_you = true;
+        r.busy = false;
+        assert!(!slot_row(&r, r.last_activity_ms, &[]).wants_you);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_host_and_workspace_fall_back_in_order() {
+        assert_eq!(host_from(Some("zero\n".into())), "zero");
+        assert_eq!(host_from(Some(" \n".into())), "this container");
+        assert_eq!(host_from(None), "this container");
+        let ws = |set: Option<&str>, dir, home: Option<&str>| {
+            workspace_from(set.map(Into::into), dir, home.map(Into::into))
+        };
+        assert_eq!(ws(Some("/w"), true, Some("/h")), "/w");
+        assert_eq!(ws(Some(""), true, Some("/h")), "/workspace");
+        assert_eq!(ws(None, false, Some("/h")), "/h");
+        assert_eq!(ws(None, false, None), "/");
+    }
+
+    /// A slot record for this test's own process, alive, at its prompt.
+    fn mine(slot: &str) -> SlotRecord {
+        let pid = std::process::id();
+        let mut r = SlotRecord::new(slot, Moment::ms(0));
+        r.state = State::Live;
+        r.pid = Some(pid);
+        r.proc_start = crate::procinfo::start_time(pid);
+        r
+    }
+
+    fn attached_session(name: &str) -> zmx::Session {
+        zmx::Session {
+            name: name.into(),
+            pid: None,
+            attached: true,
+            answered: true,
+            created: None,
+        }
+    }
+
+    #[test]
+    fn a_slot_is_attached_only_when_its_own_session_is_and_its_claude_is_there() {
+        let r = mine("claude-1");
+        assert!(slot_row(&r, 0, &[attached_session("claude-1")]).attached);
+        assert!(!slot_row(&r, 0, &[attached_session("claude-2")]).attached);
+        assert!(!slot_row(&r, 0, &[]).attached);
+        // Its process gone: resumable, so offloaded, and attached to nothing.
+        let gone = SlotRecord {
+            proc_start: r.proc_start.map(|s| s + 1),
+            ..r.clone()
+        };
+        let row = slot_row(&gone, 0, &[attached_session("claude-1")]);
+        assert!(row.offloaded && !row.attached);
+        // No pid yet: a slot just started, waiting for its SessionStart.
+        let starting = SlotRecord {
+            pid: None,
+            proc_start: None,
+            ..r.clone()
+        };
+        assert!(!slot_row(&starting, 0, &[]).offloaded);
+        for state in [State::Offloading, State::Offloaded] {
+            let r = SlotRecord { state, ..r.clone() };
+            assert!(slot_row(&r, 0, &[]).offloaded, "{state:?}");
+        }
+        let closed = SlotRecord {
+            state: State::Closed,
+            ..r.clone()
+        };
+        assert!(slot_row(&closed, 0, &[]).closed);
+        assert!(!slot_row(&r, 0, &[]).closed);
     }
 
     fn row(name: &str) -> Row {
@@ -1588,6 +1667,165 @@ mod tests {
         m.replace_rows(vec![in_("infra-dev", "a"), in_("ds-dev", "z")], false);
         assert_eq!(names(&m), ["z"]);
         assert_eq!(m.view().down, None);
+    }
+
+    #[test]
+    fn esc_from_any_container_comes_back_to_that_container() {
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
+        m.key(Key::Down);
+        m.key(Key::Down);
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["b"]);
+        m.key(Key::Esc);
+        assert_eq!(m.rows()[m.view().cursor].title, "or3-dev");
+    }
+
+    #[test]
+    fn n_and_s_start_where_the_cursors_container_says_its_workspace_is() {
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), in_("or3-dev", "b")]);
+        let mut or3 = Place::new("or3-dev");
+        or3.reach = Reach::Up;
+        or3.workspace = "/w/or3".into();
+        m.set_place(or3);
+        assert_eq!(m.workspace(), "/workspace", "infra-dev's, untouched");
+        m.key(Key::Down);
+        m.key(Key::Down);
+        assert_eq!(m.workspace(), "/w/or3");
+        // Every row is still there behind a focused container.
+        m.key(Key::Enter);
+        assert_eq!(names(&m), ["b"]);
+        assert_eq!(m.all_rows().len(), 2);
+    }
+
+    #[test]
+    fn a_container_row_says_what_it_holds_and_is_amber_only_for_a_waiting_session() {
+        let mut waiting = in_("infra-dev", "a");
+        waiting.wants_you = true;
+        let m = hub_menu(vec![waiting, in_("or3-dev", "b")]);
+        let rows = m.rows();
+        let container = |name: &str| rows.iter().find(|r| r.title == name).unwrap();
+        assert!(container("infra-dev").wants_you);
+        assert!(!container("or3-dev").wants_you, "up, but nothing waits");
+        // Not answering, what it said last is not news: no amber for it.
+        let mut stale = in_("ds-dev", "z");
+        stale.wants_you = true;
+        let m = hub_menu(vec![in_("infra-dev", "a"), stale]);
+        let ds = m.rows().iter().find(|r| r.title == "ds-dev").unwrap();
+        assert!(!ds.wants_you);
+        let mut m = hub_menu(vec![in_("infra-dev", "a")]);
+        let mut or3 = Place::new("or3-dev");
+        or3.reach = Reach::Up;
+        m.set_place(or3);
+        let or3 = m.rows().iter().find(|r| r.title == "or3-dev").unwrap();
+        assert_eq!(or3.age, "nothing open");
+    }
+
+    #[test]
+    fn the_load_line_counts_only_the_containers_that_answer() {
+        let load = |centi, boot: &str| {
+            Some(crate::ui::HostLoad {
+                centi,
+                cores: None,
+                boot: boot.into(),
+            })
+        };
+        let mut m = hub_menu(vec![]);
+        let mut infra = Place::new("infra-dev");
+        infra.reach = Reach::Up;
+        infra.header.load = load(100, "a");
+        m.set_place(infra);
+        let mut ds = Place::new("ds-dev");
+        ds.reach = Reach::Down("gone".into());
+        ds.header.load = load(500, "b");
+        m.set_place(ds);
+        assert_eq!(m.view().load.and_then(|f| f.load), Some(100));
+        // The hub's own reading, once it has one, comes first.
+        m.set_home(Header {
+            load: load(300, "a"),
+            ..header()
+        });
+        assert_eq!(m.view().load.and_then(|f| f.load), Some(300));
+    }
+
+    #[test]
+    fn a_status_or_work_in_progress_takes_a_line_from_the_list_but_reading_does_not() {
+        let mut m = menu((0..40).map(|i| row(&format!("r{i}"))).collect());
+        let room = m.capacity();
+        m.set_status(Some("a status".into()));
+        assert_eq!(m.capacity(), room - 1);
+        m.set_status(None);
+        let busy = |loading| Busy {
+            frame: 0,
+            row: None,
+            what: "working".into(),
+            loading,
+        };
+        m.set_busy(Some(busy(true)));
+        assert_eq!(m.capacity(), room);
+        m.set_busy(Some(busy(false)));
+        assert_eq!(m.capacity(), room - 1);
+        assert!(m.view().busy.is_some());
+        // Work at the foot of a long list keeps its cursor on screen.
+        m.set_busy(None);
+        m.key(Key::End);
+        m.set_busy(Some(busy(false)));
+        let v = m.view();
+        assert!(
+            v.cursor >= v.scroll && v.cursor < v.scroll + m.capacity(),
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn page_keys_move_a_screenful() {
+        let mut m = menu((0..40).map(|i| row(&format!("r{i}"))).collect());
+        let page = m.capacity();
+        m.key(Key::PageDown);
+        assert_eq!(m.view().cursor, page);
+        m.key(Key::End);
+        m.key(Key::PageUp);
+        assert_eq!(m.view().cursor, 39 - page);
+    }
+
+    #[test]
+    fn a_resize_redraws_whatever_is_showing() {
+        let mut m = menu(vec![row("a"), row("b")]);
+        assert_eq!(m.key(Key::Resize), Action::Redraw);
+        m.key(Key::Char('?'));
+        assert_eq!(m.key(Key::Resize), Action::Redraw);
+        assert_eq!(m.view().screen, Screen::Keys, "and changes nothing");
+        m.key(Key::Esc);
+        m.ask_resume_failed(
+            Dialog::ResumeFailed {
+                title: "a".into(),
+                session: "0f9c4a1e".into(),
+                killed_for_memory: false,
+                output: vec![],
+                closed: false,
+            },
+            0,
+        );
+        assert_eq!(m.key(Key::Resize), Action::Redraw);
+        assert!(m.view().dialog.is_some(), "the question stays");
+    }
+
+    #[test]
+    fn an_archive_left_open_stays_open_while_it_has_rows() {
+        let mut m = menu(vec![row("live"), stored("old", true)]);
+        m.key(Key::End);
+        m.key(Key::Enter);
+        assert!(names(&m).contains(&"old".to_string()), "opened");
+        m.replace_rows(vec![row("live"), stored("old", true)], false);
+        assert!(names(&m).contains(&"old".to_string()), "still open");
+    }
+
+    #[test]
+    fn a_click_on_a_session_moves_there_without_opening_the_archive() {
+        let mut m = menu(vec![row("a"), row("b"), stored("old", true)]);
+        // Header and rule, then the Loaded heading: `b` is on screen line 4.
+        assert_eq!(m.key(Key::Click { row: 4, col: 3 }), Action::Redraw);
+        assert_eq!(m.view().cursor, 1);
+        assert!(!names(&m).contains(&"old".to_string()));
     }
 
     #[test]
