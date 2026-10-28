@@ -289,6 +289,28 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupt_is_read_from_the_file_short_or_long() {
+        let dir = std::env::temp_dir().join(format!("cs-interrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let at = crate::store::iso_ms("2026-10-06T09:23:35.516Z");
+        // The marker alone: a file this short is read whole, its first line included.
+        std::fs::write(&path, lines(&[MARK_REPLY])).unwrap();
+        assert_eq!(interrupted_at(&path), at);
+        // Behind more than the tail's worth: read from mid-file, the fragment skipped.
+        let filler = format!("{{\"type\":\"progress\",\"pad\":\"{}\"}}", "x".repeat(1000));
+        let mut body: Vec<&str> = vec![CUT_REPLY];
+        body.extend(std::iter::repeat_n(filler.as_str(), 100));
+        body.push(MARK_REPLY);
+        std::fs::write(&path, lines(&body)).unwrap();
+        assert_eq!(interrupted_at(&path), at);
+        // A reply after the marker: that turn ended some other way.
+        std::fs::write(&path, lines(&[MARK_REPLY, CUT_REPLY])).unwrap();
+        assert_eq!(interrupted_at(&path), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_turn_that_ended_otherwise_or_went_on_is_not_an_interrupt() {
         // Calibration for the test above: the same transcript up to the cut-off reply.
         assert_eq!(interrupted_in(&lines(&[CUT_REPLY, SNAPSHOT]), false), None);
@@ -414,6 +436,13 @@ mod tests {
         body.truncate(filler.len() * 10);
         std::fs::write(&path, &body).unwrap();
         assert!(!has_exchange(&path));
+        // And at half the limit, megabytes in: still read to the end, still settled.
+        let mut body = String::new();
+        while (body.len() as u64) < HEAD / 2 {
+            body.push_str(&filler);
+        }
+        std::fs::write(&path, &body).unwrap();
+        assert!(!has_exchange(&path));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -432,6 +461,12 @@ mod tests {
             body.push_str(&filler);
         }
         body.push_str("{\"type\":\"ai-title\",\"aiTitle\":\"current title\"}\n");
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(titles(&path).ai.as_deref(), Some("current title"));
+        // The title need not be last: anywhere in the tail's worth of the end is read.
+        for _ in 0..8 {
+            body.push_str(&filler);
+        }
         std::fs::write(&path, &body).unwrap();
         assert_eq!(titles(&path).ai.as_deref(), Some("current title"));
         assert_eq!(titles(&dir.join("missing.jsonl")), Titles::default());

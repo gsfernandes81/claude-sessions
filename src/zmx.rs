@@ -263,6 +263,14 @@ name=gone\terr=ConnectionRefused\tstatus=cleaning up\n";
     }
 
     #[test]
+    fn a_daemon_answers_only_with_a_client_count_and_no_error() {
+        // An error beside a count, and a line with neither: no answer either way.
+        let s = parse("name=a\tpid=1\tclients=1\terr=Timeout\nname=b\tpid=2\n");
+        assert!(!s[0].answered && !s[0].attached && s[0].pid.is_none());
+        assert!(!s[1].answered && s[1].pid.is_none());
+    }
+
+    #[test]
     fn only_claude_n_is_a_slot() {
         assert!(is_slot_name("claude-1"));
         assert!(is_slot_name("claude-42"));

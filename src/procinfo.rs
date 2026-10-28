@@ -192,6 +192,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_lineage_stops_short_of_init() {
+        let line = lineage(std::process::id(), 64);
+        assert_eq!(line.first().map(|l| l.0), Some(std::process::id()));
+        assert!(line.iter().all(|&(pid, _)| pid > 1), "{line:?}");
+        assert_eq!(lineage(std::process::id(), 0).len(), 1, "the process alone");
+    }
+
+    #[test]
     fn this_process_reads_as_alive_and_a_wrong_start_time_does_not() {
         let me = std::process::id();
         let start = start_time(me).expect("our own stat is readable");

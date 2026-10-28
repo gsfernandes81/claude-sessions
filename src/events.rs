@@ -880,9 +880,27 @@ mod tests {
             &ev(r#"{"hook_event_name":"Notification","notification_type":"idle_prompt"}"#),
             9_000,
         );
-        assert!(matches!(out, Outcome::Ignored(_)));
+        // Ignored for being what it is, not as just another type nobody listed.
+        assert_eq!(
+            out,
+            Outcome::Ignored("idle_prompt fires after every unanswered Stop")
+        );
         assert!(!rec.needs_you);
         assert_eq!(rec.last_activity_ms, 1_000, "not even activity");
+    }
+
+    #[test]
+    fn a_session_start_records_where_it_runs_and_its_title() {
+        let mut rec = slot();
+        own(
+            &mut rec,
+            &ev(
+                r#"{"hook_event_name":"SessionStart","session_id":"first","source":"resume","cwd":"/w/x","session_title":"fix the dns"}"#,
+            ),
+            2_000,
+        );
+        assert_eq!(rec.cwd.as_deref(), Some("/w/x"));
+        assert_eq!(rec.title.as_deref(), Some("fix the dns"));
     }
 
     #[test]

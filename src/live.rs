@@ -141,6 +141,17 @@ mod tests {
     }
 
     #[test]
+    fn only_a_background_session_is_not_interactive() {
+        let kind = |k: &str| parse(&fixture(1, "1").replace("\"interactive\"", k));
+        assert!(kind("\"interactive\"").is_interactive());
+        assert!(!kind("\"bg\"").is_interactive());
+        assert!(
+            kind("null").is_interactive(),
+            "no kind is no evidence of background"
+        );
+    }
+
+    #[test]
     fn a_string_proc_start_is_read_and_compared() {
         let me = std::process::id();
         let start = crate::procinfo::start_time(me).unwrap();

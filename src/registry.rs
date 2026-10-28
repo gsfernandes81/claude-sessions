@@ -471,6 +471,30 @@ mod tests {
     }
 
     #[test]
+    fn every_state_reads_back_and_anything_else_is_live() {
+        for state in [
+            State::Live,
+            State::Offloading,
+            State::Offloaded,
+            State::Closed,
+        ] {
+            assert_eq!(State::parse(state.as_str()), state);
+        }
+        assert_eq!(State::parse("hibernating"), State::Live);
+    }
+
+    #[test]
+    fn unread_is_a_stop_after_the_last_attach() {
+        let mut rec = SlotRecord::new("claude-1", Moment::ms(0));
+        assert!(!rec.unread(), "nothing finished");
+        rec.last_attach_ms = 5_000;
+        rec.last_stop_ms = Some(5_000);
+        assert!(!rec.unread(), "finished as the owner looked");
+        rec.last_stop_ms = Some(5_001);
+        assert!(rec.unread());
+    }
+
+    #[test]
     fn stamps_from_another_boot_are_forgotten() {
         let mut kept = stamped();
         kept.forget_other_boot();

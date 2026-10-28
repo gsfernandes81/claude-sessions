@@ -325,6 +325,71 @@ mod tests {
         assert_eq!(iso_ms("2000-02-29T12:00:00.5Z"), Some(951_825_600_500));
         assert_eq!(iso_ms("2026-10-03 13:24:22"), None, "not the form written");
         assert_eq!(iso_ms("2026-10-03T13:24:22+08:00"), None);
+        // Every separator is checked, and the fraction must be one.
+        for bad in [
+            "2026x10-03T13:24:22Z",
+            "2026-10x03T13:24:22Z",
+            "2026-10-03x13:24:22Z",
+            "2026-10-03T13:24:22.5",
+            "2026-10-03T13:24:22x5Z",
+            "1970-01-01T00:00Z",
+        ] {
+            assert_eq!(iso_ms(bad), None, "{bad}");
+        }
+    }
+
+    /// A line with none of the fields the head reads, `n` bytes long or near it.
+    fn filler(n: usize) -> String {
+        format!(r#"{{"type":"progress","pad":"{}"}}"#, "x".repeat(n))
+    }
+
+    #[test]
+    fn the_head_and_tail_reach_well_past_a_few_kilobytes() {
+        // The first prompt 8 KB in; the title 8 KB from the end.
+        let d = Dir::new("far");
+        let mut lines = vec![entry("mode", "/workspace", "2026-10-01T00:00:00.000Z", "")];
+        lines.extend((0..8).map(|_| filler(1000)));
+        lines.push(entry(
+            "user",
+            "/workspace",
+            "2026-10-01T00:00:01.000Z",
+            "the first prompt",
+        ));
+        lines.push(r#"{"type":"ai-title","aiTitle":"Far title","sessionId":"f"}"#.into());
+        lines.extend((0..8).map(|_| filler(1000)));
+        lines.push(entry(
+            "assistant",
+            "/workspace",
+            "2026-10-02T00:00:00.000Z",
+            "ok",
+        ));
+        let c = read(&d.write("/workspace", "f", &lines)).expect("a conversation");
+        assert_eq!(c.title, "Far title");
+        assert_eq!(c.last_ms, iso_ms("2026-10-02T00:00:00.000Z").unwrap());
+    }
+
+    #[test]
+    fn the_head_reads_a_line_that_carries_any_one_of_its_fields() {
+        // The directory only on a line that is neither prompt nor reply, the reply on a line
+        // with no directory and no prompt: each is read for what it carries.
+        let d = Dir::new("fields");
+        let reply = r#"{"type":"assistant","message":{"role":"assistant","content":[]}}"#;
+        let lines = [
+            r#"{"type":"system","cwd":"/workspace"}"#.to_string(),
+            reply.to_string(),
+        ];
+        let c = read(&d.write("/workspace", "g", &lines)).expect("a conversation");
+        assert_eq!(c.cwd, "/workspace");
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"just this"}}"#;
+        let lines = [
+            r#"{"type":"system","cwd":"/workspace"}"#.to_string(),
+            prompt.to_string(),
+        ];
+        let c = read(&d.write("/workspace", "h", &lines)).expect("a conversation");
+        assert_eq!(
+            (c.cwd.as_str(), c.title.as_str()),
+            ("/workspace", "just this")
+        );
     }
 
     #[test]
