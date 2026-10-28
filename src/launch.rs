@@ -1955,6 +1955,21 @@ exit 1"#,
     }
 
     #[test]
+    fn a_slot_whose_record_went_settles_by_whether_zmx_still_lists_it() {
+        let f = Fixture::new("settle-no-record");
+        f.zmx(":");
+        assert_eq!(
+            settle("claude-7", None, false, Duration::ZERO),
+            After::Ended
+        );
+        f.session("claude-7", false);
+        assert_eq!(
+            settle("claude-7", None, false, Duration::ZERO),
+            After::Running
+        );
+    }
+
+    #[test]
     fn a_start_put_back_leaves_a_slot_that_was_bound_meanwhile() {
         let _f = Fixture::new("put-back");
         let mut r = SlotRecord::new("claude-1", Moment::now());

@@ -537,11 +537,13 @@ mod tests {
     fn the_first_prompt_titles_it_and_only_transcripts_are_read() {
         let d = Dir::new("first-prompt");
         let ts = "2026-10-01T00:00:00.000Z";
+        // The first prompt typed elsewhere, so the head reads on to the second, which then
+        // must not replace it.
         d.write(
             "/workspace",
             "p",
             &[
-                entry("user", "/workspace", ts, "first"),
+                entry("user", "/somewhere", ts, "first"),
                 entry("user", "/workspace", ts, "second"),
             ],
         );

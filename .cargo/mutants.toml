@@ -6,7 +6,16 @@
 #
 # On zero, always under `nice -n 19 ionice -c3`, so the run takes only what the shared Pi's
 # other containers leave, with -j and --jobserver-tasks sized to keep its load around 4, its
-# core count, not pinned (owner, 2026-10-28: un-niced, two jobs took its load to 7).
+# core count, not pinned (owner, 2026-10-28: un-niced, two jobs took its load to 7). Memory is
+# the harder limit there (a 1.5 GiB container): a mutant that loops while allocating fills it
+# before any timeout, so the tests run capped, through a runner that sets `ulimit -v 786432`
+# and execs its arguments:
+#
+#   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=/path/to/capped.sh nice -n 19 ionice -c3 \
+#       cargo mutants ...
+#
+# The compiler is not capped: a fresh build needs more than 768 MiB, and it does not run away.
+# A pass that retests timeouts, as --iterate does, runs -j 1.
 
 # A build without debug info: each mutant is a fresh compile and link, and nothing reads a
 # backtrace from one.
@@ -75,7 +84,8 @@ exclude_re = [
     'src/store\.rs:12\d:\d+: replace && with \|\| in in_workspace$',
     # Thin wrappers that read the live machine, over functions tested on their own:
     # `marks_in`/`set_in`, `oom_kill_in`, `teardown_listed`, `orphans`/`kill_tree`,
-    # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts; and the agent's own log.
+    # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts, `snapshot_of` (whose
+    # `/proc` readers these are); and the agent's own log.
     'src/archive\.rs:.*: replace (dir|marks|set) -> ',
     'src/mem\.rs:.*: replace oom_kills -> ',
     'src/offload\.rs:.*: replace (teardown_zmx -> |sweep_orphans with)',
@@ -83,4 +93,5 @@ exclude_re = [
     'src/run\.rs:.*<impl Console for RawTerminal>::size',
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
+    'src/activity\.rs:.*<impl Members for Procfs>::',
 ]
