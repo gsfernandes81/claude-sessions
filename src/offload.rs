@@ -681,6 +681,38 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_is_under_zmx_only_as_its_daemons_direct_child() {
+        let p = |pid, ppid, comm: &str| Proc {
+            pid,
+            ppid,
+            comm: comm.into(),
+            start: 1,
+            state: 'S',
+            args: vec![],
+        };
+        let table = [
+            p(1, 0, "zmx"),
+            p(2, 1, "claude"),
+            p(3, 2, "sh"),
+            p(5, 4, "claude"),
+        ];
+        assert!(under_zmx(Some(&table), 2));
+        assert!(!under_zmx(Some(&table), 3), "a grandchild, under claude");
+        assert!(
+            !under_zmx(Some(&table), 5),
+            "its parent is not in the table"
+        );
+        assert!(!under_zmx(Some(&table), 9), "not in the table at all");
+        assert!(!under_zmx(None, 2), "no table, no evidence");
+    }
+
+    #[test]
+    fn a_verdict_carries_how_long_it_was_idle() {
+        assert_eq!(Verdict::Offload { idle: 7 }.idle(), 7);
+        assert_eq!(Verdict::Close { idle: 9 }.idle(), 9);
+    }
+
+    #[test]
     fn calibration_a_quiet_detached_slot_is_offloadable() {
         let (rec, seen) = idle();
         assert_eq!(decide(&rec, NOW, &seen), Ok(QUIET_FOR_MS + 1));

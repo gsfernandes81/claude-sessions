@@ -880,6 +880,56 @@ mod tests {
     }
 
     #[test]
+    fn a_character_that_ends_the_input_is_whole_not_waited_on() {
+        assert_eq!(decode("é".as_bytes()), chars("é"));
+        assert_eq!(decode("😀".as_bytes()), chars("😀"));
+    }
+
+    #[test]
+    fn a_sequence_is_waited_on_up_to_its_limit_and_dropped_past_it() {
+        // MAX_SEQ bytes with no final byte yet may still be one: the final arrives next.
+        let mut d = Decoder::new();
+        let mut long = b"\x1b[".to_vec();
+        long.resize(MAX_SEQ, b'1');
+        assert!(d.feed(&long).is_empty());
+        assert_eq!(d.feed(b"A"), vec![Key::Up]);
+        // One byte more is no sequence: dropped, and what follows is read afresh.
+        let mut d = Decoder::new();
+        long.push(b'1');
+        assert!(d.feed(&long).is_empty());
+        assert_eq!(d.feed(b"A"), chars("A"));
+    }
+
+    #[test]
+    fn an_intermediate_byte_makes_a_sequence_no_key_but_a_zero_parameter_does_not() {
+        assert_eq!(decode(b"\x1b[ A\x1b[1!B"), vec![]);
+        assert_eq!(decode(b"\x1b[05~\x1b[0A"), vec![Key::PageUp, Key::Up]);
+    }
+
+    #[test]
+    fn ss3_needs_a_final_byte_or_it_is_an_alt_o_chord() {
+        // `ESC O` then `1`: Alt-O, dropped, and the `1` is a key of its own.
+        assert_eq!(decode(b"\x1bO1x"), chars("1x"));
+    }
+
+    #[test]
+    fn a_click_with_shift_meta_or_ctrl_held_is_still_a_click() {
+        for button in [4, 8, 16, 28] {
+            let seq = format!("\x1b[<{button};10;3M");
+            assert_eq!(
+                decode(seq.as_bytes()),
+                vec![Key::Click { row: 2, col: 9 }],
+                "button {button}"
+            );
+        }
+        assert_eq!(
+            decode(b"\x1b[<2;10;3M"),
+            vec![],
+            "the right button is no click"
+        );
+    }
+
+    #[test]
     fn carriage_return_and_newline_are_enter() {
         assert_eq!(decode(b"\r\n"), vec![Key::Enter, Key::Enter]);
     }
