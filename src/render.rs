@@ -1132,6 +1132,25 @@ mod tests {
 
     /// A row from its flags: `!` wants you, `b` busy, `*` unread, `@` attached, `z`
     /// offloaded, `x` closed.
+    #[test]
+    fn a_keyed_description_wraps_beside_its_key_with_a_hanging_indent() {
+        // Two in, a key column four wide, sixteen across: ten columns for the words.
+        let mut out = Vec::new();
+        keyed(
+            &mut out,
+            2,
+            ("n", BLUE),
+            4,
+            &["one two three four five"],
+            16,
+        );
+        let texts: Vec<String> = out
+            .into_iter()
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        assert_eq!(texts, ["  n   one two", "      three four", "      five"]);
+    }
+
     fn row(flags: &str, title: &str, age: &str) -> Row {
         Row {
             host: String::new(),

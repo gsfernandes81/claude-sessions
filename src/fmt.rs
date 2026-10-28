@@ -82,6 +82,36 @@ mod tests {
     }
 
     #[test]
+    fn every_day_to_2500_follows_the_one_before() {
+        // Day by day from 1970, each date is the day after the last: across month ends, leap
+        // days, 2100 (no leap day) and 2400 (a leap day, the last day of an era).
+        let leap = |y: i64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let days_in = |y: i64, m: i64| match m {
+            2 if leap(y) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let mut was = (1970, 1, 1);
+        let mut seen_2400_leap = false;
+        for day in 1..(531 * 366) {
+            let (y, m, d, ..) = civil(day * 86_400_000);
+            let (py, pm, pd) = was;
+            let next = if pd < days_in(py, pm) {
+                (py, pm, pd + 1)
+            } else if pm < 12 {
+                (py, pm + 1, 1)
+            } else {
+                (py + 1, 1, 1)
+            };
+            assert_eq!((y, m, d), next, "day {day}");
+            seen_2400_leap |= (y, m, d) == (2400, 2, 29);
+            was = (y, m, d);
+        }
+        assert!(seen_2400_leap && was.0 >= 2500, "{was:?}");
+    }
+
+    #[test]
     fn ages_read_as_the_mockups_draw_them() {
         assert_eq!(age(59_999), "now");
         assert_eq!(age(2 * 60_000), "2m");

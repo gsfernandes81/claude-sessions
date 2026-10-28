@@ -11,3 +11,76 @@
 # A build without debug info: each mutant is a fresh compile and link, and nothing reads a
 # backtrace from one.
 profile = "mutants"
+
+# Mutants that are equivalent, or that only a fault no test can provoke would tell apart, each
+# group with why (2026-10-28, after the first full run). A pattern names the function and the
+# operator, not the line, so it outlives edits; a new mutant it hides by accident is the cost.
+exclude_re = [
+    # Flag bits that do not overlap: `|` and `^` are the same value.
+    'src/sockdiag\.rs:.*: replace \| with \^ in (tcp|dump)$',
+    'src/lockfile\.rs:.*: replace \| with \^ in SlotLock::acquire$',
+    'src/term\.rs:.*: replace \| with \^ in mouse$',
+    # Answers the kernel never gives here: descriptor 0 (stdin is open), a zero-length send,
+    # receive or write, a dump part exactly the buffer's length.
+    'src/sockdiag\.rs:.*: replace < with (==|<=) in (tcp|dump)$',
+    'src/sockdiag\.rs:.*: replace > with (==|>=) in dump$',
+    'src/signal\.rs:.*: replace < with <= in pidfd_open$',
+    'src/term\.rs:.*: replace < with <= in write_fd$',
+    # A dump asked with no flags still ends, blocking, and a part never outgrows the buffer.
+    'src/sockdiag\.rs:.*: replace \| with & in dump$',
+    # A message exactly as long as `inet_diag_msg` has no attributes, so no counts, either way.
+    'src/sockdiag\.rs:.*: replace < with <= in socket_bytes$',
+    # EINTR retries: an interrupted poll or read cannot be made to happen on cue.
+    'src/term\.rs:.*: replace == with != in RawTerminal::(wait|read_keys|read_once)$',
+    # The terminal, as Linux's ptys behave: a hangup polls readable and reads 0 (tested), so
+    # the hangup mask is reached only for a closed descriptor; the -1 fallbacks are for pipes
+    # that always exist; a zero timeout and a 1 ms one end the same way; set_nonblocking on a
+    # fresh socketpair does not fail; an Alt chord's multi-byte character is dropped whole or
+    # as invalid bytes, which are dropped too.
+    'src/term\.rs:.*: replace \| with [&^] in RawTerminal::wait$',
+    'src/term\.rs:.*: replace & with \| in RawTerminal::wait$',
+    'src/term\.rs:.*: delete - in RawTerminal::wait$',
+    'src/term\.rs:\d+:\d+: delete -$',
+    'src/term\.rs:.*: replace match guard !left\.is_zero\(\) with true in RawTerminal::wait$',
+    'src/term\.rs:.*: replace \|\| with && in RawTerminal::read_keys$',
+    'src/term\.rs:.*: replace && with \|\| in (readable_within|install|wake_pair)$',
+    'src/term\.rs:.*: replace match guard c >= 0x80 with false in parse_escape$',
+    'src/term\.rs:.*: replace \+ with \* in parse_escape$',
+    # Timing only: a deadline compared with `<` or `<=`, a wait that only adds a wait.
+    'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with)$',
+    'src/launch\.rs:.* in wait_session_gone$',
+    'src/launch\.rs:.*: replace && with \|\| in settle$',
+    'src/hub\.rs:.*: replace < with <= in offload_all$',
+    'src/zmx\.rs:.*: replace < with <= in list_from$',
+    'src/activity\.rs:.*: replace < with <= in pass$',
+    'src/run\.rs:.*: replace \+ with - in run$',
+    # The same outcome either way: stopping a process already gone succeeds; closing the fd
+    # releases a flock; "max" does not parse as a number; a down container has no rows; the
+    # home's header read again on a heard event reads the same; and in the renderer, bounds
+    # that are equal only where the result is the same or at widths the menu refuses.
+    'src/launch\.rs:.*: replace match guard procinfo::is_alive\(pid, start\) with true in (offload|close)$',
+    'src/lockfile\.rs:.*<impl Drop for SlotLock>::drop with \(\)$',
+    'src/mem\.rs:.*: replace match guard s\.trim\(\) == "max" with false in read_at$',
+    'src/menu\.rs:.*: replace && with \|\| in Menu::container_row$',
+    'src/run\.rs:.*: replace != with == in drive$',
+    'src/render\.rs:.*: replace < with <= in (Line::pad|scroll_to)$',
+    'src/render\.rs:.*: replace > with >= in wrap$',
+    'src/render\.rs:.*: replace \+ with [-*] in heading$',
+    'src/render\.rs:.*: replace \+ with \* in row$',
+    # Caches whose miss only costs a read: an unchanged transcript read again, a size or a
+    # modification time alone (an append moves both), a newline's offset kept or not.
+    'src/transcript\.rs:.*: replace match guard upto == len with false in titles_cached$',
+    'src/transcript\.rs:.*: replace < with <= in titles_cached$',
+    'src/transcript\.rs:.*: replace \+ with \* in whole_lines$',
+    'src/store\.rs:12\d:\d+: replace && with \|\| in in_workspace$',
+    # Thin wrappers that read the live machine, over functions tested on their own:
+    # `marks_in`/`set_in`, `oom_kill_in`, `teardown_listed`, `orphans`/`kill_tree`,
+    # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts; and the agent's own log.
+    'src/archive\.rs:.*: replace (dir|marks|set) -> ',
+    'src/mem\.rs:.*: replace oom_kills -> ',
+    'src/offload\.rs:.*: replace (teardown_zmx -> |sweep_orphans with)',
+    'src/zmx\.rs:.*: replace (socket_dir|Watch::sessions) -> ',
+    'src/run\.rs:.*<impl Console for RawTerminal>::size',
+    'src/agent\.rs:.*: replace log with \(\)$',
+    'src/launch\.rs:.* in Deps::from_env$',
+]

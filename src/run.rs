@@ -834,6 +834,20 @@ mod tests {
     }
 
     #[test]
+    fn a_hung_up_terminal_is_told_from_a_failure() {
+        use std::io::{Error, ErrorKind};
+        assert!(terminal_gone(&Error::from(ErrorKind::UnexpectedEof)));
+        for gone in [5, 6, 9, 32] {
+            assert!(terminal_gone(&Error::from_raw_os_error(gone)), "{gone}");
+        }
+        assert!(
+            !terminal_gone(&Error::from_raw_os_error(2)),
+            "ENOENT is a failure"
+        );
+        assert!(!terminal_gone(&Error::other("anything else")));
+    }
+
+    #[test]
     fn the_waits_default_to_fifteen_and_five_seconds() {
         // Only the pty tests set these, on the binary they run.
         if std::env::var_os("CLAUDE_SESSIONS_RETRY_MS").is_none() {

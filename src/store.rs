@@ -294,13 +294,20 @@ mod tests {
         }
     }
 
-    struct Dir(PathBuf);
+    /// A config directory of transcripts, held by one test at a time: `in_workspace`'s cache
+    /// is the process's, and a listing forgets every file it did not list.
+    struct Dir(
+        PathBuf,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     impl Dir {
         fn new(name: &str) -> Dir {
+            let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
             let d = std::env::temp_dir().join(format!("cs-store-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(d.join("projects")).unwrap();
-            Dir(d)
+            Dir(d, turn)
         }
         fn write(&self, cwd: &str, id: &str, lines: &[String]) -> PathBuf {
             let dir = self.0.join("projects").join(slug(cwd));
@@ -524,6 +531,29 @@ mod tests {
         );
         // Calibration: with the root as the workspace, everything is.
         assert_eq!(in_workspace(&d.0, "/").len(), 5);
+    }
+
+    #[test]
+    fn the_first_prompt_titles_it_and_only_transcripts_are_read() {
+        let d = Dir::new("first-prompt");
+        let ts = "2026-10-01T00:00:00.000Z";
+        d.write(
+            "/workspace",
+            "p",
+            &[
+                entry("user", "/workspace", ts, "first"),
+                entry("user", "/workspace", ts, "second"),
+            ],
+        );
+        // The same lines in a file that is not a transcript are not a conversation.
+        let other =
+            d.0.join("projects")
+                .join(slug("/workspace"))
+                .join("notes.txt");
+        std::fs::write(&other, entry("user", "/workspace", ts, "notes") + "\n").unwrap();
+        let got = in_workspace(&d.0, "/workspace");
+        let titles: Vec<&str> = got.iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(titles, ["first"]);
     }
 
     #[test]

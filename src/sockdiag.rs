@@ -363,12 +363,16 @@ mod tests {
     #[test]
     fn an_acknowledgement_is_never_counted_as_a_socket() {
         // An ack carries errno 0 and then the request it answers, which can be long enough to
-        // read as a socket's message if nothing told the two apart.
-        let mut ack = 0i32.to_ne_bytes().to_vec();
-        ack.extend(diag(42, Some(136)));
+        // read as a socket's message if nothing told the two apart. This one is a whole
+        // socket's message whose first four bytes, the errno's place, are zero.
+        let ack = diag(42, Some(136));
+        assert_eq!(ack[..4], 0i32.to_ne_bytes());
         let mut out = BTreeMap::new();
         assert!(!messages(&nlmsg(NLMSG_ERROR, &ack), &mut out).unwrap());
         assert!(out.is_empty(), "{out:?}");
+        // Calibration: the same bytes as a socket's message are counted.
+        messages(&nlmsg(SOCK_DIAG_BY_FAMILY, &ack), &mut out).unwrap();
+        assert_eq!(out.get(&42), Some(&12));
     }
 
     #[test]

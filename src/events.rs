@@ -634,6 +634,10 @@ mod tests {
         let mut rec = slot();
         land(&mut rec, &[(&two, 3_000), (&one, 2_000)]);
         assert_eq!(rec.first_prompt.as_deref(), Some("one"));
+        // Fired in the same tick, the one that landed first stays: nothing says it was later.
+        let mut rec = slot();
+        land(&mut rec, &[(&one, 2_000), (&two, 2_000)]);
+        assert_eq!(rec.first_prompt.as_deref(), Some("one"));
     }
 
     #[test]

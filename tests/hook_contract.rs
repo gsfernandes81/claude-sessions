@@ -12,6 +12,9 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
+#[path = "support/pty.rs"]
+mod pty;
+
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -438,7 +441,7 @@ fn reconcile_counts_what_it_moved_and_the_daemons_that_did_not_answer() {
     let zmx = dir.join("zmx");
     std::fs::write(
         &zmx,
-        "#!/bin/sh\nprintf 'name=claude-2\\tpid=1\\tclients=0\\nname=stuck\\terr=Timeout\\n'\n",
+        "#!/bin/sh\nprintf 'name=claude-2\\tpid=1\\tclients=0\\nname=work\\tpid=2\\tclients=1\\nname=stuck\\terr=Timeout\\n'\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -455,7 +458,7 @@ fn reconcile_counts_what_it_moved_and_the_daemons_that_did_not_answer() {
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(
         text(&out.stdout)
-            .contains("reconcile: 1 slot(s) offloaded, 2 zmx session(s), 1 not answering"),
+            .contains("reconcile: 1 slot(s) offloaded, 3 zmx session(s), 1 not answering"),
         "{}",
         text(&out.stdout)
     );
@@ -513,6 +516,15 @@ fn close_marks_a_stopped_slot_closed_and_refuses_a_running_or_missing_one() {
         "{}",
         text(&out.stderr)
     );
+    // A record that is there but cannot be read is an error, not a slot that does not exist.
+    std::fs::create_dir(dir.join("claude-8.json")).unwrap();
+    let out = run(&["close", "claude-8"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        !text(&out.stderr).contains("no such slot"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]
@@ -543,6 +555,12 @@ fn doctor_reports_and_an_unknown_subcommand_is_given_the_usage() {
 fn bare_and_piped_it_lists() {
     // Not at a terminal, the bare command is `list`, so `claude-sessions | grep` answers.
     let dir = tmpdir("bare");
+    // A record mid-write, under its temporary dot-name, is not a slot.
+    std::fs::write(
+        dir.join(".claude-5.json"),
+        r#"{"slot":"claude-5","state":"live"}"#,
+    )
+    .unwrap();
     // A zmx that lists nothing, so this machine's own sessions stay out of it.
     let out = Command::new(BIN)
         .env("CLAUDE_SESSIONS_DIR", &dir)
@@ -556,4 +574,39 @@ fn bare_and_piped_it_lists() {
         "{}",
         text(&out.stdout)
     );
+}
+
+#[test]
+fn a_terminal_on_only_one_side_still_lists() {
+    // Typed at a terminal but piped onward — `claude-sessions | grep` — is the list, not the
+    // menu, which would draw into the pipe and wait for keys.
+    let dir = tmpdir("one-side");
+    let (_master, slave) = pty::pair(80, 24).expect("a pty");
+    let mut child = Command::new(BIN)
+        .env("CLAUDE_SESSIONS_DIR", &dir)
+        .env("CLAUDE_SESSIONS_ZMX", "true")
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut said).unwrap();
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "the menu ran: {said:?}"
+    );
+    assert!(said.starts_with("no slots."), "{said:?}");
 }

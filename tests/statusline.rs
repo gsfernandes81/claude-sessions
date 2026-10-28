@@ -119,6 +119,9 @@ fn the_line_says_the_pool_and_the_machines_load() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(ok, "{out:?}");
     assert!(out.starts_with("RAM: 3.0G / 8.0G"), "{out:?}");
-    // Every Linux has a load average and a boot id.
-    assert!(out.contains("Load: "), "{out:?}");
+    // Every Linux has a load average and a boot id, so the load is a figure.
+    assert!(
+        out.contains("Load: ") && !out.contains("Load: ?"),
+        "{out:?}"
+    );
 }

@@ -363,6 +363,51 @@ mod tests {
     }
 
     #[test]
+    fn the_tail_reaches_back_a_long_way_and_never_reads_a_fragment() {
+        let dir = std::env::temp_dir().join(format!("cs-interrupt-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let at = crate::store::iso_ms("2026-10-06T09:23:35.516Z");
+        // Three kilobytes of bookkeeping after the marker are well within the tail.
+        let filler = format!("{{\"type\":\"progress\",\"pad\":\"{}\"}}", "x".repeat(1000));
+        let after = [MARK_REPLY, &filler, &filler, &filler];
+        std::fs::write(&path, lines(&after)).unwrap();
+        assert_eq!(interrupted_at(&path), at);
+        // A tail that begins exactly where a marker begins, inside a longer line: that line is
+        // a fragment, whatever it reads as, so there is no answer.
+        let rest = INTERRUPT_TAIL as usize - MARK_REPLY.len() - 1;
+        let pad = rest - r#"{"type":"progress","pad":""}"#.len() - 1;
+        let bookkeeping = format!(
+            "{{\"type\":\"progress\",\"pad\":\"{}\"}}\n",
+            "y".repeat(pad)
+        );
+        let body = format!("junk{MARK_REPLY}\n{bookkeeping}");
+        assert_eq!(
+            body.len() as u64 - INTERRUPT_TAIL,
+            4,
+            "the cut falls on the marker"
+        );
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(interrupted_at(&path), None);
+        // Calibration: read as whole text, those same bytes do hold a marker.
+        assert_eq!(interrupted_in(&body[4..], false), at);
+        assert_eq!(interrupted_in(&body[4..], true), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_transcript_with_no_exchange_is_none_if_read_to_its_end() {
+        let dir = std::env::temp_dir().join(format!("cs-exchange-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        // Two megabytes of bookkeeping, inside the head: read to the end, and nothing in it.
+        let line = format!("{SNAPSHOT}\n");
+        std::fs::write(&path, line.repeat(2 * 1024 * 1024 / line.len())).unwrap();
+        assert!(!has_exchange(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_turn_that_ended_otherwise_or_went_on_is_not_an_interrupt() {
         // Calibration for the test above: the same transcript up to the cut-off reply.
         assert_eq!(interrupted_in(&lines(&[CUT_REPLY, SNAPSHOT]), false), None);
@@ -563,6 +608,16 @@ mod tests {
             Some("generated"),
             "kept from the earlier read"
         );
+
+        // More than a tail's worth of lines after it: the name read before is kept, because
+        // only what was added is read.
+        let filler = format!(
+            "{{\"type\":\"progress\",\"pad\":\"{}\"}}\n",
+            "z".repeat(1000)
+        );
+        f.write_all(filler.repeat(TAIL as usize / filler.len() + 10).as_bytes())
+            .unwrap();
+        assert_eq!(titles_cached(&path).custom.as_deref(), Some("second"));
 
         // A file that shrank is another file: read afresh, nothing carried over.
         std::fs::write(&path, named("x")).unwrap();

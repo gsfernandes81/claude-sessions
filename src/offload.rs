@@ -774,6 +774,12 @@ mod tests {
         );
         let stale = reading(NOW - FRESH_MS - 1, NOW - 3 * QUIET_FOR_MS);
         assert_eq!(quiet(&stale, CLAUDE), None, "a pass that could not measure");
+        // Fresh is half the quiet period, by the clock and not by the constant: six minutes
+        // old is stale, four is not.
+        let six = reading(NOW - 6 * 60_000, NOW - 3 * QUIET_FOR_MS);
+        assert_eq!(quiet(&six, CLAUDE), None);
+        let four = reading(NOW - 4 * 60_000, NOW - 3 * QUIET_FOR_MS);
+        assert!(quiet(&four, CLAUDE).is_some());
         let future = reading(NOW + 1, NOW - QUIET_FOR_MS);
         assert_eq!(quiet(&future, CLAUDE), None);
         assert_eq!(quiet_for(None, CLAUDE, NOW), None);

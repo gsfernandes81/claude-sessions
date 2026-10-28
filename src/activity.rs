@@ -447,12 +447,45 @@ fn snapshot(
     pids: &[u32],
     tcp: Result<&BTreeMap<u64, u64>, &'static str>,
 ) -> Result<Snapshot, usize> {
+    snapshot_of(&Procfs, pids, tcp)
+}
+
+/// Where a snapshot reads a slot's members from: `/proc`, or a table in the tests.
+trait Members {
+    /// A member's counters, `None` if it cannot be read.
+    fn read(&self, pid: u32) -> Option<Reading>;
+    /// The inodes of the sockets it holds, `None` if they cannot be listed.
+    fn held(&self, pid: u32) -> Option<Vec<u64>>;
+    /// Whether it has gone.
+    fn gone(&self, pid: u32) -> bool;
+}
+
+struct Procfs;
+
+impl Members for Procfs {
+    fn read(&self, pid: u32) -> Option<Reading> {
+        read(pid)
+    }
+    fn held(&self, pid: u32) -> Option<Vec<u64>> {
+        crate::sockdiag::held(pid)
+    }
+    fn gone(&self, pid: u32) -> bool {
+        !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+}
+
+/// [`snapshot`], of `members`.
+fn snapshot_of(
+    members: &impl Members,
+    pids: &[u32],
+    tcp: Result<&BTreeMap<u64, u64>, &'static str>,
+) -> Result<Snapshot, usize> {
     let (mut readings, mut left, mut unreadable) = (Vec::new(), Vec::new(), 0usize);
-    let gone = |pid: u32| !std::path::Path::new(&format!("/proc/{pid}")).exists();
+    let gone = |pid: u32| members.gone(pid);
     let mut held: Vec<u64> = Vec::new();
     let mut net_err = tcp.err();
     for &pid in pids {
-        let Some(r) = read(pid) else {
+        let Some(r) = members.read(pid) else {
             // Gone since the snapshot: its bytes went to whoever reaped it, perhaps after that
             // one was read — a member that left. There but unreadable is unknown.
             if gone(pid) {
@@ -466,7 +499,7 @@ fn snapshot(
         if net_err.is_some() {
             continue;
         }
-        match crate::sockdiag::held(pid) {
+        match members.held(pid) {
             Some(inodes) => held.extend(inodes),
             // Gone between its counters and its descriptors: a member that left, as above.
             None if gone(pid) => left.push(pid),
@@ -1160,26 +1193,69 @@ mod tests {
         assert_eq!(m.rate, Some(5.0));
     }
 
+    /// Members as a table: each pid's counters, sockets, and whether it has gone.
+    #[derive(Default)]
+    struct Table {
+        readable: Vec<u32>,
+        holding: Vec<(u32, Vec<u64>)>,
+        gone: Vec<u32>,
+    }
+
+    impl Members for Table {
+        fn read(&self, pid: u32) -> Option<Reading> {
+            self.readable.contains(&pid).then(|| r(pid, 1, 0))
+        }
+        fn held(&self, pid: u32) -> Option<Vec<u64>> {
+            self.holding
+                .iter()
+                .find(|h| h.0 == pid)
+                .map(|h| h.1.clone())
+        }
+        fn gone(&self, pid: u32) -> bool {
+            self.gone.contains(&pid)
+        }
+    }
+
     #[test]
     fn a_member_there_but_unreadable_is_counted_unknown() {
-        // Another user's process: its stat is readable and its io is not. Running as root,
-        // every process reads, and there is nothing here to test.
-        let Some(theirs) = crate::procinfo::table()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| p.pid)
-            .find(|&pid| {
-                read(pid).is_none() && std::path::Path::new(&format!("/proc/{pid}")).exists()
-            })
-        else {
-            return;
+        let t = Table {
+            readable: vec![1],
+            holding: vec![(1, vec![])],
+            ..Default::default()
         };
-        let mine = std::process::id();
         let none = BTreeMap::new();
-        assert!(matches!(snapshot(&[mine, theirs], Ok(&none)), Err(1)));
-        assert!(matches!(snapshot(&[theirs, theirs], Ok(&none)), Err(2)));
-        // Calibration: this process alone reads.
-        assert!(snapshot(&[mine], Ok(&none)).is_ok());
+        assert!(matches!(snapshot_of(&t, &[1, 2], Ok(&none)), Err(1)));
+        assert!(matches!(snapshot_of(&t, &[2, 3], Ok(&none)), Err(2)));
+        // Calibration: a readable member alone reads, and one gone before it was read left.
+        assert!(snapshot_of(&t, &[1], Ok(&none)).is_ok());
+        let t = Table { gone: vec![2], ..t };
+        let snap = snapshot_of(&t, &[1, 2], Ok(&none)).unwrap();
+        assert_eq!(snap.left, [2]);
+    }
+
+    #[test]
+    fn a_member_whose_sockets_cannot_be_listed_left_if_it_went_else_the_net_is_unknown() {
+        let tcp: BTreeMap<u64, u64> = [(7, 500), (8, 900)].into();
+        let t = Table {
+            readable: vec![1, 2],
+            holding: vec![(1, vec![7, 99])],
+            ..Default::default()
+        };
+        // Pid 2's descriptors cannot be listed and it is still there: the bytes are unknown.
+        let snap = snapshot_of(&t, &[1, 2], Ok(&tcp)).unwrap();
+        assert!(snap.net.is_err(), "{:?}", snap.net);
+        assert!(snap.left.is_empty());
+        // Gone in between: it left, and the sockets read are the ones held that TCP knows.
+        let t = Table { gone: vec![2], ..t };
+        let snap = snapshot_of(&t, &[1, 2], Ok(&tcp)).unwrap();
+        assert_eq!(snap.left, [2]);
+        let socks: Vec<(u64, u64)> = snap
+            .net
+            .unwrap()
+            .iter()
+            .map(|s| (s.inode, s.bytes))
+            .collect();
+        assert_eq!(socks, [(7, 500)]);
     }
 
     #[test]

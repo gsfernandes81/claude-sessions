@@ -652,6 +652,7 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
 }
 
 /// Where a conversation is already running, if it is.
+#[derive(Debug, PartialEq)]
 enum Elsewhere {
     /// In another slot, which can be attached to instead.
     Slot(String),
@@ -1929,6 +1930,73 @@ exit 1"#,
             )
         );
         assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn another_slot_running_another_conversation_is_no_reason_to_hold_back() {
+        let mut f = Fixture::new("elsewhere-other");
+        registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
+        let (pid, start) = f.process();
+        let mut other = live("claude-3", pid, start);
+        other.session_id = Some("conv-9".into());
+        registry::store(&other).unwrap();
+        f.session("claude-3", false);
+        assert_eq!(
+            running_elsewhere("claude-1", "conv-1", clock::now()).unwrap(),
+            None
+        );
+        // Calibration: the same slot running this conversation is a reason.
+        other.session_id = Some("conv-1".into());
+        registry::store(&other).unwrap();
+        assert_eq!(
+            running_elsewhere("claude-1", "conv-1", clock::now()).unwrap(),
+            Some(Elsewhere::Slot("claude-3".into()))
+        );
+    }
+
+    #[test]
+    fn a_start_put_back_leaves_a_slot_that_was_bound_meanwhile() {
+        let _f = Fixture::new("put-back");
+        let mut r = SlotRecord::new("claude-1", Moment::now());
+        r.state = State::Live;
+        r.pid = Some(4242);
+        registry::store(&r).unwrap();
+        put_back("claude-1", State::Offloaded);
+        assert_eq!(
+            load("claude-1").state,
+            State::Live,
+            "bound: its process says"
+        );
+        r.pid = None;
+        r.state = State::Closed;
+        registry::store(&r).unwrap();
+        put_back("claude-1", State::Offloaded);
+        assert_eq!(
+            load("claude-1").state,
+            State::Closed,
+            "not a start in progress"
+        );
+        // Calibration: an unbound start is put back.
+        r.state = State::Live;
+        registry::store(&r).unwrap();
+        put_back("claude-1", State::Offloaded);
+        assert_eq!(load("claude-1").state, State::Offloaded);
+    }
+
+    #[test]
+    fn a_lock_somebody_holds_is_said_to_be_busy() {
+        let f = Fixture::new("busy");
+        let _slot = SlotLock::acquire(&registry::lock_path("claude-1"), INTERACTIVE_WAIT).unwrap();
+        match lock_slot("claude-1", "\"a\"") {
+            Err(why) => assert!(why.contains("\"a\" is busy"), "{why}"),
+            Ok(_) => panic!("took a held lock"),
+        }
+        let _all =
+            SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT).unwrap();
+        match allocate_for(&f.work(), None) {
+            Err(why) => assert!(why.contains("another menu is starting"), "{why}"),
+            Ok(got) => panic!("allocated under a held lock: {got:?}"),
+        }
     }
 
     fn stored(id: &str, cwd: &str, title: &str) -> Row {

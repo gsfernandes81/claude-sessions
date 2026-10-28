@@ -653,6 +653,19 @@ fn a_dry_run_takes_no_lock_but_a_live_pass_does() {
 }
 
 #[test]
+fn a_lock_that_cannot_be_taken_at_all_fails_the_pass() {
+    // Not held by anyone but unopenable — a directory where the lock file goes: an error, not
+    // a slot left for the next pass as a busy one is.
+    let s = idle_slot("lockdir", false);
+    std::fs::create_dir(s.root.join("registry/offload-t1.lock")).unwrap();
+    measured_before(&s, -180_000);
+    let (ok, out) = offload(&s.root, &[]);
+    assert!(!ok, "the pass succeeded: {out}");
+    assert!(!out.contains("its lock is busy"), "{out}");
+    assert!(alive(s.claude, s.claude_start), "nothing was stopped");
+}
+
+#[test]
 fn a_kept_slot_never_waits_for_its_lock() {
     // The common case — a slot that is not idle — is decided from the snapshot and the
     // record alone, so a held lock does not even slow it down.

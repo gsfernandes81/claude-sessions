@@ -45,9 +45,12 @@ pub fn read() -> Memory {
 /// This container's cgroup: `/sys/fs/cgroup`, or `CLAUDE_SESSIONS_CGROUP` for the tests, so
 /// that what they find room for does not depend on how full the machine running them is.
 fn cgroup() -> String {
-    std::env::var("CLAUDE_SESSIONS_CGROUP")
-        .ok()
-        .filter(|v| !v.is_empty())
+    cgroup_from(std::env::var("CLAUDE_SESSIONS_CGROUP").ok())
+}
+
+/// [`cgroup`] from the variable's value; set but empty is unset.
+fn cgroup_from(var: Option<String>) -> String {
+    var.filter(|v| !v.is_empty())
         .unwrap_or_else(|| "/sys/fs/cgroup".into())
 }
 
@@ -128,6 +131,17 @@ pub const SESSION_COST: u64 = 250 * 1024 * 1024;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cgroup_is_this_containers_unless_a_test_says_otherwise() {
+        // Only the pty tests set it, on the binaries they run.
+        if std::env::var_os("CLAUDE_SESSIONS_CGROUP").is_none() {
+            assert_eq!(cgroup(), "/sys/fs/cgroup");
+        }
+        assert_eq!(cgroup_from(None), "/sys/fs/cgroup");
+        assert_eq!(cgroup_from(Some(String::new())), "/sys/fs/cgroup");
+        assert_eq!(cgroup_from(Some("/t/cg".into())), "/t/cg");
+    }
 
     #[test]
     fn the_oom_kill_count_is_read_from_memory_events() {
