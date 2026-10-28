@@ -1409,9 +1409,88 @@ mod tests {
         assert_eq!(size_of(p.slave_fd()), Some((40, 24)));
         p.resize(80, 30);
         assert_eq!(size_of(p.slave_fd()), Some((80, 30)));
+        // A side of nothing is no answer.
+        p.resize(80, 0);
+        assert_eq!(size_of(p.slave_fd()), None);
+        p.resize(0, 30);
+        assert_eq!(size_of(p.slave_fd()), None);
         // Not a terminal at all.
         let f = std::fs::File::open("/dev/null").unwrap();
         assert_eq!(size_of(f.as_raw_fd()), None);
+    }
+
+    #[test]
+    fn readable_is_something_to_read_or_the_end() {
+        use std::io::{Read, Write};
+        let (r, mut w) = UnixStream::pair().unwrap();
+        let fd = r.as_raw_fd();
+        let wait = Duration::from_millis(20);
+        assert!(!readable_within(fd, wait), "nothing written yet");
+        w.write_all(b"x").unwrap();
+        assert!(readable_within(fd, wait));
+        (&r).read_exact(&mut [0u8; 1]).unwrap();
+        assert!(!readable_within(fd, wait), "drained");
+        drop(w);
+        assert!(readable_within(fd, wait), "the end is readable");
+    }
+
+    #[test]
+    fn a_sequence_split_across_reads_is_joined_and_a_hangup_ends_the_wait() {
+        use std::io::Write;
+        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        // A pair of its own rather than a `Pty`, whose reader thread would keep the master
+        // open: closing it here is the hangup.
+        let (master, slave) = pty::pair(80, 24).expect("pty");
+        let fd = slave.as_raw_fd();
+        let mut t = RawTerminal::on(fd, fd).expect("enter");
+        let mut m = master.try_clone().unwrap();
+        m.write_all(b"\x1b[").unwrap();
+        let rest = std::thread::spawn(move || {
+            std::thread::sleep(ESC_WAIT / 4);
+            m.write_all(b"B").unwrap();
+            m
+        });
+        assert_eq!(
+            t.wait(Some(Duration::from_secs(2))).unwrap(),
+            Input::Keys(vec![Key::Down])
+        );
+        drop(rest.join().unwrap());
+        drop(master);
+        let e = t.wait(Some(Duration::from_secs(2))).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "{e}");
+    }
+
+    #[test]
+    fn a_wake_ends_one_wait() {
+        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let p = pty::Pty::open(80, 24).expect("pty");
+        let fd = p.slave_fd();
+        let mut t = RawTerminal::on(fd, fd).expect("enter");
+        wake();
+        let short = Some(Duration::from_millis(200));
+        assert_eq!(t.wait(short).unwrap(), Input::Woken);
+        assert_eq!(
+            t.wait(short).unwrap(),
+            Input::Timeout,
+            "taken, not left to wake again"
+        );
+    }
+
+    #[test]
+    fn an_ignored_sigint_is_ignored_again_after_a_child() {
+        let _g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let p = pty::Pty::open(80, 24).expect("pty");
+        let fd = p.slave_fd();
+        unsafe { signal(SIGINT, SIG_IGN) };
+        let mut t = RawTerminal::on(fd, fd).expect("enter");
+        t.suspend().unwrap();
+        let during = sigint_disposition();
+        t.resume().unwrap();
+        let after = sigint_disposition();
+        drop(t);
+        unsafe { signal(SIGINT, SIG_DFL) };
+        assert_eq!(during, SIG_IGN, "the child inherits it ignored");
+        assert_eq!(after, SIG_IGN, "and the menu keeps it so");
     }
 
     /// Run one of the `child_*` tests below in a fresh copy of this test binary, on a pty of

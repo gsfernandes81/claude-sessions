@@ -60,7 +60,7 @@ const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0o4000;
 
 /// A pty pair sized `cols`×`rows`: the master, and the slave opened once.
-fn pair(cols: u16, rows: u16) -> std::io::Result<(File, OwnedFd)> {
+pub fn pair(cols: u16, rows: u16) -> std::io::Result<(File, OwnedFd)> {
     let master = OpenOptions::new()
         .read(true)
         .write(true)

@@ -144,6 +144,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_frame_showing_is_the_last_one_ticked() {
+        let t0 = Instant::now();
+        let mut spin = Spin::after(t0, Duration::ZERO);
+        assert_eq!(spin.frame(), None, "not shown yet");
+        spin.tick(t0);
+        assert_eq!(spin.frame(), Some(0));
+        spin.tick(t0 + FRAME);
+        spin.tick(t0 + FRAME * 2);
+        assert_eq!(spin.frame(), Some(2));
+    }
+
+    #[test]
     fn a_spinner_waits_then_steps_one_frame_at_a_time_on_a_fixed_cadence() {
         let t0 = Instant::now();
         let mut s = Spin::after(t0, SHOW_AFTER);

@@ -794,6 +794,14 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
     }
     dated.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     let mut rows: Vec<Row> = dated.into_iter().map(|(_, row)| row).collect();
+    rows.extend(socket_rows(&recs, sessions, clock));
+    rows
+}
+
+/// A row for every zmx session no record names: somebody's `zmx attach`, or a slot whose
+/// record went.
+fn socket_rows(recs: &[SlotRecord], sessions: &[zmx::Session], clock: Millis) -> Vec<Row> {
+    let mut rows = Vec::new();
     for sess in sessions {
         if recs.iter().any(|r| r.slot == sess.name) {
             continue;
@@ -925,6 +933,46 @@ mod tests {
         r.busy = false;
         assert!(!slot_row(&r, r.last_activity_ms, &[]).wants_you);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_host_is_this_machines_name() {
+        let named = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(host(), named.trim());
+    }
+
+    #[test]
+    fn a_zmx_session_no_record_names_is_a_row_dated_by_zmx() {
+        let clock = 1_800_000_000_000;
+        let session = |name: &str, created: Option<u64>| zmx::Session {
+            name: name.into(),
+            pid: Some(1),
+            attached: true,
+            answered: true,
+            created,
+        };
+        let recs = [SlotRecord::new("claude-1", Moment::ms(0))];
+        let rows = socket_rows(
+            &recs,
+            &[
+                session("claude-1", None),
+                session("work", Some(clock / 1000 - 7200)),
+                session("other", None),
+            ],
+            clock,
+        );
+        let got: Vec<(&str, Millis, &str, bool)> = rows
+            .iter()
+            .map(|r| (r.title.as_str(), r.at, r.age.as_str(), r.attached))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("work", clock - 7_200_000, "2h", true),
+                ("other", clock, "now", true)
+            ]
+        );
+        assert_eq!(rows[0].key, RowKey::Socket("work".into()));
     }
 
     #[test]
