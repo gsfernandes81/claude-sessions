@@ -30,7 +30,11 @@ Code already lists past conversations and reopens one, and
 custom title (the owner's own name for it), else the title Claude Code generates, else the
 first prompt. Both titles are read from the end of the conversation's transcript — its
 `custom-title` and `ai-title` entries — by the hook, on `SessionStart` and `Stop`, before it
-takes the slot's lock (`src/transcript.rs`). Until 0.3.1 the menu preferred the `name` in
+takes the slot's lock (`src/transcript.rs`). **`/rename` fires no hook at all**, so the rows
+each container's agent sends the hub also read the transcript: once from its tail, then
+only the whole lines appended since, and a title found there stands over the recorded one
+(`transcript::titles_cached`, 0.8.1). Until then a rename reached the hub only when the next
+turn ended, and never on an idle or offloaded slot. Until 0.3.1 the menu preferred the `name` in
 Claude Code's live sessions file, which on the boxes showed one of Claude's long replies in
 place of a title (owner, 2026-10-03); that file is no longer read for titles at all.
 

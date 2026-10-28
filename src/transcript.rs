@@ -55,6 +55,58 @@ pub fn titles(path: &Path) -> Titles {
     titles_in(&text)
 }
 
+/// [`titles`], kept current for the rows the agent sends the hub: **`/rename` fires no hook**,
+/// so the registry's title, read only on `SessionStart` and `Stop`, stays the old one until a
+/// turn ends — and never moves on an idle or offloaded slot. Asked every two seconds for every
+/// slot, so each transcript is read once from its tail and then only from where the last read
+/// stopped, a whole line at a time. A file that shrank is another file and is read afresh.
+pub fn titles_cached(path: &Path) -> Titles {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    // Where the last whole line ended, and the titles up to there.
+    type Seen = HashMap<std::path::PathBuf, (u64, Titles)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+        return Titles::default();
+    };
+    let had = seen.lock().ok().and_then(|m| m.get(path).cloned());
+    let (from, mut have) = match had {
+        Some((upto, t)) if upto == len => return t,
+        Some((upto, t)) if upto < len => (upto, t),
+        _ => (len.saturating_sub(TAIL), Titles::default()),
+    };
+    let Some((read, upto)) = whole_lines(path, from) else {
+        return have;
+    };
+    let new = titles_in(&read);
+    if new.custom.is_some() {
+        have.custom = new.custom;
+    }
+    if new.ai.is_some() {
+        have.ai = new.ai;
+    }
+    if let Ok(mut m) = seen.lock() {
+        m.insert(path.to_path_buf(), (upto, have.clone()));
+    }
+    have
+}
+
+/// The text from `from` to the last newline in the file, and the offset just past it: a line
+/// still being written is left for the next read.
+fn whole_lines(path: &Path, from: u64) -> Option<(String, u64)> {
+    let mut f = File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut raw = Vec::new();
+    f.take(TAIL).read_to_end(&mut raw).ok()?;
+    let end = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    raw.truncate(end);
+    Some((
+        String::from_utf8_lossy(&raw).into_owned(),
+        from + end as u64,
+    ))
+}
+
 /// How far into a transcript [`has_exchange`] looks before giving it the benefit of the doubt.
 const HEAD: u64 = 4 * 1024 * 1024;
 
@@ -470,6 +522,58 @@ mod tests {
         std::fs::write(&path, &body).unwrap();
         assert_eq!(titles(&path).ai.as_deref(), Some("current title"));
         assert_eq!(titles(&dir.join("missing.jsonl")), Titles::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_appended_later_is_read_and_a_half_written_line_waits() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("cs-titles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let named = |t: &str| format!("{{\"type\":\"custom-title\",\"customTitle\":\"{t}\"}}\n");
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                r#"{"type":"ai-title","aiTitle":"generated"}"#.to_owned() + "\n",
+                named("first")
+            ),
+        )
+        .unwrap();
+        // Calibration: what the hook's own read finds, the cached read finds.
+        assert_eq!(titles_cached(&path), titles(&path));
+        assert_eq!(titles_cached(&path).custom.as_deref(), Some("first"));
+
+        // A `/rename`, written in two pieces: until its line is whole, the old name stands.
+        let line = named("second");
+        let (a, b) = line.split_at(line.len() / 2);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(a.as_bytes()).unwrap();
+        assert_eq!(titles_cached(&path).custom.as_deref(), Some("first"));
+        f.write_all(b.as_bytes()).unwrap();
+        let t = titles_cached(&path);
+        assert_eq!(t.custom.as_deref(), Some("second"));
+        assert_eq!(
+            t.ai.as_deref(),
+            Some("generated"),
+            "kept from the earlier read"
+        );
+
+        // A file that shrank is another file: read afresh, nothing carried over.
+        std::fs::write(&path, named("x")).unwrap();
+        assert_eq!(
+            titles_cached(&path),
+            Titles {
+                custom: Some("x".into()),
+                ai: None
+            }
+        );
+        assert_eq!(titles_cached(&dir.join("missing.jsonl")), Titles::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

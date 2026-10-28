@@ -279,8 +279,16 @@ impl SlotRecord {
     /// The title a row shows: what Claude Code's own session selector would — the custom
     /// title, else the generated one — then the first prompt, then nothing yet.
     pub fn display_title(&self) -> String {
-        self.title
+        self.display_title_with(&crate::transcript::Titles::default())
+    }
+
+    /// [`Self::display_title`], with titles read from the transcript since the hook last
+    /// recorded them (`transcript::titles_cached`) taking the place of the recorded ones.
+    pub fn display_title_with(&self, read: &crate::transcript::Titles) -> String {
+        read.custom
             .clone()
+            .or_else(|| self.title.clone())
+            .or_else(|| read.ai.clone())
             .or_else(|| self.ai_title.clone())
             .or_else(|| self.first_prompt.clone())
             .unwrap_or_else(|| "(no title yet)".into())

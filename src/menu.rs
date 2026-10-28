@@ -847,8 +847,13 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         closed: r.state == State::Closed,
         archived: false,
         // What Claude Code's own session selector shows (`transcript.rs`), not the live
-        // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1).
-        title: r.display_title(),
+        // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1). Read
+        // from the transcript as well as the record: a `/rename` fires no hook.
+        title: r.display_title_with(
+            &r.conversation_path()
+                .map(|p| crate::transcript::titles_cached(&p))
+                .unwrap_or_default(),
+        ),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
@@ -986,6 +991,27 @@ mod tests {
         };
         assert!(slot_row(&closed, 0, &[]).closed);
         assert!(!slot_row(&r, 0, &[]).closed);
+    }
+
+    #[test]
+    fn a_rename_shows_without_waiting_for_a_hook() {
+        let dir = std::env::temp_dir().join(format!("cs-menu-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("conv.jsonl");
+        let ai = r#"{"type":"ai-title","aiTitle":"Generated","sessionId":"s"}"#;
+        std::fs::write(&transcript, format!("{ai}\n")).unwrap();
+        let mut r = SlotRecord::new("claude-1", Moment::ms(0));
+        r.transcript_path = Some(transcript.display().to_string());
+        r.title = Some("old name".into());
+        r.ai_title = Some("Generated".into());
+        let row = slot_row(&r, 0, &[]);
+        assert_eq!(row.title, "old name", "calibration: the recorded name");
+        // `/rename` appends this and fires no hook; the record is untouched.
+        let renamed = r#"{"type":"custom-title","customTitle":"new name","sessionId":"s"}"#;
+        std::fs::write(&transcript, format!("{ai}\n{renamed}\n")).unwrap();
+        assert_eq!(slot_row(&r, 0, &[]).title, "new name");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn row(name: &str) -> Row {
