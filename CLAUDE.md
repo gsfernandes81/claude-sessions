@@ -42,8 +42,11 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   hold the door shut. `SessionEnd` hooks additionally share a **1.5-second** budget across
   all of them — a lock wait on that path must be well inside it, or the write that marks a
   slot closed is cut off halfway.
-- **An idle menu emits zero bytes.** Ages tick at most once a minute; nothing else redraws
-  without a keypress or a registry change. The link is metered. Test it under a pty.
+- **An idle menu writes only its load line, and only when it reads differently.** Until
+  2026-10-27 it wrote nothing at all; the owner traded that for a load line kept current
+  ("Continuous refresh is fine, that rule can be removed"). Everything else still holds: ages
+  tick at most once a minute, nothing else redraws without a keypress or a registry change,
+  and only the lines that changed are written. The link is metered. Test it under a pty.
 - **Never widen a glyph's job without measuring the font.** `↵` (U+21B5) is in **no**
   monospace face on Google Fonts — JetBrains Mono, Noto Sans Mono, Source Code Pro, IBM Plex
   Mono, Fira Mono and Space Mono were each downloaded and their cmaps read on 2026-10-01.
@@ -63,7 +66,8 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
   (2026-10-03). Amber means *this one is waiting for you* — the `!` and its title, a
   session's or a container's (owner, 2026-10-26, replacing the Needs-you heading) — and is
   used for nothing else in the menu. (The status line's yellow and red for high RAM and load
-  are the owner's, 2026-10-06, outside the menu.)
+  are the owner's, 2026-10-06, outside the menu. The menu's own load line says the same
+  levels with bold and red, never yellow, which beside amber would read as waiting.)
 - **Never resume a conversation that is already running.** Two processes on one conversation
   fork it. Checked under the slot's lock, not before taking it.
 - **Never start, stop or offload anything on the fleet on your own initiative.** Bring-up is

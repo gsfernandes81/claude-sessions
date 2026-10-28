@@ -51,7 +51,16 @@ dim `├─ ` branch, the last on a `└─ ` corner, and `Enter` on a session t
 and `└` are outside the measured set**, used on the owner's word (2026-10-27): every glyph
 Claude Code and charmbracelet's crush draw works on the terminals this is driven from, and
 crush draws its trees with these. The hint line keeps `c close`: it is the same seven columns, so
-mockup 8 stands.
+mockup 8 stands. **Later on 2026-10-27 the owner added the load line** — "a claude sessions
+statusline style load display when we're in the session door", "in the same location as
+claude code puts it approximately. You have creative freedom" — so every screen with a footer
+ends with `RAM: 1.9G / 3.0G, Load: 2.3, dev` under its hints: the status line's text, every
+container's figures (`docs/design.md` § *The status line*), named for where it is read — the
+hub at the door, the container where there is only one. Every such screen below was redrawn
+for it, from the renderer, at both widths; the dialogs, which have no footer, have none. Dim
+as structure, a figure past its first threshold bold and past its second red: not yellow,
+which beside amber would read as *waiting for you*. It is the one line an idle menu rewrites,
+and only when it reads differently.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,
@@ -100,6 +109,7 @@ mark again, with its title, from 2026-10-26.
 |---|---|---|
 | the `!` before a session waiting for you, and its title — or a container's name, at the home | amber, the mark bold | the only row that is a *request*, and the only amber anywhere |
 | a key you can press — the hint line, the keys screen | blue | actionable, not alarming |
+| the load line, under the hints | dim; a figure past 70% of RAM or 0.7 load a core bold, past 85% or 1.0 red | structure until it is a worry; red is Claude Code's own for the same line |
 | every other group heading | rule dim, name bold | a divider the eye can find, and a glyph, so a monochrome terminal keeps it |
 | the Archived heading under the cursor | reverse video, like a row | the one heading the cursor can rest on |
 | an unread title | foreground, bold | news, not a problem |
@@ -139,6 +149,7 @@ mount guards on one                   2d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 2 — Nothing open
@@ -150,9 +161,9 @@ infra-dev · nothing open · 812M of 1.0G
 
   n   start one in /workspace
   s   a shell instead
-
 ────────────────────────────────────────
 n new   ? keys   s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 3 — retired 2026-10-27
@@ -226,6 +237,7 @@ mount guards on one                   2d
 detached · it is still running
 Enter open   n new   c close   ? keys
 s shell
+RAM: 1.0G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 7 — The keys, on ?
@@ -249,6 +261,7 @@ Archived   ended, still resumable; Enter
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 8 — The hint line as the terminal narrows
@@ -313,6 +326,7 @@ smartd on one                        63d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 10 — The first frame, while the list is read
@@ -323,6 +337,7 @@ infra-dev · 812M of 1.0G
 ⠋ reading sessions
 ────────────────────────────────────────
 n new   ? keys   s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 11 — Offloading a session with `c`, the spinner turning
@@ -344,6 +359,7 @@ mount guards on one                   2d
 ⠋ offloading session
 Enter open   n new   c close   ? keys
 s shell
+RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
 ## The hub: every container, and one at a time (2026-10-26)
@@ -373,7 +389,7 @@ deeper"):
 `n` and `s` at the home act in the container of the row under the cursor; `c` on a container's
 own row says what `c` is for. A container that does not answer (mockup 14) is asked
 again every 15 seconds, which changes nothing on the screen until it answers — the idle hub
-still writes nothing.
+still writes nothing but its load line.
 
 ### Mockup 12 — Every container and its loaded sessions, the hub's home
 ```
@@ -391,6 +407,7 @@ ds-dev                     not answering
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
+RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
 ### Mockup 13 — One container, from the home
@@ -411,6 +428,7 @@ mount guards on one                   2d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   Esc back
+RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
 ### Mockup 14 — A container not answering
@@ -424,9 +442,9 @@ ds-dev · not answering
 
   s   try a shell there anyway
   Esc back to every container
-
 ────────────────────────────────────────
 ? keys   s shell   Esc back
+RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
 ### Mockup 15 — The keys, at the home
@@ -448,4 +466,5 @@ Containers every one the hub reaches,
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell
+RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```

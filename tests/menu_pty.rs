@@ -1,5 +1,8 @@
-//! The menu, run on a real pseudo-terminal: **an idle menu emits zero bytes** (`CLAUDE.md`;
-//! the link it is driven over is metered).
+//! The menu, run on a real pseudo-terminal: **an idle menu writes nothing between readings of
+//! its load line, and on a reading only that line, if it changed** (`CLAUDE.md`; the link it
+//! is driven over is metered). Until 2026-10-27 an idle menu wrote nothing at all; the load line
+//! is the owner's exception. Most tests here read it once an hour, so that what they hold is
+//! everything else; `the_load_line_alone_is_rewritten_when_its_reading_changes` reads it fast.
 //!
 //! Calibrated in the same test, in both directions, because a silent pty would pass the idle
 //! check for the wrong reason: the menu is first seen to draw, then seen to say nothing while
@@ -75,7 +78,7 @@ fn no_sessions(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[test]
-fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
+fn an_idle_menu_writes_nothing_and_a_registry_change_redraws_it() {
     let root = std::env::temp_dir().join(format!("cs-menu-pty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (reg, abd) = (root.join("registry"), root.join("zmx"));
@@ -141,6 +144,8 @@ fn an_idle_menu_emits_zero_bytes_and_a_registry_change_redraws_it() {
     let mut cmd = Command::new(BIN);
     // This machine alone, whatever hub configuration the machine running the tests has.
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
+    // The load line read once an hour: what the idle checks below watch is everything else.
+    cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -246,6 +251,8 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     let mut cmd = Command::new(BIN);
     // This machine alone, whatever hub configuration the machine running the tests has.
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
+    // The load line read once an hour: what the idle checks below watch is everything else.
+    cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
     cmd.env("CLAUDE_SESSIONS_DIR", root.join("registry"))
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&root.join("zmx")))
         .env("ZMX_DIR", root.join("zmx"));
@@ -300,6 +307,8 @@ fn putting_a_session_away_turns_the_spinner_smoothly_then_falls_silent() {
     let mut cmd = Command::new(BIN);
     // This machine alone, whatever hub configuration the machine running the tests has.
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
+    // The load line read once an hour: what the idle checks below watch is everything else.
+    cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -419,6 +428,8 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
     let mut cmd = Command::new(BIN);
     // This machine alone, whatever hub configuration the machine running the tests has.
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
+    // The load line read once an hour: what the idle checks below watch is everything else.
+    cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -488,6 +499,8 @@ fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
     let mut cmd = Command::new(BIN);
     // This machine alone, whatever hub configuration the machine running the tests has.
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
+    // The load line read once an hour: what the idle checks below watch is everything else.
+    cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -534,4 +547,83 @@ fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
         .collect();
     assert!(left.is_empty(), "left behind in its directory: {left:?}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The load line is the one thing an idle menu rewrites (owner, 2026-10-27), and only when its
+/// reading changes. A stand-in pool — a cgroup directory of three files — makes the reading
+/// change on cue: unchanged, a fast refresh writes nothing; changed, it writes the bottom line
+/// and nothing else.
+#[test]
+fn the_load_line_alone_is_rewritten_when_its_reading_changes() {
+    let root = std::env::temp_dir().join(format!("cs-menu-load-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (reg, abd, pool) = (root.join("registry"), root.join("zmx"), root.join("pool"));
+    for d in [&reg, &abd, &pool] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    const G: u64 = 1 << 30;
+    std::fs::write(pool.join("memory.max"), format!("{}\n", 3 * G)).unwrap();
+    std::fs::write(pool.join("memory.stat"), "inactive_file 0\n").unwrap();
+    std::fs::write(pool.join("memory.current"), format!("{}\n", G)).unwrap();
+
+    let mut cmd = Command::new(BIN);
+    cmd.env("CLAUDE_SESSIONS_HOSTS", "local")
+        .env("CLAUDE_SESSIONS_LOAD_MS", "200")
+        .env("CLAUDE_SESSIONS_POOL", &pool)
+        .env("CLAUDE_SESSIONS_DIR", &reg)
+        .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
+        .env("ZMX_DIR", &abd)
+        .env("CLAUDE_SESSIONS_WORKSPACE", "/workspace")
+        .env("CLAUDE_CONFIG_DIR", root.join("cc"));
+    let mut term = pty::Pty::spawn(cmd, 40, 24).expect("spawn the menu on a pty");
+    let first = term.read_until(b"RAM: 1.0G / 3.0G", Duration::from_secs(5));
+    assert!(
+        String::from_utf8_lossy(&first).contains("RAM: 1.0G / 3.0G"),
+        "the pool's figure on the load line: {:?}",
+        String::from_utf8_lossy(&first)
+    );
+    term.read_for(Duration::from_millis(500));
+
+    // Ten readings of an unchanged pool: nothing written. The load average itself may move
+    // in that time, and then its line is rewritten — which is allowed, and checked for below.
+    clear_of_the_minute(&mut term, Duration::from_secs(2));
+    let idle = term.read_for(Duration::from_secs(2));
+    assert!(
+        only_the_bottom_line(&idle),
+        "an idle menu wrote more than its load line: {:?}",
+        String::from_utf8_lossy(&idle)
+    );
+
+    // The pool fills: the next reading rewrites the bottom line, and only it.
+    std::fs::write(pool.join("memory.current"), format!("{}\n", 2 * G)).unwrap();
+    let changed = term.read_until(b"RAM: 2.0G / 3.0G", Duration::from_secs(3));
+    assert!(
+        String::from_utf8_lossy(&changed).contains("RAM: 2.0G / 3.0G"),
+        "the new reading was never drawn: {:?}",
+        String::from_utf8_lossy(&changed)
+    );
+    assert!(
+        !changed.is_empty() && only_the_bottom_line(&changed),
+        "more than the load line was rewritten: {:?}",
+        String::from_utf8_lossy(&changed)
+    );
+    // Calibration: the first frame, a full draw, does move to other lines, so the check above
+    // can fail.
+    assert!(!only_the_bottom_line(&first));
+
+    term.write(b"q");
+    term.wait(Duration::from_secs(3));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Whether every cursor move in `out` is to the 24th line: the load line's, at 40×24.
+fn only_the_bottom_line(out: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(out);
+    text.split("\x1b[")
+        .skip(1)
+        .filter_map(|seq| {
+            let end = seq.find(|c: char| c.is_ascii_alphabetic())?;
+            (&seq[end..=end] == "H").then(|| seq[..end].to_string())
+        })
+        .all(|at| at.split(';').next() == Some("24"))
 }

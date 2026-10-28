@@ -7,7 +7,8 @@
 //! sent back up to run at the terminal through `ssh -t … agent exec`. A third container does
 //! not answer: its ssh fails as ssh does, exit 255 and a line on stderr.
 //!
-//! Calibrated as `menu_pty.rs` is: the hub is seen to draw, then to say nothing while idle —
+//! Calibrated as `menu_pty.rs` is: the hub is seen to draw, then to write nothing while idle but
+//! its load line —
 //! through a window in which the dead container is asked again, twice — then to redraw when
 //! one container's registry changes.
 
@@ -177,6 +178,9 @@ exec sleep 600"#,
     fn hub(&self, hosts: &str) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.env("CLAUDE_SESSIONS_HOSTS", hosts)
+            // The load line read once an hour: the idle check watches everything else
+            // (`menu_pty.rs` has the load line's own test).
+            .env("CLAUDE_SESSIONS_LOAD_MS", "3600000")
             .env("CLAUDE_SESSIONS_SSH", self.0.join("bin/ssh"))
             .env("CLAUDE_SESSIONS_REMOTE", BIN)
             .env("CLAUDE_SESSIONS_RETRY_MS", "1500")
@@ -185,6 +189,19 @@ exec sleep 600"#,
             .env_remove("CLAUDE_SESSIONS_POOL");
         cmd
     }
+}
+
+/// Whether every cursor move in `out` is to the 24th line: the load line's, at 80×24. Empty
+/// output passes.
+fn only_the_bottom_line(out: &[u8]) -> bool {
+    text(out)
+        .split("\x1b[")
+        .skip(1)
+        .filter_map(|seq| {
+            let end = seq.find(|c: char| c.is_ascii_alphabetic())?;
+            (&seq[end..=end] == "H").then(|| seq[..end].to_string())
+        })
+        .all(|at| at.split(';').next() == Some("24"))
 }
 
 fn text(b: &[u8]) -> String {
@@ -233,10 +250,12 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     // The property, through two retries of the container that is not answering.
     let window = Duration::from_secs(4);
     clear_of_the_minute(&mut term, window);
+    // Nothing but the load line: a container may send a fresh reading meanwhile, whose
+    // figures the line then shows — the one line an idle hub may rewrite (2026-10-27).
     let idle = term.read_for(window);
     assert!(
-        idle.is_empty(),
-        "an idle hub wrote {} bytes: {:?}",
+        only_the_bottom_line(&idle),
+        "an idle hub wrote more than its load line, {} bytes: {:?}",
         idle.len(),
         text(&idle)
     );
@@ -245,6 +264,10 @@ fn the_home_lists_every_container_and_a_dead_one_costs_the_idle_screen_nothing()
     root.offloaded(&or3, "claude-2", "loop on the new build", old - 2000);
     let seen = term.read_until(b"2 offloaded", Duration::from_secs(10));
     assert!(text(&seen).contains("2 offloaded"), "{:?}", text(&seen));
+    assert!(
+        !only_the_bottom_line(&seen),
+        "calibration: a row's change is drawn above the load line, which the idle check rejects"
+    );
 
     // Into the dead container, and back. End is its row, the last.
     term.write(b"\x1b[F\r");

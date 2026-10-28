@@ -67,7 +67,8 @@ binary it started from.
 
 **The agent is a channel, not a second menu.** It sends the rows `menu::gather` reads, with the
 container's header and workspace, when they change and when the minute turns (for the ages) —
-never on a timer of its own, so an idle hub still writes nothing to the owner's terminal. An
+never on a timer of its own, so an idle hub still writes nothing to the owner's terminal but
+its load line (*The status line*). An
 action arrives naming a row by its key; the agent finds it among the rows it last sent, so an
 index means what it meant on the owner's screen, and hands it to `launch.rs` exactly as the
 local menu did: decided under the slot's lock, the record written before the lock goes.
@@ -563,15 +564,48 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
 
 ## The status line
 
-`claude-sessions statusline` prints `RAM: 1.0G / 3.0G, Load: 2.3, or3-dev` (owner,
-2026-10-06; 36 columns, inside the 40 a phone shows) for Claude Code's status line: the
-menu's working-set figure against the container's limit — or the host's total and available
-memory where there is no limit — the one-minute load, and the hostname, which names the dev
-container. Anything unreadable is a `?`. **RAM turns yellow at 70% and red at 85%; load at
-0.7 and 1.0 per logical core of the machine** (`/sys/devices/system/cpu/online`) — the
-machine's, because the load average counts the whole machine too. The figures carry the meaning, colour is emphasis on top, and
-`NO_COLOR` turns it off. Yellow here is the owner's choice for this line (2026-10-06); the
-menu's amber stays reserved for *waiting for you*.
+`claude-sessions statusline` prints `RAM: 1.9G / 3.0G, Load: 2.3, or3-dev` (owner,
+2026-10-06; 36 columns, inside the 40 a phone shows) for Claude Code's status line, and the
+menu draws the same line at the foot of the door (below). **Its figures are every
+container's** (owner, 2026-10-27: "total ram and total cpu in all sessions"; "all sessions =
+every container the hub reaches"; "CPU = same load average (sum of every container if
+possible, host total otherwise)"):
+
+- **RAM is the dev containers' shared pool** where it is mounted (`CLAUDE_SESSIONS_POOL`, the
+  cgroup v2 directory the hub already reads for its home's header): its working set against
+  its ceiling, read as the menu reads a container (`mem.rs`). Where a session's container has
+  no pool mounted, the line falls back to that container's own figure against its limit — or
+  the host's total and available memory where there is no limit; the door falls back to every
+  answering container's figures added up. **For a session's line to show the pool, infra
+  mounts the pool read-only into each dev container and sets `CLAUDE_SESSIONS_POOL` there**,
+  as it does in the hub; until it does, a session's line shows its own container's figure.
+- **Load is the one-minute load average, counted once per machine.** `/proc/loadavg` is not
+  namespaced: every container on one host reads the same host-wide figure, so a sum over
+  containers would count that host once per container. Each reading carries the kernel's
+  `boot_id`, and the total adds one reading per `boot_id` (`statusline::total_load`). On a
+  fleet of one host that is the host's load — "host total otherwise" — which is what a
+  session's line reads directly; the door also adds the machines its containers report, each
+  agent sending its machine's load, core count and `boot_id` in its header (absent from an
+  older agent, which then counts as unknown, not zero).
+- The last part names where the line is read: the container's hostname in a session, the
+  hub's at the door. Anything unreadable is a `?`.
+
+**RAM turns yellow at 70% and red at 85%; load at 0.7 and 1.0 per logical core**
+(`/sys/devices/system/cpu/online`) — the machines', against all their cores, because the load
+average counts the whole machine too. The figures carry the meaning, colour is emphasis on
+top, and `NO_COLOR` turns it off. Yellow here is the owner's choice for this line
+(2026-10-06); the menu's amber stays reserved for *waiting for you*, so at the door the same
+levels are bold and red, never yellow.
+
+**The door's load line** (owner, 2026-10-27: "I'd prefer it in the same location as claude
+code puts it approximately. You have creative freedom") is the last line of every screen with
+a footer, under the hints, as Claude Code draws its status line under its input; a dialog,
+which has no footer, has none. Dim, as structure, like the header's figures; a figure past
+its first threshold bold, past its second red. It is cut at the edge, never wrapped. **It is
+kept current**: the hub reads its own figures — the pool and its machine's load — every 5
+seconds (`CLAUDE_SESSIONS_LOAD_MS` for tests), a container's arrive with its rows, and the
+line is rewritten only when its text changes. That is the one thing an idle menu writes
+(until 2026-10-27 an idle menu wrote nothing at all; the owner dropped that rule for this).
 
 `hooks-config` installs it as `statusLine` in the same drop-in as the hooks, with
 `refreshInterval: 60` — RAM and load move without any Claude Code event, and otherwise it
@@ -768,7 +802,7 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   **It steps one frame at a time on a fixed cadence**, each deadline set from the last rather
   than from when the frame was drawn, so it never skips a frame and never stutters (the owner
   saw a mockup step unevenly). **Only the lines that change are written**, so a frame costs a
-  line or two, and an idle menu still writes nothing. The work runs on its own thread
+  line or two, and an idle menu still writes nothing but its load line. The work runs on its own thread
   (`src/work.rs`); an action that hands the terminal to a child asks the menu's thread to do
   it, so the spinner covers what comes before and after the child but never draws over it.
   While it turns, keys are ignored except `q`, Ctrl-C and a resize, so nothing can be done to

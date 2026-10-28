@@ -98,6 +98,7 @@ fn header() -> Header {
     Header {
         host: menu::host(),
         memory: m.limit.zip(m.used()).map(|(limit, used)| (used, limit)),
+        load: crate::statusline::host_load(),
     }
 }
 

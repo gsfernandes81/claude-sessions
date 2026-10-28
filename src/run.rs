@@ -5,27 +5,28 @@
 //! container — `local`, when nothing else is configured — that is exactly the old single
 //! container's menu, its agent a child process instead of a container away.
 //!
-//! **An idle menu emits zero bytes** (`CLAUDE.md`; the link is metered). Three things keep it
-//! so, and each is load-bearing:
+//! **An idle menu writes only its load line, and that only when it changes.** Until 2026-10-27
+//! an idle menu wrote nothing at all; the owner then traded that for the load line kept current
+//! ("Continuous refresh is fine, that rule can be removed"). What still keeps it quiet:
 //!
 //! - **Only the lines that differ from what is on the screen are written.** Every wake-up
 //!   renders, compares line by line, and usually writes nothing; a spinner turning writes the
-//!   line or two it is on.
+//!   line or two it is on, and a fresh reading the load line, if it reads differently.
 //! - **A container's agent sends its rows only when they change**, or when the minute turns
-//!   for the ages, and the loop wakes on nothing else but a key, a resize and a reconnect due
-//!   to a container that is not answering — which changes nothing on screen unless it answers.
-//! - **The home's memory figure is refreshed only with something else.** The pool's memory
-//!   moves by a megabyte every few seconds on a busy box; refreshed on its own it would redraw
-//!   the screen that often. It is brought up to date when a key is pressed and when the minute
-//!   turns — the one tick the ages are allowed. A container's own figure arrives with its rows.
+//!   for the ages, and the loop wakes on nothing else but a key, a resize, a reconnect due to a
+//!   container that is not answering — which changes nothing on screen unless it answers — and
+//!   the load line's reading, every [`load_every`].
+//! - **The hub's own figures are read on that tick**: the pool's memory, which the home's
+//!   header shows too, and the load of the machine the hub is on. A container's arrive with
+//!   its rows.
 
 use crate::clock;
 use crate::hub::{self, Conn, Event};
 use crate::json::Value;
-use crate::mem;
 use crate::menu::{self, Action, Menu, Place, Reach};
 use crate::proto;
 use crate::render;
+use crate::statusline;
 use crate::term::{self, Input, RawTerminal};
 use crate::ui::{Busy, Header, Key, Outcome, Row, Terminal, TooNarrow};
 use crate::work::{self, Event as WorkEvent, Spin, Work};
@@ -43,21 +44,28 @@ fn retry() -> Duration {
         .map_or(Duration::from_secs(15), Duration::from_millis)
 }
 
+/// How often the hub reads its own figures for the load line: `CLAUDE_SESSIONS_LOAD_MS`, for
+/// the tests, else 5 seconds — the one-minute load average moves slowly, and a line that
+/// changed every second would cost a line of output on the metered link every second.
+fn load_every() -> Duration {
+    std::env::var("CLAUDE_SESSIONS_LOAD_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(Duration::from_secs(5), Duration::from_millis)
+}
+
 /// Clear the screen, for the first frame and after anything that leaves it in an unknown
 /// state — a child that had the terminal, a resize.
 const CLEAR: &[u8] = b"\x1b[2J";
 
-/// The home's header: the hub's own name, and the pool's memory where infra mounts it
-/// (`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory).
+/// The home's header: the hub's own name, the pool's memory where infra mounts it
+/// (`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory), and the load of the machine the hub is on,
+/// which the load line counts first (`statusline::door`).
 fn home_header() -> Header {
-    let memory = std::env::var("CLAUDE_SESSIONS_POOL")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| mem::read_at(&d))
-        .and_then(|m| m.limit.zip(m.used()).map(|(limit, used)| (used, limit)));
     Header {
         host: menu::host(),
-        memory,
+        memory: statusline::pool(),
+        load: statusline::host_load(),
     }
 }
 
@@ -314,6 +322,8 @@ fn drive(
 ) -> Result<(), Stop> {
     let mut screen: Screen = None;
     let mut minute = menu::age_clock(clock::now());
+    let every = load_every();
+    let mut next_reading = Instant::now() + every;
     // The first rows to arrive are sorted into their groups, as the first reading always
     // was; after that, rows keep their places.
     let mut first = menu.all_rows().is_empty();
@@ -348,12 +358,21 @@ fn drive(
         }
         draw(term, menu, &mut screen)?;
 
+        let until_reading = next_reading.saturating_duration_since(Instant::now());
         let wait = match loading.as_ref() {
-            Some(spin) => Some(spin.until_next(Instant::now()).min(CHECK)),
-            None => hub.next_retry(),
+            Some(spin) => spin.until_next(Instant::now()).min(CHECK),
+            None => hub
+                .next_retry()
+                .map_or(until_reading, |r| r.min(until_reading)),
         };
-        match term.wait(wait).map_err(io)? {
-            Input::Timeout => hub.reconnect_due(),
+        match term.wait(Some(wait)).map_err(io)? {
+            Input::Timeout => {
+                hub.reconnect_due();
+                if Instant::now() >= next_reading {
+                    next_reading = Instant::now() + every;
+                    menu.set_home(home_header());
+                }
+            }
             Input::Woken => {}
             Input::Keys(keys) => {
                 menu.set_home(home_header());

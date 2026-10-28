@@ -133,6 +133,21 @@ pub struct Header {
     pub host: String,
     /// Bytes used and the ceiling, from the cgroup. `None` when there is no ceiling to show.
     pub memory: Option<(u64, u64)>,
+    /// The load of the machine the container runs on, for the load line's total (2026-10-27).
+    /// `None` from an agent too old to send it, or where it cannot be read.
+    pub load: Option<HostLoad>,
+}
+
+/// One machine's load, as a container on it reads it. Containers share their host's kernel, and
+/// `/proc/loadavg` is not namespaced, so every container on one machine reads the same figure:
+/// `boot` — the kernel's `boot_id` — says which machine, so a total counts each one once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLoad {
+    /// The one-minute load average, in hundredths: a whole number, so a header compares exactly.
+    pub centi: u64,
+    /// The machine's logical CPUs, which the load is judged against.
+    pub cores: Option<usize>,
+    pub boot: String,
 }
 
 /// A question in a frame over the list. It names the session by its title: nothing on the
@@ -204,6 +219,9 @@ pub struct View {
     pub status: Option<String>,
     /// Something is being worked on and has taken long enough to show (mockups 10 and 11).
     pub busy: Option<Busy>,
+    /// The load line at the foot of every screen with a footer, under the hints, where Claude
+    /// Code draws its own status line (owner, 2026-10-27): RAM and load across every container.
+    pub load: Option<crate::statusline::Figures>,
 }
 
 /// Docker Compose's spinner (owner, 2026-10-04): ten braille frames, one every 100 ms. Braille
@@ -232,12 +250,14 @@ impl Busy {
     }
 }
 
-/// A colour from the approved table in `docs/mockups.md`. Two, and only two: amber is spent
-/// on the `!` of a session waiting for the owner and nothing else; blue is the keys.
+/// A colour from the approved table in `docs/mockups.md`. Amber is spent on the `!` of a
+/// session waiting for the owner and nothing else; blue is the keys; red is the load line's
+/// figure past its second threshold (2026-10-27), as Claude Code's status line has it red.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colour {
     Amber,
     Blue,
+    Red,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

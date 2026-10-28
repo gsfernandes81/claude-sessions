@@ -103,6 +103,7 @@ impl Place {
             header: Header {
                 host: name.to_string(),
                 memory: None,
+                load: None,
             },
             workspace: "/workspace".to_string(),
             reach: Reach::Connecting,
@@ -476,7 +477,8 @@ impl Menu {
             .as_deref()
             .or(self.status.as_deref())
             .map_or(0, |s| render::status_line_count(self.width, s));
-        let fixed = 3 + status + self.hint_lines();
+        // Header, rule, closing rule and the load line, then status and hints.
+        let fixed = 4 + status + self.hint_lines();
         usize::from(self.height).saturating_sub(fixed).max(1)
     }
 
@@ -513,7 +515,23 @@ impl Menu {
             dialog,
             status: self.status.clone(),
             busy: self.busy.clone(),
+            load: Some(self.load()),
         }
+    }
+
+    /// The load line's figures: the hub's own reading first, then every container answering.
+    fn load(&self) -> crate::statusline::Figures {
+        let answering = self
+            .places
+            .iter()
+            .filter(|p| p.reach == Reach::Up)
+            .map(|p| &p.header);
+        crate::statusline::door(
+            self.home.load.clone(),
+            self.home.memory,
+            answering,
+            &self.home.host,
+        )
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -913,6 +931,7 @@ mod tests {
         Header {
             host: "infra-dev".into(),
             memory: None,
+            load: None,
         }
     }
 
@@ -1388,8 +1407,9 @@ mod tests {
     fn the_cursor_stays_on_screen_in_a_short_terminal() {
         let rows: Vec<Row> = (0..30).map(|i| row(&format!("r{i}"))).collect();
         let mut m = Menu::new(40, 10, header(), "/w".into(), rows);
-        // 10 lines: header, rule, closing rule, two hint lines at 40 columns → 5 rows.
-        assert_eq!(m.capacity(), 5);
+        // 10 lines: header, rule, closing rule, two hint lines at 40 columns, the load line
+        // → 4 rows.
+        assert_eq!(m.capacity(), 4);
         for _ in 0..7 {
             m.key(Key::Down);
         }
@@ -1397,7 +1417,7 @@ mod tests {
         assert_eq!(v.cursor, 7);
         // Line 0 of the list is the Idle heading, so session 7 is on line 8.
         let items = render::layout(&v.rows);
-        let (shown, _) = render::window(&items, v.scroll, 5);
+        let (shown, _) = render::window(&items, v.scroll, 4);
         assert!(shown.contains(&8), "cursor 7 not within {shown:?}");
         m.key(Key::Home);
         assert_eq!(m.view().scroll, 0);

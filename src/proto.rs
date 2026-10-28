@@ -29,7 +29,7 @@
 //! and a menu that shows less beats one that refuses.
 
 use crate::json::Value;
-use crate::ui::{Dialog, Header, Outcome, Row, RowKey};
+use crate::ui::{Dialog, Header, HostLoad, Outcome, Row, RowKey};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::process::Command;
@@ -150,6 +150,16 @@ pub fn header_to(h: &Header) -> Value {
             arr([Value::num(used as f64), Value::num(limit as f64)]),
         );
     }
+    if let Some(l) = &h.load {
+        let mut load = obj(vec![
+            ("centi", Value::num(l.centi as f64)),
+            ("boot", Value::string(&l.boot)),
+        ]);
+        if let Some(cores) = l.cores {
+            load.set("cores", Value::num(cores as f64));
+        }
+        o.set("load", load);
+    }
     o
 }
 
@@ -161,9 +171,19 @@ pub fn header_from(v: &Value) -> Header {
             [used, limit] => Some((used.as_u64()?, limit.as_u64()?)),
             _ => None,
         });
+    // An agent older than the load line sends none, and its machine's load is then unknown —
+    // not zero, which would be a guess.
+    let load = v.get("load").and_then(|l| {
+        Some(HostLoad {
+            centi: l.get("centi")?.as_u64()?,
+            cores: l.get("cores").and_then(Value::as_u64).map(|c| c as usize),
+            boot: s(l, "boot").filter(|b| !b.is_empty())?,
+        })
+    });
     Header {
         host: s(v, "host").unwrap_or_default(),
         memory,
+        load,
     }
 }
 
@@ -471,6 +491,11 @@ mod tests {
         let header = Header {
             host: "infra-dev".into(),
             memory: Some((812 << 20, 1 << 30)),
+            load: Some(HostLoad {
+                centi: 231,
+                cores: Some(4),
+                boot: "6f1c0e8a-pi".into(),
+            }),
         };
         let rows = vec![row(RowKey::Slot("claude-1".into()))];
         let v = wire(&snapshot_to(&header, "/workspace", &rows));
@@ -481,12 +506,25 @@ mod tests {
         let bare = Header {
             host: "x".into(),
             memory: None,
+            load: None,
         };
         assert_eq!(
             snapshot_from(&wire(&snapshot_to(&bare, "/w", &[])), "x")
                 .unwrap()
                 .header,
             bare
+        );
+        // An older agent's header has no load at all, and one that cannot say which machine it
+        // is on is no reading: either is unknown, never zero.
+        let old = json::parse(r#"{"host":"x","memory":[1,2]}"#).unwrap();
+        assert_eq!(header_from(&old).load, None);
+        let nameless = json::parse(r#"{"host":"x","load":{"centi":50,"boot":""}}"#).unwrap();
+        assert_eq!(header_from(&nameless).load, None);
+        // Calibration: the same with its machine named is read.
+        let named = json::parse(r#"{"host":"x","load":{"centi":50,"boot":"pi"}}"#).unwrap();
+        assert_eq!(
+            header_from(&named).load.map(|l| (l.centi, l.cores)),
+            Some((50, None))
         );
         assert_eq!(snapshot_from(&Value::obj(), "x"), None, "not a snapshot");
     }

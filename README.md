@@ -47,7 +47,7 @@ they all mount ([`docs/design.md`](docs/design.md) § *The hub*):
 | `claude-sessions reconcile` | makes the registry agree with reality after a restart |
 | `claude-sessions close` | ends a session without opening it |
 | `claude-sessions doctor` | says what it can and cannot see, per slot |
-| `claude-sessions statusline` | RAM, load and host, for Claude Code's status line |
+| `claude-sessions statusline` | RAM and load across every container, and the host, for Claude Code's status line |
 
 ## Status
 

@@ -18,6 +18,7 @@
 //! terminal as one.
 
 use crate::fmt::human;
+use crate::statusline::Level;
 use crate::ui::{Colour, Dialog, Frame, Group, Row, RowKey, Screen, Span, Style, TooNarrow, View};
 use std::ops::Range;
 
@@ -29,6 +30,10 @@ const FG: Style = Style {
 };
 const DIM: Style = Style { dim: true, ..FG };
 const BOLD: Style = Style { bold: true, ..FG };
+const RED: Style = Style {
+    fg: Some(Colour::Red),
+    ..FG
+};
 const BLUE: Style = Style {
     fg: Some(Colour::Blue),
     ..FG
@@ -220,6 +225,7 @@ fn sgr(style: Style) -> Option<String> {
     match style.fg {
         Some(Colour::Amber) => codes.push("38;5;214"),
         Some(Colour::Blue) => codes.push("38;5;75"),
+        Some(Colour::Red) => codes.push("31"),
         None => {}
     }
     (!codes.is_empty()).then(|| format!("\x1b[{}m", codes.join(";")))
@@ -755,7 +761,33 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     let mut footer = vec![rule(w)];
     footer.extend(status_lines(view, w).iter().map(|l| text(l, FG)));
     footer.extend(hints);
+    footer.extend(load_line(view, w));
     (out, footer)
+}
+
+/// The load line, the footer's last (owner, 2026-10-27): under the hints, as Claude Code draws
+/// its status line under its input. Structure, so dim, as the header's figures are; a figure
+/// past its first threshold is bold, past its second red. Not yellow, which Claude Code's line
+/// uses: beside the menu's amber it would read as *waiting for you*. The words carry the
+/// figures and the levels are emphasis — nothing is colour-only. Cut at the edge, never
+/// wrapped: one line, whatever the width.
+fn load_line(view: &View, w: usize) -> Option<Line> {
+    let f = view.load.as_ref()?;
+    let style = |level| match level {
+        Level::Calm => DIM,
+        Level::Warn => BOLD,
+        Level::High => RED,
+    };
+    let (ram, ram_level) = f.ram();
+    let (load, load_level) = f.load();
+    let mut line = Line::default();
+    line.push(&ram, style(ram_level))
+        .push(", ", DIM)
+        .push(&load, style(load_level))
+        .push(&format!(", {}", f.place()), DIM);
+    let mut cut = Line::default();
+    cut.append(line.cut(w));
+    Some(cut)
 }
 
 /// The status line, wrapped rather than cut: it is usually a reason something was refused,
@@ -926,6 +958,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     );
     let mut footer = vec![rule(w)];
     footer.extend(hint_lines(view_hints(view), GAP, w));
+    footer.extend(load_line(view, w));
     (out, footer)
 }
 
@@ -1077,6 +1110,7 @@ fn boxed(body: Vec<Line>, w: usize, box_w: usize) -> Vec<Line> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::statusline::Figures;
     use crate::ui::{Busy, Header, RowKey};
 
     const MOCKUPS_40: &str = include_str!("../docs/mockups.md");
@@ -1150,6 +1184,7 @@ mod tests {
             header: Header {
                 host: "infra-dev".to_string(),
                 memory: Some((used_mib * MIB, 1024 * MIB)),
+                load: None,
             },
             home: false,
             back: false,
@@ -1163,6 +1198,18 @@ mod tests {
             dialog: None,
             status: None,
             busy: None,
+            load: Some(load_of("infra-dev", used_mib, 1024)),
+        }
+    }
+
+    /// The load line a screen of the mockups shows: its memory, a Pi's 2.3 on four cores.
+    fn load_of(place: &str, used_mib: u64, total_mib: u64) -> Figures {
+        Figures {
+            used: Some(used_mib * MIB),
+            total: Some(total_mib * MIB),
+            load: Some(230),
+            cores: Some(4),
+            place: place.to_string(),
         }
     }
 
@@ -1311,14 +1358,18 @@ mod tests {
             header: Header {
                 host: "dev".to_string(),
                 memory: Some((1946 * MIB, 3072 * MIB)),
+                load: None,
             },
             home: true,
+            load: Some(load_of("dev", 1946, 3072)),
             ..view(w, home_rows(), 0)
         }
     }
+    /// Reached from the hub's home, so the load line is the hub's: every container's.
     fn mockup_13(w: u16) -> View {
         View {
             back: true,
+            load: Some(load_of("dev", 1946, 3072)),
             ..mockup_1(w)
         }
     }
@@ -1327,8 +1378,10 @@ mod tests {
             header: Header {
                 host: "ds-dev".to_string(),
                 memory: None,
+                load: None,
             },
             back: true,
+            load: Some(load_of("dev", 1946, 3072)),
             down: Some("ssh: connect to host ds-dev port 2222: Connection refused".to_string()),
             ..view(w, vec![], 0)
         }
@@ -1443,11 +1496,16 @@ mod tests {
         }
     }
 
-    /// The line the last hint is drawn on: the last line with ink on it. `None` when the
-    /// last ink is not a hint line (it must start with a key from the hint line).
+    /// The line the last hint is drawn on: the line above the load line, which is the last
+    /// with ink on it (owner, 2026-10-27). `None` when the last ink is not the load line, or
+    /// the line above it is not a hint line (it must start with a key from the hint line).
     fn last_hint_line(frame: &Frame) -> Option<usize> {
         let got = lines(frame);
-        let i = got.iter().rposition(|l| !l.is_empty())?;
+        let load = got.iter().rposition(|l| !l.is_empty())?;
+        if !got[load].starts_with("RAM: ") {
+            return None;
+        }
+        let i = load.checked_sub(1)?;
         let keys = ["Enter ", "n ", "c ", "? ", "s "];
         keys.iter().any(|k| got[i].starts_with(k)).then_some(i)
     }
@@ -1547,7 +1605,11 @@ mod tests {
         let p = lines(&render(&mockup_10(40)).unwrap());
         assert_eq!(p[0], "infra-dev · 812M of 1.0G", "no count yet");
         assert_eq!(p[3], "⠋ reading sessions");
-        assert_eq!(p[23], "n new   ? keys   s shell");
+        assert_eq!(p[22], "n new   ? keys   s shell");
+        assert_eq!(
+            p[23], "RAM: 0.8G / 1.0G, Load: 2.3, infra-dev",
+            "the load line, at once"
+        );
         // Calibration: the same empty list, read, says nothing is open.
         let read = View {
             busy: None,
@@ -1731,7 +1793,7 @@ mod tests {
                 let v = build(w);
                 assert_eq!(v.height, 24);
                 let f = render(&v).unwrap();
-                assert_eq!(last_hint_line(&f), Some(23), "mockup {n} at {w}x24");
+                assert_eq!(last_hint_line(&f), Some(22), "mockup {n} at {w}x24");
                 // Mockups 1 and 6 fill the screen, so the footer is at the bottom either way.
                 let expected = mockup(doc, n);
                 if expected.len() == 24 {
@@ -1743,7 +1805,7 @@ mod tests {
                 let old = footer_raised(&f, split, expected.len() - split);
                 assert_eq!(
                     last_hint_line(&old),
-                    Some(expected.len() - 1),
+                    Some(expected.len() - 2),
                     "calibration: the raised footer's last hint is where the mockup draws it"
                 );
                 assert!(
@@ -1950,8 +2012,12 @@ mod tests {
                 let frame = render(&v).expect("mockup 8 draws at this width");
                 check_shape(&frame, &v).unwrap();
                 let got = lines(&frame);
-                // The hint line is the last thing drawn.
-                let end = got.iter().rposition(|l| !l.is_empty()).unwrap() + 1;
+                // The hint line is the last thing drawn above the load line.
+                let end = got
+                    .iter()
+                    .rposition(|l| !l.is_empty() && !l.starts_with("RAM"))
+                    .unwrap()
+                    + 1;
                 let hint = &got[end - expected.len()..end];
                 assert_eq!(hint, expected.as_slice(), "the hint line at {w} columns");
             }
@@ -1991,8 +2057,8 @@ mod tests {
     #[test]
     fn the_mockup_comparison_fails_on_a_wrong_view() {
         // The parse finds real screens, not empty ones that would match anything.
-        assert_eq!(mockup(MOCKUPS_40, 1).len(), 16);
-        assert_eq!(mockup(MOCKUPS_80, 7).len(), 18);
+        assert_eq!(mockup(MOCKUPS_40, 1).len(), 17);
+        assert_eq!(mockup(MOCKUPS_80, 7).len(), 19);
         assert!(mockup(MOCKUPS_40, 5)[0].starts_with("infra-dev · 6 open"));
 
         let wrong_title = {
@@ -2154,7 +2220,7 @@ mod tests {
             chars_styled(&f, |s| s.fg == Some(Colour::Blue)),
             "Enternc?s"
         );
-        let hint = &f.lines[22];
+        let hint = &f.lines[21];
         let blue: Vec<&str> = hint
             .iter()
             .filter(|s| s.style == BLUE)
@@ -2435,7 +2501,12 @@ mod tests {
         // The blank lines between the list and the footer cost a clear and a separator each.
         let keys = render(&mockup_7(40)).unwrap().ansi();
         assert!(keys.contains("\x1b[2K\r\n\x1b[2K\r\n\x1b[2K"));
-        assert!(keys.ends_with(" shell"), "the hint line is the bottom line");
+        // The load line is the bottom line: 812M of 1.0G is past 70%, so its RAM is bold; the
+        // calm load and the place are dim.
+        assert!(
+            keys.ends_with("\x1b[1mRAM: 0.8G / 1.0G\x1b[0m\x1b[2m, Load: 2.3, infra-dev\x1b[0m"),
+            "the load line is the bottom line: {keys:?}"
+        );
     }
 
     // ── The parts the mockups do not draw ─────────────────────────────────────────────
