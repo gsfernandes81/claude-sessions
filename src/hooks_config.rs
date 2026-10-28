@@ -49,9 +49,17 @@ fn timeout_secs(event: &str) -> Option<u32> {
     }
 }
 
+/// The events the mail hook (`mail::hook`) is on: a conversation opening, and each prompt.
+/// Synchronous, because its one line per new message is its stdout, which Claude Code adds
+/// to the context only from a hook it waited for; its work is a directory listing, so the
+/// wait is milliseconds and the timeout is for a stalled disk.
+pub const MAIL_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
+const MAIL_TIMEOUT_SECS: u32 = 10;
+
 /// The settings document, with `exe` as the path to this binary.
 pub fn settings(exe: &str) -> Value {
     let command = format!("{} hook", shell_quote(exe));
+    let mail = format!("{} mail-hook", shell_quote(exe));
     let mut hooks = Value::obj();
     for event in EVENTS {
         let mut handler = Value::obj();
@@ -63,7 +71,17 @@ pub fn settings(exe: &str) -> Value {
         }
         let mut group = Value::obj();
         group.set("hooks", Value::Arr(vec![handler]));
-        hooks.set(event, Value::Arr(vec![group]));
+        let mut groups = vec![group];
+        if MAIL_EVENTS.contains(&event) {
+            let mut handler = Value::obj();
+            handler.set("type", Value::string("command"));
+            handler.set("command", Value::string(mail.as_str()));
+            handler.set("timeout", Value::num(MAIL_TIMEOUT_SECS));
+            let mut group = Value::obj();
+            group.set("hooks", Value::Arr(vec![handler]));
+            groups.push(group);
+        }
+        hooks.set(event, Value::Arr(groups));
     }
     let mut doc = Value::obj();
     doc.set("hooks", hooks);
@@ -184,6 +202,50 @@ mod tests {
                     assert!(is_async, "{event} would make claude wait on the disk");
                     assert_eq!(timeout, None, "{event}: an async hook is never timed out");
                 }
+            }
+        }
+    }
+
+    /// The mail hook is a second handler on exactly the two events it announces on, waited
+    /// for (its stdout is the announcement) and timed out; the registry hook stays first.
+    #[test]
+    fn the_mail_hook_is_on_session_start_and_each_prompt_and_is_waited_for() {
+        let doc = installed();
+        for event in EVENTS {
+            let groups = doc
+                .get("hooks")
+                .and_then(|h| h.get(event))
+                .and_then(Value::as_arr)
+                .expect("groups");
+            let commands: Vec<&str> = groups
+                .iter()
+                .filter_map(|g| g.get("hooks").and_then(Value::as_arr))
+                .flatten()
+                .filter_map(|h| h.get("command").and_then(Value::as_str))
+                .collect();
+            if MAIL_EVENTS.contains(&event) {
+                assert_eq!(
+                    commands,
+                    [
+                        "/usr/local/bin/claude-sessions hook",
+                        "/usr/local/bin/claude-sessions mail-hook"
+                    ],
+                    "{event}"
+                );
+                let h = &groups[1].get("hooks").and_then(Value::as_arr).unwrap()[0];
+                assert_eq!(
+                    h.get("async"),
+                    None,
+                    "{event}: waited for, or its line is lost"
+                );
+                assert!(
+                    h.get("timeout")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|t| t > 0.0),
+                    "{event}: a stalled disk must not hold the prompt for ever"
+                );
+            } else {
+                assert_eq!(commands, ["/usr/local/bin/claude-sessions hook"], "{event}");
             }
         }
     }

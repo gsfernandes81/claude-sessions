@@ -24,6 +24,11 @@ is doing, written only by `claude-sessions hook` from Claude Code's own hook eve
 reads the registry and `zmx list`, never guesses, and opens what the owner picks.
 [`docs/design.md`](docs/design.md) is the specification; read it before writing code.
 
+Since 0.8.0 the hub also carries **agent mail** between the containers (design § *Agent
+mail*): a message body is data, the hub's header is the only identity, the sender's file is
+deleted only after the stored copy is fsynced, and the hook that announces mail says nothing
+when there is none. The policy text, the skills and the compose side are infra's.
+
 ## The rules that have teeth
 
 - **The approved mockups are binding.** [`docs/mockups.md`](docs/mockups.md) was approved by

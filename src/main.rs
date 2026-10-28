@@ -54,6 +54,7 @@ mod keepalive;
 mod launch;
 mod live;
 mod lockfile;
+mod mail;
 mod mem;
 mod menu;
 mod offload;
@@ -108,6 +109,24 @@ fn main() -> ExitCode {
             contained(cmd_hook, log);
             ExitCode::SUCCESS
         }
+        // The mail hook has the same contract: fed by Claude Code, always 0, and the only thing
+        // it may say is its one line per new message.
+        "mail-hook" => {
+            std::panic::set_hook(Box::new(|info| {
+                log(&format!("mail-hook: panicked: {info}"))
+            }));
+            contained(
+                || mail::hook(&mut std::io::stdout().lock(), &log),
+                |e| log(&format!("mail-{e}")),
+            );
+            ExitCode::SUCCESS
+        }
+        "mail-agent" => report(mail::agent()),
+        "mail-loop" => match args.get(1).map(String::as_str) {
+            None => report(mail::run(false)),
+            Some("--once") => report(mail::run(true)),
+            Some(other) => fail(&format!("mail-loop takes only --once, not {other:?}")),
+        },
         "reconcile" => report(cmd_reconcile()),
         "doctor" => report(cmd_doctor()),
         // The menu, when there is a person at a terminal to drive it; the plain list when the
@@ -211,9 +230,15 @@ fn usage() -> String {
                                this one); the list below when not at a terminal
   claude-sessions offload-all  one offload pass in every container, over ssh; run from the
                   [--dry-run]  hub's timer every three minutes
+  claude-sessions mail-loop    carry mail between the containers: each one's outbox into the
+                  [--once]     hub's volume (HUB_MAIL), each queue into its receiver's inbox;
+                               run from the hub's start, for ever, or one pass
   claude-sessions install DIR  put this binary, its hooks drop-in and its skill in DIR, for
                                every container to mount
   claude-sessions agent        a container's half of the hub, run over ssh by the hub
+  claude-sessions mail-agent   a container's half of the mail loop, run over ssh by the hub
+  claude-sessions mail-hook    fed by Claude Code's hooks on stdin; one line per message new
+                               in /workspace/.mail/in, nothing otherwise; always exits 0
   claude-sessions list         every slot here, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart

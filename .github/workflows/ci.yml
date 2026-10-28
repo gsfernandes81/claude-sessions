@@ -196,6 +196,12 @@ jobs:
             printf '| `%s` | `%s` |\n' "$name" "$sum" >> dist/NOTES.md
             printf '%s  %s\n' "$sum" "$name" >> dist/SHA256SUMS
           done
+          # What changed, and what a consumer must know (new environment, a changed file
+          # layout), is docs/releases/<tag>.md when the release has one: written with the
+          # bump, so the notes are reviewed in the same commit as the code they describe.
+          if [ -f "docs/releases/${TAG}.md" ]; then
+            { echo; cat "docs/releases/${TAG}.md"; } >> dist/NOTES.md
+          fi
           cat dist/NOTES.md
       # `--target` makes the tag at this run's commit when it does not exist yet, which is the
       # push-to-main case; for a pushed tag it is ignored. `gh release create` refuses a

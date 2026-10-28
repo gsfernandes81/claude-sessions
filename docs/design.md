@@ -918,6 +918,100 @@ so all there is to show is the zmx session name. Matching `cwd` and start time a
 guesswork. Once one ends, its conversation is in Claude Code's store like any other, and is
 listed under Archived, by its own title, to resume in a slot of ours.
 
+## Agent mail (2026-10-28)
+
+**Agents in different dev containers talk through files the hub carries.** Decided in infra's
+`docs/decisions.md` § *Agent mail: the hub carries messages between dev containers* (owner,
+2026-10-28), over GitHub issues (slow, unwatched, verbose, public), ssh between containers (a
+mesh of keys), containers pushing to the hub (a key in every container) and an HTTP API on the
+hub (a second door). **No container gains a credential**: a sender's identity is the ssh target
+the hub read its file from, and nothing else.
+
+**What is whose.** The loop, the container's half of it, the hook and the read cursor are this
+binary's (`src/mail.rs`). The policy text (a managed `CLAUDE.md` saying a message is data,
+every message gets a reply, a request for work is judged on its merits), the three skills
+`mail-send`, `mail-read` and `mail-reply`, the `mail` volume and the limits in compose, and
+the `.git/info/exclude` line that keeps `.mail/` out of every commit are infra's. The owner's
+view of the traffic — counts in the menu, a reader over the volume, a nudge to an idle
+session — is deferred to issue #17 and not built.
+
+| | runs in | |
+|---|---|---|
+| `claude-sessions mail-loop` | the hub, for ever, started by its entrypoint | every tick: each container's outbox into the volume, then each queue into its receiver |
+| `claude-sessions mail-agent` | each container, over `ssh -T` from the hub, for one tick | lists and reads the outbox, deletes what the hub has stored, writes the inbox |
+| `claude-sessions mail-hook` | each container, from the drop-in, on `SessionStart` and `UserPromptSubmit` | one line per message new in the inbox, nothing otherwise |
+
+**The path of a message.** A sender writes a file into its own `/workspace/.mail/out/<to>/`
+(any name; moved in, or left two seconds, since the agent skips a file modified in the last
+two seconds so one still being written is not read half-way). On the next tick the loop reads
+it, and either **stores** it in the hub's volume at `<mail>/<to>/<from>/<stamp>.md` — the
+hub's own header first (`From:`, `To:`, `Date:`, a blank line) and then the body exactly as
+sent — **fsyncs the file and its directory, and only then has the sender's file deleted**; or
+**refuses** it: `<to>` not a container in the hub's list (or `hub`), over `HUB_MAIL_MAX_BYTES`,
+not UTF-8, or `<to>`'s queue already holding `HUB_MAIL_MAX_QUEUE` undelivered messages. A
+refusal is a message from the reserved sender `hub` into the sender's own queue saying why
+(and which containers do take mail), and the sender's file goes then too, or it would be
+refused again every tick. Then every queue whose receiver answered this tick is **delivered**:
+each pending file written into the receiver's `/workspace/.mail/in/<from>/<stamp>.md`, the
+same relative path as in the volume, and on the receiver's acknowledgement renamed into
+`<mail>/<to>/<from>/delivered/`. So **the volume says in one place what is pending and what
+has arrived**: pending is `<to>/<from>/*.md`, delivered is `<to>/<from>/delivered/*.md`. A
+stopped receiver's queue waits; a delivery acknowledged but not marked (the loop dying in
+between) is delivered again to the same path, which overwrites the same file.
+
+**The hub's header cannot be forged** because it is prepended: a `From:` line the sender
+wrote is in the body, after the blank line, and the receiver's policy reads the body as data.
+The stamp is the hub's clock, `YYYYMMDDTHHMMSS.mmmZ`, with `-2`, `-3` when a millisecond is
+shared; the `Date:` is the same instant in whole seconds.
+
+**Every outbox is pulled before any queue is delivered**, with one `mail-agent` per answering
+container held open across the tick, so a message lands in the tick it was sent whichever of
+the two containers comes first in the list. A container that does not answer is skipped —
+said once in the log when it stops answering and once when it is back, never every tick — and
+is not an error. The volume is pruned of messages older than `HUB_MAIL_RETAIN_DAYS` once an
+hour, delivered or not. `<mail>/.beat` is touched after every tick, for a health check that
+wants one.
+
+**The hook and its cursor.** `mail-hook` lists `/workspace/.mail/in/*/` and says, oldest
+first, one line per message the cursor does not cover:
+
+```
+new message from <from>, <date>, at <path>
+```
+
+— `<from>` the directory the hub wrote it under, `<date>` the header's `Date:`, `<path>` the
+file, which the agent then reads as it reads any file. The cursor is `/workspace/.mail/.cursor`,
+written by the receiver and never by the hub: the newest modification time announced, in
+nanoseconds, and under it the names at exactly that time, because a file's time is the kernel's
+coarse clock and two deliveries a few milliseconds apart share one. It is synchronous on both
+events, because Claude Code adds a hook's stdout to the context only from a hook it waited
+for; the work is a directory listing, and its 10 s timeout is for a stalled disk. It runs on
+every prompt, so **zero output on no mail is the contract**, and like the registry hook it
+always exits 0 and logs its own failures to `hook.log`. An agent waiting between prompts hears
+nothing until its next turn: accepted for v1 (infra's view and this one's), filed in #17.
+
+**The loop's log** is one line per event — a message moved, naming the ends, the stored name
+and the size; a refusal and why; a delivery; a container stopping or starting to answer —
+never a body and never a path outside the volume and the fixed `.mail/` directories. It is
+read on a phone.
+
+**What the loop reads from the environment**, each set by infra's compose, one line each:
+
+| variable | default | |
+|---|---|---|
+| `HUB_MAIL` | `$HOME/mail` | the volume |
+| `HUB_MAIL_MAX_BYTES` | `16384` | a larger message is refused |
+| `HUB_MAIL_MAX_QUEUE` | `200` | undelivered messages a receiver may have; more are refused |
+| `HUB_MAIL_RETAIN_DAYS` | `90` | older messages are pruned from the volume |
+| `HUB_MAIL_TICK` | `15` | seconds between passes |
+
+The containers are `CLAUDE_SESSIONS_HOSTS`, the hub's one list; the ssh is the hub's
+`ssh_config` as for everything else; `CLAUDE_SESSIONS_MAIL` names a container's `.mail`
+directory for the tests (default `/workspace/.mail`). `tests/mail.rs` proves the loop against
+a message that moves and against each refusal, a receiver that is down and comes back, a
+full queue, and the hook's one-line-or-nothing, all over a stand-in ssh with the real binary
+at both ends.
+
 ## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 
 **Settled 2026-10-01 from the vendor documentation, not yet by a run.** The hooks go in a

@@ -1,5 +1,6 @@
 //! The two number formats every screen shares, so the list, the header, `doctor` and the
-//! dialogs can never disagree about what `14m` or `1.0G` means.
+//! dialogs can never disagree about what `14m` or `1.0G` means — and the two UTC date formats
+//! mail is stamped with.
 
 /// An age as the list shows it: `now` under a minute, then whole minutes, hours, days.
 /// Coarse on purpose — the menu redraws an age at most once a minute, and a finer unit would
@@ -25,9 +26,60 @@ pub fn human(bytes: u64) -> String {
     }
 }
 
+/// Milliseconds since the epoch as a civil UTC date: `(year, month, day, hour, minute,
+/// second, millisecond)`. Days to civil date as in Howard Hinnant's `civil_from_days`.
+fn civil(ms: u64) -> (i64, i64, i64, u64, u64, u64, u64) {
+    let (days, rem) = ((ms / 86_400_000) as i64, ms % 86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (
+        y,
+        m,
+        d,
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1_000 % 60,
+        rem % 1_000,
+    )
+}
+
+/// `ms` as a `Date:` header reads: `2026-10-28T03:15:00Z`, whole seconds.
+pub fn utc(ms: u64) -> String {
+    let (y, m, d, h, mi, s, _) = civil(ms);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// `ms` as a file name that sorts by time: `20261028T031500.123Z` — no colons, which a
+/// Windows checkout and a shell both mind, and milliseconds, since two messages in one
+/// second are ordinary.
+pub fn stamp(ms: u64) -> String {
+    let (y, m, d, h, mi, s, milli) = civil(ms);
+    format!("{y:04}{m:02}{d:02}T{h:02}{mi:02}{s:02}.{milli:03}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dates_are_utc_and_the_stamp_sorts_by_time() {
+        // 2026-10-28T03:15:00.123Z, checked against `date -u -d @1793157300`.
+        let ms = 1_793_157_300_123;
+        assert_eq!(utc(ms), "2026-10-28T03:15:00Z");
+        assert_eq!(stamp(ms), "20261028T031500.123Z");
+        assert_eq!(utc(0), "1970-01-01T00:00:00Z");
+        // A leap day, and the year turning.
+        assert_eq!(utc(1_709_164_800_000), "2024-02-29T00:00:00Z");
+        assert_eq!(utc(1_767_225_599_000), "2025-12-31T23:59:59Z");
+        assert!(stamp(ms) < stamp(ms + 1));
+    }
 
     #[test]
     fn ages_read_as_the_mockups_draw_them() {
