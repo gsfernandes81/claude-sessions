@@ -43,7 +43,12 @@ pub const HUB: &str = "hub";
 
 /// A container's mail directory: `CLAUDE_SESSIONS_MAIL`, else `/workspace/.mail`.
 pub fn container_dir() -> PathBuf {
-    match std::env::var_os("CLAUDE_SESSIONS_MAIL") {
+    container_dir_from(std::env::var_os("CLAUDE_SESSIONS_MAIL"))
+}
+
+/// [`container_dir`] from the variable's value; set but empty is unset.
+fn container_dir_from(var: Option<std::ffi::OsString>) -> PathBuf {
+    match var {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => PathBuf::from("/workspace/.mail"),
     }
@@ -200,7 +205,7 @@ fn pull_outbox(dir: &Path, max: u64) -> Vec<Value> {
             let Ok(meta) = fs::symlink_metadata(f.path()) else {
                 continue;
             };
-            if !meta.is_file() || meta.modified().is_ok_and(|m| m > settled) {
+            if !meta.is_file() || settling(&meta, settled) {
                 continue;
             }
             let mut file = Value::obj();
@@ -222,6 +227,11 @@ fn pull_outbox(dir: &Path, max: u64) -> Vec<Value> {
     let n = out.len();
     out.push(reply("pulled", Value::num(n as f64)));
     out
+}
+
+/// Written after `settled`: possibly still being written, so left for a later pull.
+fn settling(meta: &fs::Metadata, settled: SystemTime) -> bool {
+    meta.modified().is_ok_and(|m| m > settled)
 }
 
 fn named<'a>(v: &'a Value, key: &str) -> io::Result<&'a str> {
@@ -443,15 +453,19 @@ pub struct Limits {
 
 impl Limits {
     pub fn from_env() -> Limits {
+        Limits::from_vars(|key| std::env::var_os(key))
+    }
+
+    /// [`Limits::from_env`] from `var`, the environment's lookup.
+    fn from_vars(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Limits {
         let num = |key: &str, default: u64| -> u64 {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
+            var(key)
+                .and_then(|v| v.to_str()?.trim().parse().ok())
                 .unwrap_or(default)
         };
-        let dir = match std::env::var_os("HUB_MAIL") {
+        let dir = match var("HUB_MAIL") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => std::env::var_os("HOME")
+            _ => var("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/home/dev"))
                 .join("mail"),
@@ -716,9 +730,13 @@ fn refusal_of(f: &Value, to: &str, hosts: &[String], limits: &Limits) -> Option<
 
 /// Store a message in the volume with the hub's header, durably; the stored name.
 fn store(dir: &Path, to: &str, from: &str, body: &str) -> io::Result<String> {
+    store_at(dir, to, from, body, now_ms())
+}
+
+/// [`store`] at `now`.
+fn store_at(dir: &Path, to: &str, from: &str, body: &str, now: u64) -> io::Result<String> {
     let qdir = dir.join(to).join(from);
     fs::create_dir_all(&qdir)?;
-    let now = now_ms();
     let base = stamp(now);
     let mut name = format!("{base}.md");
     let mut n = 1;
@@ -1023,6 +1041,120 @@ mod tests {
         assert_ne!(name, second, "two in one millisecond still get two names");
         assert_eq!(queue(&dir, "or3").len(), 2);
         assert_eq!(pending(&dir, "infra"), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_settings_default_and_an_empty_variable_is_unset() {
+        use std::ffi::OsString;
+        assert_eq!(container_dir_from(None), PathBuf::from("/workspace/.mail"));
+        assert_eq!(
+            container_dir_from(Some(OsString::new())),
+            PathBuf::from("/workspace/.mail")
+        );
+        assert_eq!(container_dir_from(Some("/m".into())), PathBuf::from("/m"));
+        let with = |pairs: &'static [(&'static str, &'static str)]| {
+            Limits::from_vars(move |k| pairs.iter().find(|p| p.0 == k).map(|p| p.1.into()))
+        };
+        let d = with(&[("HOME", "/home/x")]);
+        assert_eq!(d.dir, PathBuf::from("/home/x/mail"));
+        assert_eq!((d.max_bytes, d.max_queue), (16_384, 200));
+        assert_eq!(d.retain, Duration::from_secs(90 * 86_400));
+        assert_eq!(d.tick, Duration::from_secs(15));
+        let set = with(&[
+            ("HUB_MAIL", "/v"),
+            ("HUB_MAIL_MAX_BYTES", " 10 "),
+            ("HUB_MAIL_MAX_QUEUE", "3"),
+            ("HUB_MAIL_RETAIN_DAYS", "2"),
+            ("HUB_MAIL_TICK", "0"),
+        ]);
+        assert_eq!(set.dir, PathBuf::from("/v"));
+        assert_eq!((set.max_bytes, set.max_queue), (10, 3));
+        assert_eq!(set.retain, Duration::from_secs(2 * 86_400));
+        assert_eq!(set.tick, Duration::from_secs(1), "never a busy loop");
+        let empty = with(&[("HUB_MAIL", ""), ("HOME", "/home/x")]);
+        assert_eq!(empty.dir, PathBuf::from("/home/x/mail"));
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_limit_is_carried() {
+        let dir = tmp("limit");
+        let out = dir.join("out/infra");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("a.md"), "x".repeat(10)).unwrap();
+        settled(&out.join("a.md"));
+        let got = answer(&dir, &json::parse(r#"{"pull":{"max":10}}"#).unwrap());
+        assert!(
+            json::to_line(&got[0]).contains(r#""text":"xxxxxxxxxx""#),
+            "{got:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_file_already_gone_is_done_and_anything_else_failing_is_an_error() {
+        let dir = tmp("delete");
+        fs::create_dir_all(dir.join("out/infra/a-dir.md")).unwrap();
+        let del = |name: &str| {
+            let req = format!(r#"{{"delete":{{"to":"infra","name":"{name}"}}}}"#);
+            json::to_line(&answer(&dir, &json::parse(&req).unwrap())[0])
+        };
+        assert_eq!(del("gone.md"), r#"{"deleted":true}"#);
+        assert!(
+            del("a-dir.md").starts_with(r#"{"error":"#),
+            "{}",
+            del("a-dir.md")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hidden_directory_in_the_inbox_is_not_a_sender() {
+        let dir = tmp("hidden");
+        put(&inbox_path(&dir, ".partial", "1.md"), b"x\n", false).unwrap();
+        assert!(inbox_since(&dir, &Cursor::parse("")).is_empty());
+        // Calibration: the same file from a sender is announced.
+        put(&inbox_path(&dir, "infra", "1.md"), b"x\n", false).unwrap();
+        assert_eq!(inbox_since(&dir, &Cursor::parse("")).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_taken_now_or_delivered_before_gets_the_next_number() {
+        let dir = tmp("names");
+        let now = 1_793_157_300_123;
+        let base = stamp(now);
+        assert_eq!(
+            store_at(&dir, "or3", "infra", "a", now).unwrap(),
+            format!("{base}.md")
+        );
+        assert_eq!(
+            store_at(&dir, "or3", "infra", "b", now).unwrap(),
+            format!("{base}-2.md")
+        );
+        // One delivered under the next name holds it too: it is never overwritten.
+        let done = dir.join("or3/infra/delivered");
+        fs::create_dir_all(&done).unwrap();
+        fs::write(done.join(format!("{base}-3.md")), "old").unwrap();
+        assert_eq!(
+            store_at(&dir, "or3", "infra", "c", now).unwrap(),
+            format!("{base}-4.md")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queue_is_messages_from_senders_and_nothing_else() {
+        let dir = tmp("queue");
+        store(&dir, "or3", "infra", "one\n").unwrap();
+        fs::write(dir.join("or3/infra/notes.txt"), "x").unwrap();
+        fs::create_dir_all(dir.join("or3/infra/folder.md")).unwrap();
+        fs::create_dir_all(dir.join("or3/.odd")).unwrap();
+        fs::write(dir.join("or3/.odd/1.md"), "x").unwrap();
+        fs::write(dir.join("or3/stray.md"), "x").unwrap();
+        let q = queue(&dir, "or3");
+        assert_eq!(q.len(), 1, "{q:?}");
+        assert_eq!(q[0].0, "infra");
         let _ = fs::remove_dir_all(&dir);
     }
 
