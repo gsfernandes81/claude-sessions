@@ -187,7 +187,12 @@ mod tests {
 
     #[test]
     fn a_worker_that_dies_is_reported_rather_waited_for() {
-        let work = Work::spawn(Box::new(|_: &mut dyn Terminal| panic!("boom")));
+        // Unwound without the panic hook: a real panic runs `term.rs`'s hook, which puts back
+        // whichever terminal another test has raw at that moment — a terminal test then read
+        // the leave sequence it never wrote (CI, 2026-10-28). The worker dies just the same.
+        let work = Work::spawn(Box::new(|_: &mut dyn Terminal| {
+            std::panic::resume_unwind(Box::new("boom"))
+        }));
         let mut got = None;
         for _ in 0..100 {
             if let Some(ev) = work.next(Duration::from_millis(50)) {
