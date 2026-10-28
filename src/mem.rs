@@ -39,7 +39,16 @@ fn read_u64(path: &str) -> Option<u64> {
 }
 
 pub fn read() -> Memory {
-    read_at("/sys/fs/cgroup")
+    read_at(&cgroup())
+}
+
+/// This container's cgroup: `/sys/fs/cgroup`, or `CLAUDE_SESSIONS_CGROUP` for the tests, so
+/// that what they find room for does not depend on how full the machine running them is.
+fn cgroup() -> String {
+    std::env::var("CLAUDE_SESSIONS_CGROUP")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/sys/fs/cgroup".into())
 }
 
 /// The same reading of any cgroup v2 directory: the hub reads the dev containers' shared pool
@@ -106,7 +115,7 @@ impl Memory {
 /// an unrelated kill in the same moment would be misread as this one; that is rare enough for
 /// a dialog that only ever adds a hint.
 pub fn oom_kills() -> Option<u64> {
-    oom_kill_in(&fs::read_to_string("/sys/fs/cgroup/memory.events").ok()?)
+    oom_kill_in(&fs::read_to_string(format!("{}/memory.events", cgroup())).ok()?)
 }
 
 fn oom_kill_in(events: &str) -> Option<u64> {

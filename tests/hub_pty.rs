@@ -100,9 +100,13 @@ exec "$@""#,
     /// command in a forked copy of itself, which is named `zmx` as a real daemon is.
     fn container(&self, host: &str) -> PathBuf {
         let d = self.0.join(host);
-        for sub in ["registry", "zmx", "cc", "work", "bin"] {
+        for sub in ["registry", "zmx", "cc", "work", "bin", "cgroup"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
+        // A cgroup with room, so a resume here never depends on how full the machine running
+        // the test is: 1 GiB used of 8.
+        std::fs::write(d.join("cgroup/memory.max"), "8589934592\n").unwrap();
+        std::fs::write(d.join("cgroup/memory.current"), "1073741824\n").unwrap();
         let zmx_dir = d.join("zmx");
         script(
             &d.join("bin/zmx"),
@@ -144,13 +148,14 @@ exec sleep 600"#,
             format!(
                 "export CLAUDE_SESSIONS_DIR='{reg}' CLAUDE_SESSIONS_ZMX='{zmx}' ZMX_DIR='{zdir}' \
                  CLAUDE_SESSIONS_CLAUDE='{claude}' CLAUDE_SESSIONS_WORKSPACE='{work}' \
-                 CLAUDE_CONFIG_DIR='{cc}'\n",
+                 CLAUDE_CONFIG_DIR='{cc}' CLAUDE_SESSIONS_CGROUP='{cgroup}'\n",
                 reg = d.join("registry").display(),
                 zmx = d.join("bin/zmx").display(),
                 zdir = zmx_dir.display(),
                 claude = d.join("bin/claude").display(),
                 work = d.join("work").display(),
                 cc = d.join("cc").display(),
+                cgroup = d.join("cgroup").display(),
             ),
         )
         .unwrap();
