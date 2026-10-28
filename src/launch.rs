@@ -103,6 +103,8 @@ pub struct Deps {
     /// The memory reading behind the no-room check.
     pub memory: fn() -> mem::Memory,
     pub quick: Duration,
+    /// How long a start that died quickly gives zmx to drop its session (`SESSION_SETTLE`).
+    pub settle: Duration,
     /// The container's OOM-kill count (`mem::oom_kills`), read around each start.
     pub oom_kills: fn() -> Option<u64>,
     /// Whether the login has set this environment variable, which the slot's claude then
@@ -119,6 +121,7 @@ impl Deps {
             memory: mem::read,
             oom_kills: mem::oom_kills,
             quick: QUICK_FAIL,
+            settle: SESSION_SETTLE,
             // The login is the hub's when this runs in a container's agent, and it sends
             // what that login set (`agent::preset`).
             preset: |key| std::env::var_os(key).is_some() || crate::agent::preset(key),
@@ -438,7 +441,7 @@ fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -
     if let Err(why) = run_child(&mut cmd, term) {
         return Outcome::Refused(why);
     }
-    match settle(slot, None, false) {
+    match settle(slot, None, false, deps.settle) {
         After::Running => detached(),
         After::Ended | After::DiedUnbound => ended(&n),
     }
@@ -534,7 +537,7 @@ fn resume(
             return Outcome::Refused(why);
         }
     };
-    match settle(slot, Some(back_to), took < deps.quick) {
+    match settle(slot, Some(back_to), took < deps.quick, deps.settle) {
         After::Running => detached(),
         After::Ended => ended(n),
         // Gone with no SessionStart: claude never got as far as running the conversation.
@@ -773,7 +776,7 @@ fn resume_conversation(
             return Outcome::Refused(why);
         }
     };
-    match settle(&slot, Some(State::Closed), took < deps.quick) {
+    match settle(&slot, Some(State::Closed), took < deps.quick, deps.settle) {
         After::Running => detached(),
         After::Ended => ended(n),
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
@@ -817,7 +820,7 @@ pub(crate) fn new_session_with(
     };
     // A new slot that dies unbound is closed rather than offloaded: it never had a
     // conversation, so there is nothing for a row to bring back.
-    match settle(&slot, Some(State::Closed), took < deps.quick) {
+    match settle(&slot, Some(State::Closed), took < deps.quick, deps.settle) {
         After::Running => detached(),
         After::Ended => ended("the new session"),
         After::DiedUnbound if took < deps.quick => {
@@ -1129,14 +1132,14 @@ enum After {
 /// `unbound_death` is the state a start that died without ever being bound goes back to, and
 /// `just_started` says the child returned quickly enough for that to be the explanation, so
 /// the socket is given a moment to go.
-fn settle(slot: &str, unbound_death: Option<State>, just_started: bool) -> After {
+fn settle(slot: &str, unbound_death: Option<State>, just_started: bool, wait: Duration) -> After {
     if just_started
         && registry::load(slot)
             .ok()
             .flatten()
             .is_some_and(|r| r.pid.is_none())
     {
-        wait_session_gone(slot, SESSION_SETTLE);
+        wait_session_gone(slot, wait);
     }
     let lock = SlotLock::acquire(&registry::lock_path(slot), INTERACTIVE_WAIT).ok();
     let Ok(Some(mut rec)) = registry::load(slot) else {
@@ -1283,6 +1286,9 @@ mod tests {
     use std::process::{Child, Stdio};
     use std::sync::{Barrier, Mutex, MutexGuard};
 
+    /// The settle wait in tests: the fakes drop a session as their command exits.
+    const SETTLE_IN_TESTS: Duration = Duration::ZERO;
+
     static ENV: Mutex<()> = Mutex::new(());
 
     struct Fixture {
@@ -1427,6 +1433,7 @@ exit 1"#,
                 memory: room,
                 oom_kills: || Some(0),
                 quick: QUICK_FAIL,
+                settle: SETTLE_IN_TESTS,
                 preset: |_| false,
             }
         }
@@ -2444,6 +2451,7 @@ exit 1"#,
             memory: room,
             oom_kills: || Some(0),
             quick: QUICK_FAIL,
+            settle: SETTLE_IN_TESTS,
             preset: |key| key == "CLAUDE_CODE_DISABLE_MOUSE",
         };
         let cmd = start_command("claude-3", Path::new("/r/e"), &[], &deps);
@@ -2489,6 +2497,7 @@ exit 1"#,
             memory: room,
             oom_kills: || Some(0),
             quick: QUICK_FAIL,
+            settle: SETTLE_IN_TESTS,
             preset: |_| false,
         };
         let cmd = start_command(
