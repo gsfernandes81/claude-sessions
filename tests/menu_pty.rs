@@ -20,6 +20,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
+/// A stand-in cgroup whose figures never move, for the menu's own memory: with no pool the
+/// header shows this container's, and a figure that changed mid-test — a build next door —
+/// rewrote a line in a window the idle checks require to be silent.
+fn steady_cgroup() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("cs-menu-cgroup-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("memory.max"), "8589934592\n").unwrap();
+    std::fs::write(d.join("memory.current"), "1073741824\n").unwrap();
+    d
+}
+
 /// A transcript with an exchange in it: a conversation on disk to resume.
 const PROMPTED: &str = r#"{"type":"user","message":{"role":"user","content":"hello"}}
 "#;
@@ -146,6 +157,7 @@ fn an_idle_menu_writes_nothing_and_a_registry_change_redraws_it() {
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     // The load line read once an hour: what the idle checks below watch is everything else.
     cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
+    cmd.env("CLAUDE_SESSIONS_CGROUP", steady_cgroup());
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -253,6 +265,7 @@ fn too_narrow_a_terminal_is_refused_before_it_is_touched() {
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     // The load line read once an hour: what the idle checks below watch is everything else.
     cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
+    cmd.env("CLAUDE_SESSIONS_CGROUP", steady_cgroup());
     cmd.env("CLAUDE_SESSIONS_DIR", root.join("registry"))
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&root.join("zmx")))
         .env("ZMX_DIR", root.join("zmx"));
@@ -309,6 +322,7 @@ fn putting_a_session_away_turns_the_spinner_smoothly_then_falls_silent() {
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     // The load line read once an hour: what the idle checks below watch is everything else.
     cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
+    cmd.env("CLAUDE_SESSIONS_CGROUP", steady_cgroup());
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -431,6 +445,7 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     // The load line read once an hour: what the idle checks below watch is everything else.
     cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
+    cmd.env("CLAUDE_SESSIONS_CGROUP", steady_cgroup());
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
@@ -503,6 +518,7 @@ fn a_terminal_that_hangs_up_ends_the_menu_quietly() {
     cmd.env("CLAUDE_SESSIONS_HOSTS", "local");
     // The load line read once an hour: what the idle checks below watch is everything else.
     cmd.env("CLAUDE_SESSIONS_LOAD_MS", "3600000");
+    cmd.env("CLAUDE_SESSIONS_CGROUP", steady_cgroup());
     cmd.env("CLAUDE_SESSIONS_DIR", &reg)
         .env("CLAUDE_SESSIONS_ZMX", no_sessions(&abd))
         .env("ZMX_DIR", &abd)
