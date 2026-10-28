@@ -1286,14 +1286,13 @@ mod tests {
     use std::process::{Child, Stdio};
     use std::sync::{Barrier, Mutex, MutexGuard};
 
-    /// The settle wait in tests: the fakes drop a session as their command exits.
-    const SETTLE_IN_TESTS: Duration = Duration::ZERO;
-
     static ENV: Mutex<()> = Mutex::new(());
 
     struct Fixture {
         root: PathBuf,
         kids: Vec<Child>,
+        /// Whether the claude this fixture wrote stays up (`claude_ok`).
+        lasting: std::cell::Cell<bool>,
         _env: MutexGuard<'static, ()>,
     }
 
@@ -1315,6 +1314,7 @@ mod tests {
             let f = Fixture {
                 root,
                 kids: Vec::new(),
+                lasting: std::cell::Cell::new(false),
                 _env: guard,
             };
             // Listing works from the start, before a test chooses how attaching behaves.
@@ -1386,9 +1386,14 @@ exit 2"#,
         }
 
         /// A claude that stays up: it records its pid, directory and arguments, and the
-        /// scrollback variables it was given, writes a line to stderr, and becomes a long sleep
-        /// under the same pid.
+        /// scrollback variables it was given, writes a line to stderr, and waits under the
+        /// same pid while the fixture's directory and the test binary are both there. So it
+        /// ends with the test even when the test is over before it has recorded its pid for
+        /// `drop` to kill, which under load left a `sleep 600` holding the test run's output
+        /// open for ten minutes; and with the binary, if its writes raced `drop`'s removal of
+        /// the directory and kept it.
         fn claude_ok(&self) -> String {
+            self.lasting.set(true);
             self.script(
                 "claude",
                 &format!(
@@ -1396,10 +1401,12 @@ exit 2"#,
 echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{}"
 echo "${{CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN-unset}} ${{CLAUDE_CODE_DISABLE_MOUSE-unset}} ${{CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL-unset}}" >> "{}"
 echo "a warning on stderr" >&2
-exec sleep 600"#,
+while [ -d "{}" ] && kill -0 {}; do sleep 0.2; done"#,
                     self.path("claude.log").display(),
                     self.path("claude.started").display(),
-                    self.path("claude.env").display()
+                    self.path("claude.env").display(),
+                    self.root.display(),
+                    std::process::id()
                 ),
             )
         }
@@ -1414,6 +1421,7 @@ exec sleep 600"#,
 
         /// A claude that fails as `--resume` of a missing transcript does.
         fn claude_fails(&self) -> String {
+            self.lasting.set(false);
             self.script(
                 "claude",
                 &format!(
@@ -1433,7 +1441,15 @@ exit 1"#,
                 memory: room,
                 oom_kills: || Some(0),
                 quick: QUICK_FAIL,
-                settle: SETTLE_IN_TESTS,
+                // A claude that stays up never drops its session, so the settle wait would
+                // run its whole second for nothing in every test that starts one; one that
+                // fails gets the real wait, which ends once the stand-in's session is gone
+                // and which a loaded machine needs (two tests failed with none, 2026-10-28).
+                settle: if self.lasting.get() {
+                    Duration::ZERO
+                } else {
+                    SESSION_SETTLE
+                },
                 preset: |_| false,
             }
         }
@@ -1488,7 +1504,13 @@ exit 1"#,
                 let _ = kid.kill();
                 let _ = kid.wait();
             }
-            let _ = std::fs::remove_dir_all(&self.root);
+            // A stand-in still writing its files can refill the directory mid-removal.
+            for _ in 0..5 {
+                if std::fs::remove_dir_all(&self.root).is_ok() || !self.root.exists() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
 
@@ -1608,8 +1630,10 @@ exit 1"#,
         r.state = State::Offloaded;
         r.session_id = Some(session.into());
         r.cwd = Some(cwd.into());
-        // Beside the test's other files, never in `cwd`, which may be `/`.
-        let dir = std::env::temp_dir().join(format!("cs-launch-conv-{}", std::process::id()));
+        // Beside the test's other files, never in `cwd`, which may be `/`: in the fixture's
+        // root, which every caller holds (and with it the registry's directory), so it goes
+        // when the fixture does.
+        let dir = registry::dir().with_file_name("conversations");
         std::fs::create_dir_all(&dir).unwrap();
         let transcript = dir.join(format!("{slot}-{session}.jsonl"));
         std::fs::write(&transcript, PROMPTED).unwrap();
@@ -1757,7 +1781,12 @@ exit 1"#,
         assert_eq!(rec.state, State::Live);
         assert_eq!(rec.pid, None, "unbound until SessionStart");
         assert!(rec.last_attach_ms > 0);
-        let captured = std::fs::read_to_string(stderr_path("claude-1")).unwrap();
+        // The stand-in writes it after the line `started` waited for.
+        let captured = wait_for("its stderr", || {
+            std::fs::read_to_string(stderr_path("claude-1"))
+                .ok()
+                .filter(|s| s.ends_with('\n'))
+        });
         assert_eq!(captured, "a warning on stderr\n");
         let env = wait_for("its environment", || f.claude_env().pop());
         assert_eq!(
@@ -2451,7 +2480,7 @@ exit 1"#,
             memory: room,
             oom_kills: || Some(0),
             quick: QUICK_FAIL,
-            settle: SETTLE_IN_TESTS,
+            settle: SESSION_SETTLE,
             preset: |key| key == "CLAUDE_CODE_DISABLE_MOUSE",
         };
         let cmd = start_command("claude-3", Path::new("/r/e"), &[], &deps);
@@ -2497,7 +2526,7 @@ exit 1"#,
             memory: room,
             oom_kills: || Some(0),
             quick: QUICK_FAIL,
-            settle: SETTLE_IN_TESTS,
+            settle: SESSION_SETTLE,
             preset: |_| false,
         };
         let cmd = start_command(

@@ -963,11 +963,25 @@ mod tests {
         assert_eq!(how, Stopped::ByTerm);
         polite.wait().ok();
 
-        let mut stubborn = std::process::Command::new("sh")
-            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
-            .spawn()
-            .expect("spawn");
-        let pid = stubborn.id();
+        // Killed when the test ends however it ends: it ignores TERM, so a `stop` that fails
+        // to escalate (a mutant, say) would otherwise leave it looping for good, holding the
+        // test run's output open.
+        struct Reaped(std::process::Child);
+        impl Drop for Reaped {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stubborn = Reaped(
+            std::process::Command::new("sh")
+                .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn"),
+        );
+        let pid = stubborn.0.id();
         let start = procinfo::start_time(pid).unwrap();
         // Let the shell install its trap before it is tested.
         sleep(Duration::from_millis(200));
@@ -979,6 +993,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(how, Stopped::ByKill);
-        stubborn.wait().ok();
     }
 }

@@ -17,12 +17,13 @@ license = "AGPL-3.0-or-later"
 #      these containers, so an unknown or renamed field must degrade to "no evidence"
 #      rather than to an error on the door. src/json.rs reads a Value tree, which does that
 #      more honestly than a struct of twelve Options.
-#   3. The container this is developed in HAS NO C LINKER and no way to install one, so a
-#      crate with a build script or a proc macro cannot be compiled here at all. With no
-#      dependencies the whole crate builds and its tests run against
-#      aarch64-unknown-linux-musl using the toolchain's own rust-lld — see
-#      .cargo/config.toml. A dependency on serde would mean the tests could only ever be
-#      run in CI, and the tests are the product.
+#   3. Until 2026-10-27 the container this is developed in HAD NO C LINKER, so a crate with
+#      a build script or a proc macro could not be compiled there at all, and a dependency
+#      on serde would have meant the tests only ever ran in CI. The owner has since let a C
+#      toolchain into the image; whether the crate now takes dependencies is the owner's
+#      call (CLAUDE.md), and until then it takes none. The tests still build and run
+#      against aarch64-unknown-linux-musl with the toolchain's own rust-lld — see
+#      .cargo/config.toml — which is what ships.
 #
 # The syscalls needed are declared directly, each with a note on why its layout is the same
 # on both targets: flock in src/lockfile.rs; kill and the pidfd calls in src/signal.rs;
@@ -38,3 +39,9 @@ strip = true
 # Panics unwind, as they do in the tests. Aborting would make any panic a SIGABRT and a core
 # dump in the cwd (a git checkout, for the menu; issue #6), show a panicking synchronous hook
 # to the person, and kill the whole menu where the tests see a worker thread's panic caught.
+
+# For cargo-mutants (.cargo/mutants.toml): the test profile without debug info, so the build
+# each mutant pays is smaller.
+[profile.mutants]
+inherits = "test"
+debug = "none"
