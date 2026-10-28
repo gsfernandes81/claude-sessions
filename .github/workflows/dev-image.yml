@@ -1,0 +1,126 @@
+name: dev-image
+
+# Build this repo's dev container image (Dockerfile.dev) and push it to ghcr, so infra can pull
+# it instead of building it on zero from a git context. Since 2026-10-27 the image compiles
+# cargo-mutants, which is minutes of Rust on a Pi at every rebuild; built here once, it is a
+# pull, and a pull of only the layers that changed.
+#
+# NATIVE ON EACH ARCHITECTURE, NEVER QEMU. infra's dev-base builds both platforms on one runner
+# under QEMU, which is fine for a base that installs packages; a Rust compile under QEMU is
+# unusable (CLAUDE.md, on the release). So arm64 builds on GitHub's arm64 runner and amd64 on
+# the ordinary one, each pushes its image by digest alone, and a last job joins the two digests
+# into one multi-platform tag.
+#
+# LAYERS ARE CACHED ACROSS RUNS, as infra's dev-base caches them (its header has the reasons):
+# type=registry, mode=max, in this same package, one cache tag per architecture —
+# `buildcache-amd64`, `buildcache-arm64` — so the two legs never overwrite each other's. Both
+# the cache and the image are zstd with OCI media types, so a cached blob is reused byte for
+# byte and keeps its digest: a change to a late step leaves every earlier layer as it was, and
+# zero pulls only what changed. A cache tag is not an image; nothing pulls or pins it, and
+# deleting one costs one uncached run.
+#
+# TAGS. `sha-<12 hex>` is the commit the image was built from, and never moves: what infra
+# pins. `main` follows the latest build. The base is Dockerfile.dev's own BASE_TAG default,
+# since this build has no infra to pass one; moving the base is a commit here.
+#
+# THE PACKAGE STARTS PRIVATE. The first push creates ghcr.io/<owner>/claude-sessions-dev
+# private, as every new ghcr package is; the owner flips it public once (infra's base made the
+# same call, 2026-08-24: pure toolchain, so a public pull needs no token on the Pis).
+#
+# Runs on a push to main that touches the image's inputs, and by hand:
+#   gh workflow run dev-image.yml
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile.dev'
+      - '.github/workflows/dev-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/claude-sessions-dev
+
+# One build at a time: two would race on the cache tags and on `main`.
+concurrency:
+  group: dev-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+
+      # Pushed by digest, with no tag: the merge job below names it, together with the other
+      # architecture's.
+      - name: Build and push linux/${{ matrix.arch }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,compression=zstd,oci-mediatypes=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,compression=zstd,oci-mediatypes=true
+
+      - name: Keep the digest for the merge
+        run: |
+          mkdir -p digests
+          d='${{ steps.build.outputs.digest }}'
+          touch "digests/${d#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+
+      - name: One tag for both architectures
+        working-directory: digests
+        run: |
+          sha=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
+          refs=$(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
+          [ "$(ls | wc -l)" = 2 ] || { echo "expected two digests, got: $(ls)" >&2; exit 1; }
+          # shellcheck disable=SC2086
+          docker buildx imagetools create -t "$IMAGE:sha-$sha" -t "$IMAGE:main" $refs
+          docker buildx imagetools inspect "$IMAGE:sha-$sha"
+          {
+            echo "Pushed \`$IMAGE:sha-$sha\` and \`$IMAGE:main\` (amd64, arm64)."
+            echo "For infra: \`image: $IMAGE:sha-$sha\` in place of the claude-sessions service's git-context \`build:\`."
+          } >> "$GITHUB_STEP_SUMMARY"
