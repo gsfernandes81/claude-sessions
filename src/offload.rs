@@ -992,11 +992,13 @@ mod tests {
     #[test]
     fn kill_tree_gives_term_its_grace_and_no_longer() {
         // A daemon that takes a moment to finish once told to: TERM, then 300 ms of cleanup.
+        // It loops rather than waiting on one child, so its child dying first on the same
+        // TERM cannot end it before the trap runs.
         let dir = std::env::temp_dir().join(format!("cs-kill-tree-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mark = dir.join("cleaned-up");
         let script = format!(
-            "trap 'sleep 0.3; touch {}; exit 0' TERM; sleep 600 & wait",
+            "trap 'sleep 0.3; touch {}; exit 0' TERM; while :; do sleep 1; done",
             mark.display()
         );
         let mut daemon = std::process::Command::new("sh")
