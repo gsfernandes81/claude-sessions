@@ -1863,6 +1863,74 @@ exit 1"#,
         assert!(load("claude-2").last_attach_ms > 0);
     }
 
+    #[test]
+    fn a_conversation_claude_says_is_live_in_a_slot_is_attached_only_through_zmx() {
+        // Claude Code's live file names the process of claude-2, which holds conv-1.
+        let mut f = Fixture::new("live-in-slot");
+        registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
+        let (pid, start) = f.process();
+        let mut other = live("claude-2", pid, start);
+        other.session_id = Some("conv-0".into());
+        registry::store(&other).unwrap();
+        std::fs::write(
+            f.path(&format!("config/sessions/{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"conv-1","procStart":{start}}}"#),
+        )
+        .unwrap();
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        let open = || open_with(&rows, 0, &mut Term::new(&f), &deps, true);
+        // No zmx session to attach to: its process is outside any slot we can reach.
+        match open() {
+            Outcome::Refused(why) => assert!(why.contains("outside any slot"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        f.session("claude-2", false);
+        assert_eq!(open(), detached());
+        assert_eq!(f.calls(), ["zmx attach claude-2 false"]);
+        // A record whose process has gone is not the one running it, listed or not.
+        let mut stale = load("claude-2");
+        stale.proc_start = Some(start + 1);
+        registry::store(&stale).unwrap();
+        assert!(matches!(open(), Outcome::Refused(why) if why.contains("outside any slot")));
+    }
+
+    #[test]
+    fn a_conversation_running_in_a_slot_with_no_zmx_session_is_refused() {
+        let mut f = Fixture::new("elsewhere-unlisted");
+        registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
+        let (pid, start) = f.process();
+        let mut other = live("claude-2", pid, start);
+        other.session_id = Some("conv-1".into());
+        registry::store(&other).unwrap();
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        match open_with(&rows, 0, &mut Term::new(&f), &deps, true) {
+            Outcome::Refused(why) => {
+                assert!(why.contains("claude-2, which has no zmx session"), "{why}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn a_slot_another_menu_is_starting_is_left_to_it() {
+        let f = Fixture::new("starting");
+        let mut r = SlotRecord::new("claude-1", Moment::now());
+        r.state = State::Live;
+        registry::store(&r).unwrap();
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        assert_eq!(
+            open_with(&rows, 0, &mut Term::new(&f), &deps, true),
+            Outcome::Refused(
+                "\"a\" is being started somewhere else — try again in a moment".into()
+            )
+        );
+        assert!(f.calls().is_empty());
+    }
+
     fn stored(id: &str, cwd: &str, title: &str) -> Row {
         Row {
             key: RowKey::Conversation {
@@ -2020,6 +2088,37 @@ exit 1"#,
             }) => assert!(!killed_for_memory),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_start_that_dies_slowly_ended_rather_than_failed() {
+        // Past the quick window a death says only that it ended: claude ran, unbound, and
+        // stopped. The client stays attached until its session is gone, as zmx's does.
+        let wait_gone = r#"while [ -e "$dir/$name" ]; do sleep 0.05; done"#;
+        let slow = |f: &Fixture| Deps {
+            quick: Duration::ZERO,
+            ..f.deps(f.zmx(wait_gone), f.claude_fails())
+        };
+
+        let f = Fixture::new("slow-resume");
+        registry::store(&offloaded("claude-5", "0f9c4a1e-7d", &f.work())).unwrap();
+        let rows = [row("claude-5", "t")];
+        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f), true);
+        assert_eq!(out, Outcome::Back(Some("\"t\" ended".into())));
+        assert_eq!(load("claude-5").state, State::Offloaded);
+        drop(f);
+
+        let f = Fixture::new("slow-stored");
+        let rows = [stored("conv-9", &f.work(), "fix the dns")];
+        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f), true);
+        assert_eq!(out, Outcome::Back(Some("\"fix the dns\" ended".into())));
+        assert_eq!(load("claude-1").state, State::Closed);
+        drop(f);
+
+        let f = Fixture::new("slow-new");
+        let out = new_session_with(&[], &f.work(), &mut Term::new(&f), &slow(&f), true);
+        assert_eq!(out, Outcome::Back(Some("claude-1 ended".into())));
+        assert_eq!(load("claude-1").state, State::Closed);
     }
 
     #[test]
@@ -2351,6 +2450,116 @@ exit 1"#,
         assert!(procinfo::is_alive(pid, start), "calibration: it is running");
         assert!(listed("claude-1") == Some(true));
         (pid, start)
+    }
+
+    #[test]
+    fn a_live_record_is_read_by_its_process_then_by_zmx_then_by_how_recent_it_is() {
+        let mut f = Fixture::new("classify");
+        let (pid, start) = f.process();
+        let now = clock::now();
+        let mut r = live("claude-1", pid, start);
+        assert_eq!(classify(&r, now), Kind::Running);
+        r.proc_start = Some(start + 1);
+        assert_eq!(classify(&r, now), Kind::Resumable, "its process has gone");
+        // No process recorded: zmx's session is the evidence, else how recently another menu
+        // marked it, up to the grace period and not at it.
+        r.pid = None;
+        r.proc_start = None;
+        r.updated_ms = now - STARTING_GRACE + 1;
+        assert_eq!(classify(&r, now), Kind::Starting);
+        f.session("claude-1", false);
+        assert_eq!(classify(&r, now), Kind::Running);
+        std::fs::remove_file(f.path("zmx/claude-1")).unwrap();
+        r.updated_ms = now - STARTING_GRACE;
+        assert_eq!(classify(&r, now), Kind::Resumable);
+    }
+
+    #[test]
+    fn a_label_is_cut_after_twenty_four_characters() {
+        let x = |n| "x".repeat(n);
+        assert_eq!(label(&row("claude-1", &x(24))), format!("\"{}\"", x(24)));
+        assert_eq!(label(&row("claude-1", &x(25))), format!("\"{}...\"", x(24)));
+    }
+
+    /// A live record of a process that has gone, with its conversation on disk or not.
+    fn gone(f: &mut Fixture, prompted: bool) {
+        let (pid, start) = f.process();
+        let mut r = live("claude-1", pid, start + 1);
+        if prompted {
+            let transcript = Path::new(&f.work()).join("conv-of-claude-1.jsonl");
+            std::fs::write(&transcript, PROMPTED).unwrap();
+            r.transcript_path = Some(transcript.display().to_string());
+        }
+        r.busy = true;
+        registry::store(&r).unwrap();
+    }
+
+    #[test]
+    fn c_on_a_slot_whose_process_has_gone_only_catches_the_record_up() {
+        let rows = [row("claude-1", "a")];
+        for (prompted, said, state) in [
+            (true, "offloaded · resumable from disk", State::Offloaded),
+            (
+                false,
+                "closed · it had no conversation to keep",
+                State::Closed,
+            ),
+        ] {
+            let mut f = Fixture::new("offload-gone");
+            gone(&mut f, prompted);
+            assert_eq!(offload(&rows, 0), Outcome::Back(Some(said.into())));
+            let rec = load("claude-1");
+            assert_eq!((rec.state, rec.busy), (state, false));
+        }
+        let mut f = Fixture::new("close-gone");
+        gone(&mut f, true);
+        // A session zmx still lists does not make a process that has gone a running one.
+        f.session("claude-1", false);
+        assert_eq!(
+            close(&rows, 0),
+            Outcome::Back(Some("archived · resumable from disk".into()))
+        );
+        assert_eq!(load("claude-1").state, State::Closed);
+    }
+
+    #[test]
+    fn a_slot_with_no_process_recorded_is_stopped_only_once_zmx_says_it_has_no_session() {
+        let f = Fixture::new("close-unbound");
+        let mut r = SlotRecord::new("claude-1", Moment::now());
+        r.state = State::Live;
+        registry::store(&r).unwrap();
+        let rows = [row("claude-1", "a")];
+        let refused = |o: Outcome| matches!(o, Outcome::Refused(why) if why.contains("no process is recorded"));
+        assert!(refused(offload(&rows, 0)));
+        f.session("claude-1", false);
+        assert!(refused(close(&rows, 0)));
+        assert_eq!(load("claude-1").state, State::Live);
+        std::fs::remove_file(f.path("zmx/claude-1")).unwrap();
+        // Nothing on disk to resume, so it is closed rather than archived.
+        assert_eq!(close(&rows, 0), Outcome::Back(Some("closed".into())));
+        assert_eq!(load("claude-1").state, State::Closed);
+    }
+
+    #[test]
+    fn a_slot_whose_record_went_is_opened_by_its_session_while_zmx_has_one() {
+        let f = Fixture::new("open-unrecorded");
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let rows = [row("claude-1", "a")];
+        let mut term = Term::new(&f);
+        assert_eq!(
+            open_with(&rows, 0, &mut term, &deps, true),
+            Outcome::Refused("\"a\" is gone".into())
+        );
+        assert!(f.calls().is_empty(), "nothing attached");
+        f.session("claude-1", false);
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert!(!matches!(out, Outcome::Refused(_)), "{out:?}");
+        assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
+        assert!(
+            f.calls()[0].starts_with("zmx attach claude-1"),
+            "{:?}",
+            f.calls()
+        );
     }
 
     #[test]
