@@ -87,14 +87,29 @@ struct Hub {
     places: HashMap<String, Place>,
     /// When each container that is not answering is to be asked again.
     retry: HashMap<String, Instant>,
+    /// How long a container that is not answering waits to be asked again.
+    retry_after: Duration,
     events: Sender<Event>,
+    connect: Connect,
 }
+
+/// How the hub reaches a container: [`hub::connect`], or a stand-in in the tests.
+type Connect = fn(&str, Sender<Event>, fn()) -> Arc<Conn>;
 
 impl Hub {
     fn start(names: Vec<String>, events: Sender<Event>) -> Hub {
+        Hub::with(names, events, hub::connect, retry())
+    }
+
+    fn with(
+        names: Vec<String>,
+        events: Sender<Event>,
+        connect: Connect,
+        retry_after: Duration,
+    ) -> Hub {
         let conns = names
             .iter()
-            .map(|n| (n.clone(), hub::connect(n, events.clone(), term::wake)))
+            .map(|n| (n.clone(), connect(n, events.clone(), term::wake)))
             .collect();
         Hub {
             names,
@@ -103,7 +118,9 @@ impl Hub {
             heard: Default::default(),
             places: HashMap::new(),
             retry: HashMap::new(),
+            retry_after,
             events,
+            connect,
         }
     }
 
@@ -133,7 +150,8 @@ impl Hub {
             }
             Event::Down(name, why) => {
                 self.heard.insert(name.clone());
-                self.retry.insert(name.clone(), Instant::now() + retry());
+                self.retry
+                    .insert(name.clone(), Instant::now() + self.retry_after);
                 self.rows.remove(&name);
                 let place = self
                     .places
@@ -175,7 +193,7 @@ impl Hub {
             .collect();
         for name in due {
             self.retry.remove(&name);
-            let conn = hub::connect(&name, self.events.clone(), term::wake);
+            let conn = (self.connect)(&name, self.events.clone(), term::wake);
             self.conns.insert(name, conn);
         }
     }
@@ -207,13 +225,7 @@ pub fn run() -> Result<(), Stop> {
     let (tx, rx) = mpsc::channel();
     let mut hub = Hub::start(hub::hosts(), tx);
     let started = Instant::now();
-    while hub.heard.len() < hub.names.len() {
-        let left = work::SHOW_AFTER.saturating_sub(started.elapsed());
-        match rx.recv_timeout(left) {
-            Ok(ev) => hub.apply(ev),
-            Err(_) => break,
-        }
-    }
+    settle(&mut hub, &rx, started + work::SHOW_AFTER);
     let single = hub.names.len() == 1;
     let loading = single && hub.heard.is_empty();
     let mut menu = Menu::hub(width, height, home_header(), hub.initial(), hub.merged());
@@ -232,9 +244,46 @@ pub fn run() -> Result<(), Stop> {
         Stop::Failed(why) => Stop::Failed(format!("cannot set up the terminal: {why}")),
         gone => gone,
     })?;
-    let result = drive(&mut term, &mut menu, &mut hub, &rx, loading.then_some(spin));
+    let result = drive(
+        &mut term,
+        &mut menu,
+        &mut hub,
+        &rx,
+        loading.then_some(spin),
+        load_every(),
+    );
     drop(term);
     result
+}
+
+/// The terminal as the loop uses it: [`RawTerminal`], or a scripted stand-in in the tests.
+trait Console: Terminal {
+    fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<Input>;
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    /// The window's size as (cols, rows).
+    fn size(&self) -> Option<(u16, u16)>;
+}
+
+impl Console for RawTerminal {
+    fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<Input> {
+        RawTerminal::wait(self, timeout)
+    }
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        RawTerminal::write_all(self, bytes)
+    }
+    fn size(&self) -> Option<(u16, u16)> {
+        term::size()
+    }
+}
+
+/// Take in what the containers say until every one has said something, or `deadline`.
+fn settle(hub: &mut Hub, rx: &Receiver<Event>, deadline: Instant) {
+    while hub.heard.len() < hub.names.len() {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(ev) => hub.apply(ev),
+            Err(_) => break,
+        }
+    }
 }
 
 /// Why the menu stopped, when it did not stop because the owner quit.
@@ -282,7 +331,7 @@ type Screen = Option<Vec<String>>;
 /// Draw the menu, writing only what differs from what is on the screen. Nothing at all when
 /// nothing changed — the idle menu's zero bytes — and one line when one line did, such as
 /// the spinner turning.
-fn draw(term: &mut RawTerminal, menu: &Menu, screen: &mut Screen) -> Result<(), Stop> {
+fn draw(term: &mut dyn Console, menu: &Menu, screen: &mut Screen) -> Result<(), Stop> {
     let frame = render::render(&menu.view()).map_err(|t| Stop::Failed(too_narrow(&t)))?;
     let lines: Vec<String> = (0..frame.lines.len()).map(|i| frame.ansi_line(i)).collect();
     let out = match screen.as_ref() {
@@ -314,15 +363,15 @@ fn draw(term: &mut RawTerminal, menu: &Menu, screen: &mut Screen) -> Result<(), 
 const CHECK: Duration = Duration::from_millis(20);
 
 fn drive(
-    term: &mut RawTerminal,
+    term: &mut dyn Console,
     menu: &mut Menu,
     hub: &mut Hub,
     rx: &Receiver<Event>,
     mut loading: Option<Spin>,
+    every: Duration,
 ) -> Result<(), Stop> {
     let mut screen: Screen = None;
     let mut minute = menu::age_clock(clock::now());
-    let every = load_every();
     let mut next_reading = Instant::now() + every;
     // The first rows to arrive are sorted into their groups, as the first reading always
     // was; after that, rows keep their places.
@@ -341,8 +390,8 @@ fn drive(
             if sort {
                 first = false;
             }
-            if loading.is_some() && !hub.heard.is_empty() {
-                loading = None;
+            // Whatever was heard, a container has now said something.
+            if loading.take().is_some() {
                 menu.set_busy(None);
             }
             let now = menu::age_clock(clock::now());
@@ -378,7 +427,7 @@ fn drive(
                 menu.set_home(home_header());
                 for key in keys {
                     if key == Key::Resize {
-                        if let Some((w, h)) = term::size() {
+                        if let Some((w, h)) = term.size() {
                             menu.resize(w, h);
                         }
                         screen = None;
@@ -409,33 +458,50 @@ enum Done {
 /// to need one (mockup 11). The container's rows after it arrive as its snapshot, sent before
 /// it says the action is done.
 fn act(
-    term: &mut RawTerminal,
+    term: &mut dyn Console,
     menu: &mut Menu,
     screen: &mut Screen,
     hub: &Hub,
     action: Action,
 ) -> Result<Done, Stop> {
-    let rows = menu.rows().to_vec();
+    let Some(plan) = plan(&action, menu.rows()) else {
+        return Ok(Done::Nothing);
+    };
+    let Some(host) = plan.host.clone() else {
+        menu.set_status(Some("that session is no longer listed".into()));
+        return Ok(Done::Changed);
+    };
+    let job = match route(hub.answering(&host), &action) {
+        Route::Agent(conn) => hub::job(conn, plan.op.clone()),
+        Route::Shell => hub::shell_job(&host),
+        Route::Unreachable => {
+            menu.set_status(Some(format!("{host} is not answering")));
+            return Ok(Done::Changed);
+        }
+    };
+    finish(term, menu, screen, Work::spawn(job), &plan, &host)
+}
+
+/// What an action asks of a container: which one, what is sent, the spinner shown meanwhile,
+/// and the row to open afterwards should a dialog come of it.
+#[derive(Debug, Clone, PartialEq)]
+struct Plan {
+    /// `None` when the row the action is about is no longer listed.
+    host: Option<String>,
+    op: Value,
+    /// The row the spinner stands on, and what it says. No title: the row says which (owner,
+    /// 2026-10-04).
+    row: Option<usize>,
+    what: &'static str,
+    /// The row to open once there is room, for the no-room and resume-failed dialogs.
+    then: Option<usize>,
+}
+
+/// [`Plan`] for `action` over the menu's `rows`; `None` for an action that asks nothing.
+fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
     let host_of = |i: usize| rows.get(i).map(|r| r.host.clone());
     let key_of = |i: usize| rows.get(i).map(|r| proto::key_to(&r.key));
-    // What the spinner says, and the row it stands on. No title: the row says which (owner,
-    // 2026-10-04).
     let resumes = |i: usize| rows.get(i).is_some_and(|r| r.offloaded || r.closed);
-    let (row, what): (Option<usize>, &str) = match &action {
-        Action::None | Action::Redraw | Action::Quit => return Ok(Done::Nothing),
-        Action::Open(i) if resumes(*i) => (Some(*i), "resuming session"),
-        Action::Open(i) => (Some(*i), "opening session"),
-        Action::New(_) => (None, "starting new session"),
-        Action::Shell(_) => (None, "starting shell"),
-        Action::Offload(i) => (Some(*i), "offloading session"),
-        Action::Archive(i) => (Some(*i), "archiving session"),
-        Action::OffloadThenOpen { victim, .. } => (Some(*victim), "offloading session for room"),
-    };
-    let then = match &action {
-        Action::Open(i) => Some(*i),
-        Action::OffloadThenOpen { then, .. } => *then,
-        _ => None,
-    };
     let op = |name: &str, fields: Vec<(&str, Option<Value>)>| {
         let mut v = Value::obj();
         v.set("op", Value::string(name));
@@ -446,43 +512,104 @@ fn act(
         }
         v
     };
-    let (host, op) = match &action {
-        Action::None | Action::Redraw | Action::Quit => return Ok(Done::Nothing),
-        Action::Open(i) => (host_of(*i), op("open", vec![("key", key_of(*i))])),
-        Action::New(h) => (Some(h.clone()), op("new", vec![])),
-        Action::Shell(h) => (Some(h.clone()), op("shell", vec![])),
-        Action::Offload(i) => (host_of(*i), op("offload", vec![("key", key_of(*i))])),
+    let (host, op, row, what, then) = match action {
+        Action::None | Action::Redraw | Action::Quit => return None,
+        Action::Open(i) => (
+            host_of(*i),
+            op("open", vec![("key", key_of(*i))]),
+            Some(*i),
+            if resumes(*i) {
+                "resuming session"
+            } else {
+                "opening session"
+            },
+            Some(*i),
+        ),
+        Action::New(h) => (
+            Some(h.clone()),
+            op("new", vec![]),
+            None,
+            "starting new session",
+            None,
+        ),
+        Action::Shell(h) => (
+            Some(h.clone()),
+            op("shell", vec![]),
+            None,
+            "starting shell",
+            None,
+        ),
+        Action::Offload(i) => (
+            host_of(*i),
+            op("offload", vec![("key", key_of(*i))]),
+            Some(*i),
+            "offloading session",
+            None,
+        ),
         // Archiving is the agent's `close`, which an agent of any version understands.
-        Action::Archive(i) => (host_of(*i), op("close", vec![("key", key_of(*i))])),
+        Action::Archive(i) => (
+            host_of(*i),
+            op("close", vec![("key", key_of(*i))]),
+            Some(*i),
+            "archiving session",
+            None,
+        ),
         Action::OffloadThenOpen { victim, then } => (
             host_of(*victim),
             op(
                 "offload_then_open",
                 vec![("victim", key_of(*victim)), ("then", then.and_then(key_of))],
             ),
+            Some(*victim),
+            "offloading session for room",
+            *then,
         ),
     };
-    let Some(host) = host else {
-        menu.set_status(Some("that session is no longer listed".into()));
-        return Ok(Done::Changed);
-    };
-    let job = match hub.answering(&host) {
-        Some(conn) => hub::job(conn, op),
-        // A shell is still worth trying where the agent is not answering: ssh may be.
-        None if matches!(action, Action::Shell(_)) => hub::shell_job(&host),
-        None => {
-            menu.set_status(Some(format!("{host} is not answering")));
-            return Ok(Done::Changed);
-        }
-    };
-    let Some(outcome) = wait_on(term, menu, screen, Work::spawn(job), row, what)? else {
+    Some(Plan {
+        host,
+        op,
+        row,
+        what,
+        then,
+    })
+}
+
+/// Where an action's work goes.
+#[derive(Debug, PartialEq)]
+enum Route<C> {
+    /// To the container's agent, which is answering.
+    Agent(C),
+    /// Straight to ssh: a shell is still worth trying where the agent is not answering.
+    Shell,
+    /// Nowhere: the container is not answering.
+    Unreachable,
+}
+
+fn route<C>(answering: Option<C>, action: &Action) -> Route<C> {
+    match answering {
+        Some(conn) => Route::Agent(conn),
+        None if matches!(action, Action::Shell(_)) => Route::Shell,
+        None => Route::Unreachable,
+    }
+}
+
+/// Wait out an action's `work` in `host`, then show what came of it.
+fn finish(
+    term: &mut dyn Console,
+    menu: &mut Menu,
+    screen: &mut Screen,
+    work: Work,
+    plan: &Plan,
+    host: &str,
+) -> Result<Done, Stop> {
+    let Some(outcome) = wait_on(term, menu, screen, work, plan.row, plan.what)? else {
         return Ok(Done::Quit);
     };
     match outcome {
         Outcome::Back(status) => menu.set_status(status),
         Outcome::Refused(why) => menu.set_status(Some(why)),
-        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, then, &host),
-        Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, then.unwrap_or(0)),
+        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, plan.then, host),
+        Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, plan.then.unwrap_or(0)),
     }
     Ok(Done::Changed)
 }
@@ -493,7 +620,7 @@ fn act(
 /// Keys are not acted on while it works, so nothing can be done to a session mid-close —
 /// except `q` and Ctrl-C, which quit, and a resize, which redraws.
 fn wait_on(
-    term: &mut RawTerminal,
+    term: &mut dyn Console,
     menu: &mut Menu,
     screen: &mut Screen,
     work: Work,
@@ -555,7 +682,7 @@ fn wait_on(
                     match key {
                         Key::Char('q') | Key::Char('\u{3}') => return Ok(None),
                         Key::Resize => {
-                            if let Some((w, h)) = term::size() {
+                            if let Some((w, h)) = term.size() {
                                 menu.resize(w, h);
                             }
                             *screen = None;
@@ -569,5 +696,472 @@ fn wait_on(
             }
             Input::Timeout | Input::Woken => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::Snapshot;
+    use crate::ui::RowKey;
+    use std::collections::VecDeque;
+
+    /// A scripted terminal. Each `wait` takes the next input; a scripted `Timeout`, or a wait
+    /// past the end of the script, first sleeps out the timeout (at most 600 ms), as a real
+    /// terminal would, so time moves on as the loop expects.
+    struct Fake {
+        script: VecDeque<Input>,
+        waits: Vec<Option<Duration>>,
+        out: Vec<u8>,
+        size: (u16, u16),
+        handed: Vec<&'static str>,
+    }
+
+    impl Fake {
+        fn new(script: Vec<Input>) -> Fake {
+            Fake {
+                script: script.into(),
+                waits: Vec::new(),
+                out: Vec::new(),
+                size: (80, 24),
+                handed: Vec::new(),
+            }
+        }
+
+        fn clears(&self) -> usize {
+            self.out
+                .windows(CLEAR.len())
+                .filter(|w| *w == CLEAR)
+                .count()
+        }
+    }
+
+    impl Terminal for Fake {
+        fn suspend(&mut self) -> std::io::Result<()> {
+            self.handed.push("suspend");
+            Ok(())
+        }
+        fn resume(&mut self) -> std::io::Result<()> {
+            self.handed.push("resume");
+            Ok(())
+        }
+    }
+
+    impl Console for Fake {
+        fn wait(&mut self, timeout: Option<Duration>) -> std::io::Result<Input> {
+            self.waits.push(timeout);
+            assert!(
+                self.waits.len() < 10_000,
+                "the loop ran far past its script"
+            );
+            match self.script.pop_front() {
+                Some(Input::Timeout) | None => {
+                    if let Some(t) = timeout {
+                        std::thread::sleep(t.min(Duration::from_millis(600)));
+                    }
+                    Ok(Input::Timeout)
+                }
+                Some(input) => Ok(input),
+            }
+        }
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.out.extend_from_slice(bytes);
+            Ok(())
+        }
+        fn size(&self) -> Option<(u16, u16)> {
+            Some(self.size)
+        }
+    }
+
+    fn keys(k: &[Key]) -> Input {
+        Input::Keys(k.to_vec())
+    }
+
+    fn quit() -> Input {
+        keys(&[Key::Char('q')])
+    }
+
+    fn row(title: &str, at: u64) -> Row {
+        Row {
+            host: hub::LOCAL.into(),
+            key: RowKey::Slot(title.into()),
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: false,
+            archived: false,
+            title: title.into(),
+            age: "1m".into(),
+            at,
+            nested: false,
+        }
+    }
+
+    fn header() -> Header {
+        Header {
+            host: "hub".into(),
+            memory: None,
+            load: None,
+        }
+    }
+
+    fn snapshot(rows: Vec<Row>) -> Snapshot {
+        Snapshot {
+            header: header(),
+            workspace: "/workspace".into(),
+            rows,
+        }
+    }
+
+    /// A hub over `names` whose connections are never made, asking again after an hour.
+    fn offline(names: &[&str]) -> (Hub, Sender<Event>, Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        let names = names.iter().map(|n| n.to_string()).collect();
+        let hub = Hub::with(
+            names,
+            tx.clone(),
+            |n, _, _| Conn::detached(n),
+            Duration::from_secs(3600),
+        );
+        (hub, tx, rx)
+    }
+
+    /// One container's menu, with `rows`.
+    fn menu(rows: Vec<Row>) -> Menu {
+        Menu::hub(80, 24, header(), vec![Place::new(hub::LOCAL)], rows)
+    }
+
+    #[test]
+    fn the_waits_default_to_fifteen_and_five_seconds() {
+        // Only the pty tests set these, on the binary they run.
+        if std::env::var_os("CLAUDE_SESSIONS_RETRY_MS").is_none() {
+            assert_eq!(retry(), Duration::from_secs(15));
+        }
+        if std::env::var_os("CLAUDE_SESSIONS_LOAD_MS").is_none() {
+            assert_eq!(load_every(), Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn local_is_named_for_this_machine_and_others_for_themselves() {
+        let (hub, _, _) = offline(&[hub::LOCAL, "or3-dev"]);
+        let places = hub.initial();
+        assert_eq!(places[0].header.host, menu::host());
+        assert_eq!(places[1].header.host, Place::new("or3-dev").header.host);
+        assert_ne!(places[1].header.host, menu::host());
+    }
+
+    #[test]
+    fn a_container_that_is_down_is_asked_again_after_the_wait_and_not_before() {
+        let (mut hub, _, _) = offline(&["a"]);
+        assert_eq!(hub.next_retry(), None, "nothing is down");
+        assert!(hub.answering("a").is_some());
+        hub.apply(Event::Down("a".into(), "no route".into()));
+        let next = hub.next_retry().expect("a retry is due");
+        assert!(next > Duration::from_secs(3590), "{next:?}");
+        assert!(hub.answering("a").is_none(), "not answering meanwhile");
+        // Its rows arriving ends the wait.
+        hub.apply(Event::Snapshot("a".into(), snapshot(vec![])));
+        assert_eq!(hub.next_retry(), None);
+        assert!(hub.answering("a").is_some());
+    }
+
+    #[test]
+    fn the_first_frame_waits_for_every_container_or_the_deadline() {
+        let (mut hub, tx, rx) = offline(&["a", "b"]);
+        tx.send(Event::Snapshot("a".into(), snapshot(vec![])))
+            .unwrap();
+        let began = Instant::now();
+        settle(&mut hub, &rx, began + Duration::from_millis(300));
+        assert_eq!(hub.heard.len(), 1);
+        assert!(
+            began.elapsed() >= Duration::from_millis(250),
+            "{:?}",
+            began.elapsed()
+        );
+
+        let (mut hub, tx, rx) = offline(&["a", "b"]);
+        tx.send(Event::Snapshot("a".into(), snapshot(vec![])))
+            .unwrap();
+        tx.send(Event::Down("b".into(), "no route".into())).unwrap();
+        let began = Instant::now();
+        settle(&mut hub, &rx, began + Duration::from_secs(5));
+        assert_eq!(hub.heard.len(), 2);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_frame_writes_only_the_lines_that_changed() {
+        let mut m = menu(vec![row("one", 2), row("two", 1)]);
+        let mut t = Fake::new(vec![]);
+        // A screen of no lines is drawn from nothing.
+        let mut screen: Screen = Some(vec![]);
+        draw(&mut t, &m, &mut screen).unwrap();
+        assert_eq!(t.clears(), 1);
+        // Nothing changed: nothing written.
+        let before = t.out.len();
+        draw(&mut t, &m, &mut screen).unwrap();
+        assert_eq!(t.out.len(), before);
+        // One line changed: that line, by a cursor move, and no clear.
+        m.set_status(Some("detached · it is still running".into()));
+        draw(&mut t, &m, &mut screen).unwrap();
+        let wrote = String::from_utf8_lossy(&t.out[before..]).into_owned();
+        assert_eq!(t.clears(), 1, "{wrote:?}");
+        assert!(
+            wrote.starts_with("\x1b[") && wrote.contains("detached"),
+            "{wrote:?}"
+        );
+    }
+
+    #[test]
+    fn the_load_line_is_read_again_each_interval_from_when_it_was_last_read() {
+        let (mut hub, _, rx) = offline(&[hub::LOCAL]);
+        let mut m = menu(vec![row("one", 1)]);
+        let mut t = Fake::new(vec![quit()]);
+        drive(&mut t, &mut m, &mut hub, &rx, None, Duration::from_secs(5)).unwrap();
+        let first = t.waits[0].unwrap();
+        assert!(first > Duration::from_secs(4), "{first:?}");
+
+        let every = Duration::from_millis(500);
+        let mut t = Fake::new(vec![Input::Timeout, Input::Timeout, quit()]);
+        drive(&mut t, &mut m, &mut hub, &rx, None, every).unwrap();
+        let second = t.waits[1].unwrap();
+        assert!(second > Duration::from_millis(200), "{:?}", t.waits);
+    }
+
+    #[test]
+    fn the_first_rows_heard_are_sorted_and_later_ones_keep_their_places() {
+        let x = row("x", 2);
+        let y = Row {
+            wants_you: true,
+            ..row("y", 1)
+        };
+        let titles = |m: &Menu| {
+            m.all_rows()
+                .iter()
+                .map(|r| r.title.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let (mut hub, tx, rx) = offline(&[hub::LOCAL]);
+        let mut m = menu(vec![]);
+        let snap = snapshot(vec![x.clone(), y.clone()]);
+        tx.send(Event::Snapshot(hub::LOCAL.into(), snap.clone()))
+            .unwrap();
+        let mut t = Fake::new(vec![quit()]);
+        drive(&mut t, &mut m, &mut hub, &rx, None, Duration::from_secs(5)).unwrap();
+        assert_eq!(titles(&m), ["y", "x"], "sorted: the one waiting leads");
+
+        let (mut hub, tx, rx) = offline(&[hub::LOCAL]);
+        let mut m = menu(vec![x.clone(), row("y", 1)]);
+        assert_eq!(titles(&m), ["x", "y"], "calibration");
+        tx.send(Event::Snapshot(hub::LOCAL.into(), snap)).unwrap();
+        let mut t = Fake::new(vec![quit()]);
+        drive(&mut t, &mut m, &mut hub, &rx, None, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            titles(&m),
+            ["x", "y"],
+            "rows already shown keep their places"
+        );
+    }
+
+    #[test]
+    fn the_reading_spinner_goes_once_a_container_has_said_something() {
+        let (mut hub, tx, rx) = offline(&[hub::LOCAL]);
+        let mut m = menu(vec![]);
+        m.set_busy(Some(reading(0)));
+        tx.send(Event::Snapshot(
+            hub::LOCAL.into(),
+            snapshot(vec![row("x", 1)]),
+        ))
+        .unwrap();
+        let spin = Spin::after(Instant::now(), work::SHOW_AFTER);
+        let mut t = Fake::new(vec![quit()]);
+        drive(
+            &mut t,
+            &mut m,
+            &mut hub,
+            &rx,
+            Some(spin),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(m.view().busy.is_none());
+    }
+
+    #[test]
+    fn a_resize_takes_the_new_size_and_redraws_from_nothing() {
+        let (mut hub, _, rx) = offline(&[hub::LOCAL]);
+        let mut m = menu(vec![row("x", 1)]);
+        let mut t = Fake::new(vec![keys(&[Key::Resize]), quit()]);
+        t.size = (40, 24);
+        drive(&mut t, &mut m, &mut hub, &rx, None, Duration::from_secs(5)).unwrap();
+        assert_eq!(m.view().width, 40);
+        assert_eq!(
+            t.clears(),
+            2,
+            "the first frame, then the frame after the resize"
+        );
+    }
+
+    fn rows_to_act_on() -> Vec<Row> {
+        vec![
+            Row {
+                closed: true,
+                ..row("closed", 3)
+            },
+            Row {
+                offloaded: true,
+                ..row("offloaded", 2)
+            },
+            row("live", 1),
+        ]
+    }
+
+    #[test]
+    fn opening_says_whether_it_resumes_and_opens_that_row_after_a_dialog() {
+        let rows = rows_to_act_on();
+        let what = |i| plan(&Action::Open(i), &rows).unwrap().what;
+        assert_eq!(what(0), "resuming session");
+        assert_eq!(what(1), "resuming session");
+        assert_eq!(what(2), "opening session");
+        let p = plan(&Action::Open(2), &rows).unwrap();
+        assert_eq!(
+            (p.host.as_deref(), p.row, p.then),
+            (Some(hub::LOCAL), Some(2), Some(2))
+        );
+        let key = |i: usize| crate::json::to_line(&proto::key_to(&rows[i].key));
+        assert_eq!(
+            crate::json::to_line(&p.op),
+            format!(r#"{{"key":{},"op":"open"}}"#, key(2))
+        );
+        // A row no longer listed has no container to go to.
+        assert_eq!(plan(&Action::Open(9), &rows).unwrap().host, None);
+    }
+
+    #[test]
+    fn offloading_for_room_spins_on_the_victim_and_opens_the_other_after() {
+        let rows = rows_to_act_on();
+        let action = Action::OffloadThenOpen {
+            victim: 2,
+            then: Some(1),
+        };
+        let p = plan(&action, &rows).unwrap();
+        assert_eq!(
+            (p.row, p.what, p.then),
+            (Some(2), "offloading session for room", Some(1))
+        );
+        let key = |i: usize| crate::json::to_line(&proto::key_to(&rows[i].key));
+        assert_eq!(
+            crate::json::to_line(&p.op),
+            format!(
+                r#"{{"op":"offload_then_open","then":{},"victim":{}}}"#,
+                key(1),
+                key(2)
+            )
+        );
+        // The rest: what each sends and says, and that nothing is asked of a key that asks
+        // nothing.
+        let say = |a: Action| {
+            let p = plan(&a, &rows).unwrap();
+            (crate::json::to_line(&p.op), p.what, p.row, p.then)
+        };
+        let new = say(Action::New("h".into()));
+        assert_eq!(
+            new,
+            (r#"{"op":"new"}"#.into(), "starting new session", None, None)
+        );
+        let shell = say(Action::Shell("h".into()));
+        assert_eq!(
+            shell,
+            (r#"{"op":"shell"}"#.into(), "starting shell", None, None)
+        );
+        let (op, what, row, then) = say(Action::Archive(2));
+        assert!(
+            op.starts_with(r#"{"key":"#) && op.ends_with(r#","op":"close"}"#),
+            "{op}"
+        );
+        assert_eq!((what, row, then), ("archiving session", Some(2), None));
+        let (op, what, _, then) = say(Action::Offload(2));
+        assert!(
+            op.starts_with(r#"{"key":"#) && op.ends_with(r#","op":"offload"}"#),
+            "{op}"
+        );
+        assert_eq!((what, then), ("offloading session", None));
+        assert_eq!(plan(&Action::Quit, &rows), None);
+    }
+
+    #[test]
+    fn only_a_shell_is_tried_where_the_agent_is_not_answering() {
+        let shell = Action::Shell("h".into());
+        assert_eq!(route(Some(7), &shell), Route::Agent(7));
+        assert_eq!(route(Some(7), &Action::Offload(0)), Route::Agent(7));
+        assert_eq!(route(None::<u8>, &shell), Route::Shell);
+        assert_eq!(route(None::<u8>, &Action::Offload(0)), Route::Unreachable);
+    }
+
+    fn open_plan() -> Plan {
+        plan(&Action::Open(0), &[row("x", 1)]).unwrap()
+    }
+
+    #[test]
+    fn work_that_ends_while_it_has_the_terminal_hands_it_back() {
+        let mut m = menu(vec![row("x", 1)]);
+        let mut t = Fake::new(vec![]);
+        let job: work::Job = Box::new(|term| {
+            term.suspend().unwrap();
+            Outcome::Back(Some("the session ended".into()))
+        });
+        let done = finish(
+            &mut t,
+            &mut m,
+            &mut None,
+            Work::spawn(job),
+            &open_plan(),
+            "local",
+        );
+        assert_eq!(done.unwrap(), Done::Changed);
+        assert_eq!(t.handed, ["suspend", "resume"]);
+        assert_eq!(m.view().status.as_deref(), Some("the session ended"));
+    }
+
+    #[test]
+    fn q_quits_while_work_runs_and_a_resize_is_taken_meanwhile() {
+        let slow = |ms| -> work::Job {
+            Box::new(move |_| {
+                std::thread::sleep(Duration::from_millis(ms));
+                Outcome::Back(None)
+            })
+        };
+        let mut m = menu(vec![row("x", 1)]);
+        let mut t = Fake::new(vec![quit()]);
+        let done = finish(
+            &mut t,
+            &mut m,
+            &mut None,
+            Work::spawn(slow(300)),
+            &open_plan(),
+            "local",
+        );
+        assert_eq!(done.unwrap(), Done::Quit);
+
+        let mut t = Fake::new(vec![keys(&[Key::Resize])]);
+        t.size = (40, 24);
+        let done = finish(
+            &mut t,
+            &mut m,
+            &mut None,
+            Work::spawn(slow(300)),
+            &open_plan(),
+            "local",
+        );
+        assert_eq!(done.unwrap(), Done::Changed);
+        assert_eq!(m.view().width, 40);
     }
 }

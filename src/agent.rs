@@ -85,6 +85,20 @@ struct Seen {
     said: bool,
 }
 
+impl Seen {
+    /// Whether `rows` at age-clock `minute` are to be said: the first time, when they or the
+    /// minute changed, or when `force`d. Recorded as said if so.
+    fn update(&mut self, rows: &[Row], minute: u64, force: bool) -> bool {
+        if !(force || !self.said || rows != self.rows || minute != self.minute) {
+            return false;
+        }
+        self.said = true;
+        self.rows = rows.to_vec();
+        self.minute = minute;
+        true
+    }
+}
+
 struct Agent {
     out: Out,
     workspace: String,
@@ -109,13 +123,9 @@ impl Agent {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         let now = clock::now();
         let rows = menu::gather(now, &self.workspace, seen.zmx.sessions(force));
-        let minute = menu::age_clock(now);
-        if force || !seen.said || rows != seen.rows || minute != seen.minute {
+        if seen.update(&rows, menu::age_clock(now), force) {
             self.out
                 .send(&proto::snapshot_to(&header(), &self.workspace, &rows));
-            seen.said = true;
-            seen.rows = rows.clone();
-            seen.minute = minute;
         }
         rows
     }
@@ -311,24 +321,33 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             let Some(conv) = index("key").and_then(id) else {
                 return refused();
             };
-            let now = clock::now();
-            let archiving = op == "archive";
-            let mark = if archiving {
-                Mark::Archived(now)
-            } else {
-                Mark::Kept(now)
-            };
-            Outcome::Back(Some(match archive::set(&conv, mark) {
-                Ok(()) if archiving => "archived · c under Archived undoes it".into(),
-                Ok(()) => "back under Closed".into(),
-                Err(e) => format!("could not change the archive: {e}"),
-            }))
+            mark(op == "archive", &conv, clock::now(), archive::set)
         }
         other => Outcome::Refused(format!(
             "this container's claude-sessions does not know how to {other:?} — it may be older \
              than the hub's"
         )),
     }
+}
+
+/// Archive conversation `conv` at `now`, or take it out of the archive, through `set`; what
+/// the status line says of it.
+fn mark(
+    archiving: bool,
+    conv: &str,
+    now: clock::Millis,
+    set: impl FnOnce(&str, Mark) -> io::Result<()>,
+) -> Outcome {
+    let mark = if archiving {
+        Mark::Archived(now)
+    } else {
+        Mark::Kept(now)
+    };
+    Outcome::Back(Some(match set(conv, mark) {
+        Ok(()) if archiving => "archived · c under Archived undoes it".into(),
+        Ok(()) => "back under Closed".into(),
+        Err(e) => format!("could not change the archive: {e}"),
+    }))
 }
 
 /// `claude-sessions agent exec <hex>`: become the command the hub was sent, at the terminal
@@ -358,6 +377,67 @@ fn log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rows_are_said_first_then_only_when_they_or_the_minute_change_or_when_asked() {
+        let mut seen = Seen {
+            zmx: zmx::Watch::default(),
+            rows: Vec::new(),
+            minute: 0,
+            said: false,
+        };
+        assert!(
+            seen.update(&[], 7, false),
+            "the first time, though there are none"
+        );
+        assert!(!seen.update(&[], 7, false), "nothing changed");
+        assert!(seen.update(&[], 7, true), "asked");
+        assert!(seen.update(&[], 8, false), "the minute turned");
+        assert!(!seen.update(&[], 8, false));
+        let one = [Row {
+            host: String::new(),
+            key: RowKey::Slot("claude-1".into()),
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: false,
+            archived: false,
+            title: "x".into(),
+            age: "now".into(),
+            at: 0,
+            nested: false,
+        }];
+        assert!(seen.update(&one, 8, false), "the rows changed");
+        assert!(!seen.update(&one, 8, false));
+    }
+
+    #[test]
+    fn archiving_marks_the_conversation_and_says_how_to_undo_it() {
+        let mut got = None;
+        let said = mark(true, "c1", 5, |id, m| {
+            got = Some((id.to_string(), m));
+            Ok(())
+        });
+        assert_eq!(got, Some(("c1".into(), Mark::Archived(5))));
+        assert_eq!(
+            said,
+            Outcome::Back(Some("archived · c under Archived undoes it".into()))
+        );
+        let mut got = None;
+        let said = mark(false, "c1", 5, |id, m| {
+            got = Some((id.to_string(), m));
+            Ok(())
+        });
+        assert_eq!(got, Some(("c1".into(), Mark::Kept(5))));
+        assert_eq!(said, Outcome::Back(Some("back under Closed".into())));
+        let said = mark(true, "c1", 5, |_, _| Err(io::Error::other("read-only")));
+        assert_eq!(
+            said,
+            Outcome::Back(Some("could not change the archive: read-only".into()))
+        );
+    }
 
     #[test]
     fn a_child_sent_to_the_hub_carries_the_logins_scrollback_values() {

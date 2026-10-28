@@ -121,6 +121,17 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// A connection to `name` not yet made, which [`connect`] then makes: until it is, a job
+    /// sent to it is refused at once, as one sent to a container whose agent has gone.
+    pub fn detached(name: &str) -> Arc<Conn> {
+        Arc::new(Conn {
+            name: name.to_string(),
+            stdin: Mutex::new(None),
+            waiting: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+        })
+    }
+
     fn send(&self, v: &Value) -> io::Result<()> {
         let mut stdin = self.stdin.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pipe) = stdin.as_mut() else {
@@ -142,12 +153,7 @@ impl Conn {
 /// Start `host`'s agent. Its snapshots, and its going away, arrive on `events`, each followed
 /// by a call to `wake` so a menu blocked on the terminal looks at them.
 pub fn connect(host: &str, events: Sender<Event>, wake: fn()) -> Arc<Conn> {
-    let conn = Arc::new(Conn {
-        name: host.to_string(),
-        stdin: Mutex::new(None),
-        waiting: Mutex::new(HashMap::new()),
-        next: AtomicU64::new(1),
-    });
+    let conn = Conn::detached(host);
     let mut cmd = command(host, &["agent"], false);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -550,6 +556,20 @@ mod tests {
         );
     }
 
+    /// `offload_all(true)` run in a process of its own over `hosts`, reached through `ssh`;
+    /// what it printed.
+    fn offload_all_over(hosts: &str, ssh: &std::path::Path) -> String {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hub::tests::offload_all_child", "--nocapture"])
+            .env("CS_OFFLOAD_ALL_CHILD", "1")
+            .env("CLAUDE_SESSIONS_HOSTS", hosts)
+            .env("CLAUDE_SESSIONS_SSH", ssh)
+            .env("CLAUDE_SESSIONS_REMOTE", "cs")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     /// `offload_all` over stand-ins: a container whose pass prints and succeeds, one whose
     /// ssh fails as ssh does, and one whose pass fails — every line prefixed, every failure
     /// said, the run failing only once all have finished.
@@ -566,7 +586,7 @@ mod tests {
 while [ $# -gt 0 ]; do case $1 in -T|-t) shift;; -o) shift 2;; --) shift; break;; *) break;; esac; done
 host=$1; shift
 case $host in
-  good) echo "claude-1: kept — attached"; echo "args: $*" ;;
+  good) echo "claude-1: kept — attached"; echo "args: $*"; echo "a note" >&2; echo >&2 ;;
   gone) echo "ssh: connect to host gone port 2222: Connection refused" >&2; exit 255 ;;
   bad)  echo "registry unreadable" >&2; exit 1 ;;
 esac
@@ -574,25 +594,103 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "hub::tests::offload_all_child", "--nocapture"])
-            .env("CS_OFFLOAD_ALL_CHILD", "1")
-            .env("CLAUDE_SESSIONS_HOSTS", "good gone bad")
-            .env("CLAUDE_SESSIONS_SSH", &ssh)
-            .env("CLAUDE_SESSIONS_REMOTE", "cs")
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
+        let text = offload_all_over("good gone bad", &ssh);
         for want in [
             "good: claude-1: kept — attached",
             "good: args: cs offload --dry-run",
+            "good: a note",
             "gone: pass failed: exit 255: ssh: connect to host gone port 2222: Connection refused",
             "bad: pass failed: exit 1: registry unreadable",
             "RESULT: 2 of 3 container(s) did not finish a pass",
         ] {
             assert!(text.contains(want), "{want:?} not in {text}");
         }
+        // A successful pass's blank stderr lines are not said.
+        assert!(!text.lines().any(|l| l.trim_end() == "good:"), "{text}");
+        // All of them succeeding is success.
+        let text = offload_all_over("good", &ssh);
+        assert!(text.contains("RESULT: ok"), "{text}");
+        // One that could not even be started is a failure too, and counted.
+        let text = offload_all_over("a b", &dir.join("no-such-ssh"));
+        assert!(
+            text.contains("a: pass failed: could not start it"),
+            "{text}"
+        );
+        assert!(text.contains("RESULT: 2 of 2 container(s)"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A terminal whose child exits with the raw wait status given, or cannot be run.
+    struct Exits(Option<i32>);
+
+    impl Terminal for Exits {
+        fn suspend(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn run(&mut self, _: &mut Command) -> io::Result<std::process::ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            match self.0 {
+                Some(raw) => Ok(std::process::ExitStatus::from_raw(raw)),
+                None => Err(io::Error::other("no ssh here")),
+            }
+        }
+    }
+
+    /// Exited with `code`, as a wait status.
+    fn exited(code: i32) -> Option<i32> {
+        Some(code << 8)
+    }
+
+    #[test]
+    fn a_child_run_there_answers_its_code_or_why_it_could_not_run() {
+        let child = json::parse(r#"{"argv":["claude"]}"#).unwrap();
+        let ran = |host: &str, raw| json::to_line(&run_there(host, &child, &mut Exits(raw)));
+        assert_eq!(ran("x", exited(0)), r#"{"code":0}"#);
+        assert_eq!(ran("x", exited(3)), r#"{"code":3}"#);
+        // 255 from ssh is ssh failing; from a child here, just its code.
+        assert_eq!(ran("x", exited(255)), r#"{"error":"ssh to x failed"}"#);
+        assert_eq!(ran(LOCAL, exited(255)), r#"{"code":255}"#);
+        // Killed: the code a shell would say, 128 and the signal.
+        assert_eq!(ran("x", Some(9)), r#"{"code":137}"#);
+        assert_eq!(ran("x", None), r#"{"error":"no ssh here"}"#);
+        let nothing = run_there("x", &Value::obj(), &mut Exits(exited(0)));
+        assert!(json::to_line(&nothing).contains("asked for nothing"));
+    }
+
+    #[test]
+    fn a_shell_where_the_agent_is_not_answering_says_when_ssh_failed() {
+        let shell = |host: &str, raw| (shell_job(host))(&mut Exits(raw));
+        assert_eq!(
+            shell("x", exited(255)),
+            Outcome::Refused("ssh to x failed too".into())
+        );
+        assert_eq!(shell(LOCAL, exited(255)), Outcome::Back(None));
+        assert_eq!(shell("x", exited(0)), Outcome::Back(None));
+        assert_eq!(
+            shell("x", None),
+            Outcome::Refused("could not run ssh: no ssh here".into())
+        );
+        let args = |host| {
+            shell_command(host)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(LOCAL), ["-l"]);
+        assert_eq!(args("x"), ["-t", "-o", "BatchMode=yes", "--", "x"]);
+    }
+
+    #[test]
+    fn a_connection_that_fails_tells_everything_waiting_on_it_why() {
+        let conn = Conn::detached("a");
+        let (tx, rx) = mpsc::channel();
+        conn.waiting.lock().unwrap().insert(1, tx);
+        conn.fail_all("the agent exited");
+        assert!(matches!(rx.try_recv(), Ok(Reply::Gone(why)) if why == "the agent exited"));
+        assert!(conn.waiting.lock().unwrap().is_empty());
     }
 
     /// Run by the test above in a process of its own, with the environment it set.
