@@ -398,6 +398,7 @@ fn putting_a_session_away_turns_the_spinner_smoothly_then_falls_silent() {
     // Nothing of it was ever on disk, so it is closed, as the offloader would close it.
     assert!(all.contains("closed"), "{all:?}");
     assert!(!all.contains("Close this session?"), "no question: {all:?}");
+    clear_of_the_minute(&mut term, Duration::from_secs(3));
     let idle = term.read_for(Duration::from_secs(3));
     assert!(
         idle.is_empty(),
@@ -473,6 +474,7 @@ fn a_slow_first_reading_draws_the_frame_with_a_spinner_then_the_list() {
         "the list replaced the spinner: {after:?}"
     );
     // Past the next reading (every two seconds), which must find the file and carry on.
+    clear_of_the_minute(&mut term, Duration::from_secs(3));
     let idle = term.read_for(Duration::from_secs(3));
     assert!(idle.is_empty(), "the spinner stopped: {} bytes", idle.len());
 
