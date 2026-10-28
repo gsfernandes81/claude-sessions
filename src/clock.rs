@@ -88,6 +88,25 @@ impl Moment {
 mod tests {
     use super::*;
 
+    /// Seconds since boot, as `/proc/uptime` says it.
+    fn uptime() -> f64 {
+        let s = std::fs::read_to_string("/proc/uptime").unwrap();
+        s.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn the_time_since_boot_is_the_uptime() {
+        let ns = since_tick_ns(0).expect("readable") as f64;
+        assert!(
+            (ns / 1e9 - uptime()).abs() < 1.0,
+            "{ns} against {}",
+            uptime()
+        );
+        // And a tick later is a tick less.
+        let later = since_tick_ns(100).unwrap() as f64;
+        assert!((ns - later - 1e9).abs() < 1e8, "{ns} then {later}");
+    }
+
     #[test]
     fn a_tick_reads_as_one_wall_clock_moment() {
         // Margins are a scheduler's; a wrong USER_HZ or clock id is off by hundreds of ms.

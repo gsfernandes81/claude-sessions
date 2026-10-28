@@ -234,13 +234,13 @@ pub fn stop(
     if signal::send(pid, start, SIGTERM)? == Sent::Gone {
         return Ok(Stopped::AlreadyGone);
     }
-    if wait_gone(pid, start, term_grace) {
+    if wait_gone(&[(pid, start)], term_grace) {
         return Ok(Stopped::ByTerm);
     }
     if signal::send(pid, start, SIGKILL)? == Sent::Gone {
         return Ok(Stopped::ByTerm);
     }
-    if wait_gone(pid, start, kill_grace) {
+    if wait_gone(&[(pid, start)], kill_grace) {
         return Ok(Stopped::ByKill);
     }
     Err(io::Error::other(format!(
@@ -248,10 +248,14 @@ pub fn stop(
     )))
 }
 
-fn wait_gone(pid: u32, start: u64, within: Duration) -> bool {
+/// Whether every one of `procs` is gone within `within`, looking every 20 ms.
+fn wait_gone(procs: &[(u32, u64)], within: Duration) -> bool {
     let deadline = Instant::now() + within;
     loop {
-        if !procinfo::is_alive(pid, start) {
+        if !procs
+            .iter()
+            .any(|&(pid, start)| procinfo::is_alive(pid, start))
+        {
             return true;
         }
         if Instant::now() >= deadline {
@@ -276,14 +280,24 @@ pub fn under_zmx(table: Option<&[Proc]>, pid: u32) -> bool {
 /// daemon lingers a couple of seconds and exits by itself; nothing waits for that. A slot whose
 /// claude was not under zmx — its daemon killed — has no session to wait for.
 pub fn teardown_zmx(slot: &str, was_under_zmx: bool) -> Vec<String> {
+    teardown_listed(was_under_zmx, ZMX_GRACE, || zmx::session_for(slot))
+}
+
+/// [`teardown_zmx`] over `listing`, which says whether zmx lists the session — `None` when it
+/// could not be asked — and is asked until it says no or `grace` is up.
+fn teardown_listed<T>(
+    was_under_zmx: bool,
+    grace: Duration,
+    mut listing: impl FnMut() -> Option<Option<T>>,
+) -> Vec<String> {
     let mut notes = Vec::new();
     if !was_under_zmx {
         notes.push("no zmx daemon above it".into());
         return notes;
     }
-    let deadline = Instant::now() + ZMX_GRACE;
+    let deadline = Instant::now() + grace;
     loop {
-        match zmx::session_for(slot) {
+        match listing() {
             Some(None) => return notes,
             _ if Instant::now() >= deadline => {
                 notes.push("zmx still lists its session".into());
@@ -562,26 +576,11 @@ fn kill_tree(o: &Orphan<'_>, grace: Duration) -> usize {
     for &(pid, start) in &targets {
         let _ = signal::send(pid, start, SIGTERM);
     }
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline
-        && targets
-            .iter()
-            .any(|&(pid, start)| procinfo::is_alive(pid, start))
-    {
-        sleep(Duration::from_millis(20));
-    }
-    for &(pid, start) in &targets {
-        if procinfo::is_alive(pid, start) {
+    if !wait_gone(&targets, grace) {
+        for &(pid, start) in &targets {
             let _ = signal::send(pid, start, SIGKILL);
         }
-    }
-    let settle = Instant::now() + KILL_GRACE;
-    while Instant::now() < settle
-        && targets
-            .iter()
-            .any(|&(pid, start)| procinfo::is_alive(pid, start))
-    {
-        sleep(Duration::from_millis(20));
+        wait_gone(&targets, KILL_GRACE);
     }
     targets
         .iter()
@@ -936,23 +935,29 @@ mod tests {
     #[test]
     fn kill_tree_stops_the_daemon_and_everything_under_it() {
         // A stand-in leaked daemon: a shell whose argv reads `daemon run --origin transient`,
-        // with two children. Its parent is this test, not a claude, so `orphans` picks it.
+        // with two children, one of which ignores TERM (an ignored signal stays ignored across
+        // exec), so only KILL ends it. Its parent is this test, not a claude, so `orphans`
+        // picks it. Its output goes nowhere, so a survivor cannot hold the test run's open.
         let mut daemon = std::process::Command::new("sh")
             .args([
                 "-c",
-                "sleep 600 & sleep 600 & wait",
+                "(trap '' TERM; exec sleep 600) & sleep 600 & wait",
                 "daemon",
                 "run",
                 "--origin",
                 "transient",
             ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn");
         let pid = daemon.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let table = loop {
             let t = procinfo::table().unwrap();
-            if procinfo::descendants(&t, pid).len() == 2 {
+            // Both children exec'd, so the trap is in place before anything is signalled.
+            let under = procinfo::descendants(&t, pid);
+            if under.len() == 2 && under.iter().all(|p| p.comm == "sleep") {
                 break t;
             }
             assert!(
@@ -977,9 +982,84 @@ mod tests {
             .filter(|&&(p, s)| procinfo::is_alive(p, s))
             .map(|&(p, _)| std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default())
             .collect();
+        for &(p, s) in &all {
+            let _ = signal::send(p, s, SIGKILL);
+        }
         assert_eq!(left, 0, "nothing survives: {stats:?}");
-        assert!(all.iter().all(|&(p, s)| !procinfo::is_alive(p, s)));
         daemon.wait().ok();
+    }
+
+    #[test]
+    fn kill_tree_gives_term_its_grace_and_no_longer() {
+        // A daemon that takes a moment to finish once told to: TERM, then 300 ms of cleanup.
+        let dir = std::env::temp_dir().join(format!("cs-kill-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join("cleaned-up");
+        let script = format!(
+            "trap 'sleep 0.3; touch {}; exit 0' TERM; sleep 600 & wait",
+            mark.display()
+        );
+        let mut daemon = std::process::Command::new("sh")
+            .args(["-c", &script, "daemon", "run", "--origin", "transient"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = daemon.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let table = loop {
+            let t = procinfo::table().unwrap();
+            let under = procinfo::descendants(&t, pid);
+            if under.len() == 1 && under[0].comm == "sleep" {
+                break t;
+            }
+            assert!(Instant::now() < deadline, "the stand-in never started");
+            sleep(Duration::from_millis(20));
+        };
+        let found = orphans(&table);
+        let o = found
+            .iter()
+            .find(|o| o.daemon.pid == pid)
+            .expect("an orphan");
+        let began = Instant::now();
+        let left = kill_tree(o, Duration::from_secs(10));
+        let took = began.elapsed();
+        daemon.wait().ok();
+        let cleaned = mark.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left, 0);
+        assert!(cleaned, "KILL came before the grace was up");
+        // Everything went on TERM, so nothing waits out the rest of the ten seconds.
+        assert!(took < Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn zmx_is_asked_until_it_drops_the_session_or_the_grace_is_up() {
+        let none: Option<Option<()>> = None;
+        // Not under zmx: nothing to wait for, and zmx is not asked.
+        let notes = teardown_listed(false, Duration::from_secs(5), || -> Option<Option<()>> {
+            panic!("asked")
+        });
+        assert_eq!(notes, ["no zmx daemon above it"]);
+        // Listed twice, then gone: no note, and three looks.
+        let mut looks = 0;
+        let notes = teardown_listed(true, Duration::from_secs(5), || {
+            looks += 1;
+            if looks < 3 {
+                Some(Some(()))
+            } else {
+                Some(None)
+            }
+        });
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(looks, 3);
+        // A listing that fails is asked again too, and one that never clears is reported once
+        // the grace is up, and not before.
+        let began = Instant::now();
+        let notes = teardown_listed(true, Duration::from_millis(300), || none);
+        assert_eq!(notes, ["zmx still lists its session"]);
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert!(began.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

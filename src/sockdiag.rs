@@ -348,4 +348,52 @@ mod tests {
         bad[0] = 4;
         assert!(messages(&bad, &mut BTreeMap::new()).is_err());
     }
+
+    #[test]
+    fn a_header_alone_ending_the_datagram_is_still_read() {
+        // A bare `NLMSG_DONE`, sixteen bytes and nothing after: exactly one header long.
+        let mut done = nlmsg(NLMSG_DONE, &[]);
+        assert_eq!(done.len(), NLMSG_HDR);
+        assert!(messages(&done, &mut BTreeMap::new()).unwrap());
+        // Calibration: a byte short of a header is not a message, so not the end either.
+        done.pop();
+        assert!(!messages(&done, &mut BTreeMap::new()).unwrap());
+    }
+
+    #[test]
+    fn an_acknowledgement_is_never_counted_as_a_socket() {
+        // An ack carries errno 0 and then the request it answers, which can be long enough to
+        // read as a socket's message if nothing told the two apart.
+        let mut ack = 0i32.to_ne_bytes().to_vec();
+        ack.extend(diag(42, Some(136)));
+        let mut out = BTreeMap::new();
+        assert!(!messages(&nlmsg(NLMSG_ERROR, &ack), &mut out).unwrap());
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn attributes_are_walked_by_their_own_lengths() {
+        // An inode whose second byte is not zero, so the attribute's type is read from where it
+        // is and not from the message before it.
+        let inode = 0x0102_0304;
+        assert_eq!(
+            socket_bytes(&diag(inode, Some(136))),
+            Some((inode.into(), 12))
+        );
+        // An empty attribute, only its four-byte header, is passed over to the one after it.
+        let mut msg = diag(inode, None);
+        msg.extend_from_slice(&4u16.to_ne_bytes());
+        msg.extend_from_slice(&9u16.to_ne_bytes());
+        msg.extend_from_slice(&diag(inode, Some(136))[DIAG_MSG..]);
+        assert_eq!(socket_bytes(&msg), Some((inode.into(), 12)));
+        // One shorter than its own header, or longer than what is left, ends the walk.
+        let mut short = diag(inode, None);
+        short.extend_from_slice(&2u16.to_ne_bytes());
+        short.extend_from_slice(&9u16.to_ne_bytes());
+        short.extend_from_slice(&diag(inode, Some(136))[DIAG_MSG..]);
+        assert_eq!(socket_bytes(&short), None);
+        let mut long = diag(inode, Some(136));
+        long.truncate(long.len() - 1);
+        assert_eq!(socket_bytes(&long), None);
+    }
 }

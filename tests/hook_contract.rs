@@ -353,24 +353,36 @@ fn a_start_that_binds_nothing_gives_up_where_a_prompt_waits() {
     assert!(body.contains("\"UserPromptSubmit\""), "{body}");
 }
 
-#[test]
-fn reconcile_offloads_a_reused_pid_on_the_record_under_its_lock_and_skips_a_busy_one() {
-    let dir = tmpdir("reconcile");
-    let me = std::process::id();
-    let stat = std::fs::read_to_string(format!("/proc/{me}/stat")).unwrap();
-    let start: u64 = stat[stat.rfind(')').unwrap() + 2..]
+/// This process's start time, in clock ticks after boot.
+fn own_start() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+    stat[stat.rfind(')').unwrap() + 2..]
         .split_whitespace()
         .nth(19)
         .unwrap()
         .parse()
-        .unwrap();
-    let live = move |dir: &std::path::Path, slot: &str, start: u64| {
-        std::fs::write(
-            dir.join(format!("{slot}.json")),
-            format!(r#"{{"slot":"{slot}","state":"live","pid":{me},"proc_start":{start}}}"#),
-        )
-        .unwrap();
-    };
+        .unwrap()
+}
+
+/// A live record for `slot` naming this process's pid with `start`: running if that is this
+/// process's start time, gone otherwise.
+fn live(dir: &std::path::Path, slot: &str, start: u64) {
+    let me = std::process::id();
+    std::fs::write(
+        dir.join(format!("{slot}.json")),
+        format!(r#"{{"slot":"{slot}","state":"live","pid":{me},"proc_start":{start}}}"#),
+    )
+    .unwrap();
+}
+
+fn text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+#[test]
+fn reconcile_offloads_a_reused_pid_on_the_record_under_its_lock_and_skips_a_busy_one() {
+    let dir = tmpdir("reconcile");
+    let start = own_start();
     // This process's pid, as a container restart hands old pids out again.
     live(&dir, "claude-1", start + 1);
     live(&dir, "claude-2", start);
@@ -413,5 +425,135 @@ fn reconcile_offloads_a_reused_pid_on_the_record_under_its_lock_and_skips_a_busy
     assert!(
         !state("claude-3"),
         "its lock was busy: left for the next pass"
+    );
+}
+
+#[test]
+fn reconcile_counts_what_it_moved_and_the_daemons_that_did_not_answer() {
+    let dir = tmpdir("reconcile-count");
+    let start = own_start();
+    live(&dir, "claude-1", start + 1);
+    live(&dir, "claude-2", start);
+    // A stand-in zmx: one session answering, one daemon that did not.
+    let zmx = dir.join("zmx");
+    std::fs::write(
+        &zmx,
+        "#!/bin/sh\nprintf 'name=claude-2\\tpid=1\\tclients=0\\nname=stuck\\terr=Timeout\\n'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&zmx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let reconcile = || {
+        Command::new(BIN)
+            .arg("reconcile")
+            .env("CLAUDE_SESSIONS_DIR", &dir)
+            .env("CLAUDE_SESSIONS_ZMX", &zmx)
+            .output()
+            .expect("reconcile runs")
+    };
+    let out = reconcile();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout)
+            .contains("reconcile: 1 slot(s) offloaded, 2 zmx session(s), 1 not answering"),
+        "{}",
+        text(&out.stdout)
+    );
+    // A lock that cannot be taken at all, rather than one somebody holds, is an error and not
+    // a slot left for the next pass.
+    live(&dir, "claude-3", start + 1);
+    std::fs::create_dir(dir.join("claude-3.lock")).unwrap();
+    let out = reconcile();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        !text(&out.stdout).contains("claude-3: kept"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
+fn close_marks_a_stopped_slot_closed_and_refuses_a_running_or_missing_one() {
+    let dir = tmpdir("close");
+    let start = own_start();
+    live(&dir, "claude-1", start + 1);
+    live(&dir, "claude-2", start);
+    let state = |slot: &str| std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
+
+    let out = run(&["close", "claude-1"], &dir, None, "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("claude-1: closed."),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        state("claude-1").contains(r#""state": "closed""#),
+        "{}",
+        state("claude-1")
+    );
+
+    let out = run(&["close", "claude-2"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("claude-2 is still running"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        state("claude-2").contains(r#""state":"live""#),
+        "{}",
+        state("claude-2")
+    );
+
+    let out = run(&["close", "claude-9"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("no such slot claude-9"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn doctor_reports_and_an_unknown_subcommand_is_given_the_usage() {
+    let dir = tmpdir("doctor");
+    live(&dir, "claude-1", own_start());
+    let out = run(&["doctor"], &dir, None, "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let said = text(&out.stdout);
+    assert!(said.starts_with("version   : "), "{said}");
+    assert!(said.contains("\nclaude-1 [Live]\n"), "{said}");
+    assert!(said.contains("events    : none seen"), "{said}");
+
+    let out = run(&["frobnicate"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    let said = text(&out.stderr);
+    assert!(
+        said.contains(r#"unknown subcommand "frobnicate""#),
+        "{said}"
+    );
+    assert!(
+        said.contains("claude-sessions keepalive DURATION"),
+        "{said}"
+    );
+}
+
+#[test]
+fn bare_and_piped_it_lists() {
+    // Not at a terminal, the bare command is `list`, so `claude-sessions | grep` answers.
+    let dir = tmpdir("bare");
+    // A zmx that lists nothing, so this machine's own sessions stay out of it.
+    let out = Command::new(BIN)
+        .env("CLAUDE_SESSIONS_DIR", &dir)
+        .env("CLAUDE_SESSIONS_ZMX", "true")
+        .stdin(Stdio::null())
+        .output()
+        .expect("runs");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("no slots."),
+        "{}",
+        text(&out.stdout)
     );
 }

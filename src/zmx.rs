@@ -69,7 +69,12 @@ pub fn command(program: &str) -> Command {
 /// time. **`None` is not "no sessions"**: a caller deciding whether something is safe treats
 /// it as "cannot rule it out".
 pub fn sessions() -> Option<Vec<Session>> {
-    let mut child = command(&program())
+    list_from(&program(), LIST_LIMIT)
+}
+
+/// [`sessions`], asked of `program`, given `limit` to answer.
+fn list_from(program: &str, limit: Duration) -> Option<Vec<Session>> {
+    let mut child = command(program)
         .arg("list")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -82,7 +87,7 @@ pub fn sessions() -> Option<Vec<Session>> {
         let _ = std::io::Read::read_to_string(&mut out, &mut s);
         s
     });
-    let deadline = Instant::now() + LIST_LIMIT;
+    let deadline = Instant::now() + limit;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -148,14 +153,19 @@ fn parse(text: &str) -> Vec<Session> {
 /// wrong verdict. `tests/zmx_real.rs` sees a session made by hand listed well inside that
 /// minute, with `ZMX_DIR` set; the fallbacks are zmx's README, as `zmx version` prints them.
 pub fn socket_dir() -> PathBuf {
-    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    socket_dir_from(|k| std::env::var(k).ok(), uid())
+}
+
+/// [`socket_dir`] from `env` and this process's uid.
+fn socket_dir_from(env: impl Fn(&str) -> Option<String>, uid: Option<u32>) -> PathBuf {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty());
     if let Some(d) = var("ZMX_DIR") {
         return PathBuf::from(d);
     }
     if let Some(d) = var("XDG_RUNTIME_DIR") {
         return PathBuf::from(d).join("zmx");
     }
-    let uid = uid().unwrap_or(0);
+    let uid = uid.unwrap_or(0);
     let base = var("TMPDIR").unwrap_or_else(|| "/tmp".into());
     PathBuf::from(base).join(format!("zmx-{uid}"))
 }
@@ -189,17 +199,29 @@ impl Watch {
         let dir = std::fs::metadata(socket_dir())
             .and_then(|m| m.modified())
             .ok();
+        self.refresh(Instant::now(), force, dir, sessions)
+    }
+
+    /// [`Watch::sessions`] at `now`, with the socket directory last modified at `dir`, asking
+    /// `list` only when the reading can have changed.
+    fn refresh(
+        &mut self,
+        now: Instant,
+        force: bool,
+        dir: Option<SystemTime>,
+        list: impl FnOnce() -> Option<Vec<Session>>,
+    ) -> &[Session] {
         let stale = match self.seen {
             None => true,
-            Some((at, was)) => force || was != dir || at.elapsed() >= MENU_REFRESH,
+            Some((at, was)) => force || was != dir || now.duration_since(at) >= MENU_REFRESH,
         };
         if stale {
             // An unanswered listing keeps the last good one: the menu shows what it last
             // knew rather than emptying the list on a slow daemon.
-            if let Some(now) = sessions() {
-                self.last = now;
+            if let Some(listed) = list() {
+                self.last = listed;
             }
-            self.seen = Some((Instant::now(), dir));
+            self.seen = Some((now, dir));
         }
         &self.last
     }
@@ -268,6 +290,111 @@ name=gone\terr=ConnectionRefused\tstatus=cleaning up\n";
         let s = parse("name=a\tpid=1\tclients=1\terr=Timeout\nname=b\tpid=2\n");
         assert!(!s[0].answered && !s[0].attached && s[0].pid.is_none());
         assert!(!s[1].answered && s[1].pid.is_none());
+    }
+
+    #[test]
+    fn the_socket_directory_is_resolved_as_zmx_resolves_it() {
+        fn env<'a>(pairs: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |k| pairs.iter().find(|p| p.0 == k).map(|p| p.1.to_string())
+        }
+        let all = [
+            ("ZMX_DIR", "/z"),
+            ("XDG_RUNTIME_DIR", "/run/user/7"),
+            ("TMPDIR", "/t"),
+        ];
+        assert_eq!(socket_dir_from(env(&all), Some(7)), PathBuf::from("/z"));
+        assert_eq!(
+            socket_dir_from(env(&all[1..]), Some(7)),
+            PathBuf::from("/run/user/7/zmx")
+        );
+        assert_eq!(
+            socket_dir_from(env(&all[2..]), Some(7)),
+            PathBuf::from("/t/zmx-7")
+        );
+        assert_eq!(
+            socket_dir_from(env(&[]), Some(7)),
+            PathBuf::from("/tmp/zmx-7")
+        );
+        assert_eq!(socket_dir_from(env(&[]), None), PathBuf::from("/tmp/zmx-0"));
+        // A variable set but empty is unset, as zmx reads it.
+        let blank = [("ZMX_DIR", ""), ("XDG_RUNTIME_DIR", ""), ("TMPDIR", "")];
+        assert_eq!(
+            socket_dir_from(env(&blank), Some(7)),
+            PathBuf::from("/tmp/zmx-7")
+        );
+    }
+
+    #[test]
+    fn the_uid_is_this_processs_own() {
+        use std::os::unix::fs::MetadataExt;
+        let own = std::fs::metadata("/proc/self").unwrap().uid();
+        assert_eq!(uid(), Some(own));
+    }
+
+    fn session(name: &str) -> Session {
+        parse(&format!("name={name}\tpid=1\tclients=0\n")).remove(0)
+    }
+
+    #[test]
+    fn a_watch_lists_again_only_when_the_reading_can_have_changed() {
+        let t0 = Instant::now();
+        let mtime = Some(SystemTime::UNIX_EPOCH);
+        let mut w = Watch::default();
+        let list = |names: &[&str]| {
+            let out: Vec<Session> = names.iter().map(|n| session(n)).collect();
+            move || Some(out)
+        };
+        // The first reading always lists.
+        assert_eq!(w.refresh(t0, false, mtime, list(&["a"])).len(), 1);
+        // Nothing changed and not yet a minute: the last listing, unasked.
+        let unasked = || -> Option<Vec<Session>> { panic!("listed") };
+        let just_short = t0 + MENU_REFRESH - Duration::from_millis(1);
+        assert_eq!(w.refresh(just_short, false, mtime, unasked)[0].name, "a");
+        // A minute on, forced, or the directory changed: listed again.
+        let names = |w: &mut Watch, at, force, dir, l| {
+            w.refresh(at, force, dir, l)
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&mut w, t0 + MENU_REFRESH, false, mtime, list(&["b"])),
+            ["b"]
+        );
+        let at = t0 + MENU_REFRESH;
+        assert_eq!(names(&mut w, at, true, mtime, list(&["c"])), ["c"]);
+        assert_eq!(names(&mut w, at, false, None, list(&["d"])), ["d"]);
+        // A listing that went unanswered keeps the last good one.
+        assert_eq!(w.refresh(at, true, None, || None)[0].name, "d");
+    }
+
+    #[test]
+    fn a_listing_is_only_what_zmx_answered_in_time() {
+        let dir = std::env::temp_dir().join(format!("cs-zmx-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stand_in = |name: &str, body: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let ok = stand_in("ok", "printf 'name=claude-1\\tpid=5\\tclients=0\\n'");
+        let failed = stand_in("failed", "exit 1");
+        let hung = stand_in("hung", "exec sleep 30");
+        let limit = Duration::from_millis(500);
+        let listed = list_from(&ok, limit).expect("answered");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "claude-1");
+        assert_eq!(list_from(&failed, limit), None);
+        let began = Instant::now();
+        assert_eq!(list_from(&hung, limit), None);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

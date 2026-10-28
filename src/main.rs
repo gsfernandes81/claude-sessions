@@ -448,7 +448,6 @@ fn process_gone(rec: &SlotRecord) -> bool {
 // ── list and doctor ─────────────────────────────────────────────────────────
 
 fn cmd_list() -> std::io::Result<()> {
-    let now = clock::now();
     let recs = registry::all()?;
     let sessions = zmx::sessions().unwrap_or_else(|| {
         warn!(
@@ -456,6 +455,21 @@ fn cmd_list() -> std::io::Result<()> {
         );
         Vec::new()
     });
+    let alive = |r: &SlotRecord| matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
+    for line in list_lines(&recs, &sessions, alive, clock::now()) {
+        say!("{line}");
+    }
+    Ok(())
+}
+
+/// `list`'s lines: every slot not closed, in the menu's order, then every zmx session no
+/// record names. `alive` says whether a record's process is still running.
+fn list_lines(
+    recs: &[SlotRecord],
+    sessions: &[zmx::Session],
+    alive: impl Fn(&SlotRecord) -> bool,
+    now: clock::Millis,
+) -> Vec<String> {
     let mut rows: Vec<&SlotRecord> = recs.iter().filter(|r| r.state != State::Closed).collect();
     // The order the menu will use: wants you, then unread, then most recent activity.
     rows.sort_by_key(|r| {
@@ -474,33 +488,31 @@ fn cmd_list() -> std::io::Result<()> {
         .collect();
 
     if rows.is_empty() && unregistered.is_empty() {
-        say!("no slots. run claude-sessions at a terminal and press n to start one");
-        return Ok(());
+        return vec!["no slots. run claude-sessions at a terminal and press n to start one".into()];
     }
+    let mut out = Vec::new();
     for r in rows {
         let sess = sessions.iter().find(|s| s.name == r.slot);
-        let alive = matches!((r.pid, r.proc_start), (Some(p), Some(s)) if procinfo::is_alive(p, s));
         let marks = format!(
             "{}{}{}{}{}",
             if r.needs_you { "!" } else { "" },
             if r.unread() { "*" } else { "" },
             if r.kept_for(now).is_some() { "k" } else { "" },
             // Attached is only meaningful for a session we know to be alive.
-            if alive && sess.is_some_and(|s| s.attached) {
+            if alive(r) && sess.is_some_and(|s| s.attached) {
                 "@"
             } else {
                 ""
             },
             if r.state == State::Offloaded { "z" } else { "" },
         );
-        let title = r.display_title();
-        say!(
+        out.push(format!(
             "{:<10} {:<4} {:<40} {}",
             r.slot,
             marks,
-            title,
+            r.display_title(),
             age(now.saturating_sub(r.last_activity_ms))
-        );
+        ));
     }
     for sock in unregistered {
         // `u` is the mark for "not started by claude-sessions". A name that is not of the form
@@ -511,14 +523,14 @@ fn cmd_list() -> std::io::Result<()> {
         } else {
             "not started by claude-sessions"
         };
-        say!(
+        out.push(format!(
             "{:<10} {:<4} {:<40} --",
             sock.name,
             if sock.attached { "u@" } else { "u" },
             why
-        );
+        ));
     }
-    Ok(())
+    out
 }
 
 /// What is visible and what is not — per slot, per event.
@@ -532,25 +544,7 @@ fn cmd_doctor() -> std::io::Result<()> {
     let m = mem::read();
     say!("version   : {VERSION}");
     say!("registry  : {}", registry::dir().display());
-    match (m.limit, m.used()) {
-        (Some(limit), Some(used)) => say!(
-            "memory    : {} of {} used in this container{}; room for another session: {}",
-            human(used),
-            human(limit),
-            m.reclaimable
-                .map(|r| format!(
-                    " (page cache the kernel reclaims first, {}, not counted)",
-                    human(r)
-                ))
-                .unwrap_or_else(|| " (memory.stat unreadable: page cache counted as used)".into()),
-            if m.room_for(mem::SESSION_COST) {
-                "yes"
-            } else {
-                "no"
-            }
-        ),
-        _ => say!("memory    : no cgroup limit readable; /proc/meminfo describes the host"),
-    }
+    say!("{}", memory_line(&m));
     match zmx::sessions() {
         Some(all) => say!(
             "zmx       : {} session(s): {}",
@@ -623,16 +617,42 @@ fn cmd_doctor() -> std::io::Result<()> {
             say!("  events    : none seen — the hooks are not installed, or not firing");
         } else {
             for (name, at) in &rec.last_event_ms {
-                // "last seen now", not "last seen now ago".
-                let when = match age(now.saturating_sub(*at)) {
-                    a if a == "now" => a,
-                    a => format!("{a} ago"),
-                };
-                say!("  {name:<10}: last seen {when}");
+                say!("  {name:<10}: last seen {}", seen(now, *at));
             }
         }
     }
     Ok(())
+}
+
+/// `doctor`'s memory line.
+fn memory_line(m: &mem::Memory) -> String {
+    let (Some(limit), Some(used)) = (m.limit, m.used()) else {
+        return "memory    : no cgroup limit readable; /proc/meminfo describes the host".into();
+    };
+    format!(
+        "memory    : {} of {} used in this container{}; room for another session: {}",
+        human(used),
+        human(limit),
+        m.reclaimable
+            .map(|r| format!(
+                " (page cache the kernel reclaims first, {}, not counted)",
+                human(r)
+            ))
+            .unwrap_or_else(|| " (memory.stat unreadable: page cache counted as used)".into()),
+        if m.room_for(mem::SESSION_COST) {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+}
+
+/// How long ago `at` was: "now", not "now ago".
+fn seen(now: clock::Millis, at: clock::Millis) -> String {
+    match age(now.saturating_sub(at)) {
+        a if a == "now" => a,
+        a => format!("{a} ago"),
+    }
 }
 
 // ── close ───────────────────────────────────────────────────────────────────
@@ -670,6 +690,123 @@ fn cmd_close(slot: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    const NOW: clock::Millis = 10 * 86_400_000;
+
+    fn rec(slot: &str, f: impl FnOnce(&mut SlotRecord)) -> SlotRecord {
+        let mut r = SlotRecord::new(slot, clock::Moment::ms(NOW - 5 * 60_000));
+        r.title = Some(format!("{slot}'s title"));
+        f(&mut r);
+        r
+    }
+
+    fn sess(name: &str, attached: bool) -> zmx::Session {
+        zmx::Session {
+            name: name.into(),
+            pid: Some(1),
+            attached,
+            answered: true,
+            created: None,
+        }
+    }
+
+    /// Each line's first two columns: the slot and its marks.
+    fn heads(lines: &[String]) -> Vec<(String, String)> {
+        lines
+            .iter()
+            .map(|l| {
+                let mut w = l.split_whitespace();
+                let slot = w.next().unwrap().to_string();
+                let marks = l[10..15].trim().to_string();
+                (slot, marks)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_orders_and_marks_as_the_menu_does() {
+        let recs = [
+            rec("claude-1", |r| r.last_activity_ms = NOW - 60_000),
+            rec("claude-2", |r| r.needs_you = true),
+            rec("claude-3", |r| r.last_stop_ms = Some(NOW - 1_000)),
+            rec("claude-4", |r| r.state = State::Offloaded),
+            rec("claude-5", |r| r.keep_until_ms = Some(NOW + 60_000)),
+            rec("claude-6", |r| r.state = State::Closed),
+        ];
+        let sessions = [sess("claude-1", true), sess("claude-5", true)];
+        // claude-5 is attached by zmx's word, but its process is not alive: no `@`.
+        let alive = |r: &SlotRecord| r.slot != "claude-5";
+        let lines = list_lines(&recs, &sessions, alive, NOW);
+        let want = [
+            ("claude-2", "!"),
+            ("claude-3", "*"),
+            ("claude-1", "@"),
+            ("claude-4", "z"),
+            ("claude-5", "k"),
+        ];
+        let want: Vec<(String, String)> = want
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        assert_eq!(heads(&lines), want, "{lines:#?}");
+        assert!(
+            lines[2].contains("claude-1's title") && lines[2].ends_with(" 1m"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn list_shows_zmx_sessions_no_record_names() {
+        let recs = [rec("claude-1", |_| {})];
+        let sessions = [
+            sess("claude-1", false),
+            sess("claude-9", false),
+            sess("work", true),
+        ];
+        let lines = list_lines(&recs, &sessions, |_| true, NOW);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[1].starts_with("claude-9   u ") && lines[1].contains("no record — run reconcile")
+        );
+        assert!(lines[2].starts_with("work       u@") && lines[2].contains("not started by"));
+        // Nothing at all says how to start; a closed slot alone is nothing.
+        let closed = [rec("claude-1", |r| r.state = State::Closed)];
+        let none = list_lines(&closed, &[], |_| true, NOW);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].starts_with("no slots."), "{none:?}");
+        // Calibration: an unregistered session alone is something.
+        assert_eq!(list_lines(&closed, &sessions[2..], |_| true, NOW).len(), 1);
+        assert!(list_lines(&closed, &sessions[2..], |_| true, NOW)[0].starts_with("work"));
+    }
+
+    #[test]
+    fn doctor_says_memory_against_a_limit_or_that_there_is_none() {
+        let g = 1024 * 1024 * 1024;
+        let m = mem::Memory {
+            limit: Some(8 * g),
+            current: Some(3 * g),
+            reclaimable: Some(g),
+        };
+        assert_eq!(
+            memory_line(&m),
+            "memory    : 2.0G of 8.0G used in this container (page cache the kernel reclaims \
+             first, 1.0G, not counted); room for another session: yes"
+        );
+        let full = mem::Memory {
+            current: Some(8 * g),
+            reclaimable: None,
+            ..m
+        };
+        assert!(memory_line(&full).ends_with("counted as used); room for another session: no"));
+        let unlimited = mem::Memory { limit: None, ..m };
+        assert!(memory_line(&unlimited).contains("no cgroup limit"));
+    }
+
+    #[test]
+    fn doctor_says_now_or_how_long_ago() {
+        assert_eq!(seen(NOW, NOW - 1_000), "now");
+        assert_eq!(seen(NOW, NOW - 3 * 60_000), "3m ago");
+    }
 
     #[test]
     fn the_hook_lets_no_error_or_panic_out() {

@@ -544,6 +544,8 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
     let (ok, out) = keepalive(&s.root, Some("offload-t1"), "25m");
     assert!(ok, "{out}");
     assert!(out.contains("offload-t1: kept alive for 25m"), "{out}");
+    let record = std::fs::read_to_string(s.root.join("registry/offload-t1.json")).unwrap();
+    assert!(record.contains("keep_until"), "calibration: {record}");
     measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "{out}");
@@ -555,6 +557,9 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
 
     let (ok, out) = keepalive(&s.root, Some("offload-t1"), "0");
     assert!(ok && out.contains("keep-alive ended"), "{out}");
+    // Ended is no keep-alive at all, not one that runs out now.
+    let record = std::fs::read_to_string(s.root.join("registry/offload-t1.json")).unwrap();
+    assert!(!record.contains("keep_until"), "{record}");
     measured_before(&s, -180_000);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok && out.contains("offload-t1: would offload"), "{out}");

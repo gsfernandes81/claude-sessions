@@ -45,46 +45,53 @@ pub enum Sent {
 
 /// Send `sig` to `pid`, but only if it is still the process that started at `start`.
 pub fn send(pid: u32, start: u64, sig: i32) -> io::Result<Sent> {
-    match pidfd_open(pid) {
-        Ok(fd) => {
-            if !procinfo::is_alive(pid, start) {
-                return Ok(Sent::Gone);
-            }
-            use std::os::fd::AsRawFd;
-            // SAFETY: a valid pidfd owned above; the null siginfo means "as kill(2) would".
-            let rc = unsafe {
-                syscall(
-                    SYS_PIDFD_SEND_SIGNAL,
-                    fd.as_raw_fd() as c_long,
-                    sig as c_long,
-                    std::ptr::null::<u8>(),
-                    0 as c_long,
-                )
-            };
-            if rc == 0 {
-                return Ok(Sent::Delivered);
-            }
-            match io::Error::last_os_error() {
-                e if e.raw_os_error() == Some(ESRCH) => Ok(Sent::Gone),
-                e => Err(e),
-            }
-        }
-        Err(e) if e.raw_os_error() == Some(ESRCH) => Ok(Sent::Gone),
-        Err(e) if e.raw_os_error() == Some(ENOSYS) => {
-            if !procinfo::is_alive(pid, start) {
-                return Ok(Sent::Gone);
-            }
-            // SAFETY: plain kill(2); pid fits, it came from /proc.
-            if unsafe { kill(pid as i32, sig) } == 0 {
-                Ok(Sent::Delivered)
-            } else {
-                match io::Error::last_os_error() {
-                    e if e.raw_os_error() == Some(ESRCH) => Ok(Sent::Gone),
-                    e => Err(e),
-                }
-            }
-        }
-        Err(e) => Err(e),
+    let fd = match pidfd_open(pid) {
+        Ok(fd) => fd,
+        Err(e) if e.raw_os_error() == Some(ENOSYS) => return send_by_kill(pid, start, sig),
+        Err(e) => return gone_or(e),
+    };
+    if !procinfo::is_alive(pid, start) {
+        return Ok(Sent::Gone);
+    }
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid pidfd owned above; the null siginfo means "as kill(2) would".
+    let rc = unsafe {
+        syscall(
+            SYS_PIDFD_SEND_SIGNAL,
+            fd.as_raw_fd() as c_long,
+            sig as c_long,
+            std::ptr::null::<u8>(),
+            0 as c_long,
+        )
+    };
+    if rc == 0 {
+        Ok(Sent::Delivered)
+    } else {
+        gone_or(io::Error::last_os_error())
+    }
+}
+
+/// A kernel before 5.3, which has no pidfds: the same start-time check, then `kill(2)`, which
+/// leaves the window a pidfd closes but is the best that kernel offers.
+fn send_by_kill(pid: u32, start: u64, sig: i32) -> io::Result<Sent> {
+    if !procinfo::is_alive(pid, start) {
+        return Ok(Sent::Gone);
+    }
+    // SAFETY: plain kill(2); pid fits, it came from /proc.
+    if unsafe { kill(pid as i32, sig) } == 0 {
+        Ok(Sent::Delivered)
+    } else {
+        gone_or(io::Error::last_os_error())
+    }
+}
+
+/// `ESRCH` is the process having gone between being looked at and being signalled, which is
+/// what `Gone` says; anything else is an error.
+fn gone_or(e: io::Error) -> io::Result<Sent> {
+    if e.raw_os_error() == Some(ESRCH) {
+        Ok(Sent::Gone)
+    } else {
+        Err(e)
     }
 }
 
@@ -122,5 +129,42 @@ mod tests {
         assert_eq!(send(pid, start, SIGKILL).unwrap(), Sent::Delivered);
         child.wait().expect("reap");
         assert_eq!(send(pid, start, SIGTERM).unwrap(), Sent::Gone);
+    }
+
+    /// The fallback a pre-5.3 kernel takes, driven here directly since this one never takes it.
+    #[test]
+    fn the_kill_fallback_checks_the_start_time_the_same_way() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let start = procinfo::start_time(pid).expect("readable");
+        assert_eq!(send_by_kill(pid, start, 0).unwrap(), Sent::Delivered);
+        assert_eq!(send_by_kill(pid, start + 1, SIGKILL).unwrap(), Sent::Gone);
+        assert!(
+            procinfo::is_alive(pid, start),
+            "survived the mismatched KILL"
+        );
+        assert_eq!(send_by_kill(pid, start, SIGKILL).unwrap(), Sent::Delivered);
+        child.wait().expect("reap");
+        assert_eq!(send_by_kill(pid, start, SIGTERM).unwrap(), Sent::Gone);
+    }
+
+    #[test]
+    fn only_esrch_means_gone() {
+        let gone = gone_or(io::Error::from_raw_os_error(ESRCH)).unwrap();
+        assert_eq!(gone, Sent::Gone);
+        let e = gone_or(io::Error::from_raw_os_error(1)).unwrap_err();
+        assert_eq!(
+            e.raw_os_error(),
+            Some(1),
+            "EPERM is an error, not a gone process"
+        );
+        // And through `send`: pid 0 is no process, which pidfd_open refuses with EINVAL — an
+        // error, not a process that has gone, nor a reason to fall back to kill(2), which
+        // would signal the whole process group.
+        let e = send(0, 0, 0).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(22), "{e}");
     }
 }

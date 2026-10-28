@@ -192,6 +192,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_boot_id_and_an_age_are_this_machines() {
+        let id = boot_id();
+        assert_eq!(id.len(), 36, "{id:?}");
+        assert_eq!(
+            id,
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim()
+        );
+        // Started at boot is as old as the machine has been up.
+        let up: f64 = fs::read_to_string("/proc/uptime")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let age = age(0).expect("readable").as_secs_f64();
+        assert!((age - up).abs() < 1.0, "{age} against {up}");
+    }
+
+    #[test]
     fn a_lineage_stops_short_of_init() {
         let line = lineage(std::process::id(), 64);
         assert_eq!(line.first().map(|l| l.0), Some(std::process::id()));

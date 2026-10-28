@@ -1144,9 +1144,42 @@ mod tests {
             plain(vec![r(1, 9, 2_000), r(2, 8, 3_000)], false),
         );
         assert_eq!(m.rate, Some(50.0));
+        // Its CPU too: a new member's 301 ticks are over the budget on their own.
+        let busy = Reading {
+            cpu: 301,
+            ..r(2, 8, 0)
+        };
+        let (_, m) = step(
+            Some(&s),
+            T0 + 100_000,
+            plain(vec![r(1, 7, 1_000), busy], false),
+        );
+        assert_eq!((m.cpu_ms, m.quiet_ms), (3010.0, 0));
         // The same process: only what it did since.
         let (_, m) = step(Some(&s), T0 + 100_000, plain(vec![r(1, 7, 1_500)], false));
         assert_eq!(m.rate, Some(5.0));
+    }
+
+    #[test]
+    fn a_member_there_but_unreadable_is_counted_unknown() {
+        // Another user's process: its stat is readable and its io is not. Running as root,
+        // every process reads, and there is nothing here to test.
+        let Some(theirs) = crate::procinfo::table()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.pid)
+            .find(|&pid| {
+                read(pid).is_none() && std::path::Path::new(&format!("/proc/{pid}")).exists()
+            })
+        else {
+            return;
+        };
+        let mine = std::process::id();
+        let none = BTreeMap::new();
+        assert!(matches!(snapshot(&[mine, theirs], Ok(&none)), Err(1)));
+        assert!(matches!(snapshot(&[theirs, theirs], Ok(&none)), Err(2)));
+        // Calibration: this process alone reads.
+        assert!(snapshot(&[mine], Ok(&none)).is_ok());
     }
 
     #[test]
