@@ -1,9 +1,9 @@
 # Handoff 2026-10-29: agent mail v2 — built on main, not released
 
-**First orders for the next session: read this, check the inbox for infra's answer (below),
-say where things stand, and stop.** The release is the owner's to cut. This note goes once
-0.9.0 is on the fleet and a message has moved through the server there; the durable reasoning
-is in `docs/design.md` § *Agent mail*, the contract with infra in `docs/releases/v0.9.0.md`.
+**First orders for the next session: read this, say where things stand, and stop.** The
+release is the owner's to cut. This note goes once 0.9.0 is on the fleet and a message has
+moved through the server there; the durable reasoning is in `docs/design.md` § *Agent mail*,
+the contract with infra in `docs/releases/v0.9.0.md`.
 
 ## State
 
@@ -13,10 +13,10 @@ is in `docs/design.md` § *Agent mail*, the contract with infra in `docs/release
   (`agent::nudge`), the three mail skills in `skills/`. `mail-loop` and `mail-agent` are gone.
 - **Not released.** `Cargo.toml` still says 0.8.1; the notes are written for 0.9.0. A bump is a
   publish, and the owner's.
-- **Asked of infra, not yet answered** (reply `20261029T021502Z-mail-v2-ack.md`): where the hub
-  writes each container's `mail-token`. Built as `HUB_MAIL_TOKENS` (default
-  `$HOME/mail-tokens`), `<dir>/<container>/mail-token`, mode 0644. Change the default to what
-  infra answers, if it names one.
+- **The token path is settled** (infra, `20261029T084708.707Z`): the hub's `github-tokens`
+  volume at `/home/dev/tokens`, the default now, and infra's compose sets `HUB_MAIL_TOKENS`
+  beside `HUB_GITHUB_TOKENS`. Infra's cutover waits for 0.9.0 and its SHA256SUMS; nothing of
+  v1 is torn down before then.
 
 ## The first run on the fleet
 

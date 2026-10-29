@@ -980,7 +980,7 @@ the first.
 |---|---|---|
 | `HUB_MAIL_LISTEN` | `0.0.0.0:8025` | where the server listens |
 | `HUB_MAIL` | `$HOME/mail` | the store |
-| `HUB_MAIL_TOKENS` | `$HOME/mail-tokens` | `<container>/mail-token`, one per container |
+| `HUB_MAIL_TOKENS` | `$HOME/tokens` | `<container>/mail-token`, one per container; the same directory as `HUB_GITHUB_TOKENS`, whose per-container subdirectory each container mounts at `/run/github` |
 | `HUB_MAIL_MAX_BYTES` | `16384` | a larger body is refused |
 | `HUB_MAIL_MAX_QUEUE` | `200` | messages one address may hold unread, or one offline repo queued |
 | `HUB_MAIL_RETAIN_DAYS` | `90` | older messages are pruned |

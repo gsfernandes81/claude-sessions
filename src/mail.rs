@@ -84,7 +84,7 @@ impl ServerConfig {
                 .unwrap_or_else(|| home(var).join("mail")),
             tokens: text(var, "HUB_MAIL_TOKENS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home(var).join("mail-tokens")),
+                .unwrap_or_else(|| home(var).join("tokens")),
             limits: Limits {
                 max_bytes: num(var, "HUB_MAIL_MAX_BYTES", d.max_bytes as u64) as usize,
                 max_queue: num(var, "HUB_MAIL_MAX_QUEUE", d.max_queue as u64) as usize,
@@ -1244,7 +1244,7 @@ mod tests {
             ServerConfig {
                 listen: "0.0.0.0:8025".into(),
                 store: "/h/mail".into(),
-                tokens: "/h/mail-tokens".into(),
+                tokens: "/h/tokens".into(),
                 limits: Limits::default(),
             }
         );
