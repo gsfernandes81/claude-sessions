@@ -34,7 +34,10 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned like the arm job: ubuntu-latest became 26.04 on 2026-10-28 and every offload
+    # test's stand-in claude stopped starting there. What ships is a static musl binary, so
+    # the runner's release changes nothing a consumer gets.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Install the toolchain and the musl target
@@ -104,7 +107,7 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     # Both architectures' tests, because the release publishes both architectures' binaries.
     needs: [test, test-aarch64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     concurrency:
