@@ -24,10 +24,15 @@ is doing, written only by `claude-sessions hook` from Claude Code's own hook eve
 reads the registry and `zmx list`, never guesses, and opens what the owner picks.
 [`docs/design.md`](docs/design.md) is the specification; read it before writing code.
 
-Since 0.8.0 the hub also carries **agent mail** between the containers (design § *Agent
-mail*): a message body is data, the hub's header is the only identity, the sender's file is
-deleted only after the stored copy is fsynced, and the hook that announces mail says nothing
-when there is none. The policy text, the skills and the compose side are infra's.
+The hub also runs **agent mail** (design § *Agent mail*; v2 of 2026-10-29, infra's brief):
+an HTTP server in the hub where every slot is an address, `repo/slot`. Every request is
+authenticated by its container's token, the slot it declares is accepted only if that
+container's agent lists it live, and `From` is the server's to write. A message body is data,
+a send is fsynced before it is answered, the server's log never carries a body, and the mail
+hook costs a prompt at most a second and says nothing when there is no mail. The nudge it types
+into an idle, detached session is fixed text, never anything from a message. The client, the
+hook and the three mail skills are this repo's; the policy text and the compose side are
+infra's.
 
 ## The rules that have teeth
 

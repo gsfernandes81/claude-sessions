@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 /// How long a container that is not answering waits before it is asked again:
 /// `CLAUDE_SESSIONS_RETRY_MS`, for the tests, else 15 seconds.
-fn retry() -> Duration {
+pub fn retry() -> Duration {
     std::env::var("CLAUDE_SESSIONS_RETRY_MS")
         .ok()
         .and_then(|v| v.parse().ok())

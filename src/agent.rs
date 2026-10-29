@@ -323,11 +323,82 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             };
             mark(op == "archive", &conv, clock::now(), archive::set)
         }
+        // The mail server's, not the menu's: the one line that says mail has come.
+        "nudge" => match msg.get("slot").and_then(Value::as_str) {
+            Some(slot) => match nudge(slot) {
+                Ok(()) => Outcome::Back(None),
+                Err(why) => Outcome::Refused(why),
+            },
+            None => refused(),
+        },
         other => Outcome::Refused(format!(
             "this container's claude-sessions does not know how to {other:?} — it may be older \
              than the hub's"
         )),
     }
+}
+
+/// What the hub types into an idle session that has mail (`docs/design.md` § *Agent mail*):
+/// fixed, because what is typed becomes a prompt, and nothing from a message may. The mail
+/// hook knows it when it sees it as a prompt, and says the hub typed it.
+pub const NUDGE: &str = "[claude-sessions mail] you have mail; the hook names it";
+
+/// Type [`NUDGE`] into `slot`'s session, then `Enter` a moment later so it reads as typing
+/// rather than a paste — if, looked at now, it may be: why not, otherwise. The one place a
+/// nudge is made, so that another way to tell a session (Claude Code's own background
+/// messaging, off on this fleet by infra's managed setting) can be swapped in here.
+pub fn nudge(slot: &str) -> Result<(), String> {
+    if !zmx::is_slot_name(slot) {
+        return Err(format!("{slot:?} is not a slot"));
+    }
+    let rec = crate::registry::load(slot)
+        .map_err(|e| format!("its record cannot be read: {e}"))?
+        .ok_or_else(|| "no such slot".to_string())?;
+    let session = zmx::session_for(slot).ok_or_else(|| "zmx did not list".to_string())?;
+    may_nudge(&rec, session.as_ref())?;
+    let send = |text: &str| -> Result<(), String> {
+        let status = zmx::command(&zmx::program())
+            .args(["send", slot, text])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("zmx send: {e}"))?;
+        status
+            .success()
+            .then_some(())
+            .ok_or_else(|| format!("zmx send exited {status}"))
+    };
+    send(NUDGE)?;
+    std::thread::sleep(Duration::from_millis(250));
+    send("\r")
+}
+
+/// Whether a session may be typed into: ours, live, between turns, no dialog open, and on
+/// nobody's screen — an attached one may hold the owner's half-typed prompt, and a dialog
+/// would take the keystrokes as its answer.
+fn may_nudge(
+    rec: &crate::registry::SlotRecord,
+    session: Option<&zmx::Session>,
+) -> Result<(), String> {
+    use crate::registry::State;
+    let why = if !rec.registered {
+        "not a session this tool started"
+    } else if rec.state != State::Live {
+        "not live"
+    } else if rec.busy {
+        "mid-turn"
+    } else if rec.needs_you {
+        "a dialog is open"
+    } else {
+        match session {
+            None => "no zmx session",
+            Some(s) if !s.answered => "its zmx session did not answer",
+            Some(s) if s.attached => "attached",
+            Some(_) => return Ok(()),
+        }
+    };
+    Err(why.to_string())
 }
 
 /// Archive conversation `conv` at `now`, or take it out of the archive, through `set`; what
@@ -377,6 +448,47 @@ fn log(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nudge_is_typed_only_into_an_idle_session_nobody_is_on() {
+        use crate::registry::{SlotRecord, State};
+        let rec = SlotRecord::new("claude-1", clock::Moment::ms(1));
+        let session = |attached, answered| zmx::Session {
+            name: "claude-1".into(),
+            pid: Some(7),
+            attached,
+            answered,
+            created: None,
+        };
+        let free = session(false, true);
+        assert_eq!(may_nudge(&rec, Some(&free)), Ok(()), "calibration");
+        let with = |f: fn(&mut SlotRecord)| {
+            let mut r = rec.clone();
+            f(&mut r);
+            may_nudge(&r, Some(&free)).unwrap_err()
+        };
+        assert_eq!(with(|r| r.busy = true), "mid-turn");
+        assert_eq!(with(|r| r.needs_you = true), "a dialog is open");
+        assert_eq!(with(|r| r.state = State::Offloaded), "not live");
+        assert_eq!(
+            with(|r| r.registered = false),
+            "not a session this tool started"
+        );
+        assert_eq!(
+            may_nudge(&rec, Some(&session(true, true))).unwrap_err(),
+            "attached"
+        );
+        assert_eq!(
+            may_nudge(&rec, Some(&session(false, false))).unwrap_err(),
+            "its zmx session did not answer"
+        );
+        assert_eq!(may_nudge(&rec, None).unwrap_err(), "no zmx session");
+    }
+
+    #[test]
+    fn the_nudge_is_plain_ascii_on_one_line() {
+        assert!(NUDGE.bytes().all(|c| (0x20..0x7f).contains(&c)));
+    }
 
     #[test]
     fn the_rows_are_said_first_then_only_when_they_or_the_minute_change_or_when_asked() {

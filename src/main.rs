@@ -47,6 +47,7 @@ mod clock;
 mod events;
 mod fmt;
 mod hooks_config;
+mod http;
 mod hub;
 mod install;
 mod json;
@@ -55,6 +56,7 @@ mod launch;
 mod live;
 mod lockfile;
 mod mail;
+mod mailbox;
 mod mem;
 mod menu;
 mod offload;
@@ -85,6 +87,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The keep-alive skill, printed by `claude-sessions skill` so an image needs only the binary.
 const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 
+/// Every skill this binary ships, by name: what `install` writes and `skill` prints.
+pub const SKILLS: [(&str, &str); 4] = [
+    ("keepalive", SKILL),
+    ("mail-send", include_str!("../skills/mail-send/SKILL.md")),
+    ("mail-read", include_str!("../skills/mail-read/SKILL.md")),
+    ("mail-reply", include_str!("../skills/mail-reply/SKILL.md")),
+];
+
 /// The menu's exit status when its terminal went away: 128 + SIGHUP, what a shell reports
 /// for a hangup, so the door can tell it from a failure worth explaining.
 const TERMINAL_GONE: u8 = 129;
@@ -110,23 +120,34 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         // The mail hook has the same contract: fed by Claude Code, always 0, and the only thing
-        // it may say is its one line per new message.
+        // it may say is its lines — one per new message, or a Stop's block.
         "mail-hook" => {
             std::panic::set_hook(Box::new(|info| {
                 log(&format!("mail-hook: panicked: {info}"))
             }));
             contained(
-                || mail::hook(&mut std::io::stdout().lock(), &log),
+                || {
+                    let mut payload = String::new();
+                    std::io::stdin()
+                        .take(1 << 20)
+                        .read_to_string(&mut payload)?;
+                    mail::hook(&payload, &mut std::io::stdout().lock(), &log)
+                },
                 |e| log(&format!("mail-{e}")),
             );
             ExitCode::SUCCESS
         }
-        "mail-agent" => report(mail::agent()),
-        "mail-loop" => match args.get(1).map(String::as_str) {
-            None => report(mail::run(false)),
-            Some("--once") => report(mail::run(true)),
-            Some(other) => fail(&format!("mail-loop takes only --once, not {other:?}")),
-        },
+        "mail-server" => report(mail::server()),
+        "mail" => {
+            match mail::cli(
+                &args[1..],
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e),
+            }
+        }
         "reconcile" => report(cmd_reconcile()),
         "doctor" => report(cmd_doctor()),
         // The menu, when there is a person at a terminal to drive it; the plain list when the
@@ -179,8 +200,17 @@ fn main() -> ExitCode {
             }
         }
         "skill" => {
-            say_nl!("{SKILL}");
-            ExitCode::SUCCESS
+            let name = args.get(1).map(String::as_str).unwrap_or("keepalive");
+            match SKILLS.iter().find(|(n, _)| *n == name) {
+                Some((_, text)) => {
+                    say_nl!("{text}");
+                    ExitCode::SUCCESS
+                }
+                None => fail(&format!(
+                    "no skill {name:?}: {}",
+                    SKILLS.map(|(n, _)| n).join(", ")
+                )),
+            }
         }
         "offload" => {
             let dry = match args.get(1).map(String::as_str) {
@@ -230,15 +260,16 @@ fn usage() -> String {
                                this one); the list below when not at a terminal
   claude-sessions offload-all  one offload pass in every container, over ssh; run from the
                   [--dry-run]  hub's timer every three minutes
-  claude-sessions mail-loop    carry mail between the containers: each one's outbox into the
-                  [--once]     hub's volume (HUB_MAIL), each queue into its receiver's inbox;
-                               run from the hub's start, for ever, or one pass
-  claude-sessions install DIR  put this binary, its hooks drop-in and its skill in DIR, for
+  claude-sessions mail-server  the hub's mail server (HUB_MAIL_LISTEN, default 0.0.0.0:8025),
+                               holding an agent in every container for who is live; run from
+                               the hub's start, for ever
+  claude-sessions install DIR  put this binary, its hooks drop-in and its skills in DIR, for
                                every container to mount
   claude-sessions agent        a container's half of the hub, run over ssh by the hub
-  claude-sessions mail-agent   a container's half of the mail loop, run over ssh by the hub
+  claude-sessions mail who|send|list|read|reply|wait|status
+                               agent mail, from a session to others; `mail` alone says how
   claude-sessions mail-hook    fed by Claude Code's hooks on stdin; one line per message new
-                               in /workspace/.mail/in, nothing otherwise; always exits 0
+                               to this session, nothing otherwise; always exits 0
   claude-sessions list         every slot here, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart
@@ -251,9 +282,9 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill        print the keep-alive skill that tells claude when to run that,
-                               to be saved as skills/keepalive/SKILL.md in Claude Code's
-                               config directory
+  claude-sessions skill [NAME] print a skill this binary ships (keepalive, mail-send,
+                               mail-read, mail-reply; default keepalive), as install writes
+                               it into skills/NAME/SKILL.md
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status

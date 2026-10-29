@@ -11,8 +11,10 @@
 //! - `managed-settings.d/claude-sessions.json` — the hooks and the status line naming
 //!   `DIR/bin/claude-sessions` (`hooks-config`), for a container to mount at
 //!   `/etc/claude-code/managed-settings.d/`;
-//! - `skills/keepalive/SKILL.md` — the keep-alive skill (`skill`), for a container's start to
-//!   copy into Claude Code's config directory.
+//! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, and the three mail skills
+//!   `mail-send`, `mail-read` and `mail-reply`, for a container's start to link into Claude
+//!   Code's config directory. A file here it did not write — a skill infra keeps beside these —
+//!   is left alone.
 //!
 //! **`DIR` must be the same path in the hub and in the containers**, because the drop-in names
 //! the binary by it. Every file goes through a temporary name and a rename, so a container
@@ -45,9 +47,11 @@ pub fn run(dir: &Path) -> io::Result<Vec<String>> {
     let drop_in = dir.join("managed-settings.d/claude-sessions.json");
     put(dir, &drop_in, settings.as_bytes(), 0o644)?;
     done.push(drop_in.display().to_string());
-    let skill = dir.join("skills/keepalive/SKILL.md");
-    put(dir, &skill, crate::SKILL.as_bytes(), 0o644)?;
-    done.push(skill.display().to_string());
+    for (name, text) in crate::SKILLS {
+        let skill = dir.join(format!("skills/{name}/SKILL.md"));
+        put(dir, &skill, text.as_bytes(), 0o644)?;
+        done.push(skill.display().to_string());
+    }
     Ok(done)
 }
 
@@ -87,7 +91,7 @@ mod tests {
             "a relative path names nothing"
         );
         let done = run(&dir).unwrap();
-        assert_eq!(done.len(), 3);
+        assert_eq!(done.len(), 2 + crate::SKILLS.len());
         let bin = dir.join("bin/claude-sessions");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&bin), 0o755);
@@ -102,6 +106,11 @@ mod tests {
             text.contains(&format!("{} hook", bin.display())),
             "the hooks name the installed binary: {text}"
         );
+        for (name, text) in crate::SKILLS {
+            let path = dir.join(format!("skills/{name}/SKILL.md"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), text, "{name}");
+            assert_eq!(mode(&path), 0o644, "{name}");
+        }
         assert_eq!(
             fs::read_to_string(dir.join("skills/keepalive/SKILL.md")).unwrap(),
             crate::SKILL
@@ -112,11 +121,19 @@ mod tests {
             "managed-settings.d",
             "skills",
             "skills/keepalive",
+            "skills/mail-send",
+            "skills/mail-read",
+            "skills/mail-reply",
         ] {
             assert_eq!(mode(&dir.join(d)), 0o755, "{d}");
         }
-        // Again, over itself, and nothing temporary is left behind.
+        // Again, over itself, and nothing temporary is left behind — nor anything of somebody
+        // else's taken away.
+        let theirs = dir.join("skills/infra-only/SKILL.md");
+        fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        fs::write(&theirs, "infra's").unwrap();
         run(&dir).unwrap();
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "infra's");
         let stray: Vec<_> = fs::read_dir(dir.join("bin"))
             .unwrap()
             .filter_map(Result::ok)

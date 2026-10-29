@@ -94,14 +94,4 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # mail.rs: an outbox entry that is not a directory fails its read_dir and is skipped either
-    # way; a file's time equal to the settle mark, or to the prune cutoff, to the nanosecond;
-    # pruning more often than hourly prunes the same messages; and Link's drop, which reaps an
-    # agent that ignores end of input after five seconds — invisible to the loop, and testable
-    # only through ssh settings in the process's environment.
-    'src/mail\.rs:.*: replace \|\| with && in pull_outbox$',
-    'src/mail\.rs:.*: replace > with >= in settling$',
-    'src/mail\.rs:.*: replace < with <= in prune$',
-    'src/mail\.rs:.*: replace >= with < in run$',
-    'src/mail\.rs:.*<impl Drop for Link>::drop',
 ]

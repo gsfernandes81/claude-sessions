@@ -141,6 +141,14 @@ impl Conn {
         pipe.flush()
     }
 
+    /// `op` sent to the container's agent with an id of its own, and its answer not waited
+    /// for: the mail server's nudge, which the agent judges and the log does not need back.
+    pub fn fire(&self, mut op: Value) -> io::Result<()> {
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        op.set("id", Value::num(id as f64));
+        self.send(&op)
+    }
+
     fn fail_all(&self, why: &str) {
         let mut waiting = self.waiting.lock().unwrap_or_else(|p| p.into_inner());
         for (_, tx) in waiting.drain() {
