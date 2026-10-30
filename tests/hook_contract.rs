@@ -78,6 +78,8 @@ fn hook_exits_zero_and_says_nothing_whatever_the_payload() {
     let payloads = [
         r#"{"hook_event_name":"UserPromptSubmit","session_id":"s1","cwd":"/workspace"}"#,
         r#"{"hook_event_name":"Stop","session_id":"s1"}"#,
+        r#"{"pi_event":"agent_settled","aborted":false,"session_id":"s1","cwd":"/workspace"}"#,
+        r#"{"pi_event":"something_new","session_id":"s1"}"#,
         r#"{"hook_event_name":"UserPromptSubmit","session_id":null}"#,
         r#"{"hook_event_name":"Stop""#,
         r#"{"hook_event_name":"Stop","tool_input":"not an object"}"#,
@@ -141,6 +143,21 @@ fn a_hook_writes_a_readable_record() {
         String::from_utf8_lossy(&out.stdout).contains("claude-7"),
         "list should show the slot: {}",
         String::from_utf8_lossy(&out.stdout)
+    );
+    // A pi slot's events, from its extension, write a record that says what it runs.
+    assert_eq!(
+        run_hook(
+            &dir,
+            Some("pi-2"),
+            r#"{"pi_event":"before_agent_start","messageType":"user","prompt":"go","session_id":"p"}"#
+        ),
+        0
+    );
+    let body = std::fs::read_to_string(dir.join("pi-2.json")).expect("the record exists");
+    assert!(body.contains("\"harness\": \"pi\""), "got: {body}");
+    assert!(
+        body.contains("\"UserPromptSubmit\""),
+        "seen as the table's row: {body}"
     );
 }
 

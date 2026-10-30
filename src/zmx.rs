@@ -227,11 +227,10 @@ impl Watch {
     }
 }
 
-/// Is this one of ours? The menu names its slots `claude-<n>`; any other zmx session is
-/// somebody's own and gets marked rather than adopted.
+/// Is this one of ours? The menu names its slots `claude-<n>` and `pi-<n>` (`harness.rs`); any
+/// other zmx session is somebody's own and gets marked rather than adopted.
 pub fn is_slot_name(name: &str) -> bool {
-    name.strip_prefix("claude-")
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+    crate::harness::Harness::of_slot(name).is_some()
 }
 
 #[cfg(test)]
@@ -398,9 +397,11 @@ name=gone\terr=ConnectionRefused\tstatus=cleaning up\n";
     }
 
     #[test]
-    fn only_claude_n_is_a_slot() {
+    fn only_a_harness_dash_n_is_a_slot() {
         assert!(is_slot_name("claude-1"));
         assert!(is_slot_name("claude-42"));
+        assert!(is_slot_name("pi-1"));
+        assert!(!is_slot_name("pi"));
         assert!(!is_slot_name("claude"));
         assert!(!is_slot_name("claude-"));
         assert!(!is_slot_name("claude-1a"));

@@ -12,6 +12,7 @@
 
 use crate::clock::Moment;
 use crate::events::Binding;
+use crate::harness::Harness;
 use crate::procinfo;
 
 /// The slot this process runs in, and whether we started it.
@@ -63,13 +64,14 @@ pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Place {
 
 /// How a hook's line of parents, nearest first, places it.
 ///
-/// The claude is the slot's own when its parent is a `zmx` daemon: the daemon forks the
-/// session's command directly (seen on zmx 0.8.1), so a nested claude has another claude or a
-/// shell in between. A hook fired in a subagent's own context is nested whatever the tree says
-/// (`Event::fired_in_subagent`). No claude at all is a hook whose claude has gone, or one run
-/// by hand, and neither may rebind a slot.
+/// The harness — a `claude`, or a `pi` (`Harness::of_comm`) — is the slot's own when its
+/// parent is a `zmx` daemon: the daemon forks the session's command directly (seen on zmx
+/// 0.8.1), so a nested one has another harness or a shell in between. A hook fired in a
+/// subagent's own context is nested whatever the tree says (`Event::fired_in_subagent`). No
+/// harness at all is a hook whose harness has gone, or one run by hand, and neither may
+/// rebind a slot.
 fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
-    let Some(c) = (1..line.len()).find(|&c| line[c].1 == "claude") else {
+    let Some(c) = (1..line.len()).find(|&c| Harness::of_comm(&line[c].1).is_some()) else {
         return Place {
             binding: Binding::Nested,
             own_pid: None,
@@ -116,6 +118,14 @@ mod tests {
         // `sh` exec'd the hook: the hook is what claude forked.
         let exec = line(&["claude-sessions", "claude", "zmx"]);
         assert_eq!(place(&exec, false), placed(Binding::Own, Some(11), 10));
+        // pi's extension spawns the hook itself, with nothing between.
+        let pi = line(&["claude-sessions", "pi", "zmx"]);
+        assert_eq!(place(&pi, false), placed(Binding::Own, Some(11), 10));
+        // A pi under a claude's tool call, or a claude under pi's: nested either way.
+        let mixed = line(&["claude-sessions", "pi", "bash", "claude", "zmx"]);
+        assert_eq!(place(&mixed, false), placed(Binding::Nested, None, 10));
+        let mixed = line(&["claude-sessions", "claude", "bash", "pi", "zmx"]);
+        assert_eq!(place(&mixed, false), placed(Binding::Nested, None, 10));
     }
 
     #[test]

@@ -75,9 +75,10 @@ pub fn key_to(k: &RowKey) -> Value {
     match k {
         RowKey::Slot(slot) => obj(vec![("slot", Value::string(slot))]),
         RowKey::Socket(name) => obj(vec![("socket", Value::string(name))]),
-        RowKey::Conversation { id, cwd } => obj(vec![
+        RowKey::Conversation { id, cwd, harness } => obj(vec![
             ("conversation", Value::string(id)),
             ("cwd", Value::string(cwd)),
+            ("harness", Value::string(harness.as_str())),
         ]),
         RowKey::ArchiveFold => obj(vec![("fold", Value::Bool(true))]),
         RowKey::Container => obj(vec![("container", Value::Bool(true))]),
@@ -95,6 +96,10 @@ pub fn key_from(v: &Value) -> Option<RowKey> {
         return Some(RowKey::Conversation {
             id,
             cwd: s(v, "cwd")?,
+            // A 0.9.0 agent sends none, and lists only claude's.
+            harness: s(v, "harness")
+                .map(|h| crate::harness::Harness::parse(&h))
+                .unwrap_or_default(),
         });
     }
     if b(v, "fold") {
@@ -280,12 +285,14 @@ fn dialog_to(d: &Dialog) -> Value {
         Dialog::ResumeFailed {
             title,
             session,
+            harness,
             killed_for_memory,
             output,
             closed,
         } => obj(vec![
             ("title", Value::string(title)),
             ("session", Value::string(session)),
+            ("harness", Value::string(harness.as_str())),
             ("killed_for_memory", Value::Bool(*killed_for_memory)),
             ("output", strs(output)),
             ("closed", Value::Bool(*closed)),
@@ -312,6 +319,10 @@ fn dialog_from(v: &Value) -> Option<Dialog> {
     Some(Dialog::ResumeFailed {
         title: s(v, "title")?,
         session: s(v, "session").unwrap_or_default(),
+        // A 0.9.0 agent names none, and only ever resumed claude.
+        harness: s(v, "harness")
+            .map(|h| crate::harness::Harness::parse(&h))
+            .unwrap_or_default(),
         killed_for_memory: b(v, "killed_for_memory"),
         output: str_list(v.get("output")),
         closed: b(v, "closed"),
@@ -473,6 +484,12 @@ mod tests {
             RowKey::Conversation {
                 id: "0f9c4a1e".into(),
                 cwd: "/workspace/sub dir".into(),
+                harness: crate::harness::Harness::Claude,
+            },
+            RowKey::Conversation {
+                id: "p".into(),
+                cwd: "/workspace".into(),
+                harness: crate::harness::Harness::Pi,
             },
             RowKey::ArchiveFold,
             RowKey::Container,
@@ -550,6 +567,7 @@ mod tests {
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "mount guards on one".into(),
                 session: "0f9c4a1e".into(),
+                harness: crate::harness::Harness::Pi,
                 killed_for_memory: true,
                 output: vec!["No conversation found".into(), "".into()],
                 closed: true,

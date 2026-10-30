@@ -15,6 +15,7 @@
 //! record this version cannot parse at all is reported, not guessed at.
 
 use crate::clock::{Millis, Moment};
+use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::procinfo;
 use std::collections::BTreeMap;
@@ -175,6 +176,8 @@ impl std::ops::Index<Field> for Written {
 #[derive(Debug, Clone)]
 pub struct SlotRecord {
     pub slot: String,
+    /// What runs in it: claude, or pi (0.10.0). Absent on an older record, which is claude's.
+    pub harness: Harness,
     pub pid: Option<u32>,
     /// `/proc` start-time ticks for `pid`. Present whenever `pid` is: a pid without one is a
     /// pid that will eventually name the wrong process.
@@ -221,6 +224,7 @@ impl SlotRecord {
     pub fn new(slot: &str, made: Moment) -> Self {
         SlotRecord {
             slot: slot.to_string(),
+            harness: Harness::of_slot(slot).unwrap_or_default(),
             pid: None,
             proc_start: None,
             session_id: None,
@@ -253,11 +257,16 @@ impl SlotRecord {
     /// for a record written before 0.3.3 recorded it — where Claude Code puts one, under
     /// `projects/` named for the directory with every character that is not a letter, a
     /// digit or `-` turned into `-` (`/home/user/x` → `-home-user-x`).
+    /// For pi, the file is named for the moment it was written and exists only once there is
+    /// a message in it, so it is looked up by its id each time (`pisession::conversation_path`).
     pub fn conversation_path(&self) -> Option<PathBuf> {
         if let Some(p) = &self.transcript_path {
             return Some(PathBuf::from(p));
         }
         let (id, cwd) = (self.session_id.as_deref()?, self.cwd.as_deref()?);
+        if self.harness == Harness::Pi {
+            return crate::pisession::conversation_path(cwd, id);
+        }
         let slug = crate::store::slug(cwd);
         Some(
             crate::live::config_dir()
@@ -273,7 +282,10 @@ impl SlotRecord {
     /// to. So the transcript must hold an exchange (`transcript::has_exchange`).
     pub fn has_conversation(&self) -> bool {
         self.conversation_path()
-            .is_some_and(|p| crate::transcript::has_exchange(&p))
+            .is_some_and(|p| match self.harness {
+                Harness::Claude => crate::transcript::has_exchange(&p),
+                Harness::Pi => crate::pisession::has_exchange(&p),
+            })
     }
 
     /// The title a row shows: what Claude Code's own session selector would — the custom
@@ -316,6 +328,7 @@ impl SlotRecord {
     pub fn to_json(&self) -> Value {
         let mut o = Value::obj();
         o.set("slot", Value::string(&self.slot));
+        o.set("harness", Value::string(self.harness.as_str()));
         o.set("state", Value::string(self.state.as_str()));
         set_opt_u64(&mut o, "pid", self.pid.map(u64::from));
         set_opt_u64(&mut o, "proc_start", self.proc_start);
@@ -365,6 +378,13 @@ impl SlotRecord {
         }
         Some(SlotRecord {
             slot: slot.to_string(),
+            // A record from before 0.10.0 names no harness, and the name it has says claude.
+            harness: v
+                .get("harness")
+                .and_then(Value::as_str)
+                .map(Harness::parse)
+                .or_else(|| Harness::of_slot(slot))
+                .unwrap_or_default(),
             pid: v.get("pid").and_then(Value::as_u32),
             proc_start: v.get("proc_start").and_then(Value::as_u64),
             session_id: str_of(v, "session_id"),
@@ -553,6 +573,13 @@ mod tests {
         );
         assert!(!rec.unread());
         assert_eq!(rec.keep_until_ms, None);
+        assert_eq!(rec.harness, Harness::Claude, "no harness field is claude");
+        let v = crate::json::parse(r#"{"slot":"pi-2","harness":"pi"}"#).unwrap();
+        assert_eq!(
+            SlotRecord::from_json(&v, "pi-2").unwrap().harness,
+            Harness::Pi
+        );
+        assert_eq!(SlotRecord::new("pi-1", Moment::ms(0)).harness, Harness::Pi);
     }
 
     #[test]

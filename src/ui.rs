@@ -20,9 +20,14 @@ pub enum RowKey {
     /// A zmx session with no record at all — a session started before the hooks were
     /// installed, listed under Idle. All there is to show is its name.
     Socket(String),
-    /// A conversation in Claude Code's own store that is not running (`store.rs`), listed
-    /// under Closed: `Enter` resumes it in a slot, from the directory it started in.
-    Conversation { id: String, cwd: String },
+    /// A conversation on disk that is not running — Claude Code's own store, or pi's
+    /// (`store.rs`, `pisession.rs`) — listed under Archived: `Enter` resumes it in a slot of
+    /// its harness, from the directory it started in.
+    Conversation {
+        id: String,
+        cwd: String,
+        harness: crate::harness::Harness,
+    },
     /// The Archived group's heading (owner, 2026-10-03): the one line the cursor can rest on
     /// that is not a session. `Enter` on it folds the archive open or shut.
     ArchiveFold,
@@ -174,6 +179,8 @@ pub enum Dialog {
     ResumeFailed {
         title: String,
         session: String,
+        /// Whose command line ended: `claude --resume`, or `pi --session-id`.
+        harness: crate::harness::Harness,
         killed_for_memory: bool,
         output: Vec<String>,
         closed: bool,

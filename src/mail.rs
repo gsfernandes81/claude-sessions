@@ -1347,6 +1347,7 @@ mod tests {
                     RowKey::Conversation {
                         id: "x".into(),
                         cwd: "/".into(),
+                        harness: crate::harness::Harness::Claude,
                     },
                     |r| r.closed = true,
                 ),

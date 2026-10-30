@@ -14,7 +14,11 @@
 //! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, and the three mail skills
 //!   `mail-send`, `mail-read` and `mail-reply`, for a container's start to link into Claude
 //!   Code's config directory. A file here it did not write — a skill infra keeps beside these —
-//!   is left alone.
+//!   is left alone;
+//! - `extensions/claude-sessions.js` — the pi extension (`pi-extension`), which feeds the
+//!   same hook from a pi slot (`docs/design.md` § *Harnesses*), with `DIR/bin/claude-sessions`
+//!   written in where it names the binary, for a container's start to link into pi's agent
+//!   directory as it links the skills.
 //!
 //! **`DIR` must be the same path in the hub and in the containers**, because the drop-in names
 //! the binary by it. Every file goes through a temporary name and a rename, so a container
@@ -52,7 +56,23 @@ pub fn run(dir: &Path) -> io::Result<Vec<String>> {
         put(dir, &skill, text.as_bytes(), 0o644)?;
         done.push(skill.display().to_string());
     }
+    let ext = dir.join("extensions/claude-sessions.js");
+    put(
+        dir,
+        &ext,
+        pi_extension(&bin.display().to_string()).as_bytes(),
+        0o644,
+    )?;
+    done.push(ext.display().to_string());
     Ok(done)
+}
+
+/// The pi extension, naming the binary at `exe`: `extensions/claude-sessions.js` as written,
+/// with its placeholder filled. The path lands inside a JavaScript string literal, so a quote
+/// or a backslash in it is escaped as JSON would — and a path with either is one nobody has.
+pub fn pi_extension(exe: &str) -> String {
+    let escaped = exe.replace('\\', "\\\\").replace('"', "\\\"");
+    crate::PI_EXTENSION.replace("__CLAUDE_SESSIONS_BIN__", &escaped)
 }
 
 /// Write `bytes` to `path` whole: to a temporary name beside it, then renamed over it. The
@@ -91,7 +111,7 @@ mod tests {
             "a relative path names nothing"
         );
         let done = run(&dir).unwrap();
-        assert_eq!(done.len(), 2 + crate::SKILLS.len());
+        assert_eq!(done.len(), 3 + crate::SKILLS.len());
         let bin = dir.join("bin/claude-sessions");
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&bin), 0o755);
@@ -115,10 +135,18 @@ mod tests {
             fs::read_to_string(dir.join("skills/keepalive/SKILL.md")).unwrap(),
             crate::SKILL
         );
+        let ext = fs::read_to_string(dir.join("extensions/claude-sessions.js")).unwrap();
+        assert!(
+            ext.contains(&format!("const BIN = \"{}\";", bin.display())),
+            "the extension names the installed binary: {ext}"
+        );
+        assert!(!ext.contains("__CLAUDE_SESSIONS_BIN__"));
+        assert_eq!(mode(&dir.join("extensions/claude-sessions.js")), 0o644);
         for d in [
             "",
             "bin",
             "managed-settings.d",
+            "extensions",
             "skills",
             "skills/keepalive",
             "skills/mail-send",

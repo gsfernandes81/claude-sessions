@@ -17,10 +17,12 @@ owner; say so rather than inventing caution.
 
 ## What it is, in one paragraph
 
-A **slot** is one `zmx` session, i.e. one running `claude` process. A slot holds a
-sequence of **conversations** (Claude session ids): `/clear` starts a new one in the same
-process, `--resume` re-enters an old one. A **registry** keyed by slot records what each one
-is doing, written only by `claude-sessions hook` from Claude Code's own hook events. The menu
+A **slot** is one `zmx` session, i.e. one running `claude` process — or, since 0.10.0, one
+`pi` (pi.dev) process, in a `pi-<n>` slot; the owner's brief of 2026-10-30, design § *Harnesses*.
+A slot holds a sequence of **conversations** (Claude session ids): `/clear` starts a new one in
+the same process, `--resume` re-enters an old one. A **registry** keyed by slot records what
+each one is doing, written only by `claude-sessions hook` from Claude Code's own hook events —
+and, for pi, from the extension `install` ships, which feeds the same hook. The menu
 reads the registry and `zmx list`, never guesses, and opens what the owner picks.
 [`docs/design.md`](docs/design.md) is the specification; read it before writing code.
 

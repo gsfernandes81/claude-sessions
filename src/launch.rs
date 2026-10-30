@@ -26,6 +26,7 @@
 use crate::activity;
 use crate::clock::{self, Millis, Moment};
 use crate::fmt;
+use crate::harness::Harness;
 use crate::live;
 use crate::lockfile::{INTERACTIVE_WAIT, SlotLock};
 use crate::mem;
@@ -98,6 +99,9 @@ pub const SCROLLBACK: [&str; 3] = [
 pub struct Deps {
     pub zmx: String,
     pub claude: String,
+    /// The pi to run (`CLAUDE_SESSIONS_PI`, default `pi`): one table with `claude`, so a
+    /// test stands a program in for either harness the same way (`Harness::program_var`).
+    pub pi: String,
     /// `$SHELL`, because some containers set bash and some fish.
     pub shell: String,
     /// The memory reading behind the no-room check.
@@ -114,9 +118,14 @@ pub struct Deps {
 
 impl Deps {
     pub fn from_env() -> Deps {
+        let program = |h: Harness| {
+            let (var, default) = h.program_var();
+            env_or(var, default)
+        };
         Deps {
             zmx: zmx::program(),
-            claude: env_or("CLAUDE_SESSIONS_CLAUDE", "claude"),
+            claude: program(Harness::Claude),
+            pi: program(Harness::Pi),
             shell: env_or("SHELL", "/bin/sh"),
             memory: mem::read,
             oom_kills: mem::oom_kills,
@@ -136,6 +145,67 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+impl Deps {
+    /// The program a harness runs as.
+    fn program(&self, h: Harness) -> &str {
+        match h {
+            Harness::Claude => &self.claude,
+            Harness::Pi => &self.pi,
+        }
+    }
+}
+
+/// What a harness is started with, and started again with: the one place the two command
+/// lines differ (`docs/design.md` § *Harnesses*).
+///
+/// **Claude Code** names its own conversation and tells the hook, so a new slot starts bare
+/// and a resume is `--resume <id>`. **pi** is told its id — `--session-id <id>` opens or
+/// creates exactly that id (letters, digits, `.`, `_`, `-`) — so the id is in the record
+/// before pi runs and the same line starts and resumes it; and `--tui-mode regular` keeps it
+/// off the alternate screen and off mouse tracking, which its default `fullscreen` mode turns
+/// on (read from the 1.4.0 bundle, 2026-10-30): the twin of the scrollback variables, as a
+/// flag, since pi reads no such variable.
+fn start_args(h: Harness, session: Option<&str>) -> Vec<String> {
+    match (h, session) {
+        (Harness::Claude, None) => vec![],
+        (Harness::Claude, Some(id)) => vec!["--resume".into(), id.into()],
+        (Harness::Pi, Some(id)) => vec![
+            "--session-id".into(),
+            id.into(),
+            "--tui-mode".into(),
+            "regular".into(),
+        ],
+        (Harness::Pi, None) => unreachable!("a pi slot is given its id at allocation"),
+    }
+}
+
+/// A fresh session id for a harness that takes one at launch: 32 hex digits from the
+/// kernel's randomness, in a UUID's shape so it reads like pi's own (`randomUUID()`), and
+/// within what pi accepts. Falls back to the clock and pid, which cannot collide on one box.
+fn fresh_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+        .is_ok();
+    if !read {
+        let now = clock::now() as u128;
+        let pid = std::process::id() as u128;
+        bytes = ((now << 32) ^ pid).to_be_bytes();
+    }
+    // Version 4, variant 1, as a UUID is marked.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 // ── the menu's entry points ─────────────────────────────────────────────────
 
 /// `Enter` on a row: attach to it if it is running, resume it if it is offloaded.
@@ -147,9 +217,14 @@ pub fn open(rows: &[Row], index: usize, _workspace: &str, term: &mut dyn Termina
     open_with(rows, index, term, &Deps::from_env(), true)
 }
 
-/// `n`: a new slot running claude in the workspace.
-pub fn new_session(rows: &[Row], workspace: &str, term: &mut dyn Terminal) -> Outcome {
-    new_session_with(rows, workspace, term, &Deps::from_env(), true)
+/// `n`: a new slot running claude in the workspace; `p`, one running pi.
+pub fn new_session(
+    rows: &[Row],
+    harness: Harness,
+    workspace: &str,
+    term: &mut dyn Terminal,
+) -> Outcome {
+    new_session_with(rows, harness, workspace, term, &Deps::from_env(), true)
 }
 
 /// Mockup 4's `y`: offload `victim`, then open `then`, or start a new slot when it is `None`.
@@ -157,10 +232,19 @@ pub fn offload_then_open(
     rows: &[Row],
     victim: usize,
     then: Option<usize>,
+    harness: Harness,
     workspace: &str,
     term: &mut dyn Terminal,
 ) -> Outcome {
-    offload_then_open_with(rows, victim, then, workspace, term, &Deps::from_env())
+    offload_then_open_with(
+        rows,
+        victim,
+        then,
+        harness,
+        workspace,
+        term,
+        &Deps::from_env(),
+    )
 }
 
 /// `s`: a login shell in the workspace.
@@ -342,8 +426,16 @@ pub(crate) fn open_with(
     let n = label(row);
     let slot = match &row.key {
         RowKey::Socket(name) => return attach_socket(name, &n, term, deps),
-        RowKey::Conversation { id, cwd } => {
-            return resume_conversation(rows, (id, cwd, &row.title), &n, term, deps, check_room);
+        RowKey::Conversation { id, cwd, harness } => {
+            return resume_conversation(
+                rows,
+                (id, cwd, &row.title),
+                *harness,
+                &n,
+                term,
+                deps,
+                check_room,
+            );
         }
         // A heading, not a session; the menu folds it rather than asking for it to be opened.
         RowKey::ArchiveFold | RowKey::Container => return no_row(index),
@@ -494,6 +586,7 @@ enum Plan {
     Start {
         session: String,
         cwd: String,
+        harness: Harness,
         /// Where the record goes back to if the start does not take: offloaded or closed,
         /// whichever it was.
         back_to: State,
@@ -520,17 +613,18 @@ fn resume(
         .iter()
         .find(|r| matches!(&r.key, RowKey::Slot(s) if s == slot))
         .map_or(slot, |r| r.title.as_str());
-    let (session, cwd, back_to) = match plan_resume(slot, n) {
+    let (session, cwd, harness, back_to) = match plan_resume(slot, n) {
         Plan::Start {
             session,
             cwd,
+            harness,
             back_to,
-        } => (session, cwd, back_to),
+        } => (session, cwd, harness, back_to),
         Plan::Attach(other) => return attach_slot(rows, &other, term, deps),
         Plan::Refuse(why) => return Outcome::Refused(why),
     };
-    let args = ["--resume".to_string(), session.clone()];
-    let (took, oom) = match start_slot(slot, &cwd, &args, term, deps) {
+    let args = start_args(harness, Some(&session));
+    let (took, oom) = match start_slot(slot, harness, &cwd, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(slot, back_to);
@@ -546,6 +640,7 @@ fn resume(
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
             title: title.to_string(),
             session: session.chars().take(8).collect(),
+            harness,
             killed_for_memory: oom,
             output: stderr_tail(&stderr_path(slot), STDERR_LINES),
             closed: back_to == State::Closed,
@@ -647,6 +742,7 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
     Plan::Start {
         session,
         cwd,
+        harness: rec.harness,
         back_to,
     }
 }
@@ -728,6 +824,7 @@ fn running_elsewhere(slot: &str, session: &str, now: Millis) -> io::Result<Optio
 fn resume_conversation(
     rows: &[Row],
     (id, cwd, title): (&str, &str, &str),
+    harness: Harness,
     n: &str,
     term: &mut dyn Terminal,
     deps: &Deps,
@@ -761,7 +858,7 @@ fn resume_conversation(
              ran in"
         ));
     }
-    let slot = match allocate_for(cwd, Some((id, title))) {
+    let slot = match allocate_for(harness, cwd, Some((id, Some(title)))) {
         Ok(Ok(slot)) => slot,
         Ok(Err(Elsewhere::Slot(other))) => return attach_slot(rows, &other, term, deps),
         Ok(Err(Elsewhere::Unattachable(why))) => {
@@ -769,8 +866,8 @@ fn resume_conversation(
         }
         Err(why) => return Outcome::Refused(why),
     };
-    let args = ["--resume".to_string(), id.to_string()];
-    let (took, oom) = match start_slot(&slot, cwd, &args, term, deps) {
+    let args = start_args(harness, Some(id));
+    let (took, oom) = match start_slot(&slot, harness, cwd, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(&slot, State::Closed);
@@ -783,6 +880,7 @@ fn resume_conversation(
         After::DiedUnbound if took < deps.quick => Outcome::ResumeFailed(Dialog::ResumeFailed {
             title: title.to_string(),
             session: id.chars().take(8).collect(),
+            harness,
             killed_for_memory: oom,
             output: stderr_tail(&stderr_path(&slot), STDERR_LINES),
             closed: true,
@@ -795,6 +893,7 @@ fn resume_conversation(
 
 pub(crate) fn new_session_with(
     rows: &[Row],
+    harness: Harness,
     workspace: &str,
     term: &mut dyn Terminal,
     deps: &Deps,
@@ -808,11 +907,12 @@ pub(crate) fn new_session_with(
     if !Path::new(workspace).is_dir() {
         return Outcome::Refused(format!("{workspace} is not a directory"));
     }
-    let slot = match allocate(workspace) {
+    let (slot, session) = match allocate(harness, workspace) {
         Ok(slot) => slot,
         Err(why) => return Outcome::Refused(why),
     };
-    let (took, oom) = match start_slot(&slot, workspace, &[], term, deps) {
+    let args = start_args(harness, session.as_deref());
+    let (took, oom) = match start_slot(&slot, harness, workspace, &args, term, deps) {
         Ok(ran) => ran,
         Err(why) => {
             put_back(&slot, State::Closed);
@@ -832,7 +932,8 @@ pub(crate) fn new_session_with(
                 "ended at once"
             };
             Outcome::Refused(format!(
-                "{slot} did not start: claude {how}{}",
+                "{slot} did not start: {} {how}{}",
+                harness.as_str(),
                 said.first().map(|l| format!(": {l}")).unwrap_or_default()
             ))
         }
@@ -840,16 +941,25 @@ pub(crate) fn new_session_with(
     }
 }
 
-/// The lowest free `claude-<n>`, with its record written before anyone else can choose it.
-pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
-    match allocate_for(workspace, None)? {
-        Ok(slot) => Ok(slot),
+/// The lowest free `<harness>-<n>`, with its record written before anyone else can choose
+/// it, and — for a harness given its id at launch — the id the record names.
+pub(crate) fn allocate(
+    harness: Harness,
+    workspace: &str,
+) -> Result<(String, Option<String>), String> {
+    // pi is told its id, so the record names the conversation before pi runs: requirement 2
+    // of the brief, and what lets the slot be resumed even if nothing ever binds it.
+    let fresh = (harness == Harness::Pi).then(fresh_session_id);
+    match allocate_for(harness, workspace, fresh.as_deref().map(|id| (id, None)))? {
+        Ok(slot) => Ok((slot, fresh)),
         Err(_) => unreachable!("only a resume checks for a running conversation"),
     }
 }
 
-/// The lowest free `claude-<n>` for a slot starting in `cwd`, resuming `(id, title)` if
-/// given; `Ok(Err(..))` when that conversation is running somewhere already.
+/// The lowest free `<harness>-<n>` for a slot starting in `cwd`, naming conversation `id` if
+/// given, with its title when it is a resume — `Ok(Err(..))` when that conversation is
+/// running somewhere already. A title says it is a resume: a fresh pi id names a conversation
+/// nothing can be running yet.
 ///
 /// Free means no record that is live, offloading or offloaded, and no zmx session of that
 /// name — a session started by hand as `claude-3` is still `claude-3`. A closed record's name
@@ -863,8 +973,9 @@ pub(crate) fn allocate(workspace: &str) -> Result<String, String> {
 /// its conversation is not running is made under the same lock, and its record names the
 /// conversation, so a second menu resuming it finds it starting.
 fn allocate_for(
+    harness: Harness,
     cwd: &str,
-    resuming: Option<(&str, &str)>,
+    naming: Option<(&str, Option<&str>)>,
 ) -> Result<Result<String, Elsewhere>, String> {
     let _all = SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT)
         .map_err(|e| match e.kind() {
@@ -873,7 +984,7 @@ fn allocate_for(
             }
             _ => format!("could not take the allocation lock: {e}"),
         })?;
-    if let Some((id, _)) = resuming {
+    if let Some((id, Some(_))) = naming {
         match running_elsewhere("", id, clock::now()) {
             Ok(None) => {}
             Ok(Some(e)) => return Ok(Err(e)),
@@ -889,7 +1000,7 @@ fn allocate_for(
         "zmx did not answer, so which slot names are free cannot be told — try again".to_string()
     })?;
     for n in 1..=MAX_SLOTS {
-        let slot = format!("claude-{n}");
+        let slot = format!("{}{n}", harness.prefix());
         if sessions.iter().any(|s| s.name == slot) {
             continue;
         }
@@ -903,16 +1014,20 @@ fn allocate_for(
             Err(_) => continue,
         }
         let mut rec = SlotRecord::new(&slot, Moment::now());
+        rec.harness = harness;
         rec.cwd = Some(cwd.to_string());
-        if let Some((id, title)) = resuming {
+        if let Some((id, title)) = naming {
             rec.session_id = Some(id.to_string());
             // Shown on the row until the resumed conversation's own hooks read its titles.
-            rec.ai_title = Some(title.to_string());
+            rec.ai_title = title.map(str::to_string);
         }
         registry::store(&rec).map_err(|e| format!("{slot}: {e}"))?;
         return Ok(Ok(slot));
     }
-    Err(format!("no free slot name up to claude-{MAX_SLOTS}"))
+    Err(format!(
+        "no free slot name up to {}{MAX_SLOTS}",
+        harness.prefix()
+    ))
 }
 
 // ── offload, then open ──────────────────────────────────────────────────────
@@ -921,6 +1036,7 @@ pub(crate) fn offload_then_open_with(
     rows: &[Row],
     victim: usize,
     then: Option<usize>,
+    harness: Harness,
     workspace: &str,
     term: &mut dyn Terminal,
     deps: &Deps,
@@ -968,7 +1084,7 @@ pub(crate) fn offload_then_open_with(
     // stop another slot.
     match then {
         Some(index) => open_with(rows, index, term, deps, false),
-        None => new_session_with(rows, workspace, term, deps, false),
+        None => new_session_with(rows, harness, workspace, term, deps, false),
     }
 }
 
@@ -1051,24 +1167,34 @@ fn stderr_path(slot: &str) -> PathBuf {
 /// and then attaching was tried and is worse: that early output was lost outright (zmx 0.8.1,
 /// 2026-10-06). Claude draws nothing for far longer than the gap, so in practice nothing is
 /// missed; `tests/zmx_real.rs` pins both halves.
-fn start_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Command {
+fn start_command(
+    slot: &str,
+    harness: Harness,
+    stderr: &Path,
+    args: &[String],
+    deps: &Deps,
+) -> Command {
     let mut cmd = zmx::command(&deps.zmx);
     cmd.arg("attach")
         .arg(slot)
         .arg("env")
-        .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
-        .args(
+        .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"));
+    // The scrollback variables are Claude Code's; pi takes the same choice as a flag
+    // (`start_args`), and nothing of ours goes into its environment.
+    if harness == Harness::Claude {
+        cmd.args(
             SCROLLBACK
                 .iter()
                 .filter(|key| !(deps.preset)(key))
                 .map(|key| format!("{key}=1")),
-        )
-        .arg("sh")
+        );
+    }
+    cmd.arg("sh")
         .arg("-c")
         .arg(START_WRAP)
         .arg("sh")
         .arg(stderr)
-        .arg(&deps.claude)
+        .arg(deps.program(harness))
         .args(args);
     cmd
 }
@@ -1079,6 +1205,7 @@ fn start_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Com
 /// ended, whatever claude's own status, and 1 for a claude gone before the client connected.
 fn start_slot(
     slot: &str,
+    harness: Harness,
     cwd: &str,
     args: &[String],
     term: &mut dyn Terminal,
@@ -1090,7 +1217,7 @@ fn start_slot(
     }
     // Truncated: the dialog must show what this start said, not what the last one did.
     std::fs::File::create(&stderr).map_err(|e| format!("{}: {e}", stderr.display()))?;
-    let mut cmd = start_command(slot, &stderr, args, deps);
+    let mut cmd = start_command(slot, harness, &stderr, args, deps);
     cmd.current_dir(cwd);
     let oom_before = (deps.oom_kills)();
     let started = Instant::now();
@@ -1438,6 +1565,7 @@ exit 1"#,
             Deps {
                 zmx,
                 claude,
+                pi: "pi".into(),
                 shell: "/bin/false".into(),
                 memory: room,
                 oom_kills: || Some(0),
@@ -2008,7 +2136,7 @@ exit 1"#,
         }
         let _all =
             SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT).unwrap();
-        match allocate_for(&f.work(), None) {
+        match allocate_for(Harness::Claude, &f.work(), None) {
             Err(why) => assert!(why.contains("another menu is starting"), "{why}"),
             Ok(got) => panic!("allocated under a held lock: {got:?}"),
         }
@@ -2019,6 +2147,7 @@ exit 1"#,
             key: RowKey::Conversation {
                 id: id.into(),
                 cwd: cwd.into(),
+                harness: crate::harness::Harness::Claude,
             },
             closed: true,
             ..row("unused", title)
@@ -2117,6 +2246,7 @@ exit 1"#,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "fix the dns".into(),
                 session: "0f9c4a1e".into(),
+                harness: Harness::Claude,
                 killed_for_memory: false,
                 output: vec!["No conversation found with that session id".into()],
                 closed: true,
@@ -2199,7 +2329,14 @@ exit 1"#,
         drop(f);
 
         let f = Fixture::new("slow-new");
-        let out = new_session_with(&[], &f.work(), &mut Term::new(&f), &slow(&f), true);
+        let out = new_session_with(
+            &[],
+            Harness::Claude,
+            &f.work(),
+            &mut Term::new(&f),
+            &slow(&f),
+            true,
+        );
         assert_eq!(out, Outcome::Back(Some("claude-1 ended".into())));
         assert_eq!(load("claude-1").state, State::Closed);
     }
@@ -2218,6 +2355,7 @@ exit 1"#,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "t".into(),
                 session: "0f9c4a1e".into(),
+                harness: Harness::Claude,
                 killed_for_memory: false,
                 output: vec!["No conversation found with that session id".into()],
                 closed: false,
@@ -2357,7 +2495,8 @@ exit 1"#,
 
         // Refused while it no longer qualifies: attached since the offer was made.
         f.session("claude-1", true);
-        let out = offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
+        let out =
+            offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains("attached")),
             "{out:?}"
@@ -2365,7 +2504,8 @@ exit 1"#,
         assert!(procinfo::is_alive(pid, start), "calibration: still running");
 
         f.session("claude-1", false);
-        let out = offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
+        let out =
+            offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into())),
@@ -2396,7 +2536,7 @@ exit 1"#,
         let mut deps = f.deps(f.zmx(":"), f.claude_ok());
         deps.memory = full;
         let mut term = Term::new(&f);
-        offload_then_open_with(&rows, 0, None, &f.work(), &mut term, &deps);
+        offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
         assert!(!procinfo::is_alive(pid, start), "the victim was stopped");
         assert_eq!(load("claude-1").state, State::Closed);
     }
@@ -2406,13 +2546,17 @@ exit 1"#,
     #[test]
     fn allocation_takes_the_lowest_free_name_and_reuses_a_closed_one() {
         let mut f = Fixture::new("allocate");
-        assert_eq!(allocate("/w").unwrap(), "claude-1", "calibration: empty");
+        assert_eq!(
+            allocate(Harness::Claude, "/w").unwrap().0,
+            "claude-1",
+            "calibration: empty"
+        );
         let (pid, start) = f.process();
         registry::store(&live("claude-1", pid, start)).unwrap();
         registry::store(&offloaded("claude-3", "c", "/")).unwrap();
         f.session("claude-4", false); // started by hand under one of our names
         assert_eq!(
-            allocate("/w").unwrap(),
+            allocate(Harness::Claude, "/w").unwrap().0,
             "claude-2",
             "live, offloaded and socket-only names are taken"
         );
@@ -2427,10 +2571,10 @@ exit 1"#,
         closed.state = State::Closed;
         closed.session_id = Some("old".into());
         registry::store(&closed).unwrap();
-        assert_eq!(allocate("/w").unwrap(), "claude-2");
+        assert_eq!(allocate(Harness::Claude, "/w").unwrap().0, "claude-2");
         assert_eq!(load("claude-2").session_id, None, "a fresh record over it");
         assert_eq!(
-            allocate("/w").unwrap(),
+            allocate(Harness::Claude, "/w").unwrap().0,
             "claude-5",
             "calibration: once live again, it is taken"
         );
@@ -2450,7 +2594,7 @@ exit 1"#,
                 let gate = gate.clone();
                 std::thread::spawn(move || {
                     gate.wait();
-                    allocate("/w").unwrap()
+                    allocate(Harness::Claude, "/w").unwrap().0
                 })
             })
             .collect::<Vec<_>>()
@@ -2471,7 +2615,7 @@ exit 1"#,
         let f = Fixture::new("new");
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
-        let out = new_session_with(&[], &f.work(), &mut term, &deps, true);
+        let out = new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2497,7 +2641,7 @@ exit 1"#,
         let f = Fixture::new("new-fails");
         let deps = f.deps(f.zmx(":"), f.claude_fails());
         let mut term = Term::new(&f);
-        let out = new_session_with(&[], &f.work(), &mut term, &deps, true);
+        let out = new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
         assert_eq!(
             out,
             Outcome::Refused(
@@ -2516,7 +2660,7 @@ exit 1"#,
     fn running(f: &Fixture, prompted: bool) -> (u32, u64) {
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(f);
-        new_session_with(&[], &f.work(), &mut term, &deps, true);
+        new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         let pid: u32 = started.split_whitespace().next().unwrap().parse().unwrap();
         let start = procinfo::start_time(pid).unwrap();
@@ -2702,7 +2846,7 @@ exit 1"#,
         let f = Fixture::new("close");
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
-        new_session_with(&[], &f.work(), &mut term, &deps, true);
+        new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
         // Play the hook's part: SessionStart binds the slot's own claude.
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         let pid: u32 = started.split_whitespace().next().unwrap().parse().unwrap();
@@ -2768,6 +2912,7 @@ exit 1"#,
         let deps = Deps {
             zmx: "zmx".into(),
             claude: "claude".into(),
+            pi: "pi".into(),
             shell: String::new(),
             memory: room,
             oom_kills: || Some(0),
@@ -2775,7 +2920,7 @@ exit 1"#,
             settle: SESSION_SETTLE,
             preset: |key| key == "CLAUDE_CODE_DISABLE_MOUSE",
         };
-        let cmd = start_command("claude-3", Path::new("/r/e"), &[], &deps);
+        let cmd = start_command("claude-3", Harness::Claude, Path::new("/r/e"), &[], &deps);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -2792,6 +2937,158 @@ exit 1"#,
                 "CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1"
             ],
             "no assignment for the one the login set, so claude inherits the login's value"
+        );
+    }
+
+    #[test]
+    fn a_pi_slot_is_told_its_id_and_the_regular_tui_and_gets_no_scrollback_variables() {
+        let deps = Deps {
+            zmx: "zmx".into(),
+            claude: "claude".into(),
+            pi: "/opt/npm-global/bin/pi".into(),
+            shell: String::new(),
+            memory: room,
+            oom_kills: || Some(0),
+            quick: QUICK_FAIL,
+            settle: SESSION_SETTLE,
+            preset: |_| false,
+        };
+        let args = start_args(Harness::Pi, Some("a1b2"));
+        let cmd = start_command(
+            "pi-2",
+            Harness::Pi,
+            Path::new("/r/pi-2.stderr"),
+            &args,
+            &deps,
+        );
+        let argv: Vec<String> = std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "zmx",
+                "attach",
+                "pi-2",
+                "env",
+                "CLAUDE_SESSIONS_SLOT=pi-2",
+                "sh",
+                "-c",
+                r#"e=$1; shift; exec "$@" 2>>"$e""#,
+                "sh",
+                "/r/pi-2.stderr",
+                "/opt/npm-global/bin/pi",
+                "--session-id",
+                "a1b2",
+                "--tui-mode",
+                "regular",
+            ]
+        );
+        // The same line starts and resumes a pi; claude's two differ.
+        assert_eq!(start_args(Harness::Claude, None), Vec::<String>::new());
+        assert_eq!(start_args(Harness::Claude, Some("c")), ["--resume", "c"]);
+        // A fresh id is what pi accepts: alphanumeric ends, `-` within, and distinct.
+        let (a, b) = (fresh_session_id(), fresh_session_id());
+        assert_ne!(a, b);
+        for id in [&a, &b] {
+            assert_eq!(id.len(), 36, "{id}");
+            assert!(
+                id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+                "{id}"
+            );
+            assert!(id.starts_with(|c: char| c.is_ascii_hexdigit()));
+            assert!(id.ends_with(|c: char| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn a_new_pi_session_is_named_in_its_record_before_it_runs() {
+        let f = Fixture::new("new-pi");
+        let mut deps = f.deps(f.zmx(":"), "/bin/false".into());
+        deps.pi = f.claude_ok();
+        let mut term = Term::new(&f);
+        let out = new_session_with(&[], Harness::Pi, &f.work(), &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::Back(Some("detached · it is still running".into()))
+        );
+        let started = wait_for("the stand-in pi", || f.claude_log().pop());
+        let fields: Vec<&str> = started.split_whitespace().collect();
+        let rec = load("pi-1");
+        assert_eq!(rec.harness, Harness::Pi);
+        assert_eq!(rec.state, State::Live);
+        let id = rec.session_id.clone().expect("the id is in the record");
+        assert_eq!(rec.cwd.as_deref(), Some(f.work().as_str()));
+        assert_eq!(
+            &fields[1..],
+            [
+                f.work().as_str(),
+                "pi-1",
+                "--session-id",
+                id.as_str(),
+                "--tui-mode",
+                "regular"
+            ],
+            "told the id the record names"
+        );
+        assert!(
+            f.calls()[0].contains(" env CLAUDE_SESSIONS_SLOT=pi-1 sh -c "),
+            "no scrollback variables: {:?}",
+            f.calls()
+        );
+        // The second pi slot is pi-2; claude's numbering is its own.
+        assert_eq!(allocate(Harness::Pi, "/w").unwrap().0, "pi-2");
+        assert_eq!(allocate(Harness::Claude, "/w").unwrap().0, "claude-1");
+    }
+
+    #[test]
+    fn a_pi_slot_resumes_with_its_own_line() {
+        let f = Fixture::new("resume-pi");
+        let mut deps = f.deps(f.zmx(":"), "/bin/false".into());
+        deps.pi = f.claude_ok();
+        let mut rec = offloaded("pi-3", "given", &f.work());
+        rec.harness = Harness::Pi;
+        // pi's conversation is found by its id in its cwd's directory, not by a recorded
+        // path; the fixture stands one in where `pisession` looks.
+        rec.transcript_path = None;
+        registry::store(&rec).unwrap();
+        let rows = vec![Row {
+            key: RowKey::Slot("pi-3".into()),
+            offloaded: true,
+            ..row("pi-3", "named")
+        }];
+        let mut term = Term::new(&f);
+        // No conversation on disk under pi's layout: refused rather than started.
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert!(
+            matches!(&out, Outcome::Refused(why) if why.contains("no conversation on disk")),
+            "{out:?}"
+        );
+        // Pointed at the file, it resumes with pi's line.
+        rec.transcript_path = offloaded("pi-3", "given", &f.work()).transcript_path;
+        let path = rec.transcript_path.clone().unwrap();
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"given","timestamp":"2026-10-30T10:00:00.000Z","cwd":"/w"}"#,
+                "\n",
+                r#"{"type":"message","id":"u","parentId":null,"timestamp":"2026-10-30T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        registry::store(&rec).unwrap();
+        let out = open_with(&rows, 0, &mut term, &deps, true);
+        assert_eq!(
+            out,
+            Outcome::Back(Some("detached · it is still running".into()))
+        );
+        let started = wait_for("the stand-in pi", || f.claude_log().pop());
+        let fields: Vec<&str> = started.split_whitespace().collect();
+        assert_eq!(
+            &fields[2..],
+            ["pi-3", "--session-id", "given", "--tui-mode", "regular"]
         );
     }
 
@@ -2814,6 +3111,7 @@ exit 1"#,
         let deps = Deps {
             zmx: "zmx".into(),
             claude: "claude".into(),
+            pi: "pi".into(),
             shell: String::new(),
             memory: room,
             oom_kills: || Some(0),
@@ -2823,6 +3121,7 @@ exit 1"#,
         };
         let cmd = start_command(
             "claude-3",
+            Harness::Claude,
             Path::new("/r/claude-3.stderr"),
             &["--resume".into(), "c".into()],
             &deps,

@@ -37,8 +37,14 @@ pub enum Binding {
 pub struct Event(pub Value);
 
 impl Event {
+    /// A Claude Code hook payload, or a pi one (`pi_event` in place of `hook_event_name`,
+    /// from the extension `install` ships), which is read as the Claude Code event it means.
     pub fn parse(body: &str) -> Result<Event, String> {
-        json::parse(body).map(Event)
+        let v = json::parse(body)?;
+        Ok(match v.get("pi_event").and_then(Value::as_str) {
+            Some(name) => Event(from_pi(name, &v)),
+            None => Event(v),
+        })
     }
     fn s(&self, key: &str) -> Option<&str> {
         self.0.get(key).and_then(Value::as_str)
@@ -86,6 +92,72 @@ impl Event {
     pub fn fired_in_subagent(&self) -> bool {
         self.0.get("agent_id").is_some()
     }
+}
+
+/// A pi event as the Claude Code event of the table it means (`docs/design.md` § *Harnesses*),
+/// so one state machine serves both. The extension sends `session_id`, `cwd` and
+/// `transcript_path` under those names already; what differs is the event's own name and
+/// the field that qualifies it:
+///
+/// | pi | here |
+/// |---|---|
+/// | `session_start` startup / resume / fork | `SessionStart`, the same source |
+/// | `session_start` new (`/new`) | `SessionStart` clear: a new conversation, same process |
+/// | `session_start` reload | `SessionStart` compact: the same conversation, nothing settled |
+/// | `before_agent_start` with `prompt` | `UserPromptSubmit` |
+/// | `agent_settled` | `Stop` — pi's documented final-idle point; `agent_end` is not |
+/// | `ui_prompt_start` | `Notification` permission_prompt: a blocking prompt waits |
+/// | `ui_prompt_end` | `PromptAnswered` (pi only): the prompt was answered |
+/// | `session_shutdown` quit | `SessionEnd` other |
+/// | `session_shutdown` new / resume / fork / reload | `SessionEnd` clear: a start follows |
+/// | `session_info_changed` | `TitleChanged` (pi only), with `session_title`, absent = cleared |
+///
+/// An event not in the table keeps its pi name, which `apply` ignores as it ignores any
+/// unknown Claude Code event.
+fn from_pi(name: &str, v: &Value) -> Value {
+    let s = |key: &str| v.get(key).and_then(Value::as_str);
+    let mut out = v.clone();
+    let mut set = |key: &str, value: &str| out.set(key, Value::string(value));
+    match name {
+        "session_start" => {
+            set("hook_event_name", "SessionStart");
+            let source = match s("reason") {
+                Some("new") => "clear",
+                Some("reload") => "compact",
+                Some(r @ ("startup" | "resume" | "fork")) => r,
+                _ => "",
+            };
+            if !source.is_empty() {
+                set("source", source);
+            }
+        }
+        "before_agent_start" => set("hook_event_name", "UserPromptSubmit"),
+        "agent_settled" => set("hook_event_name", "Stop"),
+        "ui_prompt_start" => {
+            set("hook_event_name", "Notification");
+            set("notification_type", "permission_prompt");
+        }
+        "ui_prompt_end" => set("hook_event_name", "PromptAnswered"),
+        "session_shutdown" => {
+            set("hook_event_name", "SessionEnd");
+            set(
+                "reason",
+                if s("reason") == Some("quit") {
+                    "other"
+                } else {
+                    "clear"
+                },
+            );
+        }
+        "session_info_changed" => {
+            set("hook_event_name", "TitleChanged");
+            if let Some(n) = s("name") {
+                set("session_title", n);
+            }
+        }
+        other => set("hook_event_name", other),
+    }
+    out
 }
 
 /// What `apply` did, so the caller knows whether to write and `doctor` can say why not.
@@ -256,6 +328,23 @@ pub fn apply(
             }
             _ => Outcome::Ignored("notification type does not mean a person is needed"),
         },
+        // pi only: the blocking prompt was answered, and the turn goes on. A Stop clears it
+        // too, as it does for claude; this clears it sooner.
+        "PromptAnswered" => {
+            if rec.written.claim(Field::NeedsYou, tick) {
+                rec.needs_you = false;
+                active(rec, at);
+                Outcome::Changed
+            } else {
+                Outcome::Ignored("a newer prompt has landed")
+            }
+        }
+        // pi only: `/name` fired an event, where claude's `/rename` fires none. The title is
+        // the owner's own, so it is the custom one; cleared when the event carries none.
+        "TitleChanged" => {
+            rec.title = ev.session_title().and_then(one_line);
+            Outcome::Changed
+        }
         "SessionEnd" => match ev.reason() {
             // Both are followed by a SessionStart in the same process.
             Some("clear") | Some("resume") => {
@@ -335,6 +424,148 @@ mod tests {
     }
     fn own(rec: &mut SlotRecord, e: &Event, now: Millis) -> Outcome {
         apply(rec, e, Moment::ms(now), Binding::Own, Some(100), Some(7))
+    }
+
+    // ── pi's events, as the table rows they mean ────────────────────────────
+
+    fn pi(body: &str) -> Event {
+        let e = ev(body);
+        assert!(e.0.get("pi_event").is_some(), "calibration: a pi payload");
+        e
+    }
+
+    #[test]
+    fn a_pi_session_binds_prompts_waits_settles_and_quits_like_a_claude() {
+        let mut rec = SlotRecord::new("pi-1", Moment::ms(0));
+        rec.session_id = Some("given-at-launch".into());
+        rec.cwd = Some("/workspace".into());
+        let start = pi(
+            r#"{"pi_event":"session_start","reason":"startup","session_id":"given-at-launch","cwd":"/workspace"}"#,
+        );
+        assert_eq!(start.name(), "SessionStart");
+        assert_eq!(start.source(), Some("startup"));
+        own(&mut rec, &start, 1_000);
+        assert_eq!((rec.pid, rec.proc_start), (Some(100), Some(7)), "bound");
+        assert_eq!(rec.state, State::Live);
+        assert!(!rec.busy && !rec.needs_you);
+        let prompt = pi(
+            r#"{"pi_event":"before_agent_start","messageType":"user","prompt":"fix the   dns","session_id":"given-at-launch","transcript_path":"/s/x_given-at-launch.jsonl"}"#,
+        );
+        assert_eq!(prompt.name(), "UserPromptSubmit");
+        own(&mut rec, &prompt, 2_000);
+        assert!(rec.busy);
+        assert_eq!(rec.first_prompt.as_deref(), Some("fix the dns"));
+        assert_eq!(
+            rec.transcript_path.as_deref(),
+            Some("/s/x_given-at-launch.jsonl"),
+            "the file pi wrote at the first message"
+        );
+        let ask = pi(
+            r#"{"pi_event":"ui_prompt_start","reason":"ui_prompt","kind":"confirm","title":"Run rm?","session_id":"given-at-launch"}"#,
+        );
+        assert_eq!(ask.name(), "Notification");
+        own(&mut rec, &ask, 3_000);
+        assert!(rec.needs_you, "a blocking prompt is the amber !");
+        let answered = pi(
+            r#"{"pi_event":"ui_prompt_end","reason":"ui_prompt","kind":"confirm","session_id":"given-at-launch"}"#,
+        );
+        own(&mut rec, &answered, 4_000);
+        assert!(!rec.needs_you, "answered, and the turn goes on");
+        assert!(rec.busy);
+        let settled =
+            pi(r#"{"pi_event":"agent_settled","aborted":false,"session_id":"given-at-launch"}"#);
+        assert_eq!(settled.name(), "Stop");
+        own(&mut rec, &settled, 5_000);
+        assert!(!rec.busy);
+        assert_eq!(rec.last_stop_ms, Some(5_000), "unread from here");
+        // An Esc settles the run too: no transcript marker to read, unlike claude's.
+        own(&mut rec, &prompt, 6_000);
+        let aborted =
+            pi(r#"{"pi_event":"agent_settled","aborted":true,"session_id":"given-at-launch"}"#);
+        own(&mut rec, &aborted, 7_000);
+        assert!(!rec.busy);
+        // /name, seen at once; cleared when the name is.
+        let named = pi(
+            r#"{"pi_event":"session_info_changed","name":"dns records","session_id":"given-at-launch"}"#,
+        );
+        assert_eq!(named.name(), "TitleChanged");
+        own(&mut rec, &named, 8_000);
+        assert_eq!(rec.title.as_deref(), Some("dns records"));
+        assert_eq!(rec.display_title(), "dns records");
+        own(
+            &mut rec,
+            &pi(r#"{"pi_event":"session_info_changed","session_id":"given-at-launch"}"#),
+            9_000,
+        );
+        assert_eq!(rec.title, None);
+        assert_eq!(rec.display_title(), "fix the dns", "the prompt again");
+        // A /new, /resume or reload is not an end: a start follows in the same process.
+        for reason in ["new", "resume", "fork", "reload"] {
+            let out = own(
+                &mut rec,
+                &pi(&format!(
+                    r#"{{"pi_event":"session_shutdown","reason":"{reason}","session_id":"given-at-launch"}}"#
+                )),
+                10_000,
+            );
+            assert!(matches!(out, Outcome::Ignored(_)), "{reason}");
+            assert_eq!(rec.state, State::Live, "{reason}");
+        }
+        // /new: a new conversation in the same process, as claude's /clear.
+        let new = pi(
+            r#"{"pi_event":"session_start","reason":"new","session_id":"second","cwd":"/workspace"}"#,
+        );
+        assert_eq!(new.source(), Some("clear"));
+        own(&mut rec, &new, 11_000);
+        assert_eq!(rec.session_id.as_deref(), Some("second"));
+        assert_eq!(
+            rec.first_prompt, None,
+            "the new conversation wears no old name"
+        );
+        assert_eq!(rec.transcript_path, None);
+        // A reload keeps the conversation and settles nothing, as a compaction does.
+        own(&mut rec, &prompt_of("second"), 12_000);
+        let reload = pi(
+            r#"{"pi_event":"session_start","reason":"reload","session_id":"second","cwd":"/workspace"}"#,
+        );
+        assert_eq!(reload.source(), Some("compact"));
+        own(&mut rec, &reload, 13_000);
+        assert!(rec.busy, "a reload mid-turn does not end it");
+        // Quit is the end.
+        let quit = pi(r#"{"pi_event":"session_shutdown","reason":"quit","session_id":"second"}"#);
+        assert_eq!((quit.name(), quit.reason()), ("SessionEnd", Some("other")));
+        own(&mut rec, &quit, 14_000);
+        assert_eq!(rec.state, State::Closed);
+        assert!(!rec.busy);
+        // An event pi fires that the table has no row for changes nothing.
+        let stray = pi(r#"{"pi_event":"turn_start","turnIndex":3,"session_id":"second"}"#);
+        assert_eq!(stray.name(), "turn_start");
+        assert!(matches!(own(&mut rec, &stray, 15_000), Outcome::Ignored(_)));
+    }
+
+    fn prompt_of(session: &str) -> Event {
+        pi(&format!(
+            r#"{{"pi_event":"before_agent_start","messageType":"user","prompt":"go","session_id":"{session}"}}"#
+        ))
+    }
+
+    #[test]
+    fn a_pi_nested_under_a_tool_call_is_work_under_the_slot() {
+        let mut rec = slot();
+        let before = rec.session_id.clone();
+        let out = apply(
+            &mut rec,
+            &pi(
+                r#"{"pi_event":"session_start","reason":"startup","session_id":"nested","cwd":"/x"}"#,
+            ),
+            Moment::ms(2_000),
+            Binding::Nested,
+            None,
+            None,
+        );
+        assert_eq!(out, Outcome::Changed);
+        assert_eq!(rec.session_id, before, "never rebound");
+        assert_eq!(rec.last_activity_ms, 2_000, "but activity");
     }
 
     // ── hooks landing out of order ──────────────────────────────────────────

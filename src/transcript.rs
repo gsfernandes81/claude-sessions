@@ -61,6 +61,13 @@ pub fn titles(path: &Path) -> Titles {
 /// slot, so each transcript is read once from its tail and then only from where the last read
 /// stopped, a whole line at a time. A file that shrank is another file and is read afresh.
 pub fn titles_cached(path: &Path) -> Titles {
+    titles_cached_by(path, titles_in)
+}
+
+/// [`titles_cached`] with the reader given: pi's sessions keep their name in another shape
+/// (`pisession::titles_in`), and are read the same incremental way. One cache for both; a
+/// path is one harness's.
+pub fn titles_cached_by(path: &Path, titles_in: fn(&str) -> Titles) -> Titles {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     // Where the last whole line ended, and the titles up to there.

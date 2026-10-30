@@ -25,6 +25,7 @@
 use crate::archive;
 use crate::clock::Millis;
 use crate::fmt;
+use crate::harness::Harness;
 use crate::live;
 use crate::procinfo;
 use crate::registry::{self, SlotRecord, State};
@@ -43,8 +44,8 @@ pub enum Action {
     Quit,
     /// Open the row at this index: attach if live, resume if offloaded.
     Open(usize),
-    /// A new session in this container.
-    New(String),
+    /// A new session in this container, running this harness.
+    New(String, Harness),
     /// A shell in this container.
     Shell(String),
     /// `c` on a loaded row: offload it, at once (owner, 2026-10-27: no question asked).
@@ -57,6 +58,8 @@ pub enum Action {
     OffloadThenOpen {
         victim: usize,
         then: Option<usize>,
+        /// The harness of the new slot, when `then` is `None`.
+        harness: Harness,
     },
 }
 
@@ -70,6 +73,8 @@ enum Ask {
     NoRoom {
         then: Option<Id>,
         victim: Option<Id>,
+        /// What `y` starts when `then` is nothing: a new slot of this harness.
+        harness: Harness,
     },
     ResumeFailed {
         key: Id,
@@ -279,7 +284,7 @@ impl Menu {
         // A dialog about a row that has gone is a question about nothing.
         let gone = match &self.ask {
             Some((Ask::ResumeFailed { key }, _)) => self.index_of(key).is_none(),
-            Some((Ask::NoRoom { victim, then }, _)) => [victim, then]
+            Some((Ask::NoRoom { victim, then, .. }, _)) => [victim, then]
                 .into_iter()
                 .flatten()
                 .any(|k| self.index_of(k).is_none()),
@@ -492,7 +497,7 @@ impl Menu {
             Some((ask, dialog)) => {
                 let key = match ask {
                     Ask::ResumeFailed { key } => Some(key),
-                    Ask::NoRoom { victim, then } => victim.as_ref().or(then.as_ref()),
+                    Ask::NoRoom { victim, then, .. } => victim.as_ref().or(then.as_ref()),
                 };
                 let about = key.and_then(|k| self.index_of(k));
                 (Some(dialog.clone()), about)
@@ -543,7 +548,13 @@ impl Menu {
     /// Ask the owner something a launch came back with (mockups 4 and 5). `then` is the row
     /// that was asked to open, by index into the rows as they were when it was asked for;
     /// `host` is the container that answered, which the offered slot is in.
-    pub fn ask_no_room(&mut self, dialog: Dialog, then: Option<usize>, host: &str) {
+    pub fn ask_no_room(
+        &mut self,
+        dialog: Dialog,
+        then: Option<usize>,
+        harness: Harness,
+        host: &str,
+    ) {
         let victim = match &dialog {
             Dialog::NoRoom {
                 offer: Some((key, _, _)),
@@ -552,7 +563,14 @@ impl Menu {
             _ => None,
         };
         let then = then.and_then(|i| self.rows.get(i)).map(id);
-        self.ask = Some((Ask::NoRoom { then, victim }, dialog));
+        self.ask = Some((
+            Ask::NoRoom {
+                then,
+                victim,
+                harness,
+            },
+            dialog,
+        ));
     }
 
     pub fn ask_resume_failed(&mut self, dialog: Dialog, index: usize) {
@@ -653,7 +671,9 @@ impl Menu {
             }
             Key::Enter if self.on(|r| r.key == RowKey::ArchiveFold) => self.toggle_archive(),
             Key::Enter if !self.rows.is_empty() => Action::Open(self.cursor),
-            Key::Char('n') => self.target().map_or(Action::None, Action::New),
+            Key::Char('n') => self
+                .target()
+                .map_or(Action::None, |h| Action::New(h, Harness::Claude)),
             Key::Char('s') => self.target().map_or(Action::None, Action::Shell),
             Key::Char('c') => self.put_away(self.cursor),
             Key::Char('?') => {
@@ -696,6 +716,7 @@ impl Menu {
                 Ask::NoRoom {
                     then,
                     victim: Some(victim),
+                    harness,
                 },
                 Key::Char('y'),
             ) => {
@@ -703,6 +724,7 @@ impl Menu {
                 Action::OffloadThenOpen {
                     victim: at(self, &victim),
                     then: then.map(|k| at(self, &k)),
+                    harness,
                 }
             }
             (Ask::NoRoom { .. }, Key::Char('n') | Key::Esc) => dismiss(self),
@@ -765,7 +787,12 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             .filter_map(|r| r.session_id.clone()),
     );
     let marks = archive::marks();
-    for c in store::in_workspace(&live::config_dir(), workspace) {
+    // pi's conversations are listed with Claude Code's, from pi's own store (`pisession.rs`),
+    // and resume in a `pi-<n>` slot.
+    let stored = store::in_workspace(&live::config_dir(), workspace)
+        .into_iter()
+        .chain(crate::pisession::in_workspace(workspace));
+    for c in stored {
         if taken.contains(&c.id) {
             continue;
         }
@@ -777,6 +804,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             key: RowKey::Conversation {
                 id: c.id,
                 cwd: c.cwd,
+                harness: c.harness,
             },
             wants_you: false,
             busy: false,
@@ -834,7 +862,10 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
     // An Esc fires no hook, so a turn the owner interrupted — or a permission prompt they
     // dismissed — would read Working or Needs you until the next turn ended. The transcript's
     // trailing marker says it is over (`transcript::interrupted_at`).
+    // pi's Esc fires `agent_settled` like any other end of a turn, so only claude's transcript
+    // is asked.
     let interrupted = (r.busy || r.needs_you)
+        && r.harness == Harness::Claude
         && r.esc_ended(
             r.conversation_path()
                 .and_then(|p| crate::transcript::interrupted_at_cached(&p)),
@@ -859,7 +890,10 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         // from the transcript as well as the record: a `/rename` fires no hook.
         title: r.display_title_with(
             &r.conversation_path()
-                .map(|p| crate::transcript::titles_cached(&p))
+                .map(|p| match r.harness {
+                    Harness::Claude => crate::transcript::titles_cached(&p),
+                    Harness::Pi => crate::pisession::titles_cached(&p),
+                })
                 .unwrap_or_default(),
         ),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
@@ -1143,6 +1177,7 @@ mod tests {
             key: RowKey::Conversation {
                 id: name.into(),
                 cwd: "/workspace".into(),
+                harness: crate::harness::Harness::Claude,
             },
             closed: true,
             archived,
@@ -1297,6 +1332,7 @@ mod tests {
         let failed = Dialog::ResumeFailed {
             title: "b".into(),
             session: "0f9c4a1e".into(),
+            harness: Harness::Claude,
             killed_for_memory: false,
             output: vec![],
             closed: false,
@@ -1426,7 +1462,10 @@ mod tests {
     #[test]
     fn the_keys_the_design_lists() {
         let mut m = menu(vec![row("a")]);
-        assert_eq!(m.key(Key::Char('n')), Action::New(String::new()));
+        assert_eq!(
+            m.key(Key::Char('n')),
+            Action::New(String::new(), Harness::Claude)
+        );
         assert_eq!(m.key(Key::Char('s')), Action::Shell(String::new()));
         assert_eq!(m.key(Key::Esc), Action::Quit);
         assert_eq!(m.key(Key::Char('q')), Action::Quit);
@@ -1490,7 +1529,7 @@ mod tests {
             want: 1,
             offer: Some((RowKey::Slot("b".into()), "2d".into(), "b".into())),
         };
-        m.ask_no_room(dialog.clone(), Some(2), "");
+        m.ask_no_room(dialog.clone(), Some(2), Harness::Claude, "");
         assert_eq!(
             m.view().about,
             Some(1),
@@ -1500,7 +1539,8 @@ mod tests {
             m.key(Key::Char('y')),
             Action::OffloadThenOpen {
                 victim: 1,
-                then: Some(2)
+                then: Some(2),
+                harness: Harness::Claude,
             }
         );
         // With nothing to offer, y does nothing and n cancels.
@@ -1512,6 +1552,7 @@ mod tests {
                 offer: None,
             },
             None,
+            Harness::Claude,
             "",
         );
         assert_eq!(m.key(Key::Char('y')), Action::None);
@@ -1525,6 +1566,7 @@ mod tests {
         let failed = Dialog::ResumeFailed {
             title: "b".into(),
             session: "0f9c4a1e".into(),
+            harness: Harness::Claude,
             killed_for_memory: false,
             output: vec![],
             closed: false,
@@ -1665,7 +1707,10 @@ mod tests {
         assert_eq!(m.rows()[m.view().cursor].title, "a");
         assert_eq!(m.key(Key::Enter), Action::Open(1), "opened, not shown");
         assert_eq!(m.key(Key::Char('c')), Action::Offload(1));
-        assert_eq!(m.key(Key::Char('n')), Action::New("infra-dev".into()));
+        assert_eq!(
+            m.key(Key::Char('n')),
+            Action::New("infra-dev".into(), Harness::Claude)
+        );
         // Offloaded, it leaves the home, and the cursor stays in its container.
         let mut a = in_("infra-dev", "a");
         a.offloaded = true;
@@ -1694,7 +1739,10 @@ mod tests {
         let v = m.view();
         assert!(!v.home && v.back, "one container, with a way back");
         assert_eq!(v.cursor, 0, "from its top");
-        assert_eq!(m.key(Key::Char('n')), Action::New("infra-dev".into()));
+        assert_eq!(
+            m.key(Key::Char('n')),
+            Action::New("infra-dev".into(), Harness::Claude)
+        );
         assert_eq!(m.key(Key::Esc), Action::Redraw, "Esc goes back, not out");
         assert!(m.view().home);
         assert_eq!(
@@ -1711,7 +1759,10 @@ mod tests {
         m.key(Key::Down);
         m.key(Key::Down);
         assert_eq!(m.rows()[m.view().cursor].title, "or3-dev");
-        assert_eq!(m.key(Key::Char('n')), Action::New("or3-dev".into()));
+        assert_eq!(
+            m.key(Key::Char('n')),
+            Action::New("or3-dev".into(), Harness::Claude)
+        );
         assert_eq!(m.key(Key::Char('s')), Action::Shell("or3-dev".into()));
         m.key(Key::End);
         assert_eq!(m.key(Key::Char('s')), Action::Shell("ds-dev".into()));
@@ -1873,6 +1924,7 @@ mod tests {
             Dialog::ResumeFailed {
                 title: "a".into(),
                 session: "0f9c4a1e".into(),
+                harness: Harness::Claude,
                 killed_for_memory: false,
                 output: vec![],
                 closed: false,

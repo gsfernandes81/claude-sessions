@@ -1036,6 +1036,7 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
         Dialog::ResumeFailed {
             title,
             session,
+            harness,
             killed_for_memory,
             output,
             closed,
@@ -1046,10 +1047,15 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             // zmx does not report its program's status (owner, 2026-10-06: `ended`, not
             // `exited 1`); the one thing the number told, a kill for memory, is read from the
             // cgroup instead.
+            // The harness's own resume line (`launch::start_args`), as mockup 5 shows claude's.
+            let resume = match harness {
+                crate::harness::Harness::Claude => format!("claude --resume {session}"),
+                crate::harness::Harness::Pi => format!("pi --session-id {session}"),
+            };
             let cmd = if *killed_for_memory {
-                format!("claude --resume {session} was killed for memory")
+                format!("{resume} was killed for memory")
             } else {
-                format!("claude --resume {session} ended")
+                format!("{resume} ended")
             };
             paragraph(&mut out, &cmd, 0, tw, FG);
             let mut said = Vec::new();
@@ -1263,6 +1269,7 @@ mod tests {
             dialog: Some(Dialog::ResumeFailed {
                 title: "mount guards on one".to_string(),
                 session: "0f9c4a1e".to_string(),
+                harness: crate::harness::Harness::Claude,
                 killed_for_memory: false,
                 output: vec!["No conversation found with that session id".to_string()],
                 closed: false,
@@ -2272,6 +2279,7 @@ mod tests {
             dialog: Some(Dialog::ResumeFailed {
                 title: "mount guards on one".to_string(),
                 session: "0f9c4a1e".to_string(),
+                harness: crate::harness::Harness::Claude,
                 killed_for_memory: false,
                 output: vec!["No conversation found with that session id".to_string()],
                 closed: true,
@@ -2732,6 +2740,7 @@ mod tests {
             dialog: Some(Dialog::ResumeFailed {
                 title: "fix the dns records".to_string(),
                 session: "5b2d0c77".to_string(),
+                harness: crate::harness::Harness::Claude,
                 killed_for_memory: false,
                 output: vec![],
                 closed: true,
@@ -2766,6 +2775,7 @@ mod tests {
             dialog: Some(Dialog::ResumeFailed {
                 title: "mount guards on one".to_string(),
                 session: "0f9c4a1e".to_string(),
+                harness: crate::harness::Harness::Claude,
                 killed_for_memory: false,
                 output,
                 closed: false,

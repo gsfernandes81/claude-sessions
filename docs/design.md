@@ -926,6 +926,95 @@ so all there is to show is the zmx session name. Matching `cwd` and start time a
 guesswork. Once one ends, its conversation is in Claude Code's store like any other, and is
 listed under Archived, by its own title, to resume in a slot of ours.
 
+## Harnesses (0.10.0)
+
+**A slot runs claude, or pi.** The owner's brief of 2026-10-30, relayed by infra (its
+`plans/pi-harness.md`, § *In claude-sessions*): pi (pi.dev, `@earendil-works/pi-coding-agent`
+1.4.0) as a second harness, in `pi-<n>` slots, started from the menu, offloaded by the same
+rule, resumed by `Enter`, listed under Archived, addressed as `<repo>/pi-<n>`. Everything the
+two differ in is asked of `src/harness.rs`; the rest of the machine does not know which it is
+running. Infra installs pi, sets `PI_CODING_AGENT_DIR` to `~/.local/share/pi`, bakes
+`tuiMode: regular`, links the extension below at every container start, and reads `pi-ext:`
+and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
+
+- **The harness is on the record and on the wire** (`harness` on a `SlotRecord`, on a
+  `Conversation` row's key and on the resume-failed dialog), absent = claude, since 0.9.0
+  wrote none and ran nothing else. The slot name says it too — `claude-3`, `pi-1`
+  (`Harness::of_slot`) — and `zmx::is_slot_name` admits both.
+- **One program table.** `CLAUDE_SESSIONS_CLAUDE` and `CLAUDE_SESSIONS_PI` name the programs
+  (`Harness::program_var`, `launch::Deps`), so the tests stand a program in for either the
+  same way.
+- **pi is told its id.** `pi --session-id <id>` opens or creates exactly that id, so the
+  launcher makes one (`fresh_session_id`, a UUID's shape, from `/dev/urandom`) and writes it
+  into the record with the cwd *before* zmx runs: the slot is resumable even if nothing ever
+  binds it, which was requirement 2 of the brief. A resume is the same line in the recorded
+  cwd (`launch::start_args`); pi groups sessions by cwd, so a resume elsewhere would create
+  a second session under the id, and a gone cwd is refused as it is for claude. A `/new`
+  inside pi changes the id, which the extension reports and the record follows, as claude's
+  `/clear` does; the older file is then a separate conversation under Archived.
+- **The scrollback twin is one flag.** pi's `tuiMode` defaults to **fullscreen**, which
+  enters the alternate screen (`?1049h`) and turns on mouse tracking (`?1000h ?1002h ?1003h
+  ?1006h`) — read from the 1.4.0 bundle on 2026-10-30, since the pi binary could not be run
+  in this container — the exact combination issue #8 took out of claude. `--tui-mode regular`
+  keeps output in the terminal's buffer and leaves the mouse to the terminal, so the launcher
+  passes it on every pi start, and no `CLAUDE_CODE_DISABLE_*` goes into pi's environment.
+  Bracketed paste is on in both modes and harmless. pi handles only SIGINT, so the
+  offloader's TERM ends it with node's default exit; the JSONL is append-only.
+- **Events come from an extension, through the same hook.** pi has no shell-command hooks;
+  it loads TypeScript or JavaScript extensions from `$PI_CODING_AGENT_DIR/extensions/`.
+  `install` ships `extensions/claude-sessions.js` (plain JavaScript, the binary's path written
+  in; `claude-sessions pi-extension [path]` prints it) and infra's start links it. It spawns
+  `claude-sessions hook` with one JSON body on stdin, `pi_event` in place of
+  `hook_event_name`, waited for on `session_start` and `session_shutdown` and fire-and-forget
+  otherwise, and the hook reads each as the row of *The event table* it means
+  (`events::from_pi`): `session_start` startup / resume / fork / new / reload as
+  `SessionStart` startup / resume / fork / clear / compact; `before_agent_start` with its
+  prompt as `UserPromptSubmit`; `agent_settled` — pi's documented final-idle point, where
+  `agent_end` is not — as `Stop`; `ui_prompt_start`, a blocking prompt such as infra's gate
+  asks through, as the amber `!`; `ui_prompt_end` clears it (`PromptAnswered`, pi only);
+  `session_shutdown` quit as an end, any other reason as nothing, since a start follows in
+  the same process; `session_info_changed` as the title (`TitleChanged`, pi only — pi's
+  `/name` fires an event where claude's `/rename` fires none). An Esc settles the run like
+  any other end, so pi's transcript is never read for claude's interrupt marker.
+  **Binding is the same `/proc` walk** (*Binding a hook to a slot*): the extension spawns the
+  hook itself, so its parents read hook → `pi` → `zmx`, and `bind.rs` admits a `pi` beside a
+  `claude` (`Harness::of_comm`; pi sets its `process.title` to `pi`, `pi-rpc` in rpc mode).
+  A pi nested under a tool call, or a claude under pi's, is work under the slot either way.
+  **Without the extension linked** a pi slot starts, lists, resumes and archives, but nothing
+  binds its pid, so the offloader holds it (`NoPid`) for ever — the same as a claude without
+  hooks — which is why the link is in infra's entrypoint and `make verify` from the first pin.
+- **pi's sessions are read in pi's shape** (`src/pisession.rs`, from the 1.4.0 package):
+  `<agent dir>/sessions/--<cwd with / \ : as ->--/<timestamp>_<id>.jsonl`, written only once a
+  user or assistant message is in it, so a slot's conversation path is looked up by its id
+  each time (`pisession::conversation_path`: the file named for it, else the one whose header
+  says it, as pi itself looks). A header line carries `id`, `cwd` and `timestamp`; an exchange
+  is a `message` entry with role `user` or `assistant`; the name is the latest `session_info`
+  entry's, an empty one clearing it, and stands as the custom title; pi generates no title,
+  so the first user message is the title of last resort, as in pi's own `/resume`. **Archived
+  lists pi's conversations with claude's**, from `$PI_CODING_AGENT_DIR/sessions/` (default
+  `~/.pi/agent`; `$PI_CODING_AGENT_SESSION_DIR` makes one flat directory), those started in
+  the workspace by their header's cwd, under the same size-plus-mtime cache (`store::Cached`),
+  and `Enter` on one allocates a `pi-<n>` and resumes it.
+- **The offload rule is untouched**: `decide` never asks the harness; `has_conversation`
+  reads the slot's harness's shape. The orphan sweep finds Claude Code's transient daemons by
+  their argv and has no pi rule: pi starts no daemon that could be found (its codemode workers
+  are in-process), and a rule with nothing to match is a rule nobody can calibrate. Infra's
+  smoke run TERMs a pi and lists what survives; if something does, that is the rule.
+- **Old hubs and old agents.** A 0.9.0 hub draws a pi row as a plain row and its `n` still
+  makes claude slots. A new hub asks a container's agent for a pi slot as its own op,
+  `new_pi` (and `offload_then_open_pi` after a no-room offload), which an agent older than
+  this answers it does not know, so a pi asked for never comes back as a claude. The
+  resume-failed dialog says the harness's own line: `pi --session-id <id> ended`.
+- **Mail**: `<repo>/pi-<n>` is an address like any other, accepted when the container's
+  agent lists the slot live. No nudge into a pi slot (not asked for): the mail hook is not run
+  under pi, and infra's policy tells pi to run `claude-sessions mail list` itself.
+- **The menu**: `n` stays claude's; how a pi slot is started, and how a pi row is told from a
+  claude one in words, is the owner's to approve (mockups) and is recorded in
+  `docs/mockups.md` when it is.
+- **Not measured here**: pi's idle CPU and RSS, and `/proc/<pid>/comm` under node — infra's
+  smoke run reports them. The no-room dialog's figure for a new session (`mem::SESSION_COST`)
+  is claude's until they say otherwise.
+
 ## Agent mail (v2, 2026-10-29)
 
 **Agents talk to each other through a mail server in the hub, and every session is an

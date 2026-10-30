@@ -21,6 +21,7 @@
 //!   its rows.
 
 use crate::clock;
+use crate::harness::Harness;
 use crate::hub::{self, Conn, Event};
 use crate::json::Value;
 use crate::menu::{self, Action, Menu, Place, Reach};
@@ -495,6 +496,8 @@ struct Plan {
     what: &'static str,
     /// The row to open once there is room, for the no-room and resume-failed dialogs.
     then: Option<usize>,
+    /// The harness a new slot runs, for the no-room dialog's `y`.
+    harness: Harness,
 }
 
 /// [`Plan`] for `action` over the menu's `rows`; `None` for an action that asks nothing.
@@ -512,6 +515,10 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
         }
         v
     };
+    let harness = match action {
+        Action::New(_, h) | Action::OffloadThenOpen { harness: h, .. } => *h,
+        _ => Harness::Claude,
+    };
     let (host, op, row, what, then) = match action {
         Action::None | Action::Redraw | Action::Quit => return None,
         Action::Open(i) => (
@@ -525,9 +532,17 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
             },
             Some(*i),
         ),
-        Action::New(h) => (
+        // A pi session is its own op (0.10.0): an agent too old to know it says so and starts
+        // nothing, where a field on `new` would be ignored and start a claude.
+        Action::New(h, harness) => (
             Some(h.clone()),
-            op("new", vec![]),
+            op(
+                match harness {
+                    Harness::Claude => "new",
+                    Harness::Pi => "new_pi",
+                },
+                vec![],
+            ),
             None,
             "starting new session",
             None,
@@ -554,10 +569,18 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
             "archiving session",
             None,
         ),
-        Action::OffloadThenOpen { victim, then } => (
+        // As `new`: a pi slot after the offload is its own op, refused by an older agent.
+        Action::OffloadThenOpen {
+            victim,
+            then,
+            harness,
+        } => (
             host_of(*victim),
             op(
-                "offload_then_open",
+                match harness {
+                    Harness::Claude => "offload_then_open",
+                    Harness::Pi => "offload_then_open_pi",
+                },
                 vec![("victim", key_of(*victim)), ("then", then.and_then(key_of))],
             ),
             Some(*victim),
@@ -571,6 +594,7 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
         row,
         what,
         then,
+        harness,
     })
 }
 
@@ -608,7 +632,7 @@ fn finish(
     match outcome {
         Outcome::Back(status) => menu.set_status(status),
         Outcome::Refused(why) => menu.set_status(Some(why)),
-        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, plan.then, host),
+        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, plan.then, plan.harness, host),
         Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, plan.then.unwrap_or(0)),
     }
     Ok(Done::Changed)
@@ -1065,6 +1089,7 @@ mod tests {
         let action = Action::OffloadThenOpen {
             victim: 2,
             then: Some(1),
+            harness: Harness::Claude,
         };
         let p = plan(&action, &rows).unwrap();
         assert_eq!(
@@ -1086,7 +1111,7 @@ mod tests {
             let p = plan(&a, &rows).unwrap();
             (crate::json::to_line(&p.op), p.what, p.row, p.then)
         };
-        let new = say(Action::New("h".into()));
+        let new = say(Action::New("h".into(), Harness::Claude));
         assert_eq!(
             new,
             (r#"{"op":"new"}"#.into(), "starting new session", None, None)

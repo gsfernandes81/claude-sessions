@@ -27,6 +27,7 @@
 
 use crate::archive::{self, Mark};
 use crate::clock;
+use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::launch;
 use crate::mem;
@@ -278,7 +279,8 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
         Some(RowKey::Conversation { id, .. }) => Some(id.clone()),
         _ => None,
     };
-    match msg.get("op").and_then(Value::as_str).unwrap_or("") {
+    let op = msg.get("op").and_then(Value::as_str).unwrap_or("");
+    match op {
         "open" => {
             let Some(i) = index("key") else {
                 return refused();
@@ -292,7 +294,10 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             }
             launch::open(rows, i, ws, term)
         }
-        "new" => launch::new_session(rows, ws, term),
+        "new" => launch::new_session(rows, Harness::Claude, ws, term),
+        // `p` (0.10.0): an agent older than that answers that it does not know the op, so a new
+        // hub never gets a claude slot for a pi it asked for.
+        "new_pi" => launch::new_session(rows, Harness::Pi, ws, term),
         "shell" => launch::shell(ws, term),
         // `c`: a loaded session is offloaded, an offloaded one closed — archived. An older hub
         // sends `close` for either, once its dialog is answered.
@@ -304,7 +309,7 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             Some(i) => launch::close(rows, i),
             None => refused(),
         },
-        "offload_then_open" => {
+        "offload_then_open" | "offload_then_open_pi" => {
             let Some(victim) = index("victim") else {
                 return refused();
             };
@@ -315,7 +320,13 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
                 },
                 None => None,
             };
-            launch::offload_then_open(rows, victim, then, ws, term)
+            // Which harness a new slot after the offload runs (0.10.0): its own op, as `new_pi`.
+            let harness = if op == "offload_then_open_pi" {
+                Harness::Pi
+            } else {
+                Harness::Claude
+            };
+            launch::offload_then_open(rows, victim, then, harness, ws, term)
         }
         op @ ("archive" | "unarchive") => {
             let Some(conv) = index("key").and_then(id) else {

@@ -46,6 +46,7 @@ mod bind;
 mod clock;
 mod events;
 mod fmt;
+mod harness;
 mod hooks_config;
 mod http;
 mod hub;
@@ -60,6 +61,7 @@ mod mailbox;
 mod mem;
 mod menu;
 mod offload;
+mod pisession;
 mod procinfo;
 mod proto;
 mod registry;
@@ -88,6 +90,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 
 /// Every skill this binary ships, by name: what `install` writes and `skill` prints.
+/// The pi extension `install` ships (`extensions/claude-sessions.js`), with the binary's path
+/// still a placeholder (`install::pi_extension` fills it).
+pub const PI_EXTENSION: &str = include_str!("../extensions/claude-sessions.js");
+
 pub const SKILLS: [(&str, &str); 4] = [
     ("keepalive", SKILL),
     ("mail-send", include_str!("../skills/mail-send/SKILL.md")),
@@ -181,6 +187,22 @@ fn main() -> ExitCode {
                 },
             };
             say!("{}", json::to_string_pretty(&hooks_config::settings(&exe)));
+            ExitCode::SUCCESS
+        }
+        "pi-extension" => {
+            // As `hooks-config`: the path the extension will run, given or this binary's own.
+            let exe = match args.get(1) {
+                Some(p) => p.clone(),
+                None => match std::env::current_exe() {
+                    Ok(p) => p.display().to_string(),
+                    Err(e) => {
+                        return fail(&format!(
+                            "cannot tell where this binary is ({e}); pass its path"
+                        ));
+                    }
+                },
+            };
+            say!("{}", install::pi_extension(&exe));
             ExitCode::SUCCESS
         }
         "statusline" => {
@@ -374,10 +396,15 @@ fn cmd_hook() -> std::io::Result<()> {
     // of this hook, and the lock is what other hooks wait on (issue #1). Only the slot's own
     // claude names the slot, and only when a title can have changed: a conversation opening,
     // and the end of each turn.
+    // Read in the slot's harness's shape: the slot name says which (`harness.rs`).
+    let harness = harness::Harness::of_slot(&slot).unwrap_or_default();
     let titles = (binding == Binding::Own && matches!(ev.name(), "SessionStart" | "Stop"))
         .then(|| ev.transcript_path())
         .flatten()
-        .map(|p| transcript::titles(std::path::Path::new(p)));
+        .map(|p| match harness {
+            harness::Harness::Claude => transcript::titles(std::path::Path::new(p)),
+            harness::Harness::Pi => pisession::titles(std::path::Path::new(p)),
+        });
 
     let _lock = lockfile::SlotLock::acquire(&registry::lock_path(&slot), wait).map_err(|e| {
         // Name the event, and a SessionEnd's reason: which event lost is the whole question

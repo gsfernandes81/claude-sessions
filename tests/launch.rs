@@ -114,7 +114,42 @@ exec sleep 600"#,
             transcript = root.join("transcript.jsonl").display(),
         ),
     );
+    // A stand-in pi: fires its extension's `session_start` through the real hook — a shell
+    // script's comm is its name, `pi`, as pi's `process.title` is — and stays up.
+    script(
+        &root.join("bin/pi"),
+        &format!(
+            r#"echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{pids}"
+printf '{{"pi_event":"session_start","reason":"startup","session_id":"%s","cwd":"%s"}}' "$2" "$PWD" | "{bin}" hook >> "{out}"
+exec sleep 600"#,
+            pids = root.join("pids").display(),
+            out = root.join("hook.out").display(),
+            bin = BIN,
+        ),
+    );
     Root(root)
+}
+
+/// The line the launcher starts a pi slot with (`launch::start_args`): no scrollback
+/// variables, the id given, the regular tui.
+fn start_pi(root: &Path, slot: &str, id: &str) {
+    let status = Command::new(root.join("bin/zmx"))
+        .arg("attach")
+        .arg(slot)
+        .arg("env")
+        .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
+        .arg("sh")
+        .arg("-c")
+        .arg(WRAP)
+        .arg("sh")
+        .arg(root.join(format!("registry/{slot}.stderr")))
+        .arg(root.join("bin/pi"))
+        .args(["--session-id", id, "--tui-mode", "regular"])
+        .current_dir(root.join("work"))
+        .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
+        .status()
+        .expect("the stand-in zmx runs");
+    assert!(status.success());
 }
 
 fn start(root: &Path, slot: &str, wrap: &str) {
@@ -224,6 +259,38 @@ fn a_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
     // The marker proves the capture; its being alone, that the slot's own hooks said nothing.
     let out = std::fs::read_to_string(root.0.join("hook.out")).unwrap();
     assert_eq!(out, "marker\n");
+}
+
+#[test]
+fn a_pi_slot_started_as_the_menu_starts_it_is_bound_by_the_hook() {
+    let root = setup("pi");
+    // The launcher writes the record, naming the id, before zmx runs.
+    std::fs::write(
+        root.0.join("registry/pi-1.json"),
+        r#"{"slot":"pi-1","harness":"pi","state":"live","session_id":"given-e2e","cwd":"/w"}"#,
+    )
+    .unwrap();
+    start_pi(&root.0, "pi-1", "given-e2e");
+    let body = record(&root.0, "pi-1");
+    let pi: u64 = std::fs::read_to_string(root.0.join("pids"))
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        number(&body, "pid"),
+        Some(pi),
+        "bound to the slot's own pi: {body}"
+    );
+    assert!(body.contains("\"harness\": \"pi\""), "{body}");
+    assert!(body.contains("\"given-e2e\""), "{body}");
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("hook.out")).unwrap(),
+        "",
+        "the hook said nothing"
+    );
 }
 
 #[test]

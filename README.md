@@ -36,7 +36,7 @@ they all mount ([`docs/design.md`](docs/design.md) § *The hub*):
 |---|---|
 | `claude-sessions` | the menu over every container — the default, and what the hub's ssh login lands on |
 | `claude-sessions offload-all` | one offload pass in every container, over ssh; the hub's timer runs it every 3 minutes |
-| `claude-sessions install DIR` | this binary, its hooks drop-in and its skill, into the volume every container mounts |
+| `claude-sessions install DIR` | this binary, its hooks drop-in, its skills and its pi extension, into the volume every container mounts |
 | `claude-sessions agent` | a container's half of the hub, run over ssh |
 | `claude-sessions hook` | fed by Claude Code's hooks; the only writer of session state |
 | `claude-sessions offload` | in a container: stops a session nobody is using, keeping its conversation — closing it if it never had one |

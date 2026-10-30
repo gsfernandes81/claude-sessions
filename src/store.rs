@@ -35,6 +35,8 @@ use std::time::SystemTime;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversation {
     pub id: String,
+    /// Which harness's it is: Claude Code's from here, pi's from `pisession.rs`.
+    pub harness: crate::harness::Harness,
     /// The directory it started in: where `claude --resume` is run from.
     pub cwd: String,
     pub path: PathBuf,
@@ -75,11 +77,68 @@ pub fn within(cwd: &str, workspace: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-type Cache = HashMap<PathBuf, (u64, Option<SystemTime>, Option<Conversation>)>;
+/// What was last read from each file, so a poll re-reads only what changed: the size and
+/// modification time a file was read at, and what it said. One per store — Claude Code's
+/// here, pi's in `pisession.rs` — since each forgets the files its last listing did not find.
+pub(crate) struct Cached {
+    map: OnceLock<Mutex<HashMap<PathBuf, Reading>>>,
+}
 
-fn cache() -> &'static Mutex<Cache> {
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// The size and modification time a file was read at, and what it said.
+type Reading = (u64, Option<SystemTime>, Option<Conversation>);
+
+impl Cached {
+    pub(crate) const fn new() -> Cached {
+        Cached {
+            map: OnceLock::new(),
+        }
+    }
+
+    /// What `read` says of each of `files`: from the cache where a file's size and
+    /// modification time are as they were, else read afresh.
+    pub(crate) fn read_all(
+        &self,
+        files: Vec<PathBuf>,
+        read: fn(&Path) -> Option<Conversation>,
+    ) -> Vec<Conversation> {
+        let map = self.map.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = map.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|p, _| files.contains(p));
+        let mut out = Vec::new();
+        for p in files {
+            let meta = std::fs::metadata(&p).ok();
+            let size = meta.as_ref().map_or(0, |m| m.len());
+            let mtime = meta.and_then(|m| m.modified().ok());
+            let fresh = match cache.get(&p) {
+                Some((s, m, c)) if *s == size && *m == mtime => c.clone(),
+                _ => {
+                    let c = read(&p);
+                    cache.insert(p.clone(), (size, mtime, c.clone()));
+                    c
+                }
+            };
+            out.extend(fresh);
+        }
+        out
+    }
+}
+
+static CACHE: Cached = Cached::new();
+
+/// One per id, the newest copy of each, most recent first.
+pub(crate) fn newest_per_id(all: Vec<Conversation>) -> Vec<Conversation> {
+    let mut found: HashMap<String, Conversation> = HashMap::new();
+    for c in all {
+        match found.get(&c.id) {
+            Some(have) if have.last_ms >= c.last_ms => {}
+            _ => {
+                found.insert(c.id.clone(), c);
+            }
+        }
+    }
+    let mut out: Vec<Conversation> = found.into_values().collect();
+    out.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.id.cmp(&b.id)));
+    out
 }
 
 /// Every conversation started in `workspace` with an exchange in it, one per id, most
@@ -110,35 +169,13 @@ pub fn in_workspace(config_dir: &Path, workspace: &str) -> Vec<Conversation> {
         }
     }
 
-    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
-    cache.retain(|p, _| files.contains(p));
-    let mut found: HashMap<String, Conversation> = HashMap::new();
-    for p in files {
-        let meta = std::fs::metadata(&p).ok();
-        let size = meta.as_ref().map_or(0, |m| m.len());
-        let mtime = meta.and_then(|m| m.modified().ok());
-        let fresh = match cache.get(&p) {
-            Some((s, m, c)) if *s == size && *m == mtime => c.clone(),
-            _ => {
-                let c = read(&p);
-                cache.insert(p.clone(), (size, mtime, c.clone()));
-                c
-            }
-        };
-        let Some(c) = fresh else { continue };
-        if !within(&c.cwd, workspace) {
-            continue;
-        }
-        match found.get(&c.id) {
-            Some(have) if have.last_ms >= c.last_ms => {}
-            _ => {
-                found.insert(c.id.clone(), c);
-            }
-        }
-    }
-    let mut out: Vec<Conversation> = found.into_values().collect();
-    out.sort_by(|a, b| b.last_ms.cmp(&a.last_ms).then_with(|| a.id.cmp(&b.id)));
-    out
+    newest_per_id(
+        CACHE
+            .read_all(files, read)
+            .into_iter()
+            .filter(|c| within(&c.cwd, workspace))
+            .collect(),
+    )
 }
 
 /// One transcript, or `None` when it holds no exchange (`transcript::has_exchange`) or no
@@ -165,6 +202,7 @@ pub fn read(path: &Path) -> Option<Conversation> {
         .unwrap_or_else(|| "(no title yet)".to_string());
     Some(Conversation {
         id,
+        harness: crate::harness::Harness::Claude,
         cwd,
         path: path.to_path_buf(),
         title,
