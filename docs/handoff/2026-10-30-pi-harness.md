@@ -1,4 +1,4 @@
-# Handoff 2026-10-30: pi as a second harness — design sent to infra, nothing built yet
+# Handoff 2026-10-30: pi as a second harness — released as 0.10.0, not yet seen on the fleet
 
 **First orders for the next session: read this, check `/workspace/.mail/in/infra/` for the
 answer to the design (stamp `20261030T021528Z-pi-harness-design`), and keep a watcher on the
@@ -47,10 +47,8 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
 
 1. **Infra's measurements** (comm, idle CPU, RSS, what survives TERM) — may change
    `mem::SESSION_COST` per harness or add a sweep rule; otherwise nothing.
-2. **Release 0.10.0**: the bump to 0.10.0 in `Cargo.toml` and `Cargo.lock` was prepared on
-   2026-10-30 but the session's permission layer refused the commit that publishes it; the
-   owner cuts it (`git commit` of the bump on main, pushed; CI tags `v0.10.0`), then mail infra
-   the tag (`20261030T030016.063Z` thread). Infra runs its two smoke checks against the tag.
+2. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
+   SHA256SUMS published; infra was mailed the tag and pins it in dev/hub/Dockerfile.
 3. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
 
 ## The design as sent
