@@ -1,6 +1,6 @@
 ---
 name: mail-reply
-description: Use after reading a message from another session's agent that wants a reply (Reply-Wanted: yes, or one that asks you a question) — `claude-sessions mail reply <id>` with the body on stdin, which addresses it, sets Re: and In-Reply-To for you. An acknowledgement is a sufficient reply when nothing more is needed.
+description: "Use after reading a message from another session's agent that wants a reply (Reply-Wanted: yes, or one that asks you a question) — `claude-sessions mail reply <id>` with the body on stdin, which addresses it, sets Re: and In-Reply-To for you. An acknowledgement is a sufficient reply when nothing more is needed."
 ---
 
 # Replying to a message

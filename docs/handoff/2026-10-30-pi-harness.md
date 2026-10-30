@@ -60,16 +60,22 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
    events on one at a time (`tests/pi_extension.rs`, design § *Harnesses*). That run's `!`
    was not the race: its record carried `Notification` alone, 220 ms after `SessionStart`,
    and no `PromptAnswered` (`20261030T052134.104Z`), so one of infra's packages opened a
-   dialog at startup that stayed open the whole window and the mark was correct. Infra is
-   finding which package (its gate `@gotgenes/pi-permission-system` or pi-lens first) and
-   will mail it. **The fix reaches the fleet only in a release** — a 0.10.1 bump is the
-   owner's call.
+   dialog at startup that stayed open the whole window and the mark was correct. The
+   package is `pi-powerline-footer`, whose welcome card is an 18 s countdown modal
+   (`20261030T110702.067Z`); infra turns it off in the footer's config. **The fix reaches
+   the fleet only in a release** — a 0.10.1 bump is the owner's call, and infra bumps its
+   pin when the tag exists.
+3. **Also for 0.10.1, fixed in the tree:** pi parses a skill's frontmatter as strict YAML,
+   and the unquoted `description:` of mail-read and mail-reply held `: `, so pi dropped
+   both skills at start on the first fleet slot (same message). The two values are now
+   double-quoted and `install::tests::every_skill_frontmatter_is_strict_yaml` guards all
+   four (calibrated: it failed on the old files).
    *For the owner, not built:* infra suggests keeping the open prompt's `title` (which
    `ui_prompt_start` carries) in the record so the menu could say what a slot waits on. That
    is a change to the approved screens, so it waits on the owner.
-3. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
+4. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
    SHA256SUMS published; infra was mailed the tag and pins it in dev/hub/Dockerfile.
-4. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
+5. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
 
 ## The design as sent
 

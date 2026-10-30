@@ -102,6 +102,63 @@ fn put(root: &Path, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// pi loads the skills too, and parses their frontmatter as strict YAML where Claude
+    /// Code is lenient: an unquoted `description:` holding `: ` is a nested mapping to pi,
+    /// which drops the skill and says so at start (infra, 2026-10-30, the first pi slot on
+    /// the fleet). Without a YAML parser in the crate, this checks the rules such a value
+    /// can break: a plain scalar carries no `: ` and no ` #` and starts with no indicator;
+    /// a quoted one closes its quote and escapes any inside.
+    #[test]
+    fn every_skill_frontmatter_is_strict_yaml() {
+        for (name, text) in crate::SKILLS.iter() {
+            let mut lines = text.lines();
+            assert_eq!(lines.next(), Some("---"), "{name}: frontmatter opens");
+            for line in lines.by_ref().take_while(|l| *l != "---") {
+                let (key, value) = line.split_once(": ").unwrap_or_else(|| {
+                    panic!("{name}: frontmatter line `{line}` is not `key: value`")
+                });
+                assert!(
+                    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                    "{name}: key `{key}`"
+                );
+                assert!(
+                    strict_scalar(value),
+                    "{name}: `{key}:` value is not strict YAML: {value}"
+                );
+            }
+        }
+    }
+
+    fn strict_scalar(v: &str) -> bool {
+        match v.as_bytes().first() {
+            Some(b'"') => {
+                let inner = &v[1..];
+                let mut escaped = false;
+                let mut closed = None;
+                for (i, c) in inner.char_indices() {
+                    if closed.is_some() {
+                        return false;
+                    }
+                    match (escaped, c) {
+                        (true, _) => escaped = false,
+                        (false, '\\') => escaped = true,
+                        (false, '"') => closed = Some(i),
+                        _ => {}
+                    }
+                }
+                closed.is_some()
+            }
+            Some(b'\'') => {
+                v.len() > 1
+                    && v.ends_with('\'')
+                    && !v[1..v.len() - 1].replace("''", "").contains('\'')
+            }
+            Some(b'[' | b'{' | b'&' | b'*' | b'!' | b'|' | b'>' | b'%' | b'@' | b'`' | b'#')
+            | None => false,
+            Some(_) => !v.contains(": ") && !v.contains(" #") && !v.ends_with(':'),
+        }
+    }
+
     #[test]
     fn install_writes_the_binary_the_drop_in_naming_it_and_the_skill_world_readable() {
         let dir = std::env::temp_dir().join(format!("cs-install-{}", std::process::id()));
