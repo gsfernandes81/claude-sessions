@@ -57,11 +57,16 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
    `needs_you` before any prompt. The released extension spawned every fire-and-forget hook
    independently, so a `ui_prompt_start`/`ui_prompt_end` pair fired a microtask apart could
    land end-first within one kernel tick and leave the `!` set; the extension now hands
-   events on one at a time (`tests/pi_extension.rs`, design § *Harnesses*). Whether that
-   run's `!` was this race or a dialog really open the whole window is asked of infra
-   (its `pi-1.json` `last_event_ms` tells: a `PromptAnswered` stamp beside `Notification`'s
-   is the race). **The fix reaches the fleet only in a release** — a 0.10.1 bump is the
+   events on one at a time (`tests/pi_extension.rs`, design § *Harnesses*). That run's `!`
+   was not the race: its record carried `Notification` alone, 220 ms after `SessionStart`,
+   and no `PromptAnswered` (`20261030T052134.104Z`), so one of infra's packages opened a
+   dialog at startup that stayed open the whole window and the mark was correct. Infra is
+   finding which package (its gate `@gotgenes/pi-permission-system` or pi-lens first) and
+   will mail it. **The fix reaches the fleet only in a release** — a 0.10.1 bump is the
    owner's call.
+   *For the owner, not built:* infra suggests keeping the open prompt's `title` (which
+   `ui_prompt_start` carries) in the record so the menu could say what a slot waits on. That
+   is a change to the approved screens, so it waits on the owner.
 3. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
    SHA256SUMS published; infra was mailed the tag and pins it in dev/hub/Dockerfile.
 4. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
