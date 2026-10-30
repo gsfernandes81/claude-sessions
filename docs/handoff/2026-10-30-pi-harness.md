@@ -45,11 +45,23 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
 
 ## Still open
 
-1. **Infra's measurements** (comm, idle CPU, RSS, what survives TERM) — may change
-   `mem::SESSION_COST` per harness or add a sweep rule; otherwise nothing.
-2. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
+1. **Infra's measurements came** (`20261030T051247.788Z`, amd64 runner): comm `pi`, about
+   1.2 s CPU over 180 s idle, 258 MB RSS, one child (`ty`, the Python language server
+   pi-lens starts), nothing surviving TERM; both binding checks pass (pid under zmx, empty
+   hook.log; bind takes about 21 s on the runner). `SESSION_COST` stays, no sweep rule.
+   Idle CPU on arm64 is unproven and infra will mail what the first slot on zero shows.
+2. **One finding from that run, fixed in the tree after 0.10.0:** a fresh pi slot read
+   `needs_you` before any prompt. The released extension spawned every fire-and-forget hook
+   independently, so a `ui_prompt_start`/`ui_prompt_end` pair fired a microtask apart could
+   land end-first within one kernel tick and leave the `!` set; the extension now hands
+   events on one at a time (`tests/pi_extension.rs`, design § *Harnesses*). Whether that
+   run's `!` was this race or a dialog really open the whole window is asked of infra
+   (its `pi-1.json` `last_event_ms` tells: a `PromptAnswered` stamp beside `Notification`'s
+   is the race). **The fix reaches the fleet only in a release** — a 0.10.1 bump is the
+   owner's call.
+3. **Released:** v0.10.0 was cut by the owner on 2026-10-30 (eda6afd), both binaries and
    SHA256SUMS published; infra was mailed the tag and pins it in dev/hub/Dockerfile.
-3. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
+4. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
 
 ## The design as sent
 

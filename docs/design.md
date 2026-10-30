@@ -966,7 +966,14 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
   in; `claude-sessions pi-extension [path]` prints it) and infra's start links it. It spawns
   `claude-sessions hook` with one JSON body on stdin, `pi_event` in place of
   `hook_event_name`, waited for on `session_start` and `session_shutdown` and fire-and-forget
-  otherwise, and the hook reads each as the row of *The event table* it means
+  otherwise — but handed on **one at a time, in the order pi fired them**: a hook is spawned
+  once the previous event's has exited. The registry orders what lands by the 10 ms kernel
+  tick of the hook's start (*Binding a hook to a slot*), so two hooks spawned a microtask
+  apart, which a prompt answered the instant it opened fires, could land in either order
+  within one tick and leave the amber `!` for a prompt nobody waits on; infra's first smoke
+  run against 0.10.0 read exactly that on a fresh slot (2026-10-30), and
+  `tests/pi_extension.rs` drives the extension under node to pin the order. The hook reads
+  each event as the row of *The event table* it means
   (`events::from_pi`): `session_start` startup / resume / fork / new / reload as
   `SessionStart` startup / resume / fork / clear / compact; `before_agent_start` with its
   prompt as `UserPromptSubmit`; `agent_settled` — pi's documented final-idle point, where
