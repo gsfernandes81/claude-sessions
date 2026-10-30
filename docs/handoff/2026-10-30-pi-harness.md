@@ -45,10 +45,13 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
 
 ## Still open
 
-1. **Infra's measurements came** (`20261030T051247.788Z`, amd64 runner): comm `pi`, about
-   1.2 s CPU over 180 s idle, 258 MB RSS, one child (`ty`, the Python language server
-   pi-lens starts), nothing surviving TERM; both binding checks pass (pid under zmx, empty
-   hook.log; bind takes about 21 s on the runner). `SESSION_COST` stays, no sweep rule.
+1. **Infra's measurements came** (`20261030T051247.788Z` and its correction
+   `20261030T051639.420Z`, amd64 runner): comm `pi`; the pi process alone about 1.2 s CPU
+   over 180 s idle and 258 MB RSS, its one child (`ty`, the Python language server pi-lens
+   starts) not summed in; the offloader's own per-slot readout in the same run counted the
+   two processes at 290 ms for one window; nothing surviving TERM; both binding checks pass
+   (pid under zmx, empty hook.log; bind takes about 21 s on the runner). `SESSION_COST`
+   stays, no sweep rule.
    Idle CPU on arm64 is unproven and infra will mail what the first slot on zero shows.
 2. **One finding from that run, fixed in the tree after 0.10.0:** a fresh pi slot read
    `needs_you` before any prompt. The released extension spawned every fire-and-forget hook
