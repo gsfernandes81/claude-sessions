@@ -47,8 +47,10 @@ both widths from the renderer (`print_the_mockups`, then `write_the_styled_mocku
 
 1. **Infra's measurements** (comm, idle CPU, RSS, what survives TERM) — may change
    `mem::SESSION_COST` per harness or add a sweep rule; otherwise nothing.
-2. **Release 0.10.0**: bump `Cargo.toml` on main (the owner asked for the release through
-   infra's brief), mail infra the tag. Infra runs its two smoke checks against the pinned tag.
+2. **Release 0.10.0**: the bump to 0.10.0 in `Cargo.toml` and `Cargo.lock` was prepared on
+   2026-10-30 but the session's permission layer refused the commit that publishes it; the
+   owner cuts it (`git commit` of the bump on main, pushed; CI tags `v0.10.0`), then mail infra
+   the tag (`20261030T030016.063Z` thread). Infra runs its two smoke checks against the tag.
 3. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
 
 ## The design as sent
