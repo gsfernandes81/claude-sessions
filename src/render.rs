@@ -55,26 +55,31 @@ type Hint = (&'static str, &'static str);
 
 /// The way out that is always offered. Its width is the narrowest the menu will draw at.
 const WAY_OUT: Hint = ("s", "shell");
-const HINTS: [Hint; 5] = [
+/// `p` starts a pi session beside `n`'s claude (owner, 2026-10-30), after the way out so the
+/// first row at 40 columns is the approved one and the second reads `s shell   p new pi`.
+const NEW_PI: Hint = ("p", "new pi");
+const HINTS: [Hint; 6] = [
     ("Enter", "open"),
     ("n", "new"),
     ("c", "close"),
     ("?", "keys"),
     WAY_OUT,
+    NEW_PI,
 ];
 /// With nothing listed there is nothing to open or close (mockup 2).
-const HINTS_EMPTY: [Hint; 3] = [("n", "new"), ("?", "keys"), WAY_OUT];
+const HINTS_EMPTY: [Hint; 4] = [("n", "new"), ("?", "keys"), WAY_OUT, NEW_PI];
 /// One container's screen reached from the home: the same, and the way back (mockup 13).
 const BACK: Hint = ("Esc", "back");
-const HINTS_BACK: [Hint; 6] = [
+const HINTS_BACK: [Hint; 7] = [
     ("Enter", "open"),
     ("n", "new"),
     ("c", "close"),
     ("?", "keys"),
     WAY_OUT,
+    NEW_PI,
     BACK,
 ];
-const HINTS_EMPTY_BACK: [Hint; 4] = [("n", "new"), ("?", "keys"), WAY_OUT, BACK];
+const HINTS_EMPTY_BACK: [Hint; 5] = [("n", "new"), ("?", "keys"), WAY_OUT, NEW_PI, BACK];
 /// A container that is not answering has nothing to open and nowhere to start one; a shell
 /// is still worth a try, since ssh may answer where the agent did not (mockup 14).
 const HINTS_DOWN: [Hint; 3] = [("?", "keys"), WAY_OUT, BACK];
@@ -663,6 +668,11 @@ fn branch(rows: &[Row], i: usize) -> Option<&'static str> {
 /// takes two columns from the title, never from the age.
 const WAITING: &str = "! ";
 
+/// What marks a pi session (owner, 2026-10-30): a dim `pi: ` before its title, ASCII and in
+/// words, so nothing is colour-only; it takes four columns from the title, after the waiting
+/// mark when both are drawn.
+const PI_MARK: &str = "pi: ";
+
 /// A session: its title, cut to fit, and its age right-aligned in the last five columns. No
 /// marks and no number (owner, 2026-10-03): the group says what state it is in, an unread
 /// title is bold, and a session attached somewhere else is drawn dim. A container's row, at
@@ -705,6 +715,10 @@ fn row(
     if r.wants_you {
         line.push(WAITING, st(AMBER_BOLD));
         indent += width(WAITING);
+    }
+    if r.harness() == crate::harness::Harness::Pi {
+        line.push(PI_MARK, st(DIM));
+        indent += width(PI_MARK);
     }
     if r.key == RowKey::Container {
         let says = width(&r.age).min(w.saturating_sub(indent + 1));
@@ -885,18 +899,20 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     let mut out = vec![head, rule(w)];
     let ws = &view.workspace;
     let new = format!("new session in {ws}");
+    let new_pi = format!("new pi session in {ws}");
     let shell = format!("a shell in {ws}");
     // `Enter`'s line breaks after "it" at 80 columns as well as at 40: the approved screens
     // break it there, so it is two segments rather than one wrapped sentence. The home's own
     // keys (mockup 15) act in the container under the cursor. `c` is one step down the list,
     // never a question (owner, 2026-10-27).
-    let keys: [(&str, &[&str]); 6] = if view.home {
+    let keys: [(&str, &[&str]); 7] = if view.home {
         [
             (
                 "Enter",
                 &["open the session; on a", "container, every session in it"],
             ),
             ("n", &["new session in the container"]),
+            ("p", &["new pi session in the container"]),
             ("c", &["offload the session"]),
             ("s", &["a shell in the container"]),
             (
@@ -912,6 +928,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
                 &["open the session; resumes it", "if offloaded or archived"],
             ),
             ("n", &[&new]),
+            ("p", &[&new_pi]),
             (
                 "c",
                 &["offload the session, or", "archive an offloaded one"],
@@ -1175,7 +1192,15 @@ mod tests {
         }
     }
 
-    /// The sessions of mockup 1, in group order: six open, seven closed.
+    /// A pi session (owner, 2026-10-30): its slot name says so, and the row carries the mark.
+    fn pi_row(flags: &str, title: &str, age: &str) -> Row {
+        Row {
+            key: RowKey::Slot("pi-1".to_string()),
+            ..row(flags, title, age)
+        }
+    }
+
+    /// The sessions of mockup 1, in group order: six open, seven closed; one of them a pi.
     fn listed() -> Vec<Row> {
         let mut claude = row("", "claude", "5h");
         claude.key = RowKey::Socket("claude".to_string());
@@ -1183,7 +1208,7 @@ mod tests {
             row("!", "permission: write hosts/one", "2m"),
             row("b", "loop: watch the base build", "now"),
             row("*", "retire the old tunnel", "14m"),
-            row("@", "immich upgrade", "3m"),
+            pi_row("@", "immich upgrade", "3m"),
             claude,
             row("z", "mount guards on one", "2d"),
             fold("7"),
@@ -1371,7 +1396,10 @@ mod tests {
             infra,
             nested("!", "permission: write hosts/one", "2m"),
             nested("b", "loop: watch the base build", "now"),
-            nested("@", "immich upgrade", "3m"),
+            Row {
+                nested: true,
+                ..pi_row("@", "immich upgrade", "3m")
+            },
             or3,
             nested("*", "retire the old tunnel", "14m"),
             container("dd-dev", "2 offloaded"),
@@ -1790,7 +1818,7 @@ mod tests {
         let p = lines(&render(&mockup_10(40)).unwrap());
         assert_eq!(p[0], "infra-dev · 812M of 1.0G", "no count yet");
         assert_eq!(p[3], "⠋ reading sessions");
-        assert_eq!(p[22], "n new   ? keys   s shell");
+        assert_eq!(p[22], "n new   ? keys   s shell   p new pi");
         assert_eq!(
             p[23], "RAM: 0.8G / 1.0G, Load: 2.3, infra-dev",
             "the load line, at once"
@@ -1856,7 +1884,7 @@ mod tests {
         assert!(style_at(&f, 8, 3).bold, "the unread session itself");
         let p = lines(&f);
         assert!(
-            p[6].starts_with("└─ immich"),
+            p[6].starts_with("└─ pi: immich"),
             "a container's last on a corner"
         );
         assert!(p[5].starts_with("├─ loop"), "the others on a branch");
@@ -2118,7 +2146,7 @@ mod tests {
                 format!("… {} more", 30 - (room - 2))
             );
             assert!(p[2 + room].starts_with('─'), "the closing rule follows");
-            assert!(p[23].ends_with("s shell"));
+            assert!(p[23].ends_with("p new pi"));
         }
     }
 
@@ -2243,7 +2271,7 @@ mod tests {
     fn the_mockup_comparison_fails_on_a_wrong_view() {
         // The parse finds real screens, not empty ones that would match anything.
         assert_eq!(mockup(MOCKUPS_40, 1).len(), 17);
-        assert_eq!(mockup(MOCKUPS_80, 7).len(), 19);
+        assert_eq!(mockup(MOCKUPS_80, 7).len(), 20);
         assert!(mockup(MOCKUPS_40, 5)[0].starts_with("infra-dev · 6 open"));
 
         let wrong_title = {
@@ -2404,7 +2432,7 @@ mod tests {
         let f = render(&mockup_1(40)).unwrap();
         assert_eq!(
             chars_styled(&f, |s| s.fg == Some(Colour::Blue)),
-            "Enternc?s"
+            "Enternc?sp"
         );
         let hint = &f.lines[21];
         let blue: Vec<&str> = hint
@@ -2413,17 +2441,18 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(blue, ["Enter", "n", "c", "?"]);
+        // Enter (two lines), n, p, c (two), s, Esc, ?: then the groups, then the mark.
         let k = render(&mockup_7(40)).unwrap();
         let first = |i: usize| k.lines[i][0].clone();
-        for i in [2, 4, 5, 7, 8, 9] {
+        for i in [2, 4, 5, 6, 8, 9, 10] {
             assert_eq!(first(i).style, BLUE, "key on line {i}");
         }
-        for i in 11..14 {
+        for i in 12..15 {
             assert_eq!(first(i).style, BOLD, "group on line {i}");
         }
-        assert_eq!(first(13).text, "Archived");
-        assert_eq!(first(15).text, "!");
-        assert_eq!(first(15).style, AMBER_BOLD, "the mark, as it is drawn");
+        assert_eq!(first(14).text, "Archived");
+        assert_eq!(first(16).text, "!");
+        assert_eq!(first(16).style, AMBER_BOLD, "the mark, as it is drawn");
     }
 
     #[test]
@@ -2447,7 +2476,8 @@ mod tests {
         assert_eq!(style_at(&f, 4, 0), FG, "plain title");
         assert_eq!(style_at(&f, 5, 0), BOLD, "unread title");
         assert_eq!(style_at(&f, 5, 39), DIM, "unread age");
-        assert_eq!(style_at(&f, 6, 0), DIM, "attached title");
+        assert_eq!(style_at(&f, 6, 0), DIM, "the pi mark, structure");
+        assert_eq!(style_at(&f, 6, 4), DIM, "attached title");
         assert_eq!(style_at(&f, 6, 39), DIM, "attached age");
         // Calibration: the same rows with nothing unread or attached draw plainly.
         let mut v = View {
@@ -2458,7 +2488,12 @@ mod tests {
         v.rows[3].attached = false;
         let f = render(&v).unwrap();
         assert_eq!(style_at(&f, 5, 0), FG);
-        assert_eq!(style_at(&f, 6, 0), FG);
+        assert_eq!(
+            style_at(&f, 6, 0),
+            DIM,
+            "the pi mark is dim on a plain row too"
+        );
+        assert_eq!(style_at(&f, 6, 4), FG);
         // The header: the container's name, then everything after it dim.
         assert_eq!(f.lines[0][0].text, "infra-dev");
         assert_eq!(f.lines[0][0].style, FG);
@@ -2493,6 +2528,7 @@ mod tests {
                         let text: String = l.iter().map(|s| s.text.as_str()).collect();
                         let text = text.trim_start();
                         let text = text.strip_prefix("! ").unwrap_or(text);
+                        let text = text.strip_prefix("pi: ").unwrap_or(text);
                         let starts = if r.key == RowKey::ArchiveFold {
                             "── Archived"
                         } else {
@@ -2676,7 +2712,13 @@ mod tests {
         assert!(f.contains("\x1b[1;38;5;214m! \x1b[0m\x1b[38;5;214mpermission: write"));
         assert!(f.contains("\x1b[38;5;75mEnter\x1b[0m open"));
         assert!(f.contains("\x1b[1mretire the old tunnel\x1b[0m"));
-        assert!(f.contains("\x1b[2mimmich upgrade"));
+        // The pi mark is dim, and the attached title after it is dim too.
+        assert!(f.contains("\x1b[2mpi: "));
+        let at = f.find("immich upgrade").unwrap();
+        assert!(
+            f[..at].ends_with("\x1b[2m") || f[..at].ends_with("\x1b[2mpi: "),
+            "{f:?}"
+        );
         let cursor = render(&View {
             cursor: RETIRE,
             ..mockup_1(40)

@@ -16,7 +16,7 @@ infra-dev · 6 open · 812M of 1.0G
   ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
   retire the old tunnel                                                      14m
-  immich upgrade                                                              3m
+  pi: immich upgrade                                                          3m
   claude                                                                      5h
 
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ infra-dev · 6 open · 812M of 1.0G
 
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -38,7 +38,7 @@ infra-dev · nothing open · 812M of 1.0G
   n   start one in /workspace
   s   a shell instead
 ────────────────────────────────────────────────────────────────────────────────
-n new   ? keys   s shell
+n new   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -97,7 +97,7 @@ infra-dev · 6 open · 1.0G of 1.0G
   ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
   retire the old tunnel                                                      now
-  immich upgrade                                                             12m
+  pi: immich upgrade                                                         12m
   claude                                                                      5h
 
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ infra-dev · 6 open · 1.0G of 1.0G
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 detached · it is still running
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 1.0G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -117,6 +117,7 @@ infra-dev · keys
 Enter  open the session; resumes it
        if offloaded or archived
 n      new session in /workspace
+p      new pi session in /workspace
 c      offload the session, or
        archive an offloaded one
 s      a shell in /workspace
@@ -129,7 +130,7 @@ Archived   ended, still resumable; Enter
            or a click on it opens it
 !          a prompt is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -138,20 +139,21 @@ RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 at 40 columns, the right edge marked:
 ========================================
 Enter open   n new   c close   ? keys
-s shell
+s shell   p new pi
 at 34 columns, the right edge marked:
 ==================================
 Enter open   n new   c close
-? keys   s shell
+? keys   s shell   p new pi
 at 26 columns, the right edge marked:
 ==========================
 Enter open   n new
 c close   ? keys   s shell
+p new pi
 at 18 columns, the right edge marked:
 ==================
 Enter open   n new
 c close   ? keys
-s shell
+s shell   p new pi
 at 12 columns, the right edge marked:
 ============
 Enter open
@@ -159,12 +161,14 @@ n new
 c close
 ? keys
 s shell
+p new pi
 at 9 columns, the right edge marked:
 =========
 n new
 c close
 ? keys
 s shell
+p new pi
 at 7 columns, the right edge marked:
 =======
 n new
@@ -193,7 +197,7 @@ infra-dev · 2 open · 812M of 1.0G
   syncthing share rename                                                     52d
   smartd on one                                                              63d
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -204,7 +208,7 @@ infra-dev · 812M of 1.0G
 
 ⠋ reading sessions
 ────────────────────────────────────────────────────────────────────────────────
-n new   ? keys   s shell
+n new   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -216,7 +220,7 @@ infra-dev · 6 open · 812M of 1.0G
   ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
   retire the old tunnel                                                        ⠋
-  immich upgrade                                                              3m
+  pi: immich upgrade                                                          3m
   claude                                                                      5h
 
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
@@ -225,7 +229,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 ⠋ offloading session
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
 ```
 
@@ -243,13 +247,13 @@ dev · 4 containers · 1.9G of 3.0G
   ! infra-dev                                             3 loaded · 1 offloaded
   ├─ ! permission: write hosts/one                                            2m
   ├─ loop: watch the base build                                              now
-  └─ immich upgrade                                                           3m
+  └─ pi: immich upgrade                                                       3m
   or3-dev                                                               1 loaded
   └─ retire the old tunnel                                                   14m
   dd-dev                                                             2 offloaded
   ds-dev                                                           not answering
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
@@ -261,7 +265,7 @@ infra-dev · 6 open · 812M of 1.0G
   ! permission: write hosts/one                                               2m
   loop: watch the base build                                                 now
   retire the old tunnel                                                      14m
-  immich upgrade                                                              3m
+  pi: immich upgrade                                                          3m
   claude                                                                      5h
 
 ── Offloaded · 1 ───────────────────────────────────────────────────────────────
@@ -269,7 +273,7 @@ infra-dev · 6 open · 812M of 1.0G
 
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell   Esc back
+Enter open   n new   c close   ? keys   s shell   p new pi   Esc back
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
@@ -295,6 +299,7 @@ dev · keys
 Enter  open the session; on a
        container, every session in it
 n      new session in the container
+p      new pi session in the container
 c      offload the session
 s      a shell in the container
 Esc    quit the launcher; from a
@@ -305,6 +310,6 @@ Containers every one the hub reaches,
            its loaded sessions under it
 !          a session is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
-Enter open   n new   c close   ? keys   s shell
+Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```

@@ -5,7 +5,7 @@
 [2K[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m      [0m[2;7m   2m[0m
 [2Kloop: watch the base build         [2m  now[0m
 [2K[1mretire the old tunnel[0m              [2m  14m[0m
-[2K[2mimmich upgrade                        3m[0m
+[2K[2mpi: immich upgrade                    3m[0m
 [2Kclaude                             [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
@@ -21,7 +21,7 @@
 [2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 2 at 40x24
 [2Kinfra-dev[2m · nothing open · 812M of 1.0G[0m
@@ -46,7 +46,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────[0m
-[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 4 at 40x24
 [2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
@@ -105,7 +105,7 @@
 [2K[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m      [2m   2m[0m
 [2Kloop: watch the base build         [2m  now[0m
 [2K[7mretire the old tunnel              [0m[2;7m  now[0m
-[2K[2mimmich upgrade                       12m[0m
+[2K[2mpi: immich upgrade                   12m[0m
 [2Kclaude                             [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
@@ -121,7 +121,7 @@
 [2K[2m────────────────────────────────────────[0m
 [2Kdetached · it is still running
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[31mRAM: 1.0G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 7 at 40x24
 [2Kinfra-dev[2m · keys[0m
@@ -129,6 +129,7 @@
 [2K[38;5;75mEnter[0m  open the session; resumes it
 [2K       if offloaded or archived
 [2K[38;5;75mn[0m      new session in /workspace
+[2K[38;5;75mp[0m      new pi session in /workspace
 [2K[38;5;75mc[0m      offload the session, or
 [2K       archive an offloaded one
 [2K[38;5;75ms[0m      a shell in /workspace
@@ -143,10 +144,9 @@
 [2K
 [2K
 [2K
-[2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 9 at 40x24
 [2Kinfra-dev[2m · 2 open · 812M of 1.0G[0m
@@ -171,7 +171,7 @@
 [2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 10 at 40x24
 [2Kinfra-dev[2m · 812M of 1.0G[0m
@@ -196,7 +196,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────[0m
-[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 11 at 40x24
 [2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
@@ -205,7 +205,7 @@
 [2K[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m      [2m   2m[0m
 [2Kloop: watch the base build         [2m  now[0m
 [2K[1;7mretire the old tunnel[0m[7m                  ⠋[0m
-[2K[2mimmich upgrade                        3m[0m
+[2K[2mpi: immich upgrade                    3m[0m
 [2Kclaude                             [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
@@ -221,7 +221,7 @@
 [2K[2m────────────────────────────────────────[0m
 [2K⠋ offloading session
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 12 at 40x24
 [2Kdev[2m · 4 containers · 1.9G of 3.0G[0m
@@ -230,7 +230,7 @@
 [2K[1;7;38;5;214m! [0m[7;38;5;214minfra-dev[0m[7m       [0m[2;7m3 loaded · 1 offloaded[0m
 [2K[2m├─ [0m[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m   [2m   2m[0m
 [2K[2m├─ [0mloop: watch the base build      [2m  now[0m
-[2K[2m└─ immich upgrade                     3m[0m
+[2K[2m└─ pi: immich upgrade                 3m[0m
 [2K[1mor3-dev[0m                         [2m1 loaded[0m
 [2K[2m└─ [0m[1mretire the old tunnel[0m           [2m  14m[0m
 [2Kdd-dev                       [2m2 offloaded[0m
@@ -246,7 +246,7 @@
 [2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
 === mockup 13 at 40x24
 [2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
@@ -255,7 +255,7 @@
 [2K[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m      [0m[2;7m   2m[0m
 [2Kloop: watch the base build         [2m  now[0m
 [2K[1mretire the old tunnel[0m              [2m  14m[0m
-[2K[2mimmich upgrade                        3m[0m
+[2K[2mpi: immich upgrade                    3m[0m
 [2Kclaude                             [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
@@ -271,7 +271,7 @@
 [2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi   [38;5;75mEsc[0m back
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
 === mockup 14 at 40x24
 [2Kds-dev[2m · not answering[0m
@@ -304,6 +304,7 @@
 [2K[38;5;75mEnter[0m  open the session; on a
 [2K       container, every session in it
 [2K[38;5;75mn[0m      new session in the container
+[2K[38;5;75mp[0m      new pi session in the container
 [2K[38;5;75mc[0m      offload the session
 [2K[38;5;75ms[0m      a shell in the container
 [2K[38;5;75mEsc[0m    quit the launcher; from a
@@ -318,10 +319,9 @@
 [2K
 [2K
 [2K
-[2K
 [2K[2m────────────────────────────────────────[0m
 [2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys
-[2K[38;5;75ms[0m shell
+[2K[38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
 === mockup 1 at 80x24
 [2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
@@ -330,7 +330,7 @@
 [2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m                                            [0m[2;7m   2m[0m
 [2K  loop: watch the base build                                               [2m  now[0m
 [2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
-[2K[2m  immich upgrade                                                              3m[0m
+[2K[2m  pi: immich upgrade                                                          3m[0m
 [2K  claude                                                                   [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
@@ -346,7 +346,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 2 at 80x24
 [2Kinfra-dev[2m · nothing open · 812M of 1.0G[0m
@@ -371,7 +371,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 4 at 80x24
 [2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
@@ -430,7 +430,7 @@
 [2K  [1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                            [2m   2m[0m
 [2K  loop: watch the base build                                               [2m  now[0m
 [2K[7m  retire the old tunnel                                                    [0m[2;7m  now[0m
-[2K[2m  immich upgrade                                                             12m[0m
+[2K[2m  pi: immich upgrade                                                         12m[0m
 [2K  claude                                                                   [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
@@ -446,7 +446,7 @@
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
 [2Kdetached · it is still running
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[31mRAM: 1.0G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 7 at 80x24
 [2Kinfra-dev[2m · keys[0m
@@ -454,6 +454,7 @@
 [2K[38;5;75mEnter[0m  open the session; resumes it
 [2K       if offloaded or archived
 [2K[38;5;75mn[0m      new session in /workspace
+[2K[38;5;75mp[0m      new pi session in /workspace
 [2K[38;5;75mc[0m      offload the session, or
 [2K       archive an offloaded one
 [2K[38;5;75ms[0m      a shell in /workspace
@@ -469,9 +470,8 @@
 [2K
 [2K
 [2K
-[2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 9 at 80x24
 [2Kinfra-dev[2m · 2 open · 812M of 1.0G[0m
@@ -496,7 +496,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 10 at 80x24
 [2Kinfra-dev[2m · 812M of 1.0G[0m
@@ -521,7 +521,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mn[0m new   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 11 at 80x24
 [2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
@@ -530,7 +530,7 @@
 [2K  [1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                            [2m   2m[0m
 [2K  loop: watch the base build                                               [2m  now[0m
 [2K[7m  [0m[1;7mretire the old tunnel[0m[7m                                                        ⠋[0m
-[2K[2m  immich upgrade                                                              3m[0m
+[2K[2m  pi: immich upgrade                                                          3m[0m
 [2K  claude                                                                   [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
@@ -546,7 +546,7 @@
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
 [2K⠋ offloading session
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[1mRAM: 0.8G / 1.0G[0m[2m, Load: 2.3, infra-dev[0m
 === mockup 12 at 80x24
 [2Kdev[2m · 4 containers · 1.9G of 3.0G[0m
@@ -555,7 +555,7 @@
 [2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214minfra-dev[0m[7m                                             [0m[2;7m3 loaded · 1 offloaded[0m
 [2K  [2m├─ [0m[1;38;5;214m! [0m[38;5;214mpermission: write hosts/one[0m                                         [2m   2m[0m
 [2K  [2m├─ [0mloop: watch the base build                                            [2m  now[0m
-[2K[2m  └─ immich upgrade                                                           3m[0m
+[2K[2m  └─ pi: immich upgrade                                                       3m[0m
 [2K  [1mor3-dev[0m                                                               [2m1 loaded[0m
 [2K  [2m└─ [0m[1mretire the old tunnel[0m                                                 [2m  14m[0m
 [2K  dd-dev                                                             [2m2 offloaded[0m
@@ -571,7 +571,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
 === mockup 13 at 80x24
 [2Kinfra-dev[2m · 6 open · 812M of 1.0G[0m
@@ -580,7 +580,7 @@
 [2K[7m  [0m[1;7;38;5;214m! [0m[7;38;5;214mpermission: write hosts/one[0m[7m                                            [0m[2;7m   2m[0m
 [2K  loop: watch the base build                                               [2m  now[0m
 [2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
-[2K[2m  immich upgrade                                                              3m[0m
+[2K[2m  pi: immich upgrade                                                          3m[0m
 [2K  claude                                                                   [2m   5h[0m
 [2K
 [2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
@@ -596,7 +596,7 @@
 [2K
 [2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mEsc[0m back
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi   [38;5;75mEsc[0m back
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m
 === mockup 14 at 80x24
 [2Kds-dev[2m · not answering[0m
@@ -629,6 +629,7 @@
 [2K[38;5;75mEnter[0m  open the session; on a
 [2K       container, every session in it
 [2K[38;5;75mn[0m      new session in the container
+[2K[38;5;75mp[0m      new pi session in the container
 [2K[38;5;75mc[0m      offload the session
 [2K[38;5;75ms[0m      a shell in the container
 [2K[38;5;75mEsc[0m    quit the launcher; from a
@@ -644,7 +645,6 @@
 [2K
 [2K
 [2K
-[2K
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell
+[2K[38;5;75mEnter[0m open   [38;5;75mn[0m new   [38;5;75mc[0m close   [38;5;75m?[0m keys   [38;5;75ms[0m shell   [38;5;75mp[0m new pi
 [2K[2mRAM: 1.9G / 3.0G, Load: 2.3, dev[0m

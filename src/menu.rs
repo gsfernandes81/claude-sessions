@@ -674,6 +674,10 @@ impl Menu {
             Key::Char('n') => self
                 .target()
                 .map_or(Action::None, |h| Action::New(h, Harness::Claude)),
+            // A pi session, beside `n` (owner, 2026-10-30): the same target, the other harness.
+            Key::Char('p') => self
+                .target()
+                .map_or(Action::None, |h| Action::New(h, Harness::Pi)),
             Key::Char('s') => self.target().map_or(Action::None, Action::Shell),
             Key::Char('c') => self.put_away(self.cursor),
             Key::Char('?') => {
@@ -1466,6 +1470,11 @@ mod tests {
             m.key(Key::Char('n')),
             Action::New(String::new(), Harness::Claude)
         );
+        assert_eq!(
+            m.key(Key::Char('p')),
+            Action::New(String::new(), Harness::Pi),
+            "p is a pi session (owner, 2026-10-30)"
+        );
         assert_eq!(m.key(Key::Char('s')), Action::Shell(String::new()));
         assert_eq!(m.key(Key::Esc), Action::Quit);
         assert_eq!(m.key(Key::Char('q')), Action::Quit);
@@ -1621,7 +1630,7 @@ mod tests {
     #[test]
     fn the_hint_line_count_matches_mockup_8() {
         let mut m = menu(vec![row("a")]);
-        for (width, lines) in [(40, 2), (34, 2), (26, 2), (18, 3), (12, 5), (9, 4), (7, 4)] {
+        for (width, lines) in [(40, 2), (34, 2), (26, 3), (18, 3), (12, 6), (9, 5), (7, 4)] {
             m.resize(width, 24);
             assert_eq!(m.hint_lines(), lines, "at {width} columns");
         }
@@ -1762,6 +1771,11 @@ mod tests {
         assert_eq!(
             m.key(Key::Char('n')),
             Action::New("or3-dev".into(), Harness::Claude)
+        );
+        assert_eq!(
+            m.key(Key::Char('p')),
+            Action::New("or3-dev".into(), Harness::Pi),
+            "p acts in the cursor's container as n does (owner, 2026-10-30)"
         );
         assert_eq!(m.key(Key::Char('s')), Action::Shell("or3-dev".into()));
         m.key(Key::End);

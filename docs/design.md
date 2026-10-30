@@ -1008,9 +1008,12 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
 - **Mail**: `<repo>/pi-<n>` is an address like any other, accepted when the container's
   agent lists the slot live. No nudge into a pi slot (not asked for): the mail hook is not run
   under pi, and infra's policy tells pi to run `claude-sessions mail list` itself.
-- **The menu**: `n` stays claude's; how a pi slot is started, and how a pi row is told from a
-  claude one in words, is the owner's to approve (mockups) and is recorded in
-  `docs/mockups.md` when it is.
+- **The menu** (owner, 2026-10-30, through infra's agent): `p` starts a pi session beside
+  `n`'s claude — no harness question on `n`, which the owner presses most — with the hint
+  line's second row `s shell   p new pi`, a `p` line on the keys screens, and `p` acting in
+  the cursor's container at the home as `n` does; a pi row carries a dim ASCII `pi: ` before
+  its title, after the `!` when both are drawn, so nothing is colour-only. `docs/mockups.md`
+  records the change and shows one.
 - **Not measured here**: pi's idle CPU and RSS, and `/proc/<pid>/comm` under node — infra's
   smoke run reports them. The no-room dialog's figure for a new session (`mem::SESSION_COST`)
   is claude's until they say otherwise.

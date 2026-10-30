@@ -116,6 +116,17 @@ impl Row {
         self.host == other.host && self.key == other.key
     }
 
+    /// What the row's session runs: a slot's by its name, a stored conversation's by its
+    /// store; anything else — a heading, a container, somebody's own zmx session — claude's,
+    /// which is to say unmarked.
+    pub fn harness(&self) -> crate::harness::Harness {
+        match &self.key {
+            RowKey::Slot(slot) => crate::harness::Harness::of_slot(slot).unwrap_or_default(),
+            RowKey::Conversation { harness, .. } => *harness,
+            _ => crate::harness::Harness::default(),
+        }
+    }
+
     /// Which group the row is drawn in. Being stopped outranks anything the record last said
     /// about the process.
     pub fn group(&self) -> Group {

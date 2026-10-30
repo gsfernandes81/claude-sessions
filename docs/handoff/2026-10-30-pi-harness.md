@@ -39,17 +39,17 @@ state machine over pi payloads, the pi start line and allocation, a resume with 
 the hook contract, and a stand-in pi bound end to end under the real hook (`tests/launch.rs`).
 `docs/design.md` § *Harnesses* has the reasoning.
 
+The owner's answers came the same day (`20261030T030016.063Z`): `p` for a pi session and the
+dim `pi: ` row mark, both built — hint line, keys screens, the mark, the mockups redrawn at
+both widths from the renderer (`print_the_mockups`, then `write_the_styled_mockups`).
+
 ## Still open
 
-1. **The `p` key and the row mark** — waiting on the owner through infra. When the word comes:
-   bind `p` in `menu.rs` (`Action::New(host, Harness::Pi)`, already plumbed through `run.rs`
-   and the agent), add the hint-line and keys-screen lines, the row mark if chosen, redraw the
-   mockups at both widths from the renderer, and pin them in `render.rs`'s tests.
-2. **Infra's measurements** (comm, idle CPU, RSS, what survives TERM) — may change
+1. **Infra's measurements** (comm, idle CPU, RSS, what survives TERM) — may change
    `mem::SESSION_COST` per harness or add a sweep rule; otherwise nothing.
-3. **Release 0.10.0** once 1 is in: bump `Cargo.toml` on main (the owner asked for the release
-   through infra's brief), mail infra the tag.
-4. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
+2. **Release 0.10.0**: bump `Cargo.toml` on main (the owner asked for the release through
+   infra's brief), mail infra the tag. Infra runs its two smoke checks against the pinned tag.
+3. Delete this note once the release is pinned and a pi slot has been seen on the fleet.
 
 ## The design as sent
 
