@@ -1322,6 +1322,7 @@ mod tests {
             age: String::new(),
             at: 5,
             nested: false,
+            remote: false,
         };
         f(&mut r);
         r

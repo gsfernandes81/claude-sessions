@@ -71,12 +71,14 @@ pub enum Item {
     Text(String),
     /// A tool call: its name and the one argument Claude Code shows beside it.
     Tool { name: String, arg: String },
-    /// A tool waiting on the owner's permission.
+    /// A tool waiting on the owner's permission. `always` is the label of Claude Code's
+    /// "Yes, and don't ask again" option, empty when claude suggested no rule to add.
     Permission {
         request_id: String,
         tool: String,
         arg: String,
         description: String,
+        always: String,
     },
     /// An `AskUserQuestion` waiting on the owner's answers.
     Ask {
@@ -112,6 +114,8 @@ pub struct Reducer {
     /// Waiting prompts and questions by request id, with the input claude sent, which an
     /// answer must carry back.
     waiting: HashMap<String, (u64, Value)>,
+    /// The rules a waiting permission prompt's "don't ask again" would add, by request id.
+    suggestions: HashMap<String, Vec<Value>>,
     /// Every tool result's full text, by item, for when the view asks.
     results: HashMap<u64, String>,
     meta: Meta,
@@ -146,6 +150,11 @@ impl Reducer {
         }
     }
 
+    /// The conversation's id, model, mode, title and effort, as last heard.
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
     /// The full text of a tool result the view was sent a preview of.
     pub fn full_result(&self, id: u64) -> Option<&str> {
         self.results.get(&id).map(String::as_str)
@@ -156,11 +165,20 @@ impl Reducer {
         self.waiting.get(request_id).map(|(_, input)| input)
     }
 
+    /// The rules "Yes, and don't ask again" adds for a waiting permission prompt.
+    pub fn waiting_suggestions(&self, request_id: &str) -> &[Value] {
+        self.suggestions
+            .get(request_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// A waiting prompt was answered by a view: it stops waiting, with `how` said. `None` when
     /// it was not waiting — answered already, by another view or by claude's withdrawal — so
     /// the relay sends claude nothing and tells that view `answered elsewhere`.
     pub fn answered(&mut self, request_id: &str, how: &str) -> Option<Out> {
         let (id, _) = self.waiting.remove(request_id)?;
+        self.suggestions.remove(request_id);
         let mut out = Out::default();
         out.ops.push(Op::Resolved {
             id,
@@ -291,8 +309,10 @@ impl Reducer {
                 tool,
                 input,
                 description,
+                suggestions,
             } => {
                 let arg = tool_arg(&tool, &input);
+                let always = always_label(&suggestions).unwrap_or_default();
                 let id = self.add(
                     &mut out,
                     Item::Permission {
@@ -300,9 +320,13 @@ impl Reducer {
                         tool,
                         arg,
                         description: description.unwrap_or_default(),
+                        always,
                     },
                 );
-                self.waiting.insert(request_id, (id, input));
+                self.waiting.insert(request_id.clone(), (id, input));
+                if !suggestions.is_empty() {
+                    self.suggestions.insert(request_id, suggestions);
+                }
                 self.set_state(&mut out, "waiting");
             }
             Msg::Question {
@@ -414,6 +438,69 @@ impl Reducer {
             }
         }
     }
+}
+
+/// The label Claude Code puts on "Yes, and don't ask again", from what claude suggested
+/// adding, read from 2.1.311's permission dialog: a Bash rule's command prefixes, said as
+/// `touch commands in this project`; another tool's rules by name; directories as access.
+/// `None` when nothing it suggested is a rule or a directory, and the option is not offered.
+pub fn always_label(suggestions: &[Value]) -> Option<String> {
+    let mut commands: Vec<String> = Vec::new();
+    let mut tools: Vec<String> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    for s in suggestions {
+        match s.get("type").and_then(Value::as_str) {
+            Some("addRules") => {
+                for r in s.get("rules").and_then(Value::as_arr).unwrap_or(&[]) {
+                    let tool = r.get("toolName").and_then(Value::as_str).unwrap_or("");
+                    match (tool, r.get("ruleContent").and_then(Value::as_str)) {
+                        ("Bash", Some(rule)) => {
+                            let prefix = rule
+                                .trim_end_matches(":*")
+                                .trim_end_matches(" *")
+                                .trim_end_matches('*')
+                                .trim();
+                            let word = prefix.split_whitespace().next().unwrap_or(prefix);
+                            if !word.is_empty() && !commands.iter().any(|c| c == word) {
+                                commands.push(word.to_string());
+                            }
+                        }
+                        ("", _) => {}
+                        (tool, _) => {
+                            if !tools.iter().any(|t| t == tool) {
+                                tools.push(tool.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("addDirectories") => {
+                for d in s.get("directories").and_then(Value::as_arr).unwrap_or(&[]) {
+                    if let Some(d) = d.as_str() {
+                        dirs.push(d.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let and = |v: &[String]| v.join(" and ");
+    let label = if !commands.is_empty() {
+        format!(
+            "Yes, and don't ask again for {} commands in this project",
+            and(&commands)
+        )
+    } else if !tools.is_empty() {
+        format!("Yes, and don't ask again for {}", and(&tools))
+    } else if !dirs.is_empty() {
+        format!(
+            "Yes, and always allow access to {} from this project",
+            and(&dirs)
+        )
+    } else {
+        return None;
+    };
+    Some(label)
 }
 
 /// Merge a batch of ops for one write: consecutive appends to one item become one.
@@ -594,13 +681,20 @@ impl Item {
                 tool,
                 arg,
                 description,
-            } => obj(vec![
-                k("perm"),
-                ("r", Value::string(request_id.clone())),
-                ("n", Value::string(tool.clone())),
-                ("a", Value::string(arg.clone())),
-                ("d", Value::string(description.clone())),
-            ]),
+                always,
+            } => {
+                let mut v = obj(vec![
+                    k("perm"),
+                    ("r", Value::string(request_id.clone())),
+                    ("n", Value::string(tool.clone())),
+                    ("a", Value::string(arg.clone())),
+                    ("d", Value::string(description.clone())),
+                ]);
+                if !always.is_empty() {
+                    v.set("al", Value::string(always.clone()));
+                }
+                v
+            }
             Item::Ask {
                 request_id,
                 questions,
@@ -1030,5 +1124,57 @@ mod tests {
             r.feed(&line(sdk::user_text("hi"))).ops.is_empty(),
             "claude echoes a prompt itself"
         );
+    }
+
+    #[test]
+    fn dont_ask_again_is_labelled_as_claude_code_labels_it_and_offered_only_with_a_rule() {
+        let v = |s: &str| parse(s).unwrap();
+        // As 2.1.311 suggested for `touch spike-file && ls` (spike, 2026-11-01).
+        let touch = v(
+            r#"{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch spike-file *"}],"behavior":"allow","destination":"localSettings"}"#,
+        );
+        let dirs = v(r#"{"type":"addDirectories","directories":["/w"],"destination":"session"}"#);
+        assert_eq!(
+            always_label(&[touch.clone(), dirs.clone()]).as_deref(),
+            Some("Yes, and don't ask again for touch commands in this project")
+        );
+        let two = v(
+            r#"{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo test:*"},{"toolName":"Bash","ruleContent":"git status"}]}"#,
+        );
+        assert_eq!(
+            always_label(&[two]).as_deref(),
+            Some("Yes, and don't ask again for cargo and git commands in this project")
+        );
+        let edit = v(r#"{"type":"addRules","rules":[{"toolName":"Edit"}]}"#);
+        assert_eq!(
+            always_label(&[edit]).as_deref(),
+            Some("Yes, and don't ask again for Edit")
+        );
+        assert_eq!(
+            always_label(&[dirs]).as_deref(),
+            Some("Yes, and always allow access to /w from this project")
+        );
+        assert_eq!(always_label(&[]), None);
+        assert_eq!(
+            always_label(&[v(r#"{"type":"setMode","mode":"acceptEdits"}"#)]),
+            None
+        );
+
+        // Carried on the item, and kept for the answer.
+        let mut r = Reducer::new();
+        let req = format!(
+            r#"{{"type":"control_request","request_id":"p1","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"touch x"}},"permission_suggestions":[{}]}}}}"#,
+            to_line(&touch)
+        );
+        let out = r.feed(&v(&req));
+        assert!(
+            wire(&out.ops)[0]
+                .contains(r#""al":"Yes, and don't ask again for touch commands in this project""#),
+            "{:?}",
+            wire(&out.ops)
+        );
+        assert_eq!(r.waiting_suggestions("p1"), [touch]);
+        r.answered("p1", "allowed");
+        assert!(r.waiting_suggestions("p1").is_empty());
     }
 }

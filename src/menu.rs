@@ -322,6 +322,7 @@ impl Menu {
                     .filter(|r| r.host == p.name && r.group() == Group::Loaded);
                 out.extend(loaded.map(|r| Row {
                     nested: true,
+                    remote: false,
                     ..r.clone()
                 }));
             }
@@ -349,6 +350,7 @@ impl Menu {
             age: archived.len().to_string(),
             at: 0,
             nested: false,
+            remote: false,
         });
         if self.archive_open {
             out.extend(archived);
@@ -398,6 +400,7 @@ impl Menu {
             age,
             at: 0,
             nested: false,
+            remote: false,
         }
     }
 
@@ -821,6 +824,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             age: fmt::age(clock.saturating_sub(c.last_ms)),
             at: c.last_ms,
             nested: false,
+            remote: false,
         };
         dated.push((c.last_ms, row));
     }
@@ -855,6 +859,7 @@ fn socket_rows(recs: &[SlotRecord], sessions: &[zmx::Session], clock: Millis) ->
             age: fmt::age(clock.saturating_sub(since)),
             at: since,
             nested: false,
+            remote: false,
         });
     }
     rows
@@ -903,6 +908,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
+        remote: r.driver == crate::registry::Driver::Holder,
     }
 }
 
@@ -1115,6 +1121,7 @@ mod tests {
             age: "1m".into(),
             at: 0,
             nested: false,
+            remote: false,
         }
     }
 

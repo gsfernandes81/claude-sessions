@@ -1189,6 +1189,7 @@ mod tests {
             age: age.to_string(),
             at: 0,
             nested: false,
+            remote: false,
         }
     }
 
@@ -1390,6 +1391,7 @@ mod tests {
         or3.unread = true;
         let nested = |flags: &str, title: &str, age: &str| Row {
             nested: true,
+            remote: false,
             ..row(flags, title, age)
         };
         vec![
@@ -1398,6 +1400,7 @@ mod tests {
             nested("b", "loop: watch the base build", "now"),
             Row {
                 nested: true,
+                remote: false,
                 ..pi_row("@", "immich upgrade", "3m")
             },
             or3,

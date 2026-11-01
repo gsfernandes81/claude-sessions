@@ -52,6 +52,9 @@ pub enum Msg {
         tool: String,
         input: Value,
         description: Option<String>,
+        /// Claude's `permission_suggestions`: the rules "Yes, and don't ask again" would add,
+        /// sent back as `updatedPermissions` when the owner picks it. Empty when none.
+        suggestions: Vec<Value>,
     },
     /// `can_use_tool` for `AskUserQuestion`: answered by allowing it with the answers added.
     Question {
@@ -346,6 +349,11 @@ fn request(v: &Value) -> Msg {
             .and_then(Value::as_str)
             .map(String::from),
         input,
+        suggestions: r
+            .get("permission_suggestions")
+            .and_then(Value::as_arr)
+            .map(<[Value]>::to_vec)
+            .unwrap_or_default(),
     }
 }
 
@@ -526,6 +534,19 @@ pub fn allow(request_id: &str, input: Value) -> Value {
         obj(vec![
             ("behavior", Value::string("allow")),
             ("updatedInput", input),
+        ]),
+    )
+}
+
+/// Allow a tool call and add the rules Claude suggested, so it is not asked again: Claude
+/// Code's "Yes, and don't ask again".
+pub fn allow_always(request_id: &str, input: Value, suggestions: &[Value]) -> Value {
+    answer(
+        request_id,
+        obj(vec![
+            ("behavior", Value::string("allow")),
+            ("updatedInput", input),
+            ("updatedPermissions", Value::Arr(suggestions.to_vec())),
         ]),
     )
 }
@@ -799,6 +820,7 @@ mod tests {
             tool,
             input,
             description,
+            suggestions,
         } = read(
             r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"touch spike-file && ls"},"description":"Create spike-file","permission_suggestions":[]}}"#,
         )
@@ -807,6 +829,7 @@ mod tests {
         };
         assert_eq!((request_id.as_str(), tool.as_str()), ("r1", "Bash"));
         assert_eq!(description.as_deref(), Some("Create spike-file"));
+        assert!(suggestions.is_empty());
         assert_eq!(
             input.get("command").and_then(Value::as_str),
             Some("touch spike-file && ls")

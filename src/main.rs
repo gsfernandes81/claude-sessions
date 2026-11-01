@@ -65,14 +65,11 @@ mod offload;
 mod pisession;
 mod procinfo;
 mod proto;
-// The hub's half of the remote view, wired by the relay next (docs/remote-view.md).
-#[allow(dead_code)]
 mod reduce;
 mod registry;
+mod relay;
 mod render;
 mod run;
-// Read and written by the remote view's holder, which lands next (docs/remote-view.md).
-#[allow(dead_code)]
 mod sdk;
 mod signal;
 mod sockdiag;
@@ -301,6 +298,8 @@ fn main() -> ExitCode {
         // The relay's way to open a session for the phone client: start or resume it under
         // the holder if need be, say which slot, then be its tap (`launch::remote_new`…).
         "remote" => cmd_remote(&args[1..]),
+        // The hub's end of the remote view, one per connected client (`relay.rs`).
+        "relay" => report(relay::serve()),
         "install" => match args.get(1) {
             Some(dir) => match install::run(std::path::Path::new(dir)) {
                 Ok(done) => {
@@ -336,6 +335,8 @@ fn usage() -> String {
                                served to taps (proposed: docs/remote-view.md)
   claude-sessions tap SLOT [FROM] [RUN]
                                the hub's way into a remote-view slot, run over ssh
+  claude-sessions relay        the hub's end of the remote view, for one client on stdin and
+                               stdout: run as ssh -T -C dev claude-sessions relay
   claude-sessions remote new [DIR] | open SLOT | resume ID CWD TITLE
                                open a session for the remote view, under the holder, then
                                be its tap; its first line names the slot, or why not
@@ -378,9 +379,7 @@ fn cmd_remote(args: &[String]) -> ExitCode {
     let a = |i: usize| args.get(i).map(String::as_str);
     let opened = match (a(0), a(1), a(2), a(3)) {
         (Some("new"), dir, None, None) => {
-            let here = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".into());
+            let here = menu::workspace();
             launch::remote_new(dir.unwrap_or(&here), &deps)
         }
         (Some("open"), Some(slot), None, None) => launch::remote_open(slot, &deps),

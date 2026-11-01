@@ -508,6 +508,7 @@ mod tests {
             age: String::new(),
             at,
             nested: false,
+            remote: false,
         }
     }
 

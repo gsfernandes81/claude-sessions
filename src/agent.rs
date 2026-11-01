@@ -531,6 +531,7 @@ mod tests {
             age: "now".into(),
             at: 0,
             nested: false,
+            remote: false,
         }];
         assert!(seen.update(&one, 8, false), "the rows changed");
         assert!(!seen.update(&one, 8, false));

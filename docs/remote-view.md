@@ -252,6 +252,37 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      every view, and a relay that reconnects and reads the log again finds it answered
      rather than waiting; a change of model, mode or effort shows at once. Effort is carried
      in the meta op as `e`, since claude's own lines never say it.
+   - **Then the relay**, `src/relay.rs`: `claude-sessions relay` on the hub, for one client
+     on stdin and stdout. It holds an agent per container as the hub's menu does and passes
+     each snapshot on whole, so the client draws its home with the menu's own code; a row
+     the holder drives carries `"remote":true` (`Row::remote`, from the record's `driver`).
+     It opens one conversation at a time with `claude-sessions remote …` in its container,
+     reduces its lines, and turns the client's actions into claude's control messages. One
+     run end to end on 2026-11-01 with the local container and a real claude: hello, home,
+     `new`, a prompt, `pong` streamed back, the model list twice (a second `initialize` is
+     answered like the first), `exit`. **3.6 KB reached the client for all of it**, the home
+     included.
+   - **The wire, v1.** JSON lines, `t` the type, through `ssh -T -C`:
+
+     | From the client | Means |
+     |---|---|
+     | `hi {v}` | first; answered `hi {v, hosts}`, then the home |
+     | `open {c, k}` · `new {c}` | open a row's conversation (`k` is the row key as the agent sends it) or a new one in container `c` |
+     | `re {c, s, run, n}` | after a reconnect: slot `s`, the holder's run, and the last `n` the client holds |
+     | `close` | back home; the conversation keeps running |
+     | `say {x}` | a prompt or slash command, `/compact` included |
+     | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
+     | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
+     | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
+     | `esc` · `exit` · `models` · `full {id}` | interrupt, end the session, the model list, a tool result whole |
+
+     | From the relay | Means |
+     |---|---|
+     | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
+     | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` | the reducer's ops (`reduce.rs`) |
+     | `n {n}` | after each batch: every op of lines up to `n` has been sent |
+     | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.

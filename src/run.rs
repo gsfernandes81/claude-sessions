@@ -48,7 +48,7 @@ pub fn retry() -> Duration {
 /// How often the hub reads its own figures for the load line: `CLAUDE_SESSIONS_LOAD_MS`, for
 /// the tests, else 5 seconds — the one-minute load average moves slowly, and a line that
 /// changed every second would cost a line of output on the metered link every second.
-fn load_every() -> Duration {
+pub(crate) fn load_every() -> Duration {
     std::env::var("CLAUDE_SESSIONS_LOAD_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -62,7 +62,7 @@ const CLEAR: &[u8] = b"\x1b[2J";
 /// The home's header: the hub's own name, the pool's memory where infra mounts it
 /// (`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory), and the load of the machine the hub is on,
 /// which the load line counts first (`statusline::door`).
-fn home_header() -> Header {
+pub(crate) fn home_header() -> Header {
     Header {
         host: menu::host(),
         memory: statusline::pool(),
@@ -820,6 +820,7 @@ mod tests {
             age: "1m".into(),
             at,
             nested: false,
+            remote: false,
         }
     }
 

@@ -108,6 +108,10 @@ pub struct Row {
     /// step, rather than under a heading of its own group. Set by the menu as it lays out the
     /// home; never sent between hub and container.
     pub nested: bool,
+    /// The remote view's holder drives it (`registry::Driver::Holder`): a phone client can open
+    /// it. A running slot without it is a terminal's, which the phone lists dimmed as
+    /// `term: ` (mockup R9). The menu draws nothing for it.
+    pub remote: bool,
 }
 
 impl Row {

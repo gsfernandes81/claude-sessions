@@ -114,7 +114,7 @@ pub fn key_from(v: &Value) -> Option<RowKey> {
 /// A row as the agent sends it. Its `host` is not sent: the hub knows which container it is
 /// talking to, and a container cannot name itself into another's rows.
 pub fn row_to(r: &Row) -> Value {
-    obj(vec![
+    let mut v = obj(vec![
         ("key", key_to(&r.key)),
         ("wants_you", Value::Bool(r.wants_you)),
         ("busy", Value::Bool(r.busy)),
@@ -126,7 +126,12 @@ pub fn row_to(r: &Row) -> Value {
         ("title", Value::string(&r.title)),
         ("age", Value::string(&r.age)),
         ("at", Value::num(r.at as f64)),
-    ])
+    ]);
+    // Only when set, so a row reads as it did to a release from before the remote view.
+    if r.remote {
+        v.set("remote", Value::Bool(true));
+    }
+    v
 }
 
 pub fn row_from(v: &Value, host: &str) -> Option<Row> {
@@ -144,6 +149,7 @@ pub fn row_from(v: &Value, host: &str) -> Option<Row> {
         age: s(v, "age").unwrap_or_default(),
         at: v.get("at").and_then(Value::as_u64).unwrap_or(0),
         nested: false,
+        remote: b(v, "remote"),
     })
 }
 
@@ -466,6 +472,7 @@ mod tests {
             age: "14m".into(),
             at: 1_759_000_000_123,
             nested: false,
+            remote: false,
         }
     }
 
@@ -501,6 +508,14 @@ mod tests {
             // The host is the hub's to say, whatever the agent sends.
             assert_eq!(row_from(&row_to(&r), "or3-dev").unwrap().host, "or3-dev");
         }
+        // The remote view's mark crosses too, and is absent from a row without it.
+        let mut r = row(RowKey::Slot("claude-2".into()));
+        assert!(
+            row_to(&r).get("remote").is_none(),
+            "as older releases wrote it"
+        );
+        r.remote = true;
+        assert_eq!(row_from(&wire(&row_to(&r)), "infra-dev").unwrap(), r);
     }
 
     #[test]
