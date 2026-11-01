@@ -155,7 +155,11 @@ the owner had already spoken (above). Two items need the owner, and both are moc
   - something the view sent gets no acknowledgement within about 5 seconds;
   - a keypress after 2 minutes of silence gets no answer to the probe it sends first.
 
-  ssh's own `ServerAliveInterval` is the owner's ssh config. The view reconnects with backoff
+  ssh's own `ServerAliveInterval` is the owner's ssh config. The link is not silent all the
+  same: the hub's sshd sends `ClientAliveInterval 30` with `ClientAliveCountMax 3`, so it
+  pings every 30 seconds and drops a dead link after about 90 (infra, 2026-11-01). The phone
+  reaches the hub through `cloudflared access ssh`, whose idle timeout is not yet measured.
+  It must be measured from Termux before the dead-link rules are fixed. The view reconnects with backoff
   from 1 to 30 seconds and a hello naming the last sequence number it holds. While
   disconnected, the scrollback stays readable and typing still works, but sending is refused,
   and the footer says so in words. That footer is a screen Claude Code does not have.
@@ -184,8 +188,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    - **TERM ends `claude -p`** with status 143 in 0.7 s, and `--resume <id>` then continues
      the same conversation with what it said intact. So the offloader's TERM is safe for a
      remote slot.
-   - **Not yet measured:** that the hub's door passes a given command through. That is
-     infra's to confirm.
+   - **The hub's door passes a given command through**, confirmed by infra from its code on
+     2026-11-01 but not yet run end to end: with `SSH_ORIGINAL_COMMAND` set, it execs the
+     command before any terminal test. So `ssh -T -C dev claude-sessions relay` runs relay.
+     The containers' door passes commands through the same way.
 1. `src/sdk.rs`: read and write Claude's lines. **Done.**
 2. `src/reduce.rs`: Claude's lines into numbered items with short keys, as a pure function tested on 2.1.311 fixtures. **Done.**
 3. The holder, its log, the `driver` field and the binding, tested under the real zmx.
