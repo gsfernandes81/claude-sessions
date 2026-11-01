@@ -187,7 +187,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    - **Not yet measured:** that the hub's door passes a given command through. That is
      infra's to confirm.
 1. `src/sdk.rs`: read and write Claude's lines. **Done.**
-2. The reducer: Claude's lines into items, as a pure function, tested on fixtures.
+2. `src/reduce.rs`: Claude's lines into numbered items with short keys, as a pure function tested on 2.1.311 fixtures. **Done.**
 3. The holder, its log, the `driver` field and the binding, tested under the real zmx.
 4. The tap: streaming from a sequence number, lines in, `keep_until` and `last_attach`.
 5. The relay.

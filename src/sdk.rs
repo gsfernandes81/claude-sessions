@@ -23,8 +23,16 @@ pub enum Msg {
     },
     /// `system/status`: `requesting`, `compacting`, or none (back to idle or streaming).
     Status(Option<String>),
-    /// Streamed text for the content block `index` of the message being written.
-    TextDelta { index: u64, text: String },
+    /// Streamed text for the content block `index` of the message `message_id` being written
+    /// (the stream event's `api_message_id`, the same id its `assistant` line carries).
+    TextDelta {
+        message_id: String,
+        index: u64,
+        text: String,
+    },
+    /// A prompt, echoed back by `--replay-user-messages` (`isReplay`): how every view sees
+    /// what any of them sent, in claude's own order.
+    Prompt(String),
     /// A finished assistant message, or the part of one finished so far: claude writes an
     /// `assistant` line per content block, all under the same message id.
     Assistant {
@@ -146,6 +154,7 @@ pub fn classify(v: &Value) -> Msg {
             let delta_kind = delta.and_then(|d| d.get("type")).and_then(Value::as_str);
             match (ev_kind, delta_kind) {
                 (Some("content_block_delta"), Some("text_delta")) => Msg::TextDelta {
+                    message_id: s(v, "api_message_id"),
                     index: ev
                         .and_then(|e| e.get("index"))
                         .and_then(Value::as_u64)
@@ -207,6 +216,14 @@ pub fn classify(v: &Value) -> Msg {
     }
 }
 
+/// The tool call a line belongs to, when it comes from inside one: a subagent's messages carry
+/// the `Task` call's id as `parent_tool_use_id`. `None` for the conversation's own lines.
+pub fn parent_tool_use_id(v: &Value) -> Option<&str> {
+    v.get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 fn block(b: &Value) -> Block {
     match b.get("type").and_then(Value::as_str).unwrap_or("") {
         "text" => Block::Text(s(b, "text")),
@@ -246,6 +263,9 @@ fn user(v: &Value) -> Msg {
         Some(Value::Str(t)) => match t.strip_prefix(LOCAL_OPEN) {
             Some(rest) => {
                 Msg::LocalOutput(rest.strip_suffix(LOCAL_CLOSE).unwrap_or(rest).to_string())
+            }
+            None if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
+                Msg::Prompt(t.clone())
             }
             None => Msg::UserText(t.clone()),
         },
@@ -563,9 +583,10 @@ mod tests {
     fn streamed_text_and_finished_blocks() {
         assert_eq!(
             read(
-                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"spi"}}}"#
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"spi"}},"api_message_id":"msg_1"}"#
             ),
             Msg::TextDelta {
+                message_id: "msg_1".into(),
                 index: 1,
                 text: "spi".into()
             }
@@ -623,6 +644,15 @@ mod tests {
             ),
             Msg::UserText("[Request interrupted by user]".into())
         );
+    }
+
+    #[test]
+    fn a_replayed_prompt_is_a_prompt_and_a_subagents_line_names_its_call() {
+        let replay = r#"{"type":"user","message":{"role":"user","content":"Reply with ok."},"isReplay":true,"parent_tool_use_id":null}"#;
+        assert_eq!(read(replay), Msg::Prompt("Reply with ok.".into()));
+        assert_eq!(parent_tool_use_id(&parse(replay).unwrap()), None);
+        let inner = parse(r#"{"type":"assistant","message":{"id":"m","content":[]},"parent_tool_use_id":"toolu_9"}"#).unwrap();
+        assert_eq!(parent_tool_use_id(&inner), Some("toolu_9"));
     }
 
     #[test]

@@ -64,6 +64,9 @@ mod offload;
 mod pisession;
 mod procinfo;
 mod proto;
+// The hub's half of the remote view, wired by the relay next (docs/remote-view.md).
+#[allow(dead_code)]
+mod reduce;
 mod registry;
 mod render;
 mod run;
