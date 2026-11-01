@@ -315,6 +315,15 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      ticked, `/copy`, `/exit` back home with `claude-1 ended`; and the relay killed under the
      client mid-conversation, redialled in a second, the conversation resumed with nothing
      drawn twice and the next prompt answered.
+   - **Claude's markdown is drawn as Claude Code draws it** (`src/markdown.rs`), read from
+     2.1.311's bundled renderer since no mockup draws it: headings without their `#`s (the
+     first bold, italic and underlined), `**`/`*`/`~~` as styles, inline code and an
+     unlabelled code block in lavender, `-` bullets and `1.`/`a.`/`i.` numbering by depth,
+     quotes behind `▎`, and tables boxed in `┌─┬─┐` with the header centred and the width
+     shared out by Claude Code's rule — a table whose row would wrap past four lines, or
+     that still does not fit, drawn as `Header: value` lines instead, as Claude Code does on
+     a narrow terminal. Not done: syntax highlighting in a labelled code block, which is
+     drawn plain, and links as OSC 8 hyperlinks, drawn as `text (address)`.
    - **An answered question stays in the transcript** as Claude Code draws it, `● User
      answered Claude's questions:` and `⎿  · question → answer`, and its `AskUserQuestion`
      call is not counted among the tool calls. Live, the answers come from the view's

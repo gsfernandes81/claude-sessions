@@ -1034,8 +1034,15 @@ fn copy_seq(text: &str) -> String {
 
 fn sgr(st: &convo::St) -> String {
     let mut codes: Vec<String> = Vec::new();
-    if st.bold {
-        codes.push("1".into());
+    for (on, code) in [
+        (st.bold, "1"),
+        (st.italic, "3"),
+        (st.underline, "4"),
+        (st.strike, "9"),
+    ] {
+        if on {
+            codes.push(code.into());
+        }
     }
     if let Some(c) = st.fg {
         codes.push(format!("38;2;{};{};{}", c >> 16, (c >> 8) & 0xff, c & 0xff));

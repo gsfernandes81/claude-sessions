@@ -26,12 +26,19 @@ pub struct St {
     pub fg: Option<u32>,
     pub bg: Option<u32>,
     pub bold: bool,
+    /// Claude's markdown (`markdown.rs`): emphasis, a first-level heading, struck text.
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
 }
 
-const PLAIN: St = St {
+pub const PLAIN: St = St {
     fg: None,
     bg: None,
     bold: false,
+    italic: false,
+    underline: false,
+    strike: false,
 };
 
 fn fg(c: u32) -> St {
@@ -781,7 +788,16 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             }
             Entry::Text(text) => {
                 out.push(Vec::new());
-                out.extend(wrapped(text.trim_end(), "● ", "  ", w, PLAIN));
+                // As `wrapped` keeps the last two columns clear, after the two of `● `.
+                for (n, l) in crate::markdown::render(text, w.saturating_sub(4))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let lead = if n == 0 { "● " } else { "  " };
+                    let mut row: Line = vec![(lead.into(), PLAIN)];
+                    row.extend(l);
+                    out.push(row);
+                }
             }
             Entry::Note(text) => {
                 out.push(Vec::new());

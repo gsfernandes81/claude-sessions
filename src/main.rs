@@ -61,6 +61,7 @@ mod live;
 mod lockfile;
 mod mail;
 mod mailbox;
+mod markdown;
 mod mem;
 mod menu;
 mod offload;
