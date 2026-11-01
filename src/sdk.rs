@@ -87,6 +87,9 @@ pub enum Msg {
     /// Known and of no use to the view: hook progress, thinking-token estimates, rate-limit
     /// readings, keep-alives and the stream events other than text.
     Noise,
+    /// A line a view sent claude, as the holder logs it (`{"type":"_in","line":…}`): read
+    /// back so every view sees what any of them answered or changed.
+    Input(Input),
     /// A line of a type this version does not know, kept by its name so a log can say so.
     Unknown(String),
 }
@@ -179,6 +182,7 @@ pub fn classify(v: &Value) -> Msg {
             }
         }
         "user" => user(v),
+        "_in" => Msg::Input(input(v.get("line").unwrap_or(&Value::Null))),
         "control_request" => request(v),
         "control_cancel_request" => Msg::Cancelled {
             request_id: s(v, "request_id"),
@@ -370,6 +374,75 @@ fn subtype(name: &str, mut rest: Vec<(&str, Value)>) -> Value {
 }
 
 /// The first line: answered with the commands, models and account claude has.
+/// What a view sent, as far as drawing it goes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Input {
+    /// An answer to a permission prompt or question: `allowed`, `answered` (a question's
+    /// answers), `denied` or `refused`.
+    Answer {
+        request_id: String,
+        how: String,
+    },
+    Model(String),
+    /// `None` is back to the model's default.
+    Effort(Option<String>),
+    Mode(String),
+    /// A prompt, an interrupt, an end, a rename: claude says what came of each itself.
+    Other,
+}
+
+fn input(line: &Value) -> Input {
+    let kind = line.get("type").and_then(Value::as_str).unwrap_or("");
+    let req = line.get("request");
+    let sub = req.map(|r| s(r, "subtype")).unwrap_or_default();
+    match (kind, sub.as_str()) {
+        ("control_response", _) => {
+            let r = line.get("response");
+            let get = |k| r.map(|r| s(r, k)).unwrap_or_default();
+            let outcome = r.and_then(|r| r.get("response"));
+            let how = match (get("subtype").as_str(), outcome.map(|o| s(o, "behavior"))) {
+                ("success", Some(b)) if b == "allow" => {
+                    let answers = outcome
+                        .and_then(|o| o.get("updatedInput"))
+                        .and_then(|i| i.get("answers"));
+                    if answers.is_some() {
+                        "answered"
+                    } else {
+                        "allowed"
+                    }
+                }
+                ("success", Some(b)) if b == "deny" => "denied",
+                _ => "refused",
+            };
+            Input::Answer {
+                request_id: get("request_id"),
+                how: how.to_string(),
+            }
+        }
+        ("control_request", "set_model") => {
+            Input::Model(req.map(|r| s(r, "model")).unwrap_or_default())
+        }
+        ("control_request", "set_permission_mode") => {
+            Input::Mode(req.map(|r| s(r, "mode")).unwrap_or_default())
+        }
+        ("control_request", "apply_flag_settings") => Input::Effort(
+            req.and_then(|r| r.get("settings"))
+                .and_then(|st| st.get("effortLevel"))
+                .and_then(Value::as_str)
+                .map(String::from),
+        ),
+        _ => Input::Other,
+    }
+}
+
+/// The permission mode, as `/auto` cycles it: `default`, `acceptEdits`, `plan`, `auto`…
+pub fn set_permission_mode(request_id: &str, mode: &str) -> Value {
+    control(
+        request_id,
+        subtype("set_permission_mode", vec![("mode", Value::string(mode))]),
+    )
+}
+
 pub fn initialize(request_id: &str) -> Value {
     control(request_id, subtype("initialize", vec![]))
 }
@@ -494,6 +567,70 @@ pub fn refuse(request_id: &str, why: &str) -> Value {
             ]),
         ),
     ])
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    fn logged(line: &Value) -> Value {
+        obj(vec![("type", Value::string("_in")), ("line", line.clone())])
+    }
+
+    #[test]
+    fn a_views_line_read_back_from_the_log_says_what_it_answered_or_changed() {
+        let q = obj(vec![("questions", Value::Arr(vec![]))]);
+        let cases = [
+            (
+                allow("r1", Value::obj()),
+                Input::Answer {
+                    request_id: "r1".into(),
+                    how: "allowed".into(),
+                },
+            ),
+            (
+                answer_questions("r2", &q, &[("Which?".into(), "Red".into())]),
+                Input::Answer {
+                    request_id: "r2".into(),
+                    how: "answered".into(),
+                },
+            ),
+            (
+                deny("r3", "no"),
+                Input::Answer {
+                    request_id: "r3".into(),
+                    how: "denied".into(),
+                },
+            ),
+            (
+                refuse("r4", "not served"),
+                Input::Answer {
+                    request_id: "r4".into(),
+                    how: "refused".into(),
+                },
+            ),
+            (set_model("c1", "opus"), Input::Model("opus".into())),
+            (
+                set_effort("c2", Some("high")),
+                Input::Effort(Some("high".into())),
+            ),
+            (set_effort("c3", None), Input::Effort(None)),
+            (
+                set_permission_mode("c4", "plan"),
+                Input::Mode("plan".into()),
+            ),
+            (user_text("hi"), Input::Other),
+            (interrupt("c5"), Input::Other),
+        ];
+        for (line, want) in cases {
+            assert_eq!(
+                classify(&logged(&line)),
+                Msg::Input(want),
+                "{}",
+                crate::json::to_line(&line)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

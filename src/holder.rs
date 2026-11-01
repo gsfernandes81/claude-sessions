@@ -26,6 +26,7 @@
 //! (`Viewing`): `keep_until` re-stamped while a view is connected, and `last_attach` when it
 //! connects and when it goes.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
@@ -77,10 +78,28 @@ pub fn paths(slot: &str) -> Paths {
 
 /// The log as the holder keeps it: where each line starts, and whether claude has gone.
 struct Log {
+    file: File,
     /// `offsets[i]` is where line `i + 1` starts; `end` is where the next one will.
     offsets: Vec<u64>,
     end: u64,
     closed: bool,
+    /// The request ids a view has answered: a second answer to one is dropped, so the first
+    /// answer wins whichever view sent it (`docs/remote-view.md` § *Decisions*).
+    answered: HashSet<String>,
+}
+
+impl Log {
+    /// Append one line, newline-ended, and number it.
+    fn append(&mut self, line: &[u8]) -> io::Result<()> {
+        self.file.write_all(line)?;
+        if line.last() != Some(&b'\n') {
+            self.file.write_all(b"\n")?;
+        }
+        let len = line.len() as u64 + u64::from(line.last() != Some(&b'\n'));
+        self.offsets.push(self.end);
+        self.end += len;
+        Ok(())
+    }
 }
 
 struct Shared {
@@ -103,7 +122,7 @@ pub fn serve(
     if let Some(dir) = paths.log.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut log_file = File::create(&paths.log)?;
+    let log_file = File::create(&paths.log)?;
     // A socket left by a holder that died is in the way; one that is live cannot be, since a
     // slot's name is free when it starts.
     let _ = std::fs::remove_file(&paths.sock);
@@ -120,9 +139,11 @@ pub fn serve(
     let run = format!("{}-{}", std::process::id(), crate::clock::now());
     let shared = Arc::new(Shared {
         log: Mutex::new(Log {
+            file: log_file,
             offsets: Vec::new(),
             end: 0,
             closed: false,
+            answered: HashSet::new(),
         }),
         grew: Condvar::new(),
         log_path: paths.log.clone(),
@@ -156,16 +177,11 @@ pub fn serve(
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        if line.last() != Some(&b'\n') {
-            line.push(b'\n');
-        }
-        log_file.write_all(&line)?;
-        {
-            let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
-            let start = log.end;
-            log.offsets.push(start);
-            log.end += line.len() as u64;
-        }
+        shared
+            .log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(&line)?;
         shared.grew.notify_all();
         if let Some(doing) = doing(&line) {
             if doing != said {
@@ -237,13 +253,11 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                let text = line.trim();
                 // Only a whole JSON object reaches claude: anything else would end its input.
-                if !matches!(json::parse(text), Ok(Value::Obj(_))) {
+                let Ok(v @ Value::Obj(_)) = json::parse(line.trim()) else {
                     continue;
-                }
-                let mut claude = shared.claude.lock().unwrap_or_else(|e| e.into_inner());
-                if claude.write_all(format!("{text}\n").as_bytes()).is_err() {
+                };
+                if from_view(&v, &shared).is_err() {
                     break;
                 }
             }
@@ -281,6 +295,39 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
             return Ok(());
         }
     }
+}
+
+/// A line a view sent: to claude, and into the log as `{"type":"_in","line":…}`, so every
+/// view, and a relay reading the log again after a reconnect, sees what was answered and
+/// asked, ahead of anything claude does with it. Serialised by claude's input lock, so the
+/// log's order of them is the order claude was given them; the log's own lock is never held while writing to claude, whose output
+/// the holder must keep reading meanwhile. An answer to a request already answered is
+/// dropped, from claude and the log alike.
+fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
+    let mut claude = shared.claude.lock().unwrap_or_else(|e| e.into_inner());
+    if v.get("type").and_then(Value::as_str) == Some("control_response") {
+        let id = v
+            .get("response")
+            .and_then(|r| r.get("request_id"))
+            .and_then(Value::as_str);
+        if let Some(id) = id {
+            let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+            if !log.answered.insert(id.to_string()) {
+                return Ok(());
+            }
+        }
+    }
+    // Logged first, so whatever claude does with it comes after it in the log.
+    let mut logged = Value::obj();
+    logged.set("type", Value::string("_in"));
+    logged.set("line", v.clone());
+    shared
+        .log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(json::to_line(&logged).as_bytes())?;
+    shared.grew.notify_all();
+    claude.write_all(format!("{}\n", json::to_line(v)).as_bytes())
 }
 
 /// `claude-sessions tap <slot> [from] [run]`: what the hub runs over `ssh -T` to reach a
@@ -468,42 +515,74 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let prompt = r#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#;
+        // As the holder writes a line on: one JSON object, its keys in the writer's order.
+        let canon = |l: &str| json::to_line(&json::parse(l).unwrap());
+        let prompt =
+            &canon(r#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#);
+        let inp = |l: &str| canon(&format!(r#"{{"type":"_in","line":{l}}}"#));
+        // One at a time: claude answers each in its own time, after the next could be logged.
         a_out.write_all(format!("{prompt}\n").as_bytes()).unwrap();
         a_out
             .write_all(b"not json, never reaches claude\n")
             .unwrap();
-        let done = r#"{"type":"result","subtype":"success","session_id":"s"}"#;
-        a_out.write_all(format!("{done}\n").as_bytes()).unwrap();
-        assert_eq!(line(&mut a), format!("1\t{prompt}"));
         assert_eq!(
             line(&mut a),
-            format!("2\t{done}"),
+            format!("1\t{}", inp(prompt)),
+            "what a view sent, first"
+        );
+        assert_eq!(
+            line(&mut a),
+            format!("2\t{prompt}"),
+            "then claude's own line"
+        );
+        let done = &canon(r#"{"type":"result","subtype":"success","session_id":"s"}"#);
+        a_out.write_all(format!("{done}\n").as_bytes()).unwrap();
+        assert_eq!(
+            line(&mut a),
+            format!("3\t{}", inp(done)),
             "the line that was not JSON was dropped"
         );
+        assert_eq!(line(&mut a), format!("4\t{done}"));
 
-        // A second tap of the same run, from line 2, gets 2 and then what follows.
-        let (mut b, _b_out) = connect(&sock, 2, &run);
+        // A second tap of the same run, from line 4, gets 4 and then what follows.
+        let (mut b, _b_out) = connect(&sock, 4, &run);
         assert_eq!(
             json::parse(&line(&mut b))
                 .unwrap()
                 .get("next")
                 .and_then(Value::as_u64),
-            Some(3)
+            Some(5)
         );
-        assert_eq!(line(&mut b), format!("2\t{done}"));
+        assert_eq!(line(&mut b), format!("4\t{done}"));
         // A tap naming another run is sent everything from the start.
-        let (mut c, _c_out) = connect(&sock, 2, "an-older-run");
+        let (mut c, mut c_out) = connect(&sock, 4, "an-older-run");
         line(&mut c);
-        assert_eq!(line(&mut c), format!("1\t{prompt}"));
+        assert_eq!(line(&mut c), format!("1\t{}", inp(prompt)));
+
+        // Two views answer one request: the first reaches claude, the second nothing.
+        let yes = &canon(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"allow"}}}"#,
+        );
+        let no = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny"}}}"#;
+        a_out.write_all(format!("{yes}\n").as_bytes()).unwrap();
+        assert_eq!(line(&mut a), format!("5\t{}", inp(yes)));
+        assert_eq!(line(&mut a), format!("6\t{yes}"));
+        c_out.write_all(format!("{no}\n").as_bytes()).unwrap();
 
         a_out.write_all(b"{\"quit\":1}\n").unwrap();
         assert_eq!(holder.join().unwrap(), 3, "claude's own exit status");
         assert!(!sock.exists(), "the socket goes with the holder");
+        let quit = &canon(r#"{"quit":1}"#);
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            format!("{prompt}\n{done}\n"),
-            "the log is claude's lines, raw"
+            format!(
+                "{}\n{prompt}\n{}\n{done}\n{}\n{yes}\n{}\n",
+                inp(prompt),
+                inp(done),
+                inp(yes),
+                inp(quit)
+            ),
+            "claude's lines raw, each view's line before it, and the late answer nowhere"
         );
         let said: Vec<String> = said_rx.try_iter().collect();
         assert_eq!(
@@ -516,9 +595,10 @@ mod tests {
             ],
             "one line per change, none repeated"
         );
-        // The tap still connected ends with the holder.
+        // The tap still connected is sent the rest, and then ends with the holder.
         let mut rest = String::new();
-        assert_eq!(b.read_line(&mut rest).unwrap(), 0);
+        while b.read_line(&mut rest).unwrap() > 0 {}
+        assert!(rest.ends_with(&format!("\t{}\n", inp(quit))), "{rest}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

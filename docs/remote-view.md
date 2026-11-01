@@ -245,6 +245,13 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    interactive timeout, skipped rather than waited on. The end of its input is the relay
    gone, and the tap leaves at once, both ways.
 5. The relay.
+   - **Done first: what views send is in the log.** The holder logs each line a view sends,
+     as `{"type":"_in","line":…}`, ahead of anything claude does with it, and drops a second
+     answer to one request, so the first answer wins at the one place every answer passes.
+     The reducer reads those lines back (`sdk::Input`): an answer resolves its prompt for
+     every view, and a relay that reconnects and reads the log again finds it answered
+     rather than waiting; a change of model, mode or effort shows at once. Effort is carried
+     in the meta op as `e`, since claude's own lines never say it.
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.

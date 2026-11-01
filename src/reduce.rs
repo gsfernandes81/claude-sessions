@@ -59,6 +59,8 @@ pub struct Meta {
     pub model: String,
     pub permission_mode: String,
     pub title: String,
+    /// The effort a view set, empty for the model's default: claude's own lines never say it.
+    pub effort: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,16 +190,13 @@ impl Reducer {
                 model,
                 permission_mode,
             } => {
-                let title = self.meta.title.clone();
-                self.set_meta(
-                    &mut out,
-                    Meta {
-                        session_id,
-                        model,
-                        permission_mode,
-                        title,
-                    },
-                );
+                let meta = Meta {
+                    session_id,
+                    model,
+                    permission_mode,
+                    ..self.meta.clone()
+                };
+                self.set_meta(&mut out, meta);
             }
             Msg::TitleChanged(title) => {
                 let meta = Meta {
@@ -353,6 +352,38 @@ impl Reducer {
                 self.texts.clear();
                 self.set_state(&mut out, "idle");
             }
+            // What a view sent, read back from the holder's log: an answer resolves its prompt
+            // for every view at once, and a change of model, mode or effort shows at once
+            // rather than at the next turn's init.
+            Msg::Input(input) => match input {
+                sdk::Input::Answer { request_id, how } => {
+                    if let Some(o) = self.answered(&request_id, &how) {
+                        out.ops.extend(o.ops);
+                    }
+                }
+                sdk::Input::Model(model) => {
+                    let meta = Meta {
+                        model,
+                        ..self.meta.clone()
+                    };
+                    self.set_meta(&mut out, meta);
+                }
+                sdk::Input::Mode(permission_mode) => {
+                    let meta = Meta {
+                        permission_mode,
+                        ..self.meta.clone()
+                    };
+                    self.set_meta(&mut out, meta);
+                }
+                sdk::Input::Effort(effort) => {
+                    let meta = Meta {
+                        effort: effort.unwrap_or_default(),
+                        ..self.meta.clone()
+                    };
+                    self.set_meta(&mut out, meta);
+                }
+                sdk::Input::Other => {}
+            },
             Msg::Response { .. } | Msg::Noise | Msg::Unknown(_) => {}
         }
         out
@@ -540,6 +571,7 @@ impl Op {
                 ("m", Value::string(m.model.clone())),
                 ("pm", Value::string(m.permission_mode.clone())),
                 ("ti", Value::string(m.title.clone())),
+                ("e", Value::string(m.effort.clone())),
             ]),
         }
     }
@@ -662,7 +694,7 @@ mod tests {
         assert_eq!(
             wire(&before.ops),
             [
-                r#"{"m":"claude-haiku-5-5","pm":"default","sid":"s1","t":"meta","ti":""}"#,
+                r#"{"e":"","m":"claude-haiku-5-5","pm":"default","sid":"s1","t":"meta","ti":""}"#,
                 r#"{"id":1,"k":"user","t":"add","x":"Make a file."}"#,
                 r#"{"s":"working","t":"st"}"#,
                 r#"{"a":"touch spike-file && ls","id":2,"k":"tool","n":"Bash","t":"add"}"#,
@@ -951,5 +983,52 @@ mod tests {
         );
         let (p, n) = preview("\u{1b}[31mred\u{1b}[0m\n\n");
         assert_eq!((p, n), (vec!["red".to_string()], 1));
+    }
+
+    #[test]
+    fn an_answer_any_view_sent_resolves_the_prompt_for_every_reader_of_the_log() {
+        let allow = to_line(&sdk::allow("req-1", Value::obj()));
+        let logged = format!(r#"{{"type":"_in","line":{allow}}}"#);
+        // Two relays reading the same log: both see the prompt answered, neither owes claude.
+        for _ in 0..2 {
+            let mut r = Reducer::new();
+            feed_all(&mut r, TURN);
+            let out = r.feed(&parse(&logged).unwrap());
+            assert_eq!(
+                wire(&out.ops),
+                [
+                    r#"{"id":3,"t":"done","x":"allowed"}"#,
+                    r#"{"s":"working","t":"st"}"#
+                ]
+            );
+            assert!(out.to_claude.is_empty());
+            assert!(r.waiting_input("req-1").is_none());
+            // The same answer again, as a log could hold had the holder not dropped it: nothing.
+            assert!(r.feed(&parse(&logged).unwrap()).ops.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_change_a_view_sent_shows_at_once_and_effort_survives_the_next_init() {
+        let mut r = Reducer::new();
+        feed_all(&mut r, TURN);
+        let line =
+            |v: Value| parse(&format!(r#"{{"type":"_in","line":{}}}"#, to_line(&v))).unwrap();
+        let out = r.feed(&line(sdk::set_model("c1", "claude-opus-5-5")));
+        assert_eq!(
+            wire(&out.ops),
+            [r#"{"e":"","m":"claude-opus-5-5","pm":"default","sid":"s1","t":"meta","ti":""}"#]
+        );
+        r.feed(&line(sdk::set_effort("c2", Some("high"))));
+        r.feed(&line(sdk::set_permission_mode("c3", "plan")));
+        let init = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-opus-5-5","permissionMode":"plan"}"#;
+        assert!(
+            feed_all(&mut r, &[init]).ops.is_empty(),
+            "the next init agrees, and keeps the effort it does not carry"
+        );
+        assert!(
+            r.feed(&line(sdk::user_text("hi"))).ops.is_empty(),
+            "claude echoes a prompt itself"
+        );
     }
 }
