@@ -283,10 +283,12 @@ fn main() -> ExitCode {
             let mut screen = |line: &str| {
                 let _ = writeln!(std::io::stdout(), "{line}");
             };
+            let history = std::env::var_os("CLAUDE_SESSIONS_HISTORY").map(std::path::PathBuf::from);
             match holder::serve(
                 std::path::Path::new(&program),
                 &args[1..],
                 &holder::paths(&slot),
+                history.as_deref(),
                 &slot,
                 &mut screen,
             ) {

@@ -143,11 +143,14 @@ struct Shared {
 }
 
 /// Run claude headless under this holder until it exits, serving taps meanwhile. Returns
-/// claude's exit status. `say` is given each line for the session's screen.
+/// claude's exit status. `say` is given each line for the session's screen. `history` is the
+/// transcript of a conversation resumed (`CLAUDE_SESSIONS_HISTORY`, read by the caller: a
+/// test run from a remote-view session has it set to that session's own).
 pub fn serve(
     program: &Path,
     args: &[String],
     paths: &Paths,
+    history: Option<&Path>,
     slot: &str,
     say: &mut dyn FnMut(&str),
 ) -> io::Result<i32> {
@@ -168,8 +171,8 @@ pub fn serve(
     };
     // A resume: the conversation so far, from its transcript, since claude sends none of it
     // again (`docs/remote-view.md` § *Decisions*, history from two sources).
-    if let Some(path) = std::env::var_os("CLAUDE_SESSIONS_HISTORY") {
-        seed(&mut log, Path::new(&path))?;
+    if let Some(path) = history {
+        seed(&mut log, path)?;
     }
 
     let mut child: Child = Command::new(program)
@@ -541,7 +544,7 @@ mod tests {
             let mut say = |s: &str| {
                 let _ = said_tx.send(s.to_string());
             };
-            serve(&program, &[], &paths, "claude-9", &mut say).unwrap()
+            serve(&program, &[], &paths, None, "claude-9", &mut say).unwrap()
         });
 
         let (mut a, mut a_out) = connect(&sock, 0, "");
