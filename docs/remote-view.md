@@ -304,8 +304,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      was sent; PageUp and PageDown scroll ten lines and a wheel report one, since Termux
      sends a report for every line a finger travels, or three under Windows Terminal
      (`WT_SESSION` set, `TERMUX_VERSION` not), which sends one a notch; End or Esc goes back down. Scrolled
-     back, the top moves from where it sat at the bottom, so the first step from a prompt
-     drawn on top with room under it is a line, not that room; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
+     back, the top moves from where it sat at the bottom, a line a step; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
      empty one goes home, as `/home` and Ctrl-D do. **Ctrl+\\ and `/disconnect`** go home from
      anywhere in a conversation, a dialog open or not, the session left running, as zmx's
      detach key does in `ssh dev`; Ctrl+\\ on the home quits the client. `/model`,

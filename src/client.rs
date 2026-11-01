@@ -279,7 +279,10 @@ impl App {
             }
             "reset" => {
                 if let Screen::Conv { c, .. } = &mut self.screen {
+                    // What was sent and not yet echoed is still on its way.
+                    let pending = std::mem::take(&mut c.pending);
                     **c = Convo::new(&c.host, &c.slot, &c.run);
+                    c.pending = pending;
                 }
             }
             "err" | "end" => {
@@ -358,11 +361,7 @@ impl App {
                 }
             }
         }
-        if let Screen::Conv { c, ui, .. } = &mut self.screen {
-            if let Some(p) = self.places.get(&c.host) {
-                ui.ram = ram(p.header.memory, 40);
-            }
-        }
+        self.status_figures();
     }
 
     fn refresh_menu(&mut self) {
@@ -395,6 +394,32 @@ impl App {
         self.menu.remote = true;
         self.menu_fresh = true;
         self.refresh_menu();
+    }
+
+    /// The conversation's status line: the figures the door's load line totals — the hub's
+    /// own reading, then every container answering — named for the conversation's container,
+    /// which is what a session's line says under ssh.
+    fn status_figures(&mut self) {
+        let Screen::Conv { c, ui, .. } = &mut self.screen else {
+            return;
+        };
+        let answering = self
+            .places
+            .values()
+            .filter(|p| p.reach == Reach::Up)
+            .map(|p| &p.header);
+        let place = self
+            .places
+            .get(&c.host)
+            .map(|p| p.header.host.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| c.host.clone());
+        ui.load = Some(crate::statusline::door(
+            self.hub.load.clone(),
+            self.hub.memory,
+            answering,
+            &place,
+        ));
     }
 
     fn home(&mut self, status: Option<String>) {
@@ -601,9 +626,16 @@ impl App {
         }
         // An Enter while the link is down keeps its text, and says it was not sent.
         if !out.is_empty() && !self.up() {
-            if let Screen::Conv { ui, .. } = &mut self.screen {
+            if let Screen::Conv { c, ui, .. } = &mut self.screen {
                 if let Link::Down { not_sent, .. } = &mut ui.link {
                     *not_sent = true;
+                }
+                // Nothing went, so nothing is on its way: it is back in the prompt instead.
+                if out
+                    .iter()
+                    .any(|m| m.get("t").and_then(Value::as_str) == Some("say"))
+                {
+                    c.pending.pop();
                 }
                 if let Some(last) = self.history.last() {
                     if ui.input.is_empty() {
@@ -755,7 +787,10 @@ fn submit(
             ui.status = Some(copied(text));
             Submit::Copy(text.clone())
         }
-        _ => Submit::Send(vec![m("say", vec![("x", Value::string(text))])]),
+        _ => {
+            c.sent(text, Instant::now());
+            Submit::Send(vec![m("say", vec![("x", Value::string(text))])])
+        }
     }
 }
 
@@ -1097,20 +1132,6 @@ fn terminal_mark(mut r: Row) -> Row {
 }
 
 /// `RAM 0.9G/2G`, as R1's footer has it.
-fn ram(memory: Option<(u64, u64)>, _w: usize) -> String {
-    let Some((used, limit)) = memory else {
-        return String::new();
-    };
-    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
-    let lim = g(limit);
-    let lim = if (lim - lim.round()).abs() < 0.05 {
-        format!("{}G", lim.round() as u64)
-    } else {
-        format!("{lim:.1}G")
-    };
-    format!("RAM {:.1}G/{lim}", g(used))
-}
-
 fn took(d: Duration) -> String {
     let s = d.as_secs();
     match s {
@@ -1229,9 +1250,6 @@ impl App {
                 }
             }
             Screen::Conv { c, ui, .. } => {
-                if let Some(p) = self.places.get(&c.host) {
-                    ui.ram = ram(p.header.memory, w as usize);
-                }
                 let f = convo::draw(c, ui, w as usize, h as usize, now);
                 (f.lines.iter().map(ansi).collect(), f.cursor)
             }
@@ -1274,6 +1292,9 @@ impl App {
             }
             if matches!(ui.link, Link::Down { .. }) {
                 soon(now + Duration::from_secs(1));
+            }
+            if !c.pending.is_empty() {
+                soon(now + SPIN_EVERY);
             }
         }
         if matches!(self.screen, Screen::Home) && !self.greeted {
@@ -1818,7 +1839,6 @@ mod tests {
         assert_eq!(base64(b"hi"), "aGk=");
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"abc"), "YWJj");
-        assert_eq!(ram(Some((966_367_641, 2 << 30)), 40), "RAM 0.9G/2G");
         assert_eq!(took(Duration::from_secs(41)), "41s");
         assert_eq!(took(Duration::from_secs(125)), "2m 5s");
     }

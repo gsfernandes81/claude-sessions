@@ -515,6 +515,17 @@ The owner's calls, each made in a comment on the page:
   `↑ 1 more` and `↓ 2 more` at the edges. Claude's preview layout is drawn side by side at 80
   columns (R4b) and stacked under the list at 40 (R4c), because side by side "is always mangled
   in portrait".
+- **A new prompt goes under what came before**, not to the top of an emptied screen (owner,
+  2026-11-01: "stop pushing the entire transcript off screen on a new user message"). The
+  transcript's end sits on the input box, and one that fits is drawn from the top, logo and
+  all. R2, R3 and R4 were redrawn from the renderer for it. Until claude echoes a prompt it is
+  drawn at once with the braille spinner where `❯` goes (owner, the same day: "make messages
+  show up instantly … but put that loading spinner to their left").
+- **The footer's first line is the ssh sessions' status line** (owner, 2026-11-01: "the
+  statusline matching … what's currently used by the normal ssh sessions, ie: ram and load"):
+  `statusline.rs`'s figures and words, from the hub's and the containers' snapshots, yellow and
+  red past its thresholds. After `container/slot` where it fits, as R1 at 80 has it; else as an
+  ssh session prints it, `RAM: …, Load: …, host`; else its figures alone, as at 40.
 - **When the link is down, the footer says `Reconnecting… (8s)`.** After an Enter it adds
   `· not sent` and keeps the text typed.
 - **The client's home is the door's list** (R9). Nothing new starts from the hub's door: "The
@@ -568,49 +579,49 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ───────────────────────── fix the door ─
 ❯ now run clippy
 ────────────────────────────────────────
-  claude-sessions/claude-3 · RAM 0.9G/2G
+  RAM: 0.9G / 2.0G, Load: 0.7
   ⏵⏵ auto mode on (/auto to cycle)
 ```
 
 ### Mockup R2 — Working
 ```
+▝▜██████▀  Opus 5.5
+ ▝▝   ▝▝   ~/workspace
+
+❯ Run the tests and tell me if any
+  fail.
+
+  Ran 1 shell command
+
+● All 478 tests pass; 4 are ignored.
+
+✻ Worked for 41s · done 1:12 AM
+
 ❯ now run clippy
 
 ● Running 1 shell command…
   ⎿  $ cargo clippy --all-targets -- -D
      warnings
-
-
-
-
-
-
-
-
-
-
-
-
 ✢ Garnishing… (12s)
 
 ───────────────────────── fix the door ─
 ❯
 ────────────────────────────────────────
-  claude-sessions/claude-3 · RAM 1.2G/2G
+  RAM: 1.2G / 2.0G, Load: 0.7
   esc to interrupt
 ```
 
 ### Mockup R3 — A permission prompt
 ```
+
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5
+ ▝▝   ▝▝   ~/workspace
+
 ❯ make a scratch file
 
 ● Creating empty file named x
   ⎿  $ touch x
-
-
-
-
-
 
 
 ────────────────────────────────────────
@@ -630,9 +641,9 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 
 ### Mockup R4 — A question with long options
 ```
+ ▝▝   ▝▝   ~/workspace
+
 ❯ where should the hub keep logs?
-
-
 ────────────────────────────────────────
  ☐ Log store
 
@@ -764,7 +775,7 @@ Esc to cancel
 ───────────────────────── fix the door ─
 ❯
 ────────────────────────────────────────
-  claude-sessions/claude-3 · RAM 0.9G/2G
+  RAM: 0.9G / 2.0G, Load: 0.7
   ⏵⏵ auto mode on (/auto to cycle)
 ```
 

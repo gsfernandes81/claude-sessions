@@ -285,6 +285,9 @@ pub struct Convo {
     /// Every tool call drawn on its own with the first lines of its result, rather than a run
     /// of them summed up: Ctrl+O in Claude Code, `/expand` here too.
     pub expanded: bool,
+    /// Prompts sent and not yet echoed by claude, and when each was sent: drawn at once under
+    /// the transcript, the spinner where `❯` goes, until claude's own line for it arrives.
+    pub pending: Vec<(String, Instant)>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -308,6 +311,11 @@ impl Convo {
             state: "idle".to_string(),
             ..Convo::default()
         }
+    }
+
+    /// A prompt just sent: shown at once, turning, until claude echoes it.
+    pub fn sent(&mut self, text: &str, now: Instant) {
+        self.pending.push((text.to_string(), now));
     }
 
     /// Something the client adds itself, such as the `❯ /model` it ran.
@@ -359,7 +367,14 @@ impl Convo {
         match s(v, "t").as_str() {
             "add" => {
                 let e = match s(v, "k").as_str() {
-                    "user" => Entry::Prompt(s(v, "x")),
+                    "user" => {
+                        let x = s(v, "x");
+                        if let Some(i) = self.pending.iter().position(|(p, _)| p.trim() == x.trim())
+                        {
+                            self.pending.remove(i);
+                        }
+                        Entry::Prompt(x)
+                    }
                     "text" => Entry::Text(s(v, "x")),
                     "note" => Entry::Note(s(v, "x")),
                     "compact" => Entry::Compacted,
@@ -858,8 +873,9 @@ pub struct Ui {
     pub scroll: usize,
     pub dialog: Option<Dialog>,
     pub link: Link,
-    /// `RAM 0.9G/2G`, from the container's latest snapshot.
-    pub ram: String,
+    /// The status line an ssh session's Claude Code shows, `RAM: 1.2G / 2.0G, Load: 2.3,
+    /// claude-sessions`: the same figures, from the hub's and the containers' snapshots.
+    pub load: Option<crate::statusline::Figures>,
     /// A word in place of the footer's first line until the next key: `/copy`'s, an error.
     pub status: Option<String>,
 }
@@ -872,7 +888,7 @@ impl Ui {
             scroll: 0,
             dialog: None,
             link: Link::Up,
-            ram: String::new(),
+            load: None,
             status: None,
         }
     }
@@ -885,6 +901,22 @@ impl Default for Ui {
 }
 
 // ── drawing ─────────────────────────────────────────────────────────────────
+
+/// A prompt on its band, after `lead`: `❯ ` once claude has it, the spinner until then.
+fn prompt_lines(text: &str, lead: &str, w: usize) -> Vec<Line> {
+    let band = St {
+        bg: Some(BAND),
+        ..PLAIN
+    };
+    wrapped(text, lead, "  ", w, band)
+        .into_iter()
+        .map(|mut l| {
+            let pad = w.saturating_sub(width(&plain(&l)));
+            l.push((" ".repeat(pad), band));
+            l
+        })
+        .collect()
+}
 
 /// The scrollable transcript, top to bottom, at width `w`, and where its last prompt starts.
 pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
@@ -987,16 +1019,7 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             Entry::Prompt(text) => {
                 out.push(Vec::new());
                 last_prompt = Some(out.len());
-                let band = St {
-                    bg: Some(BAND),
-                    ..PLAIN
-                };
-                for l in wrapped(text, "❯ ", "  ", w, band) {
-                    let pad = w.saturating_sub(width(&plain(&l)));
-                    let mut l = l;
-                    l.push((" ".repeat(pad), band));
-                    out.push(l);
-                }
+                out.extend(prompt_lines(text, "❯ ", w));
             }
             Entry::Text(text) => {
                 out.push(Vec::new());
@@ -1083,6 +1106,47 @@ fn rule(w: usize, glyph: &str, st: St) -> Line {
     line(glyph.repeat(w), st)
 }
 
+/// The ssh sessions' status line (`statusline.rs`), its figures in its words: a figure past
+/// its first threshold yellow and past its second red, as there; the words say it all
+/// without them. After the conversation's `container/slot` where that fits (R1 at 80), else
+/// as an ssh session prints it, else its figures alone, so a phone keeps the load in view.
+fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
+    use crate::statusline::Level;
+    let paint = |lvl: Level| match lvl {
+        Level::High => fg(RED),
+        Level::Warn => fg(YELLOW),
+        Level::Calm => fg(GREY),
+    };
+    let (ram, rl) = f.ram();
+    let (load, ll) = f.load();
+    let figures = width(&ram) + 2 + width(&load);
+    let room = w.saturating_sub(3);
+    let (before, after) = if width(place) + 3 + figures <= room {
+        (format!("{place} · "), String::new())
+    } else if figures + 2 + width(f.place()) <= room {
+        (String::new(), format!(", {}", f.place()))
+    } else {
+        (String::new(), String::new())
+    };
+    let parts = [
+        (format!("  {before}"), fg(GREY)),
+        (ram, paint(rl)),
+        (", ".into(), fg(GREY)),
+        (load, paint(ll)),
+        (after, fg(GREY)),
+    ];
+    let mut out: Line = Vec::new();
+    let mut left = w.saturating_sub(1);
+    for (t, st) in parts {
+        let t = if width(&t) > left { cut(&t, left) } else { t };
+        left -= width(&t).min(left);
+        if !t.is_empty() {
+            out.push((t, st));
+        }
+    }
+    out
+}
+
 /// The input box and footer: R1's last five rows.
 fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     let mut out = Vec::new();
@@ -1132,20 +1196,23 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     let cursor = (first + cur.0, 2 + cur.1);
     out.push(rule(w, "─", fg(RULE)));
     let place = format!("{}/{}", c.host, c.slot);
-    let first_foot = match (&ui.link, &ui.status) {
-        (Link::Down { since, not_sent }, _) => {
+    let first_foot = match (&ui.link, &ui.status, &ui.load) {
+        (Link::Down { since, not_sent }, _, _) => {
             let secs = since.elapsed().as_secs();
             let tail = if *not_sent { " · not sent" } else { "" };
-            format!("Reconnecting… ({secs}s){tail}")
+            Some(format!("Reconnecting… ({secs}s){tail}"))
         }
-        (Link::Up, Some(word)) => word.clone(),
-        (Link::Up, None) if ui.ram.is_empty() => place,
-        (Link::Up, None) => format!("{place} · {}", ui.ram),
+        (Link::Up, Some(word), _) => Some(word.clone()),
+        (Link::Up, None, None) => Some(place.clone()),
+        (Link::Up, None, Some(_)) => None,
     };
-    out.push(line(
-        format!("  {}", cut(&first_foot, w.saturating_sub(2))),
-        fg(GREY),
-    ));
+    match (first_foot, &ui.load) {
+        (None, Some(f)) => out.push(status_line(&place, f, w)),
+        (t, _) => out.push(line(
+            format!("  {}", cut(&t.unwrap_or_default(), w.saturating_sub(2))),
+            fg(GREY),
+        )),
+    }
     let busy = matches!(c.state.as_str(), "working" | "compacting");
     if busy {
         out.push(line("  esc to interrupt", fg(GREY)));
@@ -1548,7 +1615,13 @@ struct Parts {
 }
 
 fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
-    let (body, last_prompt) = transcript(c, w);
+    let (mut body, _) = transcript(c, w);
+    for (text, since) in &c.pending {
+        let frame = now.saturating_duration_since(*since).as_millis() / 120;
+        let glyph = crate::ui::SPINNER[frame as usize % crate::ui::SPINNER.len()];
+        body.push(Vec::new());
+        body.extend(prompt_lines(text, &format!("{glyph} "), w));
+    }
     // The bottom: a dialog, or the input box.
     let waiting = c.waiting();
     let mut cursor = None;
@@ -1602,17 +1675,12 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     };
     let room = h.saturating_sub(bottom.len() + spinner.len());
     let room = if ask_top { room.min(3) } else { room };
-    // Claude Code puts a prompt just sent at the top and keeps it there while its turn runs,
-    // a question waits or a dialog is open (R2 to R6); an idle screen that fits is drawn from
-    // the top, logo and all (R1).
-    let pin = c.state != "idle" || ui.dialog.is_some() || cursor.is_none();
+    // The transcript's end sits on the input: a prompt just sent goes under what came before
+    // rather than to the top of an emptied screen, as Claude Code's fullscreen mode draws it
+    // (owner, 2026-11-01: "stop pushing the entire transcript off screen"). One that fits is
+    // drawn from the top, logo and all (R1).
     let total = body.len();
-    let start = match last_prompt {
-        Some(p) if pin && total - p <= room => p,
-        _ if total <= room => 0,
-        Some(p) if total - p <= room => p,
-        _ => total - room,
-    };
+    let start = total.saturating_sub(room);
     Parts {
         body,
         bottom,
@@ -1883,6 +1951,18 @@ mod tests {
     }
 
     /// The mockup's rows, as `docs/mockups.md` has them.
+    /// What the status line reads in the mockups: so much of 2G, a load of 0.7 on four cores.
+    fn figures(used_g: f64, total_g: f64, load: u64) -> crate::statusline::Figures {
+        let g = |x: f64| (x * (1u64 << 30) as f64) as u64;
+        crate::statusline::Figures {
+            used: Some(g(used_g)),
+            total: Some(g(total_g)),
+            load: Some(load),
+            cores: Some(4),
+            place: "claude-sessions".into(),
+        }
+    }
+
     fn mockup(name: &str) -> Vec<String> {
         let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mockups.md"))
             .unwrap();
@@ -1912,7 +1992,7 @@ mod tests {
     }
 
     #[test]
-    fn r2_working_puts_the_new_prompt_on_top_and_the_spinner_over_the_box() {
+    fn r2_working_puts_the_new_prompt_under_the_last_turn_and_the_spinner_over_the_box() {
         let mut c = convo();
         feed(
             &mut c,
@@ -1934,7 +2014,7 @@ mod tests {
             ],
         );
         let mut ui = Ui::new();
-        ui.ram = "RAM 1.2G/2G".into();
+        ui.load = Some(figures(1.2, 2.0, 70));
         let now = c.working_since.unwrap() + Duration::from_secs(12);
         let got = text(&draw(&c, &ui, 40, 24, now));
         let want = mockup("R2");
@@ -1964,7 +2044,7 @@ mod tests {
         );
         c.local(Entry::Worked("Worked for 41s · done 1:12 AM".into()));
         let mut ui = Ui::new();
-        ui.ram = "RAM 0.9G/2G".into();
+        ui.load = Some(figures(0.9, 2.0, 70));
         ui.input = "now run clippy".into();
         ui.cursor = ui.input.chars().count();
         let f = draw(&c, &ui, 40, 24, Instant::now());
@@ -1998,7 +2078,12 @@ mod tests {
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         let mut want = mockup("R3");
         // The transcript's line is the request's own description, as claude sent it.
-        want[2] = "● Create empty file named x".into();
+        for l in want
+            .iter_mut()
+            .filter(|l| *l == "● Creating empty file named x")
+        {
+            *l = "● Create empty file named x".into();
+        }
         assert_eq!(got, want);
     }
 
@@ -2066,7 +2151,61 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_back_from_a_prompt_on_top_moves_a_line_a_step() {
+    fn a_prompt_shows_at_once_behind_the_spinner_until_claude_echoes_it() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let t0 = Instant::now();
+        c.sent("hello there", t0);
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        assert!(got.iter().any(|l| l == "⠋ hello there"), "{got:?}");
+        let later = text(&draw(
+            &c,
+            &Ui::new(),
+            40,
+            24,
+            t0 + Duration::from_millis(250),
+        ));
+        assert!(
+            later.iter().any(|l| l == "⠹ hello there"),
+            "it turns: {later:?}"
+        );
+        // Someone else's prompt is not this one.
+        feed(&mut c, &[r#"{"t":"add","id":1,"k":"user","x":"other"}"#]);
+        assert_eq!(c.pending.len(), 1);
+        feed(
+            &mut c,
+            &[r#"{"t":"add","id":2,"k":"user","x":"hello there"}"#],
+        );
+        assert!(c.pending.is_empty());
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        assert!(got.iter().any(|l| l == "❯ hello there"), "{got:?}");
+        assert_eq!(got.iter().filter(|l| l.ends_with("hello there")).count(), 1);
+    }
+
+    #[test]
+    fn the_status_line_says_what_an_ssh_sessions_says() {
+        let f = figures(0.9, 2.0, 70);
+        let at = |w: usize| plain(&status_line("claude-sessions/claude-3", &f, w));
+        // R1 at 80, in mockups-80.md.
+        assert_eq!(
+            at(80),
+            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7"
+        );
+        // Where that does not fit, the ssh session's own line, then its figures alone.
+        assert_eq!(at(52), "  RAM: 0.9G / 2.0G, Load: 0.7, claude-sessions");
+        assert_eq!(at(40), "  RAM: 0.9G / 2.0G, Load: 0.7");
+        // statusline.rs's levels: RAM past 70% and load past 0.7 a core are yellow, past 85%
+        // and 1.0 a core red.
+        let hot = status_line("x/y", &figures(1.8, 2.0, 300), 40);
+        let style = |word: &str| hot.iter().find(|(t, _)| t.starts_with(word)).unwrap().1;
+        assert_eq!(style("RAM").fg, Some(RED));
+        assert_eq!(style("Load").fg, Some(YELLOW));
+        let calm = status_line("x/y", &f, 40);
+        assert!(calm.iter().all(|(_, s)| s.fg == Some(GREY)), "{calm:?}");
+    }
+
+    #[test]
+    fn scrolling_back_moves_a_line_a_step() {
         let mut c = convo();
         let numbers: Vec<String> = (1..=30).map(|n| n.to_string()).collect();
         let add = format!(
@@ -2087,20 +2226,20 @@ mod tests {
         let mut ui = Ui::new();
         let bottom = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert!(
-            bottom[0].starts_with("❯ again"),
-            "the prompt on top: {bottom:?}"
+            bottom.iter().any(|l| l.starts_with("❯ again")),
+            "the last prompt under the count, not alone on top: {bottom:?}"
         );
+        assert!(bottom[0].trim().parse::<u32>().is_ok(), "{bottom:?}");
         ui.scroll = 1;
         let back = text(&draw(&c, &ui, 40, 24, Instant::now()));
-        // Under the pinned line, the line above the prompt, then the prompt: not a screen of
-        // the count, which is where measuring from the end put it.
-        assert_eq!(back[1], "");
-        assert!(back[2].starts_with("❯ again"), "{back:?}");
-        assert_eq!(max_scroll(&c, &ui, 40, 24), {
-            let (body, last) = transcript(&c, 40);
-            assert!(body.len() > 1);
-            last.unwrap()
-        });
+        // Under the pinned line, the line that was just above the screen, then what was on top.
+        assert_eq!(back[2], bottom[0], "{back:?}");
+        let (body, _) = transcript(&c, 40);
+        assert_eq!(
+            max_scroll(&c, &ui, 40, 24),
+            body.len() - (24 - 5),
+            "back as far as the top"
+        );
     }
 
     #[test]
@@ -2163,7 +2302,7 @@ mod tests {
             ],
         );
         let mut ui = Ui::new();
-        ui.ram = "RAM 0.9G/2G".into();
+        ui.load = Some(figures(0.9, 2.0, 70));
         // Four rows back from the bottom: the mockup has 53 at the bottom of 60, three rows
         // going to the pinned prompt and the jump line.
         ui.scroll = 4;
