@@ -223,4 +223,6 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      it.
 4. The tap: streaming from a sequence number, lines in, `keep_until` and `last_attach`.
 5. The relay.
-6. The view, once its mockups are approved.
+6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
+   [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
+   [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.

@@ -492,3 +492,347 @@ Enter open   n new   c close   ? keys
 s shell   p new pi
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
+
+## The remote view: Claude Code drawn on the phone (2026-11-01)
+
+> "If tui approvals then draw the TUI in this chat." — the owner, 2026-11-01, who then reviewed
+> these screens on a published page and approved them there the same day, comment by comment.
+
+**Approved by the owner on 2026-11-01** for `claude-remote dev`, the phone and WSL client
+([`remote-view.md`](remote-view.md)). The order of authority for this set was Claude Code's own
+design first, then a Fable advisor, then the owner. So **R1–R7 copy the fullscreen renderer of
+Claude Code 2.1.311**, the pinned version, from captures of its real screens at both widths. R4c,
+R8, R9 and R10 have no Claude equivalent.
+
+The owner's calls, each made in a comment on the page:
+
+- **R1–R7 are approved as drawn**, with tool calls collapsed (`Ran 1 shell command`) as Claude's
+  fullscreen mode draws them: "collapsed but later expandable". Expanding one comes after the
+  MVP.
+- **The mode line keeps Claude's name, icon and yellow**, with `/auto to cycle` where Claude says
+  shift+tab ("Shift tab is inconvenient on termux"). `/auto` cycles the mode.
+- **Question options may be long, and they scroll** around the cursor whatever Claude does, with
+  `↑ 1 more` and `↓ 2 more` at the edges. Claude's preview layout is drawn side by side at 80
+  columns (R4b) and stacked under the list at 40 (R4c), because side by side "is always mangled
+  in portrait".
+- **When the link is down, the footer says `Reconnecting… (8s)`.** After an Enter it adds
+  `· not sent` and keeps the text typed.
+- **The client's home is the door's list** (R9). Nothing new starts from the hub's door: "The
+  hub will never run on termux".
+  - Sessions running in a terminal are dim with `term: ` and cannot be opened from the phone.
+    Enter on one says why, in place of the hint line, until the next key (R10).
+  - Everything else opens on Enter. Offloaded and archived sessions resume in remote mode.
+  - `n` starts a new remote-mode session. The keys are `Enter open   n new   ? keys`.
+
+**R1–R8 use Claude Code's own colours**, read from its 2.1.311 output in the dark theme:
+
+| Where | Colour |
+|---|---|
+| logo, spinner | orange `d77757` |
+| dialog rules and titles, the selected option | lavender `b1b9f9` |
+| secondary text, `⎿` lines | grey `999999` |
+| input rules | grey `888888` |
+| the band behind a prompt | `373737` |
+| a current choice | green `4eba65` |
+| the mode line | Claude's yellow `ffc107` |
+
+The rule that amber means only *waiting for you* belongs to the menu. R9 and R10 keep it, with
+every other style as mockups 12 and 13 have it.
+
+**The glyphs** are the ones Claude Code draws (`❯ ● ⎿ ✻ ✢ ◐ ⏵ ▔ ╌ ▲ ☐ ✔ ↑ ↓ …` and its logo),
+which the owner's word of 2026-10-27 covers, plus the box-drawing set the mockups already use.
+
+**Nothing is colour-only.** A waiting session still has its `!`, a terminal session its
+`term: `, and a dropped link its words.
+
+R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
+
+### Mockup R1 — A conversation, idle
+```
+
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/workspace
+
+❯ Run the tests and tell me if any
+  fail.
+
+  Ran 1 shell command
+
+● All 478 tests pass; 4 are ignored.
+
+✻ Worked for 41s · done 1:12 AM
+
+
+
+
+
+
+───────────────────────── fix the door ─
+❯ now run clippy
+────────────────────────────────────────
+  claude-sessions/claude-3 · RAM 0.9G/2G
+  ⏵⏵ auto mode on (/auto to cycle)
+```
+
+### Mockup R2 — Working
+```
+❯ now run clippy
+
+● Running 1 shell command…
+  ⎿  $ cargo clippy --all-targets -- -D
+     warnings
+
+
+
+
+
+
+
+
+
+
+
+
+✢ Garnishing… (12s)
+
+───────────────────────── fix the door ─
+❯
+────────────────────────────────────────
+  claude-sessions/claude-3 · RAM 1.2G/2G
+  esc to interrupt
+```
+
+### Mockup R3 — A permission prompt
+```
+❯ make a scratch file
+
+● Creating empty file named x
+  ⎿  $ touch x
+
+
+
+
+
+
+
+────────────────────────────────────────
+ Bash command
+ Create empty file named x
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ touch x
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for
+      touch commands in this project
+   3. No
+
+ Esc to cancel
+```
+
+### Mockup R4 — A question with long options
+```
+❯ where should the hub keep logs?
+
+
+────────────────────────────────────────
+ ☐ Log store
+
+Where should the hub keep a session's
+log between reconnects?
+
+     ↑ 1 more
+❯ 2. On disk beside the registry
+     Survives a hub restart. One write
+     per line, fsynced at the end of
+     each turn; files older than 7
+     days are pruned by the offloader.
+  3. In memory only
+     Fastest and nothing to prune, but
+     a hub restart loses the history.
+     ↓ 2 more
+────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+```
+
+### Mockup R4c — A question with a preview, portrait
+```
+❯ how should the remote view connect?
+
+
+────────────────────────────────────────
+ ☐ Route
+
+Which route should the remote view
+take to a container?
+
+❯ 1. Through the hub
+     One ssh; the hub fans out
+  2. Straight to the container
+     One ssh per container
+  3. Type something.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ phone --ssh--> hub --ssh--> container
+                relay        holder
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate ·
+Esc to cancel
+
+```
+
+### Mockup R5 — /model
+```
+❯ /model
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Select model
+   For this session only.
+
+   ↑ 2.  Opus 5.5 ✔
+     3.  Fable 5.1
+   ❯ 4.  Sonnet 5.5
+     5.  Haiku 5.5
+      … +8 models
+
+   Enter to select · Esc to cancel
+```
+
+### Mockup R6 — /effort
+```
+❯ /effort
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ ◐ medium · /effort ▔
+   Effort
+
+   Faster                    Smarter
+   ───────▲──────────────────────────
+   low  medium  high  xhigh  max
+
+   ←/→ to adjust · Enter to confirm ·
+   Esc to cancel
+```
+
+### Mockup R7 — Scrolled back
+```
+❯ Write the numbers 1 to 60, one per…
+  38
+  39
+  40
+  41
+  42
+  43
+  44
+  45
+  46
+  47
+  48
+  49
+  50
+  51
+  52
+  53
+       Jump to bottom (ctrl+End) ↓
+
+───────────────────────── fix the door ─
+❯
+────────────────────────────────────────
+  claude-sessions/claude-3 · RAM 0.9G/2G
+  ⏵⏵ auto mode on (/auto to cycle)
+```
+
+### Mockup R8 — Reconnecting
+```
+
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/workspace
+
+❯ Run the tests and tell me if any
+  fail.
+
+  Ran 1 shell command
+
+● All 478 tests pass; 4 are ignored.
+
+✻ Worked for 41s · done 1:12 AM
+
+
+
+
+
+
+───────────────────────── fix the door ─
+❯ now run clippy
+────────────────────────────────────────
+  Reconnecting… (8s) · not sent
+  ⏵⏵ auto mode on (/auto to cycle)
+```
+
+### Mockup R9 — The phone client's home
+```
+dev · 4 containers · 1.9G of 3.0G
+────────────────────────────────────────
+── Containers · 4 ──────────────────────
+! claude-sessions 3 loaded · 1 offloaded
+├─ ! permission: touch x              2m
+├─ fix the door                      now
+└─ term: immich upgrade               3m
+or3-dev                         1 loaded
+└─ term: retire the old tunnel       14m
+dd-dev                       2 offloaded
+ds-dev                     not answering
+────────────────────────────────────────
+Enter open   n new   ? keys
+RAM: 1.9G / 3.0G, Load: 2.3, dev
+```
+
+### Mockup R10 — Enter on a terminal session
+```
+claude-sessions · 5 open · 812M of 1.0G
+────────────────────────────────────────
+── Loaded · 4 ──────────────────────────
+! permission: touch x                 2m
+fix the door                         now
+term: immich upgrade                  3m
+term: watch the base build            5h
+
+── Offloaded · 1 ───────────────────────
+mount guards on one                   2d
+
+── Archived · 7 · Enter shows ──────────
+────────────────────────────────────────
+Runs in a terminal: attach it from
+ssh dev, or end it there to open here
+RAM: 1.9G / 3.0G, Load: 2.3, dev
+```

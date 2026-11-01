@@ -313,3 +313,63 @@ Containers every one the hub reaches,
 Enter open   n new   c close   ? keys   s shell   p new pi
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
+
+## The remote view at 80 columns (2026-11-01)
+
+Approved with the 40-column set in [`mockups.md`](mockups.md), § *The remote view*.
+
+### Mockup R1 — A conversation, idle
+```
+
+ ▐▛███▛█   Claude Code v2.1.311
+▝▜██████▀  Opus 5.5 · Claude Ultra
+ ▝▝   ▝▝   ~/workspace
+
+
+❯ Run the tests and tell me if any fail.
+
+  Ran 1 shell command
+
+● All 478 tests pass; 4 are ignored.
+
+✻ Worked for 41s · done 1:12 AM
+
+
+
+
+
+
+───────────────────────────────────────────────────────────────── fix the door ─
+❯ now run clippy
+────────────────────────────────────────────────────────────────────────────────
+  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7
+  ⏵⏵ auto mode on (/auto to cycle)
+```
+
+### Mockup R4b — A question with a preview
+```
+❯ how should the remote view connect?
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Route
+
+Which route should the remote view take to a container?
+
+❯ 1. Through the hub              ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+     One ssh; the hub fans out     phone --ssh--> hub --ssh--> container
+  2. Straight to the container                    relay        holder
+     One ssh per container        ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+```
