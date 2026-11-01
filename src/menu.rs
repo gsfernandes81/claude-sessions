@@ -323,9 +323,11 @@ impl Menu {
                     .all
                     .iter()
                     .filter(|r| r.host == p.name && r.group() == Group::Loaded);
+                // The rest of the row as it came, `remote` included: the phone client asks it
+                // whether a terminal drives the session (0.11.0 cleared it here, and Enter on
+                // the home refused a session the holder drives).
                 out.extend(loaded.map(|r| Row {
                     nested: true,
-                    remote: false,
                     ..r.clone()
                 }));
             }
@@ -1718,6 +1720,20 @@ mod tests {
         let items = render::layout(m.rows());
         assert_eq!(items[0], render::Item::Heading(Group::Containers));
         assert_eq!(items.len(), 6, "{items:?}");
+    }
+
+    #[test]
+    fn a_session_nested_on_the_home_keeps_what_drives_it() {
+        let mut held = in_("infra-dev", "held");
+        held.remote = true;
+        let m = hub_menu(vec![held, in_("infra-dev", "term")]);
+        let remote: Vec<(&str, bool)> = m
+            .rows()
+            .iter()
+            .filter(|r| r.nested)
+            .map(|r| (r.title.as_str(), r.remote))
+            .collect();
+        assert_eq!(remote, [("held", true), ("term", false)]);
     }
 
     #[test]
