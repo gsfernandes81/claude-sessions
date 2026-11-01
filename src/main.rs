@@ -308,7 +308,15 @@ fn main() -> ExitCode {
         // The remote view's client, as `claude-remote` runs it.
         "client" => cmd_client(args.get(1).map(String::as_str)),
         // The hub's end of the remote view, one per connected client (`relay.rs`).
-        "relay" => report(relay::serve()),
+        "relay" => match args.get(1).map(String::as_str) {
+            // infra's check that the door passes a command through, answered at once.
+            Some("--version" | "-V") => {
+                say!("claude-sessions {VERSION}");
+                ExitCode::SUCCESS
+            }
+            Some(other) => fail(&format!("relay takes no arguments, not {other:?}")),
+            None => report(relay::serve()),
+        },
         "install" => match args.get(1) {
             Some(dir) => match install::run(std::path::Path::new(dir)) {
                 Ok(done) => {

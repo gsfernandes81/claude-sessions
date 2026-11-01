@@ -312,6 +312,14 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      ticked, `/copy`, `/exit` back home with `claude-1 ended`; and the relay killed under the
      client mid-conversation, redialled in a second, the conversation resumed with nothing
      drawn twice and the next prompt answered.
+   - **A resume shows what came before.** The launcher passes the conversation's transcript
+     to the holder (`CLAUDE_SESSIONS_HISTORY`), which logs its prompts and replies as
+     `_history` lines ahead of claude's own, ending with `_history_end`; the reducer reads
+     them as turns already finished. Measured the same day: an archived conversation opened
+     from the phone's home showed its two earlier turns and answered a third. Also measured:
+     a live permission prompt drawn as R3 with Claude's own "don't ask again" rule, `1`
+     running the command; and a running remote session left with Ctrl-C and opened again
+     from the home, its history whole.
    - **Not yet like the mockups**, to close next: the logo's second line stops at the model,
      since claude's lines never name the plan; the transcript's line over a permission prompt
      is the request's own description (`Create empty file named x`, where R3 has Claude's

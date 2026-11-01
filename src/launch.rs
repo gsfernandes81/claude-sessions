@@ -1547,15 +1547,25 @@ fn remote_room(deps: &Deps) -> Result<(), String> {
 /// launcher's choice reaches it whatever the login set. No scrollback variables: headless
 /// claude draws nothing. Claude inherits the holder's stderr, so a failed start is in the
 /// capture file as it is for a terminal slot.
-fn remote_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Command {
+fn remote_command(
+    slot: &str,
+    stderr: &Path,
+    args: &[String],
+    history: Option<&Path>,
+    deps: &Deps,
+) -> Command {
     let (claude_var, _) = Harness::Claude.program_var();
     let mut cmd = zmx::command(&deps.zmx);
     cmd.arg("attach")
         .arg(slot)
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
-        .arg(format!("{claude_var}={}", deps.claude))
-        .arg("sh")
+        .arg(format!("{claude_var}={}", deps.claude));
+    // A resume's transcript, for the holder to show what came before (`holder::seed`).
+    if let Some(h) = history {
+        cmd.arg(format!("CLAUDE_SESSIONS_HISTORY={}", h.display()));
+    }
+    cmd.arg("sh")
         .arg("-c")
         .arg(START_WRAP)
         .arg("sh")
@@ -1592,7 +1602,12 @@ fn remote_start(
     // A socket a killed holder left would read as this one being up.
     let sock = crate::holder::paths(slot).sock;
     let _ = std::fs::remove_file(&sock);
-    let mut cmd = remote_command(slot, &stderr, args, deps);
+    let history = registry::load(slot)
+        .ok()
+        .flatten()
+        .filter(|_| !args.is_empty())
+        .and_then(|r| r.conversation_path());
+    let mut cmd = remote_command(slot, &stderr, args, history.as_deref(), deps);
     cmd.current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

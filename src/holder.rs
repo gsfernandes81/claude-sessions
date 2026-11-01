@@ -76,6 +76,31 @@ pub fn paths(slot: &str) -> Paths {
     }
 }
 
+/// Log a transcript's prompts and replies as `{"type":"_history","line":…}`, then
+/// `{"type":"_history_end"}`, read a line at a time. A transcript that cannot be read leaves
+/// the log as a new conversation's.
+fn seed(log: &mut Log, transcript: &Path) -> io::Result<()> {
+    let Ok(f) = File::open(transcript) else {
+        return Ok(());
+    };
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        let Ok(v) = json::parse(line.trim()) else {
+            continue;
+        };
+        if !matches!(
+            v.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
+            continue;
+        }
+        let mut h = Value::obj();
+        h.set("type", Value::string("_history"));
+        h.set("line", v);
+        log.append(json::to_line(&h).as_bytes())?;
+    }
+    log.append(br#"{"type":"_history_end"}"#)
+}
+
 /// Whether a holder is serving `slot` now: its socket answers. What the record's `driver`
 /// says, checked where it matters: a release from before the holder rewrites a record
 /// without that field, and a socket answering cannot be left over.
@@ -134,6 +159,18 @@ pub fn serve(
     // slot's name is free when it starts.
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
+    let mut log = Log {
+        file: log_file,
+        offsets: Vec::new(),
+        end: 0,
+        closed: false,
+        answered: HashSet::new(),
+    };
+    // A resume: the conversation so far, from its transcript, since claude sends none of it
+    // again (`docs/remote-view.md` § *Decisions*, history from two sources).
+    if let Some(path) = std::env::var_os("CLAUDE_SESSIONS_HISTORY") {
+        seed(&mut log, Path::new(&path))?;
+    }
 
     let mut child: Child = Command::new(program)
         .args(HEADLESS)
@@ -145,13 +182,7 @@ pub fn serve(
     let stdin = child.stdin.take().expect("piped");
     let run = format!("{}-{}", std::process::id(), crate::clock::now());
     let shared = Arc::new(Shared {
-        log: Mutex::new(Log {
-            file: log_file,
-            offsets: Vec::new(),
-            end: 0,
-            closed: false,
-            answered: HashSet::new(),
-        }),
+        log: Mutex::new(log),
         grew: Condvar::new(),
         log_path: paths.log.clone(),
         run,

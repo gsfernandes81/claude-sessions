@@ -193,6 +193,13 @@ pub fn classify(v: &Value) -> Msg {
         }
         "user" => user(v),
         "_in" => Msg::Input(input(v.get("line").unwrap_or(&Value::Null))),
+        "_history" => history(v.get("line").unwrap_or(&Value::Null)),
+        // The history is in: whatever it left open was settled before this claude started.
+        "_history_end" => Msg::Result {
+            subtype: "success".into(),
+            is_error: false,
+            session_id: String::new(),
+        },
         "control_request" => request(v),
         "control_cancel_request" => Msg::Cancelled {
             request_id: s(v, "request_id"),
@@ -300,6 +307,38 @@ fn user(v: &Value) -> Msg {
             }
         }
         _ => Msg::UserText(String::new()),
+    }
+}
+
+/// A line of the conversation's transcript from before this claude, as the holder logs it on
+/// a resume: claude does not send history again. A prompt typed then reads as a prompt;
+/// Claude Code's own bookkeeping (meta lines, compaction summaries, command wrappers,
+/// subagents' lines) as nothing.
+fn history(line: &Value) -> Msg {
+    let flag = |k: &str| line.get(k).and_then(Value::as_bool) == Some(true);
+    if flag("isMeta") || flag("isCompactSummary") || flag("isSidechain") {
+        return Msg::Noise;
+    }
+    match line.get("type").and_then(Value::as_str) {
+        Some("user") => {
+            let text = line
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str);
+            match text {
+                Some(t) if t.starts_with("<command-") || t.starts_with("<local-command") => {
+                    Msg::Noise
+                }
+                Some(_) => {
+                    let mut l = line.clone();
+                    l.set("isReplay", Value::Bool(true));
+                    user(&l)
+                }
+                None => user(line),
+            }
+        }
+        Some("assistant") => classify(line),
+        _ => Msg::Noise,
     }
 }
 
@@ -607,6 +646,46 @@ pub fn refuse(request_id: &str, why: &str) -> Value {
 #[cfg(test)]
 mod input_tests {
     use super::*;
+
+    #[test]
+    fn a_transcripts_lines_read_as_the_turns_they_were() {
+        let h = |l: &str| {
+            let line = crate::json::parse(l).unwrap();
+            classify(&obj(vec![
+                ("type", Value::string("_history")),
+                ("line", line),
+            ]))
+        };
+        assert_eq!(
+            h(r#"{"type":"user","message":{"role":"user","content":"hi"}}"#),
+            Msg::Prompt("hi".into())
+        );
+        assert_eq!(
+            h(r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"x"}}"#),
+            Msg::Noise
+        );
+        assert_eq!(
+            h(
+                r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>"}}"#
+            ),
+            Msg::Noise
+        );
+        assert!(matches!(
+            h(
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"yo"}]}}"#
+            ),
+            Msg::Assistant { .. }
+        ));
+        assert_eq!(h(r#"{"type":"summary","summary":"s"}"#), Msg::Noise);
+        let end = crate::json::parse(r#"{"type":"_history_end"}"#).unwrap();
+        assert!(matches!(
+            classify(&end),
+            Msg::Result {
+                is_error: false,
+                ..
+            }
+        ));
+    }
 
     fn logged(line: &Value) -> Value {
         obj(vec![("type", Value::string("_in")), ("line", line.clone())])
