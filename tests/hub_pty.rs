@@ -214,13 +214,18 @@ fn text(b: &[u8]) -> String {
 }
 
 /// Well clear of a minute boundary: the minute is the one tick a container may send rows by
-/// itself (the ages), and a window straddling it would see bytes the rule allows.
+/// itself (the ages), and a window straddling it would see bytes the rule allows. Clear on
+/// both sides, since a container's minute rows land a poll after the boundary and a window
+/// opening just after one would see them (`menu_pty.rs`, CI on 2026-11-01).
 fn clear_of_the_minute(term: &mut pty::Pty, window: Duration) {
+    // A container's poll after the boundary, and a margin.
+    const SETTLED: u64 = 4_000;
     let into = now_ms() % 60_000;
     let need = window.as_millis() as u64 + 4_000;
     if into + need >= 60_000 {
-        std::thread::sleep(Duration::from_millis(60_000 - into + 1_000));
-        term.read_for(Duration::from_millis(3_000));
+        term.read_for(Duration::from_millis(60_000 - into + SETTLED));
+    } else if into < SETTLED {
+        term.read_for(Duration::from_millis(SETTLED - into));
     }
 }
 

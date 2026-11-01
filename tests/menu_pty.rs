@@ -23,12 +23,21 @@ const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 /// A stand-in cgroup whose figures never move, for the menu's own memory: with no pool the
 /// header shows this container's, and a figure that changed mid-test — a build next door —
 /// rewrote a line in a window the idle checks require to be silent.
+///
+/// Written once per process. Every test here shares the directory, and each used to rewrite
+/// it as it started; a write truncates before it writes, so a menu already running in another
+/// test could read an empty `memory.current`, draw no memory figure, and draw it again on the
+/// next minute (CI, 2026-11-01 14:39).
 fn steady_cgroup() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("cs-menu-cgroup-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("memory.max"), "8589934592\n").unwrap();
-    std::fs::write(d.join("memory.current"), "1073741824\n").unwrap();
-    d
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("cs-menu-cgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("memory.max"), "8589934592\n").unwrap();
+        std::fs::write(d.join("memory.current"), "1073741824\n").unwrap();
+        d
+    })
+    .clone()
 }
 
 /// A transcript with an exchange in it: a conversation on disk to resume.
@@ -63,17 +72,21 @@ fn record(slot: &str, title: &str, transcript: &std::path::Path) -> String {
 }
 
 /// Wait, if need be, until the wall clock is well clear of a minute boundary: the minute is
-/// the one tick the menu may redraw on by itself (the header's memory figure is refreshed
-/// then), and a test window straddling it would see bytes the rule allows. Anything the menu
-/// wrote while we waited — a minute's redraw, which lands on the first poll after the
-/// boundary — is drained here, or the harness would hand it to the next window.
+/// the one tick the menu may redraw on by itself (the header's memory figure and the load are
+/// read again then), and a test window straddling it would see bytes the rule allows. Clear
+/// on both sides: the minute's redraw lands on the first registry poll (2 s) after the
+/// boundary, so a window opening just after one sees it too — CI's did, opening at 14:39:00.3
+/// on 2026-11-01. Anything the menu wrote while we waited is drained here, or the harness
+/// would hand it to the next window.
 fn clear_of_the_minute(term: &mut pty::Pty, window: Duration) {
+    // One registry poll after the boundary, and a margin.
+    const SETTLED: u64 = 3_500;
     let into = now_ms() % 60_000;
     let need = window.as_millis() as u64 + 3_000;
     if into + need >= 60_000 {
-        std::thread::sleep(Duration::from_millis(60_000 - into + 1_000));
-        // One registry poll (2 s) and a margin, so the minute's redraw has happened.
-        term.read_for(Duration::from_millis(2_500));
+        term.read_for(Duration::from_millis(60_000 - into + SETTLED));
+    } else if into < SETTLED {
+        term.read_for(Duration::from_millis(SETTLED - into));
     }
 }
 
