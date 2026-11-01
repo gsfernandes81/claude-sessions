@@ -325,7 +325,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      summed into a run of tool calls: `● Explore(what it was asked)` and under it its last
      two tool calls and how many more, then `Done (4 tool uses · 21.6k tokens · 7.6s)`; a
      workflow says its phase, how many of that phase's agents are done, and what the
-     running ones are doing, then its totals. The dot is green once it ended well and grey
+     running ones are doing, then its totals. The dot is green once it ended well and red
      when it failed or was stopped, which the line under it says in words. A subagent's
      handback and structured output are counted, not listed, and its report is what `full`
      answers.

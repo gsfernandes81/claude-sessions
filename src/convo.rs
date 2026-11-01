@@ -20,6 +20,11 @@ pub const RULE: u32 = 0x88_8888;
 pub const BAND: u32 = 0x37_3737;
 pub const GREEN: u32 = 0x4e_ba65;
 pub const YELLOW: u32 = 0xff_c107;
+/// Claude Code's dark theme beyond the colours above (`claude` 2.1.311's `error`,
+/// `autoAccept` and `planMode`): a failure, accept-edits mode, plan mode.
+pub const RED: u32 = 0xff_6b80;
+pub const PURPLE: u32 = 0xaf_87ff;
+pub const TEAL: u32 = 0x48_968c;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct St {
@@ -595,12 +600,14 @@ fn expanded_tool(
     result: Option<&(bool, Vec<String>, usize)>,
     w: usize,
 ) -> Vec<Line> {
-    let head = if arg.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name}({arg})")
+    // As Claude Code marks a call: green once it worked, red when it failed.
+    let dot = match result {
+        None => PLAIN,
+        Some((true, ..)) => fg(GREEN),
+        Some((false, ..)) => fg(RED),
     };
-    let mut out = wrapped(&head, "● ", "  ", w, PLAIN);
+    let mut out = titled(name, arg, dot, w);
+    let under_st = if dot == fg(RED) { fg(RED) } else { fg(GREY) };
     let mut under: Vec<String> = Vec::new();
     match result {
         None => under.push("Running…".into()),
@@ -624,33 +631,25 @@ fn expanded_tool(
             lead,
             "     ",
             w.saturating_sub(1),
-            fg(GREY),
+            under_st,
         ));
     }
     out
 }
 
-/// A subagent or workflow as Claude Code draws one: `● Explore(what it was asked)`, and
-/// under it what it is doing or how it ended. The dot is green once it has finished well,
-/// grey when it failed or was stopped, which the line under it says in words.
-fn agent_block(name: &str, arg: &str, lines: &[String], state: &str, w: usize) -> Vec<Line> {
+/// `● Name(arg)`, wrapped, the dot in `dot` and the name in bold, as Claude Code titles a
+/// tool call.
+fn titled(name: &str, arg: &str, dot: St, w: usize) -> Vec<Line> {
     let head = if arg.is_empty() {
         name.to_string()
     } else {
         format!("{name}({arg})")
     };
     let mut out = wrapped(&head, "● ", "  ", w, PLAIN);
-    let dot = match state {
-        "completed" => fg(GREEN),
-        "running" => PLAIN,
-        _ => fg(GREY),
-    };
-    // The dot coloured, and the name in bold as Claude Code titles a tool call.
     if let Some(l) = out.first_mut() {
         let text = plain(l);
         let body = text.strip_prefix("● ").unwrap_or(&text).to_string();
-        let cut_at = body.find('(').unwrap_or(body.len()).min(name.len());
-        let (n, rest) = body.split_at(cut_at);
+        let (n, rest) = body.split_at(name.len().min(body.len()));
         let mut row: Line = vec![
             ("● ".into(), dot),
             (
@@ -666,6 +665,19 @@ fn agent_block(name: &str, arg: &str, lines: &[String], state: &str, w: usize) -
         }
         *l = row;
     }
+    out
+}
+
+/// A subagent or workflow as Claude Code draws one: `● Explore(what it was asked)`, and
+/// under it what it is doing or how it ended. The dot is green once it has finished well,
+/// red when it failed or was stopped, which the line under it says in words too.
+fn agent_block(name: &str, arg: &str, lines: &[String], state: &str, w: usize) -> Vec<Line> {
+    let dot = match state {
+        "completed" => fg(GREEN),
+        "running" => PLAIN,
+        _ => fg(RED),
+    };
+    let mut out = titled(name, arg, dot, w);
     for (i, text) in lines.iter().enumerate() {
         let lead = if i == 0 { "  ⎿  " } else { "     " };
         out.extend(wrapped_by(
@@ -713,14 +725,16 @@ pub fn effort_glyph(level: &str) -> &'static str {
 
 /// The mode line, as Claude Code words it, with `/auto` where it says shift+tab.
 pub fn mode_line(mode: &str) -> Option<(String, u32)> {
-    let (glyph, words) = match mode {
-        "auto" => ("⏵⏵", "auto mode on"),
-        "acceptEdits" => ("⏵⏵", "accept edits on"),
-        "bypassPermissions" => ("⏵⏵", "bypass permissions on"),
-        "plan" => ("⏸", "plan mode on"),
+    // Each in the colour Claude Code gives it: auto `warning`, accept edits `autoAccept`,
+    // bypass `error`, plan `planMode`.
+    let (glyph, words, colour) = match mode {
+        "auto" => ("⏵⏵", "auto mode on", YELLOW),
+        "acceptEdits" => ("⏵⏵", "accept edits on", PURPLE),
+        "bypassPermissions" => ("⏵⏵", "bypass permissions on", RED),
+        "plan" => ("⏸", "plan mode on", TEAL),
         _ => return None,
     };
-    Some((format!("{glyph} {words} (/auto to cycle)"), YELLOW))
+    Some((format!("{glyph} {words} (/auto to cycle)"), colour))
 }
 
 /// The modes `/auto` steps through, in Claude Code's shift+tab order.
@@ -999,7 +1013,14 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             }
             Entry::Note(text) => {
                 out.push(Vec::new());
-                out.extend(wrapped(text, "  ⎿  ", "     ", w, fg(GREY)));
+                // An error, or a turn interrupted, in Claude Code's `error` red; anything
+                // else a local command said, grey.
+                let st = if text.starts_with("Error") || text.starts_with("Interrupted") {
+                    fg(RED)
+                } else {
+                    fg(GREY)
+                };
+                out.extend(wrapped(text, "  ⎿  ", "     ", w, st));
             }
             Entry::Agent {
                 name,
@@ -1769,6 +1790,41 @@ mod tests {
                 "  ⎿  Error",
                 "     no such file",
             ]
+        );
+    }
+
+    #[test]
+    fn modes_failures_and_errors_take_claude_codes_own_colours() {
+        let colour = |m: &str| mode_line(m).map(|(_, c)| c);
+        assert_eq!(colour("auto"), Some(YELLOW));
+        assert_eq!(colour("acceptEdits"), Some(PURPLE));
+        assert_eq!(colour("plan"), Some(TEAL));
+        assert_eq!(colour("bypassPermissions"), Some(RED));
+        assert_eq!(colour("default"), None);
+
+        let mut c = Convo::new("h", "claude-3", "r");
+        c.expanded = true;
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"agent","n":"Workflow","a":"audit"}"#,
+                r#"{"t":"prog","id":1,"p":["Failed (0 tool uses · 0.1s)"],"st":"failed"}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"Read","a":"x"}"#,
+                r#"{"t":"res","id":2,"ok":false,"p":["gone"],"l":1}"#,
+                r#"{"t":"add","id":3,"k":"note","x":"Error: error_max_turns"}"#,
+                r#"{"t":"add","id":4,"k":"note","x":"Compacted"}"#,
+            ],
+        );
+        let t = transcript(&c, 40).0;
+        let find = |p: &str| t.iter().find(|l| plain(l).starts_with(p)).unwrap();
+        assert_eq!(find("● Workflow")[0].1, fg(RED), "a failed agent's dot");
+        assert_eq!(find("● Read")[0].1, fg(RED), "a failed call's dot");
+        assert_eq!(find("  ⎿  Error")[0].1, fg(RED));
+        assert_eq!(find("  ⎿  Error: error_max_turns")[0].1, fg(RED));
+        assert_eq!(
+            find("  ⎿  Compacted")[0].1,
+            fg(GREY),
+            "a plain note stays grey"
         );
     }
 

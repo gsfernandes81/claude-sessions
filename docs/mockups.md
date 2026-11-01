@@ -524,17 +524,14 @@ The owner's calls, each made in a comment on the page:
   - Everything else opens on Enter. Offloaded and archived sessions resume in remote mode.
   - `n` starts a new remote-mode session. The keys are `Enter open   n new   ? keys`.
 
-**R1–R8 use Claude Code's own colours**, read from its 2.1.311 output in the dark theme:
-
-| Where | Colour |
-|---|---|
-| logo, spinner | orange `d77757` |
-| dialog rules and titles, the selected option | lavender `b1b9f9` |
-| secondary text, `⎿` lines | grey `999999` |
-| input rules | grey `888888` |
-| the band behind a prompt | `373737` |
-| a current choice | green `4eba65` |
-| the mode line | Claude's yellow `ffc107` |
+**R1–R8 use Claude Code's own colours**, whichever it gives the thing drawn, from its dark
+theme (the `claude` binary's own palette, read from 2.1.311): orange `d77757` for the logo
+and spinner, lavender `b1b9f9` for dialogs, grey `999999` for secondary text and `⎿` lines,
+green `4eba65` for success, red `ff6b80` for errors and failures, and each permission mode
+in its own colour (auto yellow `ffc107`, accept edits purple `af87ff`, plan teal `48968c`,
+bypass red). There is no list of approved colours beyond that: the owner, 2026-11-01,
+"Remove the approved mockup colours list. Termux is not so limited." A new element takes
+the colour Claude Code gives it.
 
 The rule that amber means only *waiting for you* belongs to the menu. R9 and R10 keep it, with
 every other style as mockups 12 and 13 have it.

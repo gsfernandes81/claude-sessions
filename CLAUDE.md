@@ -40,7 +40,9 @@ infra's.
 
 - **The approved mockups are binding.** [`docs/mockups.md`](docs/mockups.md) was approved by
   the owner on 2026-10-01. Phase 4 renders to those screens; a change to them needs the
-  owner, not a judgement call. The colour assignment in that file is part of the approval.
+  owner, not a judgement call. The menu's colour assignment in that file is part of the
+  approval; the remote view takes Claude Code's own colours, with no list beyond that (owner,
+  2026-11-01).
 - **`claude-sessions hook` always exits 0, and says nothing.** Its stdout reaches Claude (as
   context from the synchronous `SessionStart`, and as `systemMessage`/`additionalContext` from
   a JSON line of an async event), and a failing synchronous hook is shown to the person; an
