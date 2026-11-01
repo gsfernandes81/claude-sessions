@@ -975,10 +975,10 @@ mod tests {
 
     #[test]
     fn the_first_rows_heard_are_sorted_and_later_ones_keep_their_places() {
-        let x = row("x", 2);
+        let x = row("x", 1);
         let y = Row {
             wants_you: true,
-            ..row("y", 1)
+            ..row("y", 2)
         };
         let titles = |m: &Menu| {
             m.all_rows()
@@ -994,10 +994,10 @@ mod tests {
             .unwrap();
         let mut t = Fake::new(vec![quit()]);
         drive(&mut t, &mut m, &mut hub, &rx, None, Duration::from_secs(5)).unwrap();
-        assert_eq!(titles(&m), ["y", "x"], "sorted: the one waiting leads");
+        assert_eq!(titles(&m), ["y", "x"], "sorted: the most recent leads");
 
         let (mut hub, tx, rx) = offline(&[hub::LOCAL]);
-        let mut m = menu(vec![x.clone(), row("y", 1)]);
+        let mut m = menu(vec![x.clone(), row("y", 0)]);
         assert_eq!(titles(&m), ["x", "y"], "calibration");
         tx.send(Event::Snapshot(hub::LOCAL.into(), snap)).unwrap();
         let mut t = Fake::new(vec![quit()]);

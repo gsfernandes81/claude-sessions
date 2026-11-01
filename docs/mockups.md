@@ -69,7 +69,14 @@ before its title, after the `!` when both are drawn, so a pipe and a monochrome 
 it. Mockup 5's command line is the harness's own: `pi --session-id 0f9c4a1e ended` for a pi.
 Every screen with a hint line was redrawn for it, from the renderer, at both widths, and
 mockups 1, 6, 11, 12 and 13 show `immich upgrade` as the pi session. Mockup 8 gains `p new pi`
-at every width it fits; at 7 columns it is dropped, like `Enter open` at 9.
+at every width it fits; at 7 columns it is dropped, like `Enter open` at 9. **On 2026-11-01
+the owner changed the order within a group**: "default to organising sessions by last
+activity (the same field as the 17h ago, 5m ago or 1 day ago in the right column)". A group
+now runs most recent first by that age alone; a session waiting for you keeps its `!` and its
+amber, and an unread one its bold, but neither is moved up for it. The screens below were not
+redrawn: their rows are in the order they were drawn in, which put `! permission: write
+hosts/one` above more recent sessions; read their order as illustration, and the age column
+as what decides it.
 
 They were drawn at **40 columns** — the phone in portrait, which is where this tool is
 actually driven from — and every line was *generated* to that width and asserted against it,

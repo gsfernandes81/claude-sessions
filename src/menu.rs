@@ -6,8 +6,8 @@
 //! Two behaviours that are decisions, not accidents:
 //!
 //! **Rows are grouped by state, and keep their places within a group while the menu is open**
-//! (owner, 2026-10-03). Needs you, Working, Idle, Offloaded, Closed, top to bottom; each in
-//! recency order when the menu starts, except Idle, where unread rows come first. After that
+//! (owner, 2026-10-03). Loaded, Offloaded, Archived, top to bottom; each in order of last
+//! activity, most recent first, when the menu starts (owner, 2026-11-01). After that
 //! a row that stays in its group stays where it was, and a row that is new, or has moved
 //! group, joins the top of its group. Mockup 6 is the evidence for staying put: back from a
 //! session, it reads `now` and is no longer unread, yet it is still where it was. Re-sorting
@@ -239,16 +239,16 @@ impl Menu {
 
     /// Take a fresh reading of the rows, keeping the order the owner has been looking at.
     ///
-    /// `first` sorts into groups — each in the reading's order, which is most recent first,
-    /// except Idle, where unread rows come first. Afterwards, rows that are still in the same
+    /// `first` sorts into groups, each most recent activity first. Afterwards, rows that are still in the same
     /// group keep their places, rows that are gone go, and rows that are new or have changed
     /// group join the top of theirs. The cursor stays on the row it was on.
     pub fn replace_rows(&mut self, fresh: Vec<Row>, first: bool) {
         let next: Vec<Row> = if first {
             let mut next = fresh;
-            // Stable, so the reading's recency order survives within each group: what waits
-            // for the owner first, then what is unread.
-            next.sort_by_key(|r| (r.group(), !r.wants_you, !r.unread));
+            // Within each group, most recent activity first — the age on the right — and
+            // nothing else: waiting and unread are marked on the row, not by moving it
+            // (owner, 2026-11-01). Stable, so equal times keep the reading's order.
+            next.sort_by_key(|r| (r.group(), std::cmp::Reverse(r.at)));
             next
         } else {
             let mut next = Vec::with_capacity(fresh.len());
@@ -1134,29 +1134,27 @@ mod tests {
         m.rows().iter().map(|r| r.title.clone()).collect()
     }
 
+    fn at(name: &str, at: u64) -> Row {
+        Row { at, ..row(name) }
+    }
+
     #[test]
-    fn the_first_reading_groups_and_puts_what_waits_then_what_is_unread_first() {
-        let mut a = row("a");
-        let mut b = row("b");
+    fn the_first_reading_groups_and_orders_each_group_by_last_activity() {
+        let a = at("a", 50);
+        let mut b = at("b", 40);
         b.unread = true;
-        let c = row("c");
-        let mut d = row("d");
+        let c = at("c", 60);
+        let mut d = at("d", 10);
         d.wants_you = true;
-        let mut e = row("e");
+        let mut e = at("e", 30);
         e.busy = true;
         e.unread = true;
-        let mut f = row("f");
+        let mut f = at("f", 90);
         f.offloaded = true;
-        // Gathered most-recent first.
-        let m = menu(vec![
-            f.clone(),
-            a.clone(),
-            e.clone(),
-            b.clone(),
-            c,
-            d.clone(),
-        ]);
-        assert_eq!(names(&m), ["d", "e", "b", "a", "c", "f"]);
+        // Read in no particular order: waiting and unread are marked on the row, not moved up
+        // (owner, 2026-11-01).
+        let m = menu(vec![d, f, b, a, e, c]);
+        assert_eq!(names(&m), ["c", "a", "b", "e", "d", "f"]);
         let groups: Vec<Group> = m.rows().iter().map(Row::group).collect();
         assert_eq!(
             groups,
@@ -1169,11 +1167,11 @@ mod tests {
                 Group::Offloaded
             ]
         );
-        // Calibration: with nothing flagged the recency order is untouched.
-        a.unread = false;
-        b.unread = false;
-        d.wants_you = false;
-        assert_eq!(names(&menu(vec![a, b, row("c"), d])), ["a", "b", "c", "d"]);
+        // Calibration: equal times keep the order they were read in.
+        assert_eq!(
+            names(&menu(vec![row("x"), row("y"), row("z")])),
+            ["x", "y", "z"]
+        );
     }
 
     fn stored(name: &str, archived: bool) -> Row {
@@ -1260,15 +1258,15 @@ mod tests {
 
     #[test]
     fn closed_rows_go_last_behind_the_fold_and_c_on_one_only_says_so() {
-        let mut old = row("old");
+        let mut old = at("old", 30);
         old.closed = true;
-        let mut waiting = row("waiting");
+        let mut waiting = at("waiting", 10);
         waiting.wants_you = true;
-        // Gathered most recent first, the closed one most recent of all.
-        let mut m = menu(vec![old, row("a"), waiting]);
+        // The closed one is the most recent of all.
+        let mut m = menu(vec![old, at("a", 20), waiting]);
         assert_eq!(
             names(&m),
-            ["waiting", "a", "Archived"],
+            ["a", "waiting", "Archived"],
             "closed is history: last, and shut"
         );
         m.key(Key::End);
@@ -1289,9 +1287,9 @@ mod tests {
 
     #[test]
     fn later_readings_keep_places_and_add_new_rows_at_the_top_of_their_group() {
-        let mut two = row("two");
+        let mut two = at("two", 3);
         two.unread = true;
-        let mut m = menu(vec![row("one"), two.clone(), row("three")]);
+        let mut m = menu(vec![at("one", 2), two.clone(), at("three", 1)]);
         assert_eq!(names(&m), ["two", "one", "three"]);
         // Mockup 6: back from "two", it is no longer unread and is the most recent — and it
         // stays where it was.

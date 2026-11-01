@@ -529,14 +529,8 @@ fn list_lines(
     now: clock::Millis,
 ) -> Vec<String> {
     let mut rows: Vec<&SlotRecord> = recs.iter().filter(|r| r.state != State::Closed).collect();
-    // The order the menu will use: wants you, then unread, then most recent activity.
-    rows.sort_by_key(|r| {
-        (
-            !r.needs_you,
-            !r.unread(),
-            std::cmp::Reverse(r.last_activity_ms),
-        )
-    });
+    // The order the menu will use: most recent activity first.
+    rows.sort_by_key(|r| std::cmp::Reverse(r.last_activity_ms));
     // The menu lists zmx's sessions UNION the registry, not just the registry: a `zmx attach`
     // somebody typed is real work that nothing here started, and showing only our own would
     // mean a list that disagrees with the box.
@@ -785,7 +779,11 @@ mod tests {
     fn list_orders_and_marks_as_the_menu_does() {
         let recs = [
             rec("claude-1", |r| r.last_activity_ms = NOW - 60_000),
-            rec("claude-2", |r| r.needs_you = true),
+            // Waiting, but the oldest: it is marked `!`, not moved up.
+            rec("claude-2", |r| {
+                r.needs_you = true;
+                r.last_activity_ms = NOW - 10 * 60_000;
+            }),
             rec("claude-3", |r| r.last_stop_ms = Some(NOW - 1_000)),
             rec("claude-4", |r| r.state = State::Offloaded),
             rec("claude-5", |r| r.keep_until_ms = Some(NOW + 60_000)),
@@ -796,11 +794,11 @@ mod tests {
         let alive = |r: &SlotRecord| r.slot != "claude-5";
         let lines = list_lines(&recs, &sessions, alive, NOW);
         let want = [
-            ("claude-2", "!"),
-            ("claude-3", "*"),
             ("claude-1", "@"),
+            ("claude-3", "*"),
             ("claude-4", "z"),
             ("claude-5", "k"),
+            ("claude-2", "!"),
         ];
         let want: Vec<(String, String)> = want
             .iter()
@@ -808,7 +806,7 @@ mod tests {
             .collect();
         assert_eq!(heads(&lines), want, "{lines:#?}");
         assert!(
-            lines[2].contains("claude-1's title") && lines[2].ends_with(" 1m"),
+            lines[0].contains("claude-1's title") && lines[0].ends_with(" 1m"),
             "{lines:#?}"
         );
     }

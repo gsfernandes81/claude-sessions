@@ -653,8 +653,9 @@ quits. With one container there is no home and `Esc` quits from its screen.
   many sit behind `… N more`. **From 60 columns up the rows are indented two columns** under
   their headings; at 40 the two columns stay with the titles.
   A row's group is the first that fits: closed, offloaded, else loaded; an unregistered
-  session, which nothing describes, is loaded. Within a group, most recent activity first,
-  except that rows waiting for the owner come first and unread ones next. A row is its title
+  session, which nothing describes, is loaded. Within a group, most recent activity first —
+  the age on the right — and nothing else (owner, 2026-11-01: "default to organising sessions
+  by last activity"; until then rows waiting for the owner came first and unread ones next). A row is its title
   and its age — **no numbers, and one mark**: `! ` before the title of a session with a prompt
   waiting, the mark bold and the title amber (owner, 2026-10-26: "just a yellow highlight or
   icon"), ASCII so it survives a monochrome terminal; an unread title is bold, a session
