@@ -270,6 +270,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `open {c, k}` · `new {c}` | open a row's conversation (`k` is the row key as the agent sends it) or a new one in container `c` |
      | `re {c, s, run, n}` | after a reconnect: slot `s`, the holder's run, and the last `n` the client holds |
      | `close` | back home; the conversation keeps running |
+     | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
      | `say {x}` | a prompt or slash command, `/compact` included |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
@@ -300,7 +301,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
      with a conversation open, `re`.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
-     Ctrl-U; `\` then Enter is a newline, as in Claude Code; Up and Down step through what
+     Ctrl-U; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
+     no row starts with one, as editors and Claude Code do; `\` then Enter is a newline, as in Claude Code; Up and Down step through what
      was sent; PageUp and PageDown scroll ten lines and a wheel report one, since Termux
      sends a report for every line a finger travels, or three under Windows Terminal
      (`WT_SESSION` set, `TERMUX_VERSION` not), which sends one a notch; End or Esc goes back down. Scrolled

@@ -247,6 +247,9 @@ pub struct View {
     /// Drawn by the phone client (`claude-remote`), whose home opens and starts sessions and
     /// nothing else: its hint line is mockup R9's.
     pub remote: bool,
+    /// The phone client's link is down: `⠋ Reconnecting… (8s)`, after the load line where both
+    /// fit and in its place where they do not.
+    pub reconnecting: Option<String>,
 }
 
 /// Docker Compose's spinner (owner, 2026-10-04): ten braille frames, one every 100 ms. Braille

@@ -68,6 +68,11 @@ pub enum Input {
         epoch: u64,
         answer: Result<String, String>,
     },
+    /// A home action's outcome: whether it was done, and the words for the status line.
+    HomeDone {
+        ok: bool,
+        said: String,
+    },
 }
 
 /// What the relay asks of the pipes around it.
@@ -85,6 +90,9 @@ pub enum Effect {
     ToConv { epoch: u64, line: Value },
     /// End the conversation's command.
     CloseConv { epoch: u64 },
+    /// `op` for `host`'s agent, as the hub's menu sends it (`hub::job`): offloading or
+    /// archiving a session from the phone's home. Its outcome comes back as `HomeDone`.
+    Home { host: String, op: Value },
     /// Run `claude-sessions <args>` in `host` with `input` on its stdin, its one line of
     /// answer to come back as `Side { epoch }`: `/btw`, beside the conversation's own command.
     Side {
@@ -205,6 +213,10 @@ impl Relay {
     pub fn handle(&mut self, input: Input, now: Instant) -> Vec<Effect> {
         let mut out = Vec::new();
         match input {
+            Input::HomeDone { ok, said } => out.push(Effect::Send(msg(
+                "did",
+                vec![("ok", Value::Bool(ok)), ("x", Value::string(said))],
+            ))),
             Input::Client(v) => self.client(&v, &mut out),
             Input::Hub(ev) => {
                 let (host, m) = match ev {
@@ -304,6 +316,22 @@ impl Relay {
                 self.send_home(out);
             }
             "open" | "new" | "re" => self.open(&t, v, out),
+            // The home's `c`: what the hub's menu does with it, through the same agent — its
+            // `offload`, and `close`, which archives (`run::plan`).
+            "offload" | "archive" => {
+                let host = s(v, "c").unwrap_or_default();
+                let key = v.get("k").and_then(proto::key_from);
+                match key {
+                    Some(key) if self.hosts.contains(&host) => {
+                        let what = if t == "offload" { "offload" } else { "close" };
+                        let mut op = Value::obj();
+                        op.set("op", Value::string(what));
+                        op.set("key", proto::key_to(&key));
+                        out.push(Effect::Home { host, op });
+                    }
+                    _ => out.push(err("no such session")),
+                }
+            }
             // A probe after a long silence (`docs/remote-view.md` § *Decisions*): any answer
             // says the link is alive.
             "ping" => out.push(Effect::Send(msg("pong", vec![]))),
@@ -710,6 +738,15 @@ pub fn serve() -> io::Result<()> {
                     args,
                     input,
                 } => side(epoch, &host, &args, input, &tx),
+                Effect::Home { host, op } => match conns.get(&host) {
+                    Some(conn) => home_job(conn.clone(), op, &tx),
+                    None => {
+                        let _ = tx.send(Input::HomeDone {
+                            ok: false,
+                            said: format!("{host} is not one of this hub's containers"),
+                        });
+                    }
+                },
             }
         }
         if stdout.flush().is_err() {
@@ -717,6 +754,57 @@ pub fn serve() -> io::Result<()> {
         }
     }
     finish(running)
+}
+
+/// A home action, on a thread of its own so the relay keeps serving meanwhile. Offloading and
+/// archiving need no terminal; were the agent to ask for one, the phone has none to lend.
+fn home_job(conn: Arc<hub::Conn>, op: Value, tx: &Sender<Input>) {
+    struct NoTerminal;
+    impl crate::ui::Terminal for NoTerminal {
+        fn suspend(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn run(&mut self, _: &mut std::process::Command) -> io::Result<std::process::ExitStatus> {
+            Err(io::Error::other("the phone has no terminal to lend"))
+        }
+    }
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let what = op
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let outcome = hub::job(conn, op)(&mut NoTerminal);
+        let _ = tx.send(home_done(&what, outcome));
+    });
+}
+
+/// What the phone's status line says of a home action's outcome.
+fn home_done(op: &str, outcome: crate::ui::Outcome) -> Input {
+    use crate::ui::Outcome;
+    let done = if op == "offload" {
+        "offloaded"
+    } else {
+        "archived"
+    };
+    match outcome {
+        Outcome::Back(said) => Input::HomeDone {
+            ok: true,
+            said: said.unwrap_or_else(|| done.to_string()),
+        },
+        Outcome::Refused(why) => Input::HomeDone {
+            ok: false,
+            said: why,
+        },
+        Outcome::NoRoom(_) | Outcome::ResumeFailed(_) => Input::HomeDone {
+            ok: false,
+            said: format!("not {done}"),
+        },
+    }
 }
 
 fn finish(running: Option<Running>) -> io::Result<()> {
@@ -875,6 +963,61 @@ mod tests {
 
     fn client(r: &mut Relay, line: &str) -> Vec<Effect> {
         r.handle(Input::Client(parse(line).unwrap()), Instant::now())
+    }
+
+    #[test]
+    fn the_homes_c_goes_to_the_containers_agent_as_the_doors_does() {
+        let mut r = relay();
+        let fx = client(
+            &mut r,
+            r#"{"t":"offload","c":"or3-dev","k":{"slot":"claude-3"}}"#,
+        );
+        match fx.as_slice() {
+            [Effect::Home { host, op }] => {
+                assert_eq!(host, "or3-dev");
+                assert_eq!(
+                    json::to_line(op),
+                    r#"{"key":{"slot":"claude-3"},"op":"offload"}"#
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Archiving is the agent's `close`, as `run::plan` sends it.
+        let fx = client(
+            &mut r,
+            r#"{"t":"archive","c":"claude-sessions","k":{"slot":"claude-4"}}"#,
+        );
+        assert!(
+            matches!(fx.as_slice(), [Effect::Home { op, .. }] if op.get("op").and_then(Value::as_str) == Some("close")),
+            "{fx:?}"
+        );
+        // A container the hub does not have is refused, not sent anywhere.
+        let fx = client(
+            &mut r,
+            r#"{"t":"offload","c":"elsewhere","k":{"slot":"claude-1"}}"#,
+        );
+        assert!(matches!(fx.as_slice(), [Effect::Send(_)]), "{fx:?}");
+        // Its outcome, for the status line.
+        let fx = r.handle(
+            home_done("offload", crate::ui::Outcome::Back(None)),
+            Instant::now(),
+        );
+        assert_eq!(
+            fx,
+            [Effect::Send(
+                parse(r#"{"t":"did","ok":true,"x":"offloaded"}"#).unwrap()
+            )]
+        );
+        let fx = r.handle(
+            home_done("close", crate::ui::Outcome::Refused("busy".into())),
+            Instant::now(),
+        );
+        assert_eq!(
+            fx,
+            [Effect::Send(
+                parse(r#"{"t":"did","ok":false,"x":"busy"}"#).unwrap()
+            )]
+        );
     }
 
     fn row(slot: &str, title: &str) -> Row {

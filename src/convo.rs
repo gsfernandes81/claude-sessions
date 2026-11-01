@@ -1147,6 +1147,106 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     out
 }
 
+/// Typed text wrapped at words to `room` cells, as an editor soft-wraps: a row breaks after
+/// the spaces before a word that does not fit, the spaces hanging at its end, so no row but
+/// the first of a line starts with one; a word wider than a row is broken; a newline ends a
+/// row. Returns each row's `[start, end)` in `chars`, and the cursor's row and column — on the
+/// next row when it sits where a row was wrapped, and on a row of its own after a full one.
+pub fn soft_wrap(
+    chars: &[char],
+    cursor: usize,
+    room: usize,
+) -> (Vec<(usize, usize)>, (usize, usize)) {
+    let room = room.max(1);
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    let mut col = 0;
+    // Where this row may break: just after its last run of spaces.
+    let mut brk: Option<usize> = None;
+    loop {
+        match chars.get(i) {
+            None => {
+                rows.push((start, i));
+                break;
+            }
+            Some('\n') => {
+                rows.push((start, i));
+                i += 1;
+                start = i;
+                col = 0;
+                brk = None;
+            }
+            Some(' ') => {
+                i += 1;
+                col += 1;
+                brk = Some(i);
+            }
+            Some(&c) if col + cw(c) > room && i > start => {
+                let at = brk.filter(|&b| b > start && b <= i).unwrap_or(i);
+                rows.push((start, at));
+                start = at;
+                col = chars[start..i].iter().map(|&c| cw(c)).sum();
+                brk = None;
+            }
+            Some(&c) => {
+                i += 1;
+                col += cw(c);
+            }
+        }
+    }
+    let cursor = cursor.min(chars.len());
+    let last = rows.len() - 1;
+    let mut at = (last, 0);
+    for (r, &(a, b)) in rows.iter().enumerate() {
+        let ends_line = r == last || chars.get(b) == Some(&'\n');
+        if cursor >= a && (cursor < b || (cursor == b && ends_line)) {
+            let col: usize = chars[a..cursor].iter().map(|&c| cw(c)).sum();
+            at = (r, col.min(room));
+            break;
+        }
+    }
+    // A cursor after a full row starts the next one, as typing there would.
+    if at.1 >= room {
+        let (_, b) = rows[at.0];
+        if at.0 == last && cursor == b {
+            rows.push((b, b));
+            at = (at.0 + 1, 0);
+        } else {
+            at.1 = room - 1;
+        }
+    }
+    (rows, at)
+}
+
+/// The link is down: said after the status line where both fit, the figures whole, and in its
+/// place where they do not — at 40 columns, where the figures alone take most of the line.
+fn reconnecting_line(
+    place: &str,
+    load: Option<&crate::statusline::Figures>,
+    down: &str,
+    w: usize,
+) -> Line {
+    let said = |mut l: Line| {
+        l.push((down.to_string(), PLAIN));
+        l
+    };
+    if let Some(f) = load {
+        let room = w.saturating_sub(width(down) + 3);
+        let figures = status_line(place, f, room);
+        let (ram, _) = f.ram();
+        let (load, _) = f.load();
+        let whole = width(&plain(&figures)) >= 2 + width(&ram) + 2 + width(&load)
+            && !plain(&figures).ends_with('…');
+        if whole {
+            let mut l = figures;
+            l.push((" · ".into(), fg(GREY)));
+            return said(l);
+        }
+    }
+    said(vec![("  ".into(), PLAIN)])
+}
+
 /// The input box and footer: R1's last five rows.
 fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     let mut out = Vec::new();
@@ -1161,33 +1261,24 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
             ("─".into(), fg(RULE)),
         ]);
     }
-    // The prompt, wrapped as typed, with the cursor's place.
+    // The prompt, soft-wrapped as Claude Code's is, with the cursor's place.
     let room = w.saturating_sub(2).max(1);
     let chars: Vec<char> = ui.input.chars().collect();
-    let mut rows: Vec<String> = vec![String::new()];
-    let mut cur = (0usize, 0usize);
-    let mut col = 0;
-    for (i, ch) in chars.iter().enumerate() {
-        if i == ui.cursor {
-            cur = (rows.len() - 1, col);
-        }
-        if *ch == '\n' || col + cw(*ch) > room {
-            rows.push(String::new());
-            col = 0;
-            if *ch == '\n' {
-                continue;
-            }
-        }
-        rows.last_mut().expect("one row").push(*ch);
-        col += cw(*ch);
-    }
-    if ui.cursor >= chars.len() {
-        if col >= room {
-            rows.push(String::new());
-            col = 0;
-        }
-        cur = (rows.len() - 1, col);
-    }
+    let (rows, cur) = soft_wrap(&chars, ui.cursor, room);
+    let rows: Vec<String> = rows
+        .iter()
+        .map(|&(a, b)| {
+            // Spaces hanging past the edge are not drawn: they are the break.
+            let mut used = 0;
+            chars[a..b]
+                .iter()
+                .take_while(|&&c| {
+                    used += cw(c);
+                    used <= room
+                })
+                .collect()
+        })
+        .collect();
     let first = out.len();
     for (i, r) in rows.iter().enumerate() {
         let lead = if i == 0 { "❯ " } else { "  " };
@@ -1198,20 +1289,29 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     let place = format!("{}/{}", c.host, c.slot);
     let first_foot = match (&ui.link, &ui.status, &ui.load) {
         (Link::Down { since, not_sent }, _, _) => {
-            let secs = since.elapsed().as_secs();
+            let gone = since.elapsed();
+            let frame = (gone.as_millis() / 120) as usize % crate::ui::SPINNER.len();
             let tail = if *not_sent { " · not sent" } else { "" };
-            Some(format!("Reconnecting… ({secs}s){tail}"))
+            let down = format!(
+                "{} Reconnecting… ({}s){tail}",
+                crate::ui::SPINNER[frame],
+                gone.as_secs()
+            );
+            out.push(reconnecting_line(&place, ui.load.as_ref(), &down, w));
+            None
         }
         (Link::Up, Some(word), _) => Some(word.clone()),
         (Link::Up, None, None) => Some(place.clone()),
-        (Link::Up, None, Some(_)) => None,
+        (Link::Up, None, Some(f)) => {
+            out.push(status_line(&place, f, w));
+            None
+        }
     };
-    match (first_foot, &ui.load) {
-        (None, Some(f)) => out.push(status_line(&place, f, w)),
-        (t, _) => out.push(line(
-            format!("  {}", cut(&t.unwrap_or_default(), w.saturating_sub(2))),
+    if let Some(t) = first_foot {
+        out.push(line(
+            format!("  {}", cut(&t, w.saturating_sub(2))),
             fg(GREY),
-        )),
+        ));
     }
     let busy = matches!(c.state.as_str(), "working" | "compacting");
     if busy {
@@ -2205,6 +2305,60 @@ mod tests {
     }
 
     #[test]
+    fn the_input_soft_wraps_at_words_and_no_row_starts_with_a_space() {
+        let rows = |t: &str, cursor: usize, room: usize| {
+            let chars: Vec<char> = t.chars().collect();
+            let (r, at) = soft_wrap(&chars, cursor, room);
+            let r: Vec<String> = r
+                .iter()
+                .map(|&(a, b)| chars[a..b].iter().collect())
+                .collect();
+            (r, at)
+        };
+        // The space a row breaks on hangs at its end.
+        assert_eq!(
+            rows("hello world again", 0, 11).0,
+            ["hello world ", "again"]
+        );
+        assert_eq!(
+            rows("hello world again", 0, 10).0,
+            ["hello ", "world ", "again"]
+        );
+        assert_eq!(rows("aaa bbb  ccc", 0, 8).0, ["aaa bbb  ", "ccc"]);
+        // A word wider than a row is broken; a newline ends one.
+        assert_eq!(rows("abcdefghij", 0, 4).0, ["abcd", "efgh", "ij"]);
+        assert_eq!(rows("one\ntwo", 0, 10).0, ["one", "two"]);
+        // The cursor: on the word it is in, at the start of a wrapped row, past a full one.
+        assert_eq!(rows("hello world", 6, 8).1, (1, 0));
+        assert_eq!(rows("hello world", 9, 8).1, (1, 3));
+        assert_eq!(rows("one\ntwo", 3, 10).1, (0, 3), "before the newline");
+        assert_eq!(
+            rows("abcd", 4, 4),
+            (vec!["abcd".into(), String::new()], (1, 0))
+        );
+        assert_eq!(rows("", 0, 10), (vec![String::new()], (0, 0)));
+        // Drawn in the box: no row after the first starts with a space.
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let mut ui = Ui::new();
+        ui.input = "please wrap this prompt at its words  and not mid word".into();
+        ui.cursor = ui.input.chars().count();
+        let f = draw(&c, &ui, 20, 24, Instant::now());
+        let got = text(&f);
+        let at = got.iter().position(|l| l.starts_with("❯ please")).unwrap();
+        assert_eq!(
+            &got[at..at + 4],
+            [
+                "❯ please wrap this",
+                "  prompt at its",
+                "  words  and not mid",
+                "  word"
+            ]
+        );
+        assert_eq!(f.cursor, Some((at + 3, 6)), "after the last word");
+    }
+
+    #[test]
     fn scrolling_back_moves_a_line_a_step() {
         let mut c = convo();
         let numbers: Vec<String> = (1..=30).map(|n| n.to_string()).collect();
@@ -2323,7 +2477,48 @@ mod tests {
             not_sent: true,
         };
         let f = draw(&c, &ui, 40, 24, Instant::now());
-        assert_eq!(text(&f)[22], "  Reconnecting… (8s) · not sent");
+        let got = &text(&f)[22];
+        let want = &mockup("R8")[22];
+        // The spinner's frame is the clock's; the rest is the mockup's.
+        let rest = |l: &str| l.trim_start().chars().skip(1).collect::<String>();
+        assert_eq!(rest(got), rest(want), "{got:?}");
+        assert!(
+            crate::ui::SPINNER
+                .iter()
+                .any(|g| got.trim_start().starts_with(g)),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn reconnecting_goes_after_the_status_line_where_both_fit_and_in_its_place_where_not() {
+        let f = figures(0.9, 2.0, 70);
+        let down = "⠋ Reconnecting… (8s)";
+        let at = |w: usize| {
+            plain(&reconnecting_line(
+                "claude-sessions/claude-3",
+                Some(&f),
+                down,
+                w,
+            ))
+        };
+        assert_eq!(
+            at(80),
+            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
+        );
+        assert_eq!(
+            at(70),
+            "  RAM: 0.9G / 2.0G, Load: 0.7, claude-sessions · ⠋ Reconnecting… (8s)"
+        );
+        assert_eq!(
+            at(60),
+            "  RAM: 0.9G / 2.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
+        );
+        assert_eq!(at(40), "  ⠋ Reconnecting… (8s)");
+        assert_eq!(
+            plain(&reconnecting_line("x/y", None, down, 80)),
+            "  ⠋ Reconnecting… (8s)"
+        );
     }
 
     #[test]

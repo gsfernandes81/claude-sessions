@@ -16,6 +16,7 @@
 //! the spinner while claude works and the seconds while the link is down.
 
 use crate::convo::{self, Applied, Convo, Dialog, Entry, Link, Ui};
+use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::menu::{Action, Menu, Place, Reach};
 use crate::proto;
@@ -131,6 +132,8 @@ struct App {
     greeted: bool,
     /// Lines a wheel report scrolls (`wheel_step`).
     wheel: usize,
+    /// A home action under way: since when, its row, and what the spinner says (mockup 11).
+    working: Option<(Instant, usize, String)>,
 }
 
 impl App {
@@ -166,6 +169,10 @@ impl App {
             let _ = w.child.wait();
         }
         self.awaiting = None;
+        // An action under way has no answer coming on this link.
+        if self.working.take().is_some() {
+            self.menu.set_busy(None);
+        }
         if self.down_since.is_none() {
             self.down_since = Some(now);
         }
@@ -265,6 +272,14 @@ impl App {
                 self.rows.remove(&host);
                 self.refresh_menu();
             }
+            // A home action's outcome: the spinner stops, and the status line says it.
+            "did" => {
+                if self.working.take().is_some() {
+                    self.menu.set_busy(None);
+                }
+                let said = v.get("x").and_then(Value::as_str).unwrap_or("").to_string();
+                self.menu.set_status((!said.is_empty()).then_some(said));
+            }
             "open" => {
                 if let Screen::Conv { c, ui, opening } = &mut self.screen {
                     ui.status = None;
@@ -304,7 +319,12 @@ impl App {
                         }) => *a = Some(Err(why)),
                         _ => ui.status = Some(why),
                     },
-                    Screen::Home => self.menu.set_status(Some(why)),
+                    Screen::Home => {
+                        if self.working.take().is_some() {
+                            self.menu.set_busy(None);
+                        }
+                        self.menu.set_status(Some(why));
+                    }
                 }
             }
             "models" => {
@@ -446,7 +466,8 @@ impl App {
             self.quit = true;
             return;
         }
-        match self.menu.key(k) {
+        let action = self.menu.key(k);
+        match action {
             Action::Quit => self.quit = true,
             Action::Open(i) => {
                 let Some(row) = self.menu.rows().get(i).cloned() else {
@@ -465,18 +486,37 @@ impl App {
                 );
                 self.open_conv(&row.host, open);
             }
-            Action::New(host, _) => {
+            Action::New(host, Harness::Claude) => {
                 let new = App::msg("new", vec![("c", Value::string(&host))]);
                 self.open_conv(&host, new);
             }
-            Action::Shell(_)
-            | Action::Offload(_)
-            | Action::Archive(_)
-            | Action::OffloadThenOpen { .. } => {
-                self.menu.set_status(Some(
-                    "that is for ssh dev; the phone opens and starts".into(),
+            // `c`, as at the door: offload a loaded session, archive an offloaded one.
+            Action::Offload(i) | Action::Archive(i) => {
+                let Some(row) = self.menu.rows().get(i).cloned() else {
+                    return;
+                };
+                if !self.up() {
+                    self.menu
+                        .set_status(Some("not connected: try again once it is".into()));
+                    return;
+                }
+                let (t, what) = if matches!(action, Action::Offload(_)) {
+                    ("offload", "offloading session")
+                } else {
+                    ("archive", "archiving session")
+                };
+                self.send(App::msg(
+                    t,
+                    vec![
+                        ("c", Value::string(&row.host)),
+                        ("k", proto::key_to(&row.key)),
+                    ],
                 ));
+                self.working = Some((Instant::now(), i, what.to_string()));
             }
+            // A shell, a pi session and the no-room question need the door's terminal: the
+            // phone's home does not offer them (mockup R9), and their keys do nothing.
+            Action::New(_, Harness::Pi) | Action::Shell(_) | Action::OffloadThenOpen { .. } => {}
             Action::None | Action::Redraw => {}
         }
     }
@@ -1244,6 +1284,26 @@ impl App {
                         / SPIN_EVERY.as_millis();
                     self.menu.set_busy(Some(connecting(n as usize)));
                 }
+                if let Some((since, row, what)) = &self.working {
+                    let n =
+                        now.saturating_duration_since(*since).as_millis() / SPIN_EVERY.as_millis();
+                    self.menu.set_busy(Some(Busy {
+                        frame: n as usize,
+                        row: Some(*row),
+                        what: what.clone(),
+                        loading: false,
+                    }));
+                }
+                // A link that went down after the hello: said on the load line, turning.
+                self.menu.reconnecting = self.down_since.filter(|_| self.greeted).map(|since| {
+                    let gone = now.saturating_duration_since(since);
+                    let frame = (gone.as_millis() / SPIN_EVERY.as_millis()) as usize;
+                    format!(
+                        "{} Reconnecting… ({}s)",
+                        crate::ui::SPINNER[frame % crate::ui::SPINNER.len()],
+                        gone.as_secs()
+                    )
+                });
                 match crate::render::render(&self.menu.view()) {
                     Ok(f) => ((0..f.lines.len()).map(|i| f.ansi_line(i)).collect(), None),
                     Err(_) => (vec!["\x1b[2Ktoo narrow".into()], None),
@@ -1291,13 +1351,15 @@ impl App {
                 soon(now + SPIN_EVERY);
             }
             if matches!(ui.link, Link::Down { .. }) {
-                soon(now + Duration::from_secs(1));
+                soon(now + SPIN_EVERY);
             }
             if !c.pending.is_empty() {
                 soon(now + SPIN_EVERY);
             }
         }
-        if matches!(self.screen, Screen::Home) && !self.greeted {
+        if matches!(self.screen, Screen::Home)
+            && (!self.greeted || self.down_since.is_some() || self.working.is_some())
+        {
             soon(now + SPIN_EVERY);
         }
         if let Some(a) = self.awaiting {
@@ -1352,6 +1414,7 @@ impl App {
             started: Instant::now(),
             greeted: false,
             wheel,
+            working: None,
         };
         app.menu.remote = true;
         app
@@ -1447,6 +1510,67 @@ mod tests {
         ui.input = "a\\b".into();
         ui.cursor = 3;
         assert!(!backslash_newline(&mut ui));
+    }
+
+    #[test]
+    fn the_phones_home_offers_c_and_not_what_needs_the_doors_terminal() {
+        let hub = Header {
+            host: "zero".into(),
+            memory: None,
+            load: None,
+        };
+        let mut place = Place::new("claude-sessions");
+        place.reach = Reach::Up;
+        let rows = vec![row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut m = Menu::hub(40, 24, hub, vec![place], rows);
+        m.remote = true;
+        let lines = |m: &Menu| {
+            let f = crate::render::render(&m.view()).unwrap();
+            f.plain().lines().map(str::to_string).collect::<Vec<_>>()
+        };
+        let home = lines(&m);
+        let r9 = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/mockups.md"))
+            .unwrap();
+        let at = r9.find("### Mockup R9 ").unwrap();
+        let want = r9[at..]
+            .lines()
+            .find(|l| l.starts_with("Enter open"))
+            .unwrap();
+        assert!(home.iter().any(|l| l == want), "R9's hint line: {home:?}");
+        m.key(Key::Char('?'));
+        let keys = lines(&m);
+        assert!(keys.iter().any(|l| l.starts_with("c ")), "{keys:?}");
+        assert!(
+            !keys
+                .iter()
+                .any(|l| l.starts_with("p ") || l.starts_with("s ")),
+            "no shell, no pi: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_link_on_the_home_is_said_on_its_load_line() {
+        let hub = Header {
+            host: "zero".into(),
+            memory: Some((1 << 30, 3 << 30)),
+            load: None,
+        };
+        let draw = |w: u16, down: Option<&str>| {
+            let mut m = Menu::hub(w, 24, hub.clone(), Vec::new(), Vec::new());
+            m.remote = true;
+            m.reconnecting = down.map(str::to_string);
+            let f = crate::render::render(&m.view()).unwrap();
+            f.plain().lines().last().unwrap_or("").to_string()
+        };
+        assert_eq!(draw(80, None), "RAM: 1.0G / 3.0G, Load: ?, zero");
+        assert_eq!(
+            draw(80, Some("⠋ Reconnecting… (8s)")),
+            "RAM: 1.0G / 3.0G, Load: ?, zero · ⠋ Reconnecting… (8s)"
+        );
+        assert_eq!(
+            draw(40, Some("⠋ Reconnecting… (8s)")),
+            "⠋ Reconnecting… (8s)"
+        );
     }
 
     #[test]

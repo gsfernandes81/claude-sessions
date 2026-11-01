@@ -97,8 +97,14 @@ fn hint_set(empty: bool, back: bool, down: bool) -> &'static [Hint] {
     }
 }
 
-/// The phone client's home (mockup R9): it opens and starts sessions, nothing else.
-const HINTS_REMOTE: [Hint; 3] = [("Enter", "open"), ("n", "new"), ("?", "keys")];
+/// The phone client's home (mockup R9): it opens, starts and puts away claude sessions. A
+/// shell and a pi session need the door's terminal, so it offers neither.
+const HINTS_REMOTE: [Hint; 4] = [
+    ("Enter", "open"),
+    ("n", "new"),
+    ("c", "close"),
+    ("?", "keys"),
+];
 const HINTS_REMOTE_EMPTY: [Hint; 2] = [("n", "new"), ("?", "keys")];
 
 fn view_hints(view: &View) -> &'static [Hint] {
@@ -794,7 +800,26 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
 /// figures and the levels are emphasis — nothing is colour-only. Cut at the edge, never
 /// wrapped: one line, whatever the width.
 fn load_line(view: &View, w: usize) -> Option<Line> {
-    let f = view.load.as_ref()?;
+    let figures = view.load.as_ref().map(figures_line);
+    let line = match (&view.reconnecting, figures) {
+        // The phone's link is down: after the figures where both fit, else in their place.
+        (Some(down), Some(mut l)) if l.width + 3 + width(down) <= w => {
+            l.push(" · ", DIM).push(down, FG);
+            l
+        }
+        (Some(down), _) => {
+            let mut l = Line::default();
+            l.push(down, FG);
+            l
+        }
+        (None, figures) => figures?,
+    };
+    let mut cut = Line::default();
+    cut.append(line.cut(w));
+    Some(cut)
+}
+
+fn figures_line(f: &crate::statusline::Figures) -> Line {
     let style = |level| match level {
         Level::Calm => DIM,
         Level::Warn => BOLD,
@@ -807,9 +832,7 @@ fn load_line(view: &View, w: usize) -> Option<Line> {
         .push(", ", DIM)
         .push(&load, style(load_level))
         .push(&format!(", {}", f.place()), DIM);
-    let mut cut = Line::default();
-    cut.append(line.cut(w));
-    Some(cut)
+    line
 }
 
 /// The status line, wrapped rather than cut: it is usually a reason something was refused,
@@ -950,7 +973,9 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
             ("?", &["this"]),
         ]
     };
-    for (key, what) in keys.into_iter().filter(|(k, _)| !k.is_empty()) {
+    // The phone's home has no terminal to lend a shell or a pi session.
+    let offered = |k: &str| !k.is_empty() && !(view.remote && matches!(k, "p" | "s"));
+    for (key, what) in keys.into_iter().filter(|(k, _)| offered(k)) {
         keyed(&mut out, 0, (key, BLUE), 7, what, w);
     }
     out.push(blank());
@@ -1259,6 +1284,7 @@ mod tests {
             busy: None,
             load: Some(load_of("infra-dev", used_mib, 1024)),
             remote: false,
+            reconnecting: None,
         }
     }
 

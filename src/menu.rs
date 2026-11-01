@@ -122,6 +122,8 @@ pub struct Menu {
     pub height: u16,
     /// The phone client's home (`claude-remote`): R9's hint line.
     pub remote: bool,
+    /// The phone client's link is down, as its load line says (`View::reconnecting`).
+    pub reconnecting: Option<String>,
     /// Every container, in the order the hub was given them.
     places: Vec<Place>,
     /// The home screen's header: the hub's own name and, where the pool is readable, the
@@ -175,6 +177,7 @@ impl Menu {
             width,
             height,
             remote: false,
+            reconnecting: None,
             places,
             home,
             focus,
@@ -530,6 +533,7 @@ impl Menu {
             busy: self.busy.clone(),
             load: Some(self.load()),
             remote: self.remote,
+            reconnecting: self.reconnecting.clone(),
         }
     }
 

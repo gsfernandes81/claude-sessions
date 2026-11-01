@@ -526,14 +526,21 @@ The owner's calls, each made in a comment on the page:
   `statusline.rs`'s figures and words, from the hub's and the containers' snapshots, yellow and
   red past its thresholds. After `container/slot` where it fits, as R1 at 80 has it; else as an
   ssh session prints it, `RAM: …, Load: …, host`; else its figures alone, as at 40.
-- **When the link is down, the footer says `Reconnecting… (8s)`.** After an Enter it adds
+- **When the link is down, the footer says `⠋ Reconnecting… (8s)`**, the spinner turning: after
+  the status line where both fit, the figures whole, and in its place where they do not, as at
+  40 (owner, 2026-11-01: "near the statusline or replacing the statusline depending on the
+  available space"). The home says it the same way on its load line. After an Enter it adds
   `· not sent` and keeps the text typed.
 - **The client's home is the door's list** (R9). Nothing new starts from the hub's door: "The
   hub will never run on termux".
   - Sessions running in a terminal are dim with `term: ` and cannot be opened from the phone.
     Enter on one says why, in place of the hint line, until the next key (R10).
   - Everything else opens on Enter. Offloaded and archived sessions resume in remote mode.
-  - `n` starts a new remote-mode session. The keys are `Enter open   n new   ? keys`.
+  - `n` starts a new remote-mode session. The keys are `Enter open   n new   c close   ? keys`.
+  - **`c` puts a session away as at the door** (owner, 2026-11-01: "get the offloading commands
+    etc working … and remove non working commands from being presented"): offloads a loaded one,
+    archives an offloaded one, the row's spinner turning meanwhile (mockup 11). A shell (`s`) and
+    a pi session (`p`) need the door's terminal, so neither the hint line nor `?` offers them.
 
 **R1–R8 use Claude Code's own colours**, whichever it gives the thing drawn, from its dark
 theme (the `claude` binary's own palette, read from 2.1.311): orange `d77757` for the logo
@@ -803,7 +810,7 @@ Esc to cancel
 ───────────────────────── fix the door ─
 ❯ now run clippy
 ────────────────────────────────────────
-  Reconnecting… (8s) · not sent
+  ⠋ Reconnecting… (8s) · not sent
   ⏵⏵ auto mode on (/auto to cycle)
 ```
 
@@ -821,7 +828,7 @@ or3-dev                         1 loaded
 dd-dev                       2 offloaded
 ds-dev                     not answering
 ────────────────────────────────────────
-Enter open   n new   ? keys
+Enter open   n new   c close   ? keys
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
 
