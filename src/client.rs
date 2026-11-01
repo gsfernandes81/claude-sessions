@@ -537,6 +537,8 @@ impl App {
                     ui.input.clear();
                     ui.cursor = 0;
                 }
+                // Ctrl+O, Claude Code's: every tool call drawn with its result, or summed again.
+                Key::Char('\x0f') => c.expanded = !c.expanded,
                 Key::Esc => {
                     if ui.scroll > 0 {
                         ui.scroll = 0;
@@ -702,6 +704,10 @@ fn submit(
         "/exit" | "/quit" => Submit::Send(vec![m("exit", vec![])]),
         // Back to the home, the session left running: zmx's detach, as Ctrl+\\ is in ssh dev.
         "/home" | "/disconnect" => Submit::Home,
+        "/expand" => {
+            c.expanded = !c.expanded;
+            Submit::Nothing
+        }
         "/btw" if rest.is_empty() => {
             ui.status = Some("/btw takes a question".into());
             Submit::Nothing
@@ -1688,6 +1694,19 @@ mod tests {
         let mut app = app_in(&[]);
         type_in(&mut app, "/disconnect");
         assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn ctrl_o_and_expand_switch_between_tool_calls_summed_and_shown() {
+        let mut app = app_in(&[]);
+        let expanded = |app: &App| match &app.screen {
+            Screen::Conv { c, .. } => c.expanded,
+            Screen::Home => panic!("left"),
+        };
+        app.key(Key::Char('\x0f'), Instant::now());
+        assert!(expanded(&app));
+        type_in(&mut app, "/expand");
+        assert!(!expanded(&app));
     }
 
     #[test]

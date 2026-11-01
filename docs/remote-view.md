@@ -318,6 +318,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      and no MCP servers, on the conversation's model, in the slot's directory, given two
      minutes, and refused when the container has no room for another claude. Anything
      else, `/compact` included, is claude's.
+   - **Ctrl+O and `/expand`** switch the transcript between runs of tool calls summed up, as
+     the mockups draw them, and every call on its own with the first lines of its result
+     and how many more, as Claude Code's Ctrl+O transcript does; a failed call says `Error`.
    - **Subagents and workflows** are drawn on their own, as Claude Code draws them, not
      summed into a run of tool calls: `● Explore(what it was asked)` and under it its last
      two tool calls and how many more, then `Done (4 tool uses · 21.6k tokens · 7.6s)`; a

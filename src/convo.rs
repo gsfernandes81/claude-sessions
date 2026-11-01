@@ -277,6 +277,9 @@ pub struct Convo {
     /// Whether ops are arriving live: false until the first batch after opening, which is the
     /// log as it stood.
     live: bool,
+    /// Every tool call drawn on its own with the first lines of its result, rather than a run
+    /// of them summed up: Ctrl+O in Claude Code, `/expand` here too.
+    pub expanded: bool,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -584,6 +587,49 @@ fn tools_summary(tools: &[(&str, &str)], running: bool) -> String {
     out
 }
 
+/// A tool call expanded, as Claude Code's Ctrl+O transcript draws one: `● Bash(ls)`, then
+/// the first lines of what it said and how many more, grey; a failure says so in words.
+fn expanded_tool(
+    name: &str,
+    arg: &str,
+    result: Option<&(bool, Vec<String>, usize)>,
+    w: usize,
+) -> Vec<Line> {
+    let head = if arg.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}({arg})")
+    };
+    let mut out = wrapped(&head, "● ", "  ", w, PLAIN);
+    let mut under: Vec<String> = Vec::new();
+    match result {
+        None => under.push("Running…".into()),
+        Some((ok, preview, lines)) => {
+            if !ok {
+                under.push("Error".into());
+            }
+            under.extend(preview.iter().cloned());
+            if *lines > preview.len() {
+                under.push(format!("… +{} lines", lines - preview.len()));
+            }
+            if under.is_empty() {
+                under.push("(No output)".into());
+            }
+        }
+    }
+    for (i, text) in under.iter().enumerate() {
+        let lead = if i == 0 { "  ⎿  " } else { "     " };
+        out.extend(wrapped_by(
+            text,
+            lead,
+            "     ",
+            w.saturating_sub(1),
+            fg(GREY),
+        ));
+    }
+    out
+}
+
 /// A subagent or workflow as Claude Code draws one: `● Explore(what it was asked)`, and
 /// under it what it is doing or how it ended. The dot is green once it has finished well,
 /// grey when it failed or was stopped, which the line under it says in words.
@@ -868,6 +914,15 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
     while i < c.entries.len() {
         let e = &c.entries[i];
         match e {
+            Entry::Tool { name, arg, result } if c.expanded => {
+                i += 1;
+                if name == ASK_TOOL {
+                    continue;
+                }
+                out.push(Vec::new());
+                out.extend(expanded_tool(name, arg, result.as_ref(), w));
+                continue;
+            }
             Entry::Tool { .. } => {
                 let mut tools: Vec<(&str, &str)> = Vec::new();
                 let mut open: Option<(&str, &str)> = None;
@@ -1676,6 +1731,44 @@ mod tests {
         assert_eq!(
             body[body.len() - 2..],
             ["  ⎿  Done (3 tool uses · 21.6k tokens ·", "     7.6s)"]
+        );
+    }
+
+    #[test]
+    fn expanded_every_tool_call_shows_its_result_and_collapsed_they_are_summed() {
+        let mut c = Convo::new("h", "claude-3", "r");
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"tool","n":"Bash","a":"ls"}"#,
+                r#"{"t":"res","id":1,"ok":true,"p":["a","b","c"],"l":5}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"Read","a":"x.rs"}"#,
+                r#"{"t":"res","id":2,"ok":false,"p":["no such file"],"l":1}"#,
+            ],
+        );
+        // Under the logo block's four lines, blank lines aside.
+        let body = |c: &Convo| -> Vec<String> {
+            let t = transcript(c, 40).0;
+            t.iter()
+                .skip(4)
+                .map(plain)
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+        assert_eq!(body(&c), ["  Ran 1 shell command, read 1 file"]);
+        c.expanded = true;
+        assert_eq!(
+            body(&c),
+            [
+                "● Bash(ls)",
+                "  ⎿  a",
+                "     b",
+                "     c",
+                "     … +2 lines",
+                "● Read(x.rs)",
+                "  ⎿  Error",
+                "     no such file",
+            ]
         );
     }
 
