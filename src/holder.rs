@@ -76,6 +76,13 @@ pub fn paths(slot: &str) -> Paths {
     }
 }
 
+/// Whether a holder is serving `slot` now: its socket answers. What the record's `driver`
+/// says, checked where it matters: a release from before the holder rewrites a record
+/// without that field, and a socket answering cannot be left over.
+pub fn serving(slot: &str) -> bool {
+    UnixStream::connect(paths(slot).sock).is_ok()
+}
+
 /// The log as the holder keeps it: where each line starts, and whether claude has gone.
 struct Log {
     file: File,

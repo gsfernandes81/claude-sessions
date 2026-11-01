@@ -43,7 +43,9 @@ mod activity;
 mod agent;
 mod archive;
 mod bind;
+mod client;
 mod clock;
+mod convo;
 mod events;
 mod fmt;
 mod harness;
@@ -111,6 +113,11 @@ const TERMINAL_GONE: u8 = 129;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Called as `claude-remote`, this binary is the remote view's client (`client.rs`).
+    let called = std::env::args().next().unwrap_or_default();
+    if std::path::Path::new(&called).file_name() == Some(std::ffi::OsStr::new("claude-remote")) {
+        return cmd_client(args.first().map(String::as_str));
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("");
     match cmd {
         "--version" | "-V" => {
@@ -298,6 +305,8 @@ fn main() -> ExitCode {
         // The relay's way to open a session for the phone client: start or resume it under
         // the holder if need be, say which slot, then be its tap (`launch::remote_new`…).
         "remote" => cmd_remote(&args[1..]),
+        // The remote view's client, as `claude-remote` runs it.
+        "client" => cmd_client(args.get(1).map(String::as_str)),
         // The hub's end of the remote view, one per connected client (`relay.rs`).
         "relay" => report(relay::serve()),
         "install" => match args.get(1) {
@@ -335,6 +344,8 @@ fn usage() -> String {
                                served to taps (proposed: docs/remote-view.md)
   claude-sessions tap SLOT [FROM] [RUN]
                                the hub's way into a remote-view slot, run over ssh
+  claude-sessions client NAME  the remote view's client over ssh NAME; also run as
+                               claude-remote NAME, a link to this binary
   claude-sessions relay        the hub's end of the remote view, for one client on stdin and
                                stdout: run as ssh -T -C dev claude-sessions relay
   claude-sessions remote new [DIR] | open SLOT | resume ID CWD TITLE
@@ -369,6 +380,23 @@ The registry is {} — override with CLAUDE_SESSIONS_DIR.
 ",
         registry::dir().display()
     )
+}
+
+/// `claude-remote <ssh name>`: the phone client, until the owner quits it.
+fn cmd_client(name: Option<&str>) -> ExitCode {
+    match name {
+        None | Some("--help" | "-h") => {
+            fail("usage: claude-remote <ssh name>, as in claude-remote dev")
+        }
+        Some("--version" | "-V") => {
+            say!("claude-remote {VERSION}");
+            ExitCode::SUCCESS
+        }
+        Some(name) => match client::run(name) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e),
+        },
+    }
 }
 
 /// `claude-sessions remote …`: open a slot for the remote view and stream it. The first line

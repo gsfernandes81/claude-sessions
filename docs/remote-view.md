@@ -286,3 +286,38 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.
+   **Built, 2026-11-01**: `claude-remote <ssh name>` (`src/client.rs`), the same binary
+   called by that name or as `claude-sessions client NAME`; the conversation's model and
+   drawing are `src/convo.rs`, tested as text against R1 to R8 at 40 columns.
+   - **The home is the hub's own menu** (`Menu::hub`) fed the relay's snapshots, with R9's
+     hint line (`View::remote`). A running session no holder drives is dim and `term: `, and
+     Enter on it puts R10's words where the hint line was.
+   - **The link** is `ssh -T -C -o BatchMode=yes <name> claude-sessions relay`
+     (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
+     backoff from 1 to 30 seconds; dead too when something sent has no answer in 5 seconds,
+     and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
+     with a conversation open, `re`.
+   - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
+     Ctrl-U; Up and Down step through what was sent; PageUp, PageDown and the wheel scroll,
+     End or Esc goes back down; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
+     empty one goes home, as `/home` and Ctrl-D do. `/model`, `/effort [level]`, `/auto`,
+     `/rename TITLE`, `/copy` (OSC 52, and `termux-clipboard-set` under Termux), `/exit`;
+     anything else, `/compact` included, is claude's.
+   - **A holder's live socket counts as `driver: holder`** (`holder::serving`) where the
+     record's field is missing: the released hooks on this dev container rewrote it, and the
+     fleet runs mixed releases for a while after a pin bump.
+   - **Measured end to end on 2026-11-01** in a pty at 40×24, the relay run locally behind a
+     stand-in ssh, a real claude 2.1.311: the home, `n`, a prompt streamed back with its
+     `Worked for 2s · done 9:49 AM`, `/model` listing the real models with the current one
+     ticked, `/copy`, `/exit` back home with `claude-1 ended`; and the relay killed under the
+     client mid-conversation, redialled in a second, the conversation resumed with nothing
+     drawn twice and the next prompt answered.
+   - **Not yet like the mockups**, to close next: the logo's second line stops at the model,
+     since claude's lines never name the plan; the transcript's line over a permission prompt
+     is the request's own description (`Create empty file named x`, where R3 has Claude's
+     `Creating…`); R4b's preview beside the list at 80 columns is drawn under it, as R4c;
+     before the hello the home shows an empty container; the `?` screen still lists the
+     hub's keys. Not built: a newline in the prompt, and tool calls expanded (deferred by the
+     owner).
+   - **Still to measure on the phone**: cloudflared's idle timeout, Termux's OSC 52, and
+     long-press selection with wheel reporting on.

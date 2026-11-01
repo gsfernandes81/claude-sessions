@@ -912,7 +912,9 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
-        remote: r.driver == crate::registry::Driver::Holder,
+        // Said by the record, or by the holder's socket where an older release rewrote it.
+        remote: r.driver == crate::registry::Driver::Holder
+            || (alive || r.pid.is_none()) && crate::holder::paths(&r.slot).sock.exists(),
     }
 }
 

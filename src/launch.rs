@@ -1518,10 +1518,12 @@ fn running_slot(slot: &str) -> Result<String, String> {
     }
 }
 
-/// A running slot is the remote view's only if the holder drives it.
+/// A running slot is the remote view's only if the holder drives it: its record says so, or
+/// its holder's socket answers.
 fn driven_by_holder(rec: &SlotRecord) -> Result<String, String> {
     match rec.driver {
         Driver::Holder => Ok(rec.slot.clone()),
+        Driver::Terminal if crate::holder::serving(&rec.slot) => Ok(rec.slot.clone()),
         Driver::Terminal => Err(format!(
             "{} is running in a terminal: attach to it from ssh, or end it there to open it here",
             rec.slot
