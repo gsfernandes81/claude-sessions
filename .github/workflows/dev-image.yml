@@ -19,9 +19,20 @@ name: dev-image
 # zero pulls only what changed. A cache tag is not an image; nothing pulls or pins it, and
 # deleting one costs one uncached run.
 #
-# TAGS. `sha-<12 hex>` is the commit the image was built from, and never moves: what infra
-# pins. `main` follows the latest build. The base is Dockerfile.dev's own BASE_TAG default,
-# since this build has no infra to pass one; moving the base is a commit here.
+# THE BASE IS INFRA'S, NEVER DOCKERFILE.DEV'S DEFAULT (owner, 2026-11-01; infra's
+# plans/dev-image-caches.md, "The contract a child's dev-image.yml keeps"). zero builds this
+# image itself, from this repo's Git context at main, with BASE_TAG from its compose's
+# `x-base-tag`, and reads `buildcache-arm64` as its cache: a hit needs the same base, the same
+# args (BASE_TAG alone) and the same context. So infra's dev-cache.yml dispatches this
+# workflow with `base_tag` after every base publish, and a push here reads infra's current
+# tag from its compose. The context is the Git context at the commit (build-push-action's
+# default), as zero fetches it, not the checkout. Dockerfile.dev's default is for a build by
+# hand only.
+#
+# TAGS. `sha-<12 hex>-base-<base tag>` is the commit and the base the image was built from,
+# and never moves: a dispatch rebuilds the same commit on a new base, so a tag naming the
+# commit alone would be repointed. `main` follows the latest build. Nothing pins either
+# today (zero builds from the cache); they stay for a pull by hand.
 #
 # THE PACKAGE IS PUBLIC, and needed no flip: the first push (2026-10-28) linked it to this
 # public repo, whose visibility it took. A public pull needs no token on the Pis, the same call
@@ -37,6 +48,12 @@ on:
       - 'Dockerfile.dev'
       - '.github/workflows/dev-image.yml'
   workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "infra's base tag to build on; empty reads infra's current x-base-tag"
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -51,7 +68,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # One read of the tag for both legs, so a base bump landing mid-run cannot split them. The
+  # input arrives as data in an env var, never pasted into the script, and is held to a tag's
+  # shape before it reaches a build arg.
+  base:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.base.outputs.tag }}
+    steps:
+      - name: Infra's base tag
+        id: base
+        env:
+          GIVEN: ${{ inputs.base_tag }}
+        run: |
+          tag="$GIVEN"
+          if [ -z "$tag" ]; then
+            tag=$(curl -fsSL https://raw.githubusercontent.com/gsfernandes81/infra/main/dev/compose.yaml \
+              | sed -n 's/^x-base-tag: &base-tag //p')
+          fi
+          printf '%s' "$tag" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9._-]{0,127}' \
+            || { echo "not a base tag: '$tag'" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Base: \`gsrpi-dev-base:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: base
     strategy:
       fail-fast: true
       matrix:
@@ -62,7 +103,6 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v5
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -76,8 +116,8 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
           file: Dockerfile.dev
+          build-args: BASE_TAG=${{ needs.base.outputs.tag }}
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,compression=zstd,oci-mediatypes=true
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
@@ -96,7 +136,7 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: build
+    needs: [base, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -113,8 +153,10 @@ jobs:
 
       - name: One tag for both architectures
         working-directory: digests
+        env:
+          BASE: ${{ needs.base.outputs.tag }}
         run: |
-          sha=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)
+          sha=$(printf '%s' "$GITHUB_SHA" | cut -c1-12)-base-$BASE
           refs=$(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$d"; done)
           [ "$(ls | wc -l)" = 2 ] || { echo "expected two digests, got: $(ls)" >&2; exit 1; }
           # shellcheck disable=SC2086
@@ -122,5 +164,4 @@ jobs:
           docker buildx imagetools inspect "$IMAGE:sha-$sha"
           {
             echo "Pushed \`$IMAGE:sha-$sha\` and \`$IMAGE:main\` (amd64, arm64)."
-            echo "For infra: \`image: $IMAGE:sha-$sha\` in place of the claude-sessions service's git-context \`build:\`."
           } >> "$GITHUB_STEP_SUMMARY"

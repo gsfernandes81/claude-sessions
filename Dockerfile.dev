@@ -14,10 +14,10 @@
 # fallback for a build outside infra. The container's name, volumes and environment are that
 # service's. infra's dev/README.md is the lifecycle.
 #
-# CI also builds it (.github/workflows/dev-image.yml), natively on each architecture with its
-# layers cached in the registry, and pushes ghcr.io/gsfernandes81/claude-sessions-dev:sha-<commit>
-# for infra to pull instead — a Rust compile on zero at every rebuild otherwise. That build
-# passes no BASE_TAG, so it uses the default above.
+# CI also builds it (.github/workflows/dev-image.yml), natively on each architecture, on
+# infra's current base tag (infra dispatches it when the tag moves), and pushes the layers as
+# a registry cache that zero's build reads — a Rust compile on zero at every rebuild otherwise.
+# The ARG default below is for a build by hand only.
 #
 # Nothing here is a release: changing this file is never a version bump.
 #
