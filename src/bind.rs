@@ -70,6 +70,12 @@ pub fn origin(hook_pid: u32, fired_in_subagent: bool) -> Place {
 /// subagent's own context is nested whatever the tree says (`Event::fired_in_subagent`). No
 /// harness at all is a hook whose harness has gone, or one run by hand, and neither may
 /// rebind a slot.
+///
+/// A remote-view slot has one process between: zmx forks `claude-sessions holder`, which runs
+/// claude headless on pipes (`holder.rs`), so `claude` → `claude-sessions` → `zmx` is also the
+/// slot's own. Only claude, and only that holder directly under the daemon: a holder somebody
+/// ran inside a slot's shell has the shell between it and zmx, and its claude is nested.
+/// (`claude-sessions` is exactly the 15 characters `/proc/<pid>/comm` keeps.)
 fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
     let Some(c) = (1..line.len()).find(|&c| Harness::of_comm(&line[c].1).is_some()) else {
         return Place {
@@ -78,7 +84,12 @@ fn place(line: &[(u32, String)], fired_in_subagent: bool) -> Place {
             forked: line.first().map(|(pid, _)| *pid),
         };
     };
-    let own = !fired_in_subagent && line.get(c + 1).is_some_and(|(_, comm)| comm == "zmx");
+    let comm = |i: usize| line.get(i).map(|(_, comm)| comm.as_str());
+    let under_zmx = comm(c + 1) == Some("zmx");
+    let under_holder = comm(c) == Some(Harness::Claude.comm())
+        && comm(c + 1) == Some("claude-sessions")
+        && comm(c + 2) == Some("zmx");
+    let own = !fired_in_subagent && (under_zmx || under_holder);
     Place {
         binding: if own { Binding::Own } else { Binding::Nested },
         own_pid: own.then_some(line[c].0),
@@ -126,6 +137,36 @@ mod tests {
         assert_eq!(place(&mixed, false), placed(Binding::Nested, None, 10));
         let mixed = line(&["claude-sessions", "claude", "bash", "pi", "zmx"]);
         assert_eq!(place(&mixed, false), placed(Binding::Nested, None, 10));
+    }
+
+    #[test]
+    fn a_hook_under_a_remote_slots_claude_is_its_own_and_one_beneath_it_is_nested() {
+        let own = line(&["claude-sessions", "sh", "claude", "claude-sessions", "zmx"]);
+        assert_eq!(place(&own, false), placed(Binding::Own, Some(12), 11));
+        assert_eq!(place(&own, true).binding, Binding::Nested, "in a subagent");
+        // A `claude -p` from a tool call of the remote slot's claude.
+        let nested = line(&[
+            "claude-sessions",
+            "sh",
+            "claude",
+            "bash",
+            "claude",
+            "claude-sessions",
+            "zmx",
+        ]);
+        assert_eq!(place(&nested, false), placed(Binding::Nested, None, 11));
+        // A holder somebody ran from a normal slot's shell: the shell is between it and zmx.
+        let typed = line(&[
+            "claude-sessions",
+            "claude",
+            "claude-sessions",
+            "fish",
+            "zmx",
+        ]);
+        assert_eq!(place(&typed, false).binding, Binding::Nested);
+        // pi is never under a holder: the holder runs claude.
+        let pi = line(&["claude-sessions", "pi", "claude-sessions", "zmx"]);
+        assert_eq!(place(&pi, false).binding, Binding::Nested);
     }
 
     #[test]

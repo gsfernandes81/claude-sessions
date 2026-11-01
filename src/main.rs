@@ -47,6 +47,7 @@ mod clock;
 mod events;
 mod fmt;
 mod harness;
+mod holder;
 mod hooks_config;
 mod http;
 mod hub;
@@ -264,6 +265,39 @@ fn main() -> ExitCode {
             },
             Some(other) => fail(&format!("agent takes only exec, not {other:?}")),
         },
+        // A remote-view slot's program, started by the launcher inside zmx (`holder.rs`).
+        "holder" => {
+            let Some(slot) = std::env::var("CLAUDE_SESSIONS_SLOT")
+                .ok()
+                .filter(|s| !s.is_empty())
+            else {
+                return fail("holder runs in a slot, with CLAUDE_SESSIONS_SLOT set");
+            };
+            let (var, default) = harness::Harness::Claude.program_var();
+            let program = std::env::var(var).unwrap_or_else(|_| default.to_string());
+            let mut screen = |line: &str| {
+                let _ = writeln!(std::io::stdout(), "{line}");
+            };
+            match holder::serve(
+                std::path::Path::new(&program),
+                &args[1..],
+                &holder::paths(&slot),
+                &slot,
+                &mut screen,
+            ) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(e) => fail(&format!("holder: {e}")),
+            }
+        }
+        // The hub's way into a remote-view slot, over `ssh -T` (`holder::tap`).
+        "tap" => match args.get(1) {
+            Some(slot) => {
+                let from = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1);
+                let run = args.get(3).map(String::as_str).unwrap_or("");
+                report(holder::tap(slot, from, run))
+            }
+            None => fail("tap needs a slot"),
+        },
         "install" => match args.get(1) {
             Some(dir) => match install::run(std::path::Path::new(dir)) {
                 Ok(done) => {
@@ -294,6 +328,11 @@ fn usage() -> String {
   claude-sessions install DIR  put this binary, its hooks drop-in and its skills in DIR, for
                                every container to mount
   claude-sessions agent        a container's half of the hub, run over ssh by the hub
+  claude-sessions holder [ARGS]
+                               a remote-view slot's program: claude headless beneath it,
+                               served to taps (proposed: docs/remote-view.md)
+  claude-sessions tap SLOT [FROM] [RUN]
+                               the hub's way into a remote-view slot, run over ssh
   claude-sessions mail who|send|list|read|reply|wait|status
                                agent mail, from a session to others; `mail` alone says how
   claude-sessions mail-hook    fed by Claude Code's hooks on stdin; one line per message new

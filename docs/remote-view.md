@@ -189,6 +189,17 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 1. `src/sdk.rs`: read and write Claude's lines. **Done.**
 2. `src/reduce.rs`: Claude's lines into numbered items with short keys, as a pure function tested on 2.1.311 fixtures. **Done.**
 3. The holder, its log, the `driver` field and the binding, tested under the real zmx.
+   **Done except the `driver` field**, which lands with the launcher change that starts
+   remote slots:
+   - `src/holder.rs` is the holder and `claude-sessions tap`. One run end to end on
+     2026-11-01: zmx → `claude-sessions holder` → a real `claude -p`, a tap sending a prompt
+     and reading back numbered lines and the answer, and the zmx screen saying starting,
+     working, idle.
+   - `src/bind.rs` admits that claude as the slot's own, which unit tests cover. The real hook
+     confirms it only from the release that carries this, since the installed hooks run the
+     released binary.
+   - A holder killed outright (`zmx kill`) leaves its socket file, and the next start removes
+     it.
 4. The tap: streaming from a sequence number, lines in, `keep_until` and `last_attach`.
 5. The relay.
 6. The view, once its mockups are approved.
