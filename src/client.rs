@@ -127,6 +127,8 @@ struct App {
     /// the home is mockup 10's first frame, not an empty container it knows nothing of.
     started: Instant,
     greeted: bool,
+    /// Lines a wheel report scrolls (`wheel_step`).
+    wheel: usize,
 }
 
 impl App {
@@ -495,16 +497,14 @@ impl App {
                     ui.input = at.map(|i| self.history[i].clone()).unwrap_or_default();
                     ui.cursor = ui.input.chars().count();
                 }
-                // A wheel report is a line: Termux sends one for every line a finger travels,
-                // so three a report ran a swipe three times as far as the finger went.
                 Key::PageUp | Key::WheelUp => {
-                    let step = if k == Key::PageUp { 10 } else { 1 };
+                    let step = if k == Key::PageUp { 10 } else { self.wheel };
                     let (w, h) = term::size().unwrap_or((40, 24));
                     let most = convo::max_scroll(c, ui, w as usize, h as usize);
                     ui.scroll = (ui.scroll + step).min(most);
                 }
                 Key::PageDown | Key::WheelDown => {
-                    let step = if k == Key::PageDown { 10 } else { 1 };
+                    let step = if k == Key::PageDown { 10 } else { self.wheel };
                     ui.scroll = ui.scroll.saturating_sub(step);
                 }
                 Key::End if ui.scroll > 0 => ui.scroll = 0,
@@ -941,6 +941,20 @@ fn next_question(
     None
 }
 
+/// Lines a wheel report scrolls. Termux sends one report for every line a finger travels,
+/// so a report is a line there: three ran a swipe three times as far as the finger went.
+/// Windows Terminal sends one a notch, and a notch is three lines in Claude Code; it sets
+/// `WT_SESSION`, and passes it into WSL. Anything else is taken as Termux, the phone, since
+/// a step too small is slow while a step too big jumps (owner, 2026-11-01).
+fn wheel_step(env: impl Fn(&str) -> Option<String>) -> usize {
+    let set = |k| env(k).is_some_and(|v| !v.is_empty());
+    if set("WT_SESSION") && !set("TERMUX_VERSION") {
+        3
+    } else {
+        1
+    }
+}
+
 /// A running slot that no holder drives is a terminal's: listed dim, as `term: ` (R9).
 fn is_terminal(r: &Row) -> bool {
     let running = !r.offloaded && !r.closed && !r.archived;
@@ -1189,6 +1203,7 @@ pub fn run(name: &str) -> Result<(), String> {
         quit: false,
         started: Instant::now(),
         greeted: false,
+        wheel: wheel_step(|k| std::env::var(k).ok()),
     };
     app.menu.remote = true;
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
@@ -1302,6 +1317,26 @@ mod tests {
         assert!(
             !got.iter().any(|l| l.contains("No claude session")),
             "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_wheel_report_is_three_lines_under_windows_terminal_and_one_elsewhere() {
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                set.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(wheel_step(env(&[])), 1, "nothing said: the phone");
+        assert_eq!(wheel_step(env(&[("TERMUX_VERSION", "0.118.1")])), 1);
+        assert_eq!(wheel_step(env(&[("WT_SESSION", "8c0c…")])), 3);
+        assert_eq!(wheel_step(env(&[("WT_SESSION", "")])), 1, "set but empty");
+        assert_eq!(
+            wheel_step(env(&[("WT_SESSION", "x"), ("TERMUX_VERSION", "0.118.1")])),
+            1,
+            "Termux wins: its swipes are a line a report"
         );
     }
 
