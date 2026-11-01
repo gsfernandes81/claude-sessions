@@ -67,6 +67,9 @@ mod proto;
 mod registry;
 mod render;
 mod run;
+// Read and written by the remote view's holder, which lands next (docs/remote-view.md).
+#[allow(dead_code)]
+mod sdk;
 mod signal;
 mod sockdiag;
 mod statusline;

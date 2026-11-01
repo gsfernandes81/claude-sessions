@@ -1,0 +1,797 @@
+//! Claude Code's stream-json control protocol: what a headless claude writes, read into the
+//! few things the remote view acts on, and the lines it is sent (`docs/remote-view.md`).
+//!
+//! claude runs as `claude -p --input-format stream-json --output-format stream-json --verbose
+//! --include-partial-messages --permission-prompt-tool stdio`. Every line either way is one
+//! JSON object. Read **tolerantly**, as the hook payloads are: the protocol is Claude Code's,
+//! it grows a message type most releases, and a line this version does not know is `Unknown`
+//! or `Noise`, never an error. What each variant is was read from 2.1.311's real output on
+//! 2026-11-01 (the spike recorded in `docs/remote-view.md` § *The protocol, measured*).
+//!
+//! Pure: no I/O. The holder and the relay own the pipes; this only says what a line means.
+
+use crate::json::Value;
+
+/// One line from claude, read for what the remote view does with it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Msg {
+    /// `system/init`, re-sent before every turn: the conversation's id, model and mode.
+    Init {
+        session_id: String,
+        model: String,
+        permission_mode: String,
+    },
+    /// `system/status`: `requesting`, `compacting`, or none (back to idle or streaming).
+    Status(Option<String>),
+    /// Streamed text for the content block `index` of the message being written.
+    TextDelta { index: u64, text: String },
+    /// A finished assistant message, or the part of one finished so far: claude writes an
+    /// `assistant` line per content block, all under the same message id.
+    Assistant {
+        message_id: String,
+        blocks: Vec<Block>,
+    },
+    /// Tool results, from a `user` line whose content is `tool_result` blocks.
+    ToolResults(Vec<ToolResult>),
+    /// A local command's output, `<local-command-stdout>…</local-command-stdout>`: what
+    /// `/model`, `/compact` and the like answer with.
+    LocalOutput(String),
+    /// Any other `user` line's text: a compaction's summary, `[Request interrupted by user]`.
+    UserText(String),
+    /// `can_use_tool` for anything but a question: claude waits for allow or deny.
+    Permission {
+        request_id: String,
+        tool: String,
+        input: Value,
+        description: Option<String>,
+    },
+    /// `can_use_tool` for `AskUserQuestion`: answered by allowing it with the answers added.
+    Question {
+        request_id: String,
+        input: Value,
+        questions: Vec<Question>,
+    },
+    /// Any other request claude makes of the host (`hook_callback`, `elicitation`,
+    /// `mcp_message`, …): refused at once with `refuse`, so claude never waits on a host
+    /// that has nothing to say.
+    OtherRequest { request_id: String, subtype: String },
+    /// claude withdrew a request it made, e.g. a permission it no longer needs.
+    Cancelled { request_id: String },
+    /// The answer to a request we sent.
+    Response {
+        request_id: String,
+        ok: bool,
+        body: Value,
+    },
+    /// `system/session_title_changed`, which `/rename` and `rename_session` both cause.
+    TitleChanged(String),
+    /// `system/compact_boundary`: the conversation was compacted, from and to so many tokens.
+    Compacted {
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+    },
+    /// `result`: the turn ended. `subtype` is `success` or an `error_*`.
+    Result {
+        subtype: String,
+        is_error: bool,
+        session_id: String,
+    },
+    /// Known and of no use to the view: hook progress, thinking-token estimates, rate-limit
+    /// readings, keep-alives and the stream events other than text.
+    Noise,
+    /// A line of a type this version does not know, kept by its name so a log can say so.
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    Text(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    /// Thinking, redacted thinking, images: drawn as their kind, not their content.
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub tool_use_id: String,
+    pub text: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Question {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    /// Each option's label and description.
+    pub options: Vec<(String, String)>,
+}
+
+fn s(v: &Value, key: &str) -> String {
+    v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read one line from claude.
+pub fn classify(v: &Value) -> Msg {
+    let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let sub = v.get("subtype").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "system" => match sub {
+            "init" => Msg::Init {
+                session_id: s(v, "session_id"),
+                model: s(v, "model"),
+                permission_mode: s(v, "permissionMode"),
+            },
+            "status" => Msg::Status(v.get("status").and_then(Value::as_str).map(String::from)),
+            "session_title_changed" => Msg::TitleChanged(s(v, "title")),
+            "compact_boundary" => {
+                let meta = v.get("compact_metadata");
+                let n = |k| meta.and_then(|m| m.get(k)).and_then(Value::as_u64);
+                Msg::Compacted {
+                    pre_tokens: n("pre_tokens"),
+                    post_tokens: n("post_tokens"),
+                }
+            }
+            "hook_started" | "hook_response" | "hook_progress" | "thinking_tokens" => Msg::Noise,
+            other => Msg::Unknown(format!("system/{other}")),
+        },
+        "stream_event" => {
+            let ev = v.get("event");
+            let ev_kind = ev.and_then(|e| e.get("type")).and_then(Value::as_str);
+            let delta = ev.and_then(|e| e.get("delta"));
+            let delta_kind = delta.and_then(|d| d.get("type")).and_then(Value::as_str);
+            match (ev_kind, delta_kind) {
+                (Some("content_block_delta"), Some("text_delta")) => Msg::TextDelta {
+                    index: ev
+                        .and_then(|e| e.get("index"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    text: delta.map(|d| s(d, "text")).unwrap_or_default(),
+                },
+                _ => Msg::Noise,
+            }
+        }
+        "assistant" => {
+            let msg = v.get("message");
+            let blocks = msg
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_arr)
+                .unwrap_or(&[])
+                .iter()
+                .map(block)
+                .collect();
+            Msg::Assistant {
+                message_id: msg.map(|m| s(m, "id")).unwrap_or_default(),
+                blocks,
+            }
+        }
+        "user" => user(v),
+        "control_request" => request(v),
+        "control_cancel_request" => Msg::Cancelled {
+            request_id: s(v, "request_id"),
+        },
+        "control_response" => {
+            let r = v.get("response");
+            let get = |k| r.map(|r| s(r, k)).unwrap_or_default();
+            let ok = get("subtype") == "success";
+            let body = r
+                .and_then(|r| {
+                    if ok {
+                        r.get("response")
+                    } else {
+                        r.get("error")
+                    }
+                })
+                .cloned()
+                .unwrap_or(Value::Null);
+            Msg::Response {
+                request_id: get("request_id"),
+                ok,
+                body,
+            }
+        }
+        "result" => Msg::Result {
+            subtype: sub.to_string(),
+            is_error: v
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(sub != "success"),
+            session_id: s(v, "session_id"),
+        },
+        "rate_limit_event" | "keep_alive" | "tool_progress" | "prompt_suggestion" => Msg::Noise,
+        other => Msg::Unknown(other.to_string()),
+    }
+}
+
+fn block(b: &Value) -> Block {
+    match b.get("type").and_then(Value::as_str).unwrap_or("") {
+        "text" => Block::Text(s(b, "text")),
+        "tool_use" => Block::ToolUse {
+            id: s(b, "id"),
+            name: s(b, "name"),
+            input: b.get("input").cloned().unwrap_or_else(Value::obj),
+        },
+        other => Block::Other(other.to_string()),
+    }
+}
+
+/// A tool result's text: a string, or the text blocks of an array (an image is named, not
+/// drawn).
+fn result_text(c: Option<&Value>) -> String {
+    match c {
+        Some(Value::Str(t)) => t.clone(),
+        Some(Value::Arr(parts)) => parts
+            .iter()
+            .map(|p| match p.get("type").and_then(Value::as_str) {
+                Some("text") => s(p, "text"),
+                Some(other) => format!("[{other}]"),
+                None => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+const LOCAL_OPEN: &str = "<local-command-stdout>";
+const LOCAL_CLOSE: &str = "</local-command-stdout>";
+
+fn user(v: &Value) -> Msg {
+    let content = v.get("message").and_then(|m| m.get("content"));
+    match content {
+        Some(Value::Str(t)) => match t.strip_prefix(LOCAL_OPEN) {
+            Some(rest) => {
+                Msg::LocalOutput(rest.strip_suffix(LOCAL_CLOSE).unwrap_or(rest).to_string())
+            }
+            None => Msg::UserText(t.clone()),
+        },
+        Some(Value::Arr(parts)) => {
+            let results: Vec<ToolResult> = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .map(|p| ToolResult {
+                    tool_use_id: s(p, "tool_use_id"),
+                    text: result_text(p.get("content")),
+                    is_error: p.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                })
+                .collect();
+            if results.is_empty() {
+                Msg::UserText(result_text(content))
+            } else {
+                Msg::ToolResults(results)
+            }
+        }
+        _ => Msg::UserText(String::new()),
+    }
+}
+
+fn request(v: &Value) -> Msg {
+    let request_id = s(v, "request_id");
+    let Some(r) = v.get("request") else {
+        return Msg::OtherRequest {
+            request_id,
+            subtype: String::new(),
+        };
+    };
+    let subtype = s(r, "subtype");
+    if subtype != "can_use_tool" {
+        return Msg::OtherRequest {
+            request_id,
+            subtype,
+        };
+    }
+    let tool = s(r, "tool_name");
+    let input = r.get("input").cloned().unwrap_or_else(Value::obj);
+    if tool == "AskUserQuestion" {
+        let questions = input
+            .get("questions")
+            .and_then(Value::as_arr)
+            .unwrap_or(&[])
+            .iter()
+            .map(|q| Question {
+                question: s(q, "question"),
+                header: s(q, "header"),
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                options: q
+                    .get("options")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|o| (s(o, "label"), s(o, "description")))
+                    .collect(),
+            })
+            .collect();
+        return Msg::Question {
+            request_id,
+            input,
+            questions,
+        };
+    }
+    Msg::Permission {
+        request_id,
+        tool,
+        description: r
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from),
+        input,
+    }
+}
+
+// ---- What claude is sent ----
+
+fn obj(pairs: Vec<(&str, Value)>) -> Value {
+    let mut o = Value::obj();
+    for (k, v) in pairs {
+        o.set(k, v);
+    }
+    o
+}
+
+/// A request of ours, under our own id.
+pub fn control(request_id: &str, request: Value) -> Value {
+    obj(vec![
+        ("type", Value::string("control_request")),
+        ("request_id", Value::string(request_id)),
+        ("request", request),
+    ])
+}
+
+fn subtype(name: &str, mut rest: Vec<(&str, Value)>) -> Value {
+    rest.push(("subtype", Value::string(name)));
+    obj(rest)
+}
+
+/// The first line: answered with the commands, models and account claude has.
+pub fn initialize(request_id: &str) -> Value {
+    control(request_id, subtype("initialize", vec![]))
+}
+
+/// A prompt, or a slash command typed as one (`/compact`, `/clear`).
+pub fn user_text(text: &str) -> Value {
+    obj(vec![
+        ("type", Value::string("user")),
+        (
+            "message",
+            obj(vec![
+                ("role", Value::string("user")),
+                ("content", Value::string(text)),
+            ]),
+        ),
+    ])
+}
+
+pub fn set_model(request_id: &str, model: &str) -> Value {
+    control(
+        request_id,
+        subtype("set_model", vec![("model", Value::string(model))]),
+    )
+}
+
+/// Effort has no request of its own: Claude Code's `/effort` sends this overlay to a remote
+/// session, and the next turn uses it. `None` goes back to the model's default.
+pub fn set_effort(request_id: &str, level: Option<&str>) -> Value {
+    let level = level.map(Value::string).unwrap_or(Value::Null);
+    control(
+        request_id,
+        subtype(
+            "apply_flag_settings",
+            vec![("settings", obj(vec![("effortLevel", level)]))],
+        ),
+    )
+}
+
+/// `session_id` makes claude refuse it if the process has moved to another conversation
+/// since (a `/clear`), rather than rename the wrong one.
+pub fn rename(request_id: &str, title: &str, session_id: &str) -> Value {
+    control(
+        request_id,
+        subtype(
+            "rename_session",
+            vec![
+                ("title", Value::string(title)),
+                ("source", Value::string("host")),
+                ("session_id", Value::string(session_id)),
+            ],
+        ),
+    )
+}
+
+pub fn interrupt(request_id: &str) -> Value {
+    control(request_id, subtype("interrupt", vec![]))
+}
+
+pub fn end_session(request_id: &str) -> Value {
+    control(request_id, subtype("end_session", vec![]))
+}
+
+fn answer(request_id: &str, outcome: Value) -> Value {
+    obj(vec![
+        ("type", Value::string("control_response")),
+        (
+            "response",
+            obj(vec![
+                ("subtype", Value::string("success")),
+                ("request_id", Value::string(request_id)),
+                ("response", outcome),
+            ]),
+        ),
+    ])
+}
+
+/// Allow a tool call, with its input as claude sent it or as edited.
+pub fn allow(request_id: &str, input: Value) -> Value {
+    answer(
+        request_id,
+        obj(vec![
+            ("behavior", Value::string("allow")),
+            ("updatedInput", input),
+        ]),
+    )
+}
+
+/// Deny a tool call; `message` is what claude is told.
+pub fn deny(request_id: &str, message: &str) -> Value {
+    answer(
+        request_id,
+        obj(vec![
+            ("behavior", Value::string("deny")),
+            ("message", Value::string(message)),
+        ]),
+    )
+}
+
+/// Answer an `AskUserQuestion`: allowed, with its input and `answers` keyed by each
+/// question's text. A multi-select's labels are joined with ", ", and free text is the
+/// answer as typed, as the Agent SDK documents.
+pub fn answer_questions(request_id: &str, input: &Value, answers: &[(String, String)]) -> Value {
+    let mut map = Value::obj();
+    for (q, a) in answers {
+        map.set(q, Value::string(a.clone()));
+    }
+    let mut input = input.clone();
+    input.set("answers", map);
+    allow(request_id, input)
+}
+
+/// Refuse a request claude made that the view does not serve.
+pub fn refuse(request_id: &str, why: &str) -> Value {
+    obj(vec![
+        ("type", Value::string("control_response")),
+        (
+            "response",
+            obj(vec![
+                ("subtype", Value::string("error")),
+                ("request_id", Value::string(request_id)),
+                ("error", Value::string(why)),
+            ]),
+        ),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json::{parse, to_line};
+
+    fn read(line: &str) -> Msg {
+        classify(&parse(line).expect("fixture parses"))
+    }
+
+    // The fixtures are 2.1.311's own lines from the spike, cut to the fields read and with
+    // ids shortened; nothing personal is in them.
+
+    #[test]
+    fn init_status_title_and_compaction_read_as_what_they_say() {
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s1","tools":["Bash"],"model":"claude-haiku-5-5","permissionMode":"default"}"#
+            ),
+            Msg::Init {
+                session_id: "s1".into(),
+                model: "claude-haiku-5-5".into(),
+                permission_mode: "default".into()
+            }
+        );
+        assert_eq!(
+            read(r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s1"}"#),
+            Msg::Status(Some("compacting".into()))
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}"#
+            ),
+            Msg::Status(None)
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"session_title_changed","title":"spike rename","session_id":"s1"}"#
+            ),
+            Msg::TitleChanged("spike rename".into())
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":29738,"post_tokens":8737}}"#
+            ),
+            Msg::Compacted {
+                pre_tokens: Some(29738),
+                post_tokens: Some(8737)
+            }
+        );
+    }
+
+    #[test]
+    fn hook_progress_thinking_estimates_and_rate_limits_are_noise() {
+        for line in [
+            r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:startup"}"#,
+            r#"{"type":"system","subtype":"hook_response","exit_code":0}"#,
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":50}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}}"#,
+        ] {
+            assert_eq!(read(line), Msg::Noise, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_type_this_version_does_not_know_is_unknown_not_an_error() {
+        assert_eq!(
+            read(r#"{"type":"look","x":1}"#),
+            Msg::Unknown("look".into())
+        );
+        assert_eq!(
+            read(r#"{"type":"system","subtype":"placed"}"#),
+            Msg::Unknown("system/placed".into())
+        );
+        assert_eq!(read(r#"{}"#), Msg::Unknown(String::new()));
+        // A field of the wrong type reads as absent rather than failing the line.
+        assert_eq!(
+            read(r#"{"type":"system","subtype":"session_title_changed","title":7}"#),
+            Msg::TitleChanged(String::new())
+        );
+    }
+
+    #[test]
+    fn streamed_text_and_finished_blocks() {
+        assert_eq!(
+            read(
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"spi"}}}"#
+            ),
+            Msg::TextDelta {
+                index: 1,
+                text: "spi".into()
+            }
+        );
+        let Msg::Assistant { message_id, blocks } = read(
+            r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo spike-ok"}},{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}}"#,
+        ) else {
+            panic!("an assistant line is an Assistant");
+        };
+        assert_eq!(message_id, "msg_1");
+        assert_eq!(blocks.len(), 3);
+        let Block::ToolUse { id, name, input } = &blocks[0] else {
+            panic!("tool use")
+        };
+        assert_eq!((id.as_str(), name.as_str()), ("toolu_1", "Bash"));
+        assert_eq!(
+            input.get("command").and_then(Value::as_str),
+            Some("echo spike-ok")
+        );
+        assert_eq!(blocks[1], Block::Other("thinking".into()));
+        assert_eq!(blocks[2], Block::Text("done".into()));
+    }
+
+    #[test]
+    fn user_lines_are_results_local_output_or_text() {
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"spike-ok","is_error":false}]}}"#
+            ),
+            Msg::ToolResults(vec![ToolResult {
+                tool_use_id: "toolu_1".into(),
+                text: "spike-ok".into(),
+                is_error: false
+            }])
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"a"},{"type":"image"}],"is_error":true}]}}"#
+            ),
+            Msg::ToolResults(vec![ToolResult {
+                tool_use_id: "t2".into(),
+                text: "a\n[image]".into(),
+                is_error: true
+            }])
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to `haiku (claude-haiku-5-5)`</local-command-stdout>"}}"#
+            ),
+            Msg::LocalOutput("Set model to `haiku (claude-haiku-5-5)`".into())
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#
+            ),
+            Msg::UserText("[Request interrupted by user]".into())
+        );
+    }
+
+    #[test]
+    fn a_permission_a_question_and_any_other_request() {
+        let Msg::Permission {
+            request_id,
+            tool,
+            input,
+            description,
+        } = read(
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"touch spike-file && ls"},"description":"Create spike-file","permission_suggestions":[]}}"#,
+        )
+        else {
+            panic!("a can_use_tool for Bash is a Permission")
+        };
+        assert_eq!((request_id.as_str(), tool.as_str()), ("r1", "Bash"));
+        assert_eq!(description.as_deref(), Some("Create spike-file"));
+        assert_eq!(
+            input.get("command").and_then(Value::as_str),
+            Some("touch spike-file && ls")
+        );
+
+        let Msg::Question {
+            request_id,
+            questions,
+            ..
+        } = read(
+            r#"{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Do you prefer red or blue?","header":"Color","options":[{"label":"Red","description":"Choose red"},{"label":"Blue","description":"Choose blue"}],"multiSelect":false}]}}}"#,
+        )
+        else {
+            panic!("AskUserQuestion is a Question")
+        };
+        assert_eq!(request_id, "r2");
+        assert_eq!(
+            questions,
+            vec![Question {
+                question: "Do you prefer red or blue?".into(),
+                header: "Color".into(),
+                multi_select: false,
+                options: vec![
+                    ("Red".into(), "Choose red".into()),
+                    ("Blue".into(), "Choose blue".into())
+                ]
+            }]
+        );
+
+        assert_eq!(
+            read(
+                r#"{"type":"control_request","request_id":"r3","request":{"subtype":"hook_callback","callback_id":"x"}}"#
+            ),
+            Msg::OtherRequest {
+                request_id: "r3".into(),
+                subtype: "hook_callback".into()
+            }
+        );
+        assert_eq!(
+            read(r#"{"type":"control_cancel_request","request_id":"r1"}"#),
+            Msg::Cancelled {
+                request_id: "r1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn responses_and_results() {
+        let Msg::Response {
+            request_id,
+            ok,
+            body,
+        } = read(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"c2","response":{"model":"claude-sonnet-5-5"}}}"#,
+        )
+        else {
+            panic!("response")
+        };
+        assert!(ok);
+        assert_eq!(request_id, "c2");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("claude-sonnet-5-5")
+        );
+        let Msg::Response { ok, body, .. } = read(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"c9","error":"no such model"}}"#,
+        ) else {
+            panic!("response")
+        };
+        assert!(!ok);
+        assert_eq!(body.as_str(), Some("no such model"));
+        assert_eq!(
+            read(
+                r#"{"type":"result","subtype":"error_during_execution","is_error":false,"session_id":"s1"}"#
+            ),
+            Msg::Result {
+                subtype: "error_during_execution".into(),
+                is_error: false,
+                session_id: "s1".into()
+            }
+        );
+        assert_eq!(
+            read(r#"{"type":"result","subtype":"error_max_turns","session_id":"s1"}"#),
+            Msg::Result {
+                subtype: "error_max_turns".into(),
+                is_error: true,
+                session_id: "s1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn what_is_sent_is_what_the_spike_sent() {
+        // Each line as 2.1.311 accepted it on 2026-11-01; keys sort, which claude ignores.
+        assert_eq!(
+            to_line(&initialize("c1")),
+            r#"{"request":{"subtype":"initialize"},"request_id":"c1","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&user_text("/compact")),
+            r#"{"message":{"content":"/compact","role":"user"},"type":"user"}"#
+        );
+        assert_eq!(
+            to_line(&set_model("c2", "sonnet")),
+            r#"{"request":{"model":"sonnet","subtype":"set_model"},"request_id":"c2","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&set_effort("c4", Some("low"))),
+            r#"{"request":{"settings":{"effortLevel":"low"},"subtype":"apply_flag_settings"},"request_id":"c4","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&set_effort("c5", None)),
+            r#"{"request":{"settings":{"effortLevel":null},"subtype":"apply_flag_settings"},"request_id":"c5","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&rename("c6", "spike rename", "s1")),
+            r#"{"request":{"session_id":"s1","source":"host","subtype":"rename_session","title":"spike rename"},"request_id":"c6","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&interrupt("c8")),
+            r#"{"request":{"subtype":"interrupt"},"request_id":"c8","type":"control_request"}"#
+        );
+        assert_eq!(
+            to_line(&end_session("c9")),
+            r#"{"request":{"subtype":"end_session"},"request_id":"c9","type":"control_request"}"#
+        );
+    }
+
+    #[test]
+    fn answers_carry_the_request_id_and_the_input() {
+        let input = parse(r#"{"command":"touch x"}"#).unwrap();
+        assert_eq!(
+            to_line(&allow("r1", input.clone())),
+            r#"{"response":{"request_id":"r1","response":{"behavior":"allow","updatedInput":{"command":"touch x"}},"subtype":"success"},"type":"control_response"}"#
+        );
+        assert_eq!(
+            to_line(&deny("r1", "no")),
+            r#"{"response":{"request_id":"r1","response":{"behavior":"deny","message":"no"},"subtype":"success"},"type":"control_response"}"#
+        );
+        let q = parse(r#"{"questions":[{"question":"Red or blue?"}]}"#).unwrap();
+        let line = to_line(&answer_questions(
+            "r2",
+            &q,
+            &[("Red or blue?".into(), "Red".into())],
+        ));
+        assert_eq!(
+            line,
+            r#"{"response":{"request_id":"r2","response":{"behavior":"allow","updatedInput":{"answers":{"Red or blue?":"Red"},"questions":[{"question":"Red or blue?"}]}},"subtype":"success"},"type":"control_response"}"#
+        );
+        assert_eq!(
+            to_line(&refuse("r3", "not served")),
+            r#"{"response":{"error":"not served","request_id":"r3","subtype":"error"},"type":"control_response"}"#
+        );
+    }
+}
