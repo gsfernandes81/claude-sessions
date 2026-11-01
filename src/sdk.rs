@@ -101,8 +101,110 @@ pub enum Msg {
         questions: Vec<Question>,
         answers: Vec<(String, String)>,
     },
+    /// `system/task_started`, `task_progress` and `task_notification` for a subagent or a
+    /// workflow, said under the tool call that started it (`tool_use_id`).
+    Task { tool_use_id: String, event: Task },
     /// A line of a type this version does not know, kept by its name so a log can say so.
     Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Task {
+    /// `task_type` is `local_agent`, `local_workflow`, `local_bash`, …
+    Started {
+        task_type: String,
+        description: String,
+    },
+    /// The running totals, and a workflow's phases and agents as last reported (empty when a
+    /// progress line did not carry them).
+    Progress {
+        usage: Usage,
+        phases: Vec<String>,
+        agents: Vec<WorkflowAgent>,
+    },
+    /// `status` is `completed`, `failed`, `stopped`, …; `report` a subagent's handback.
+    Done {
+        status: String,
+        usage: Usage,
+        report: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Usage {
+    pub tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowAgent {
+    pub label: String,
+    /// 1-based, into the phases.
+    pub phase: u64,
+    /// `queued`, `running`, `done`, `failed`, …
+    pub state: String,
+    pub last_tool: String,
+}
+
+fn usage(v: &Value) -> Usage {
+    let u = v.get("usage");
+    let n = |k| {
+        u.and_then(|u| u.get(k))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    Usage {
+        tokens: n("total_tokens"),
+        tool_uses: n("tool_uses"),
+        duration_ms: n("duration_ms"),
+    }
+}
+
+fn task(v: &Value, sub: &str) -> Msg {
+    let tool_use_id = s(v, "tool_use_id");
+    if tool_use_id.is_empty() {
+        return Msg::Noise;
+    }
+    let event = match sub {
+        "task_started" => Task::Started {
+            task_type: s(v, "task_type"),
+            description: s(v, "description"),
+        },
+        "task_progress" => {
+            let mut phases = Vec::new();
+            let mut agents = Vec::new();
+            if let Some(Value::Arr(items)) = v.get("workflow_progress") {
+                for it in items {
+                    match it.get("type").and_then(Value::as_str) {
+                        Some("workflow_phase") => phases.push(s(it, "title")),
+                        Some("workflow_agent") => agents.push(WorkflowAgent {
+                            label: s(it, "label"),
+                            phase: it.get("phaseIndex").and_then(Value::as_u64).unwrap_or(0),
+                            state: s(it, "state"),
+                            last_tool: s(it, "lastToolName"),
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+            Task::Progress {
+                usage: usage(v),
+                phases,
+                agents,
+            }
+        }
+        _ => Task::Done {
+            status: s(v, "status"),
+            usage: usage(v),
+            report: v
+                .get("handback_report")
+                .and_then(|r| r.get("text"))
+                .and_then(Value::as_str)
+                .map(String::from),
+        },
+    };
+    Msg::Task { tool_use_id, event }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,7 +265,13 @@ pub fn classify(v: &Value) -> Msg {
                     post_tokens: n("post_tokens"),
                 }
             }
-            "hook_started" | "hook_response" | "hook_progress" | "thinking_tokens" => Msg::Noise,
+            "task_started" | "task_progress" | "task_notification" => task(v, sub),
+            "hook_started"
+            | "hook_response"
+            | "hook_progress"
+            | "thinking_tokens"
+            | "task_updated"
+            | "background_tasks_changed" => Msg::Noise,
             other => Msg::Unknown(format!("system/{other}")),
         },
         "stream_event" => {

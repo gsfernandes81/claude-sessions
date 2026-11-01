@@ -63,6 +63,11 @@ pub enum Input {
         epoch: u64,
         why: String,
     },
+    /// A side question's answer, or why there is none, for the conversation it was asked in.
+    Side {
+        epoch: u64,
+        answer: Result<String, String>,
+    },
 }
 
 /// What the relay asks of the pipes around it.
@@ -80,6 +85,14 @@ pub enum Effect {
     ToConv { epoch: u64, line: Value },
     /// End the conversation's command.
     CloseConv { epoch: u64 },
+    /// Run `claude-sessions <args>` in `host` with `input` on its stdin, its one line of
+    /// answer to come back as `Side { epoch }`: `/btw`, beside the conversation's own command.
+    Side {
+        epoch: u64,
+        host: String,
+        args: Vec<String>,
+        input: String,
+    },
 }
 
 /// Where a client that reconnected had got to.
@@ -234,6 +247,16 @@ impl Relay {
                     self.sent.clear();
                     self.sent_hub = None;
                     self.send_home(&mut out);
+                }
+            }
+            // Only to the conversation it was asked in: one left meanwhile has no one to tell.
+            Input::Side { epoch, answer } => {
+                if self.conv.as_ref().is_some_and(|c| c.epoch == epoch) {
+                    let field = match answer {
+                        Ok(a) => ("x", Value::string(a)),
+                        Err(e) => ("e", Value::string(e)),
+                    };
+                    out.push(Effect::Send(msg("btw", vec![field])));
                 }
             }
         }
@@ -497,6 +520,24 @@ impl Relay {
                 let sid = c.reducer.meta().session_id.clone();
                 to(sdk::rename(&id, &s(v, "x").unwrap_or_default(), &sid));
             }
+            // A side question goes to its own claude, not this one (`launch::remote_btw`).
+            "btw" => {
+                let Some(slot) = c.slot.clone() else {
+                    out.push(err("the conversation is still opening"));
+                    return;
+                };
+                let mut args = vec!["remote".to_string(), "btw".to_string(), slot];
+                let model = c.reducer.meta().model.clone();
+                if !model.is_empty() {
+                    args.push(model);
+                }
+                out.push(Effect::Side {
+                    epoch,
+                    host: c.host.clone(),
+                    args,
+                    input: s(v, "x").unwrap_or_default(),
+                });
+            }
             "esc" => to(sdk::interrupt(&id)),
             "exit" => to(sdk::end_session(&id)),
             "models" => {
@@ -663,6 +704,12 @@ pub fn serve() -> io::Result<()> {
                         stop(running.take().expect("checked"));
                     }
                 }
+                Effect::Side {
+                    epoch,
+                    host,
+                    args,
+                    input,
+                } => side(epoch, &host, &args, input, &tx),
             }
         }
         if stdout.flush().is_err() {
@@ -749,6 +796,50 @@ fn open(epoch: u64, host: &str, args: &[String], tx: &Sender<Input>) -> Option<R
         child,
         stdin,
     })
+}
+
+/// Run a side question's command on its own thread: the question on stdin, then its one
+/// JSON line read back, `{"answer"}` or `{"error"}`.
+fn side(epoch: u64, host: &str, args: &[String], input: String, tx: &Sender<Input>) {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut cmd = hub::command(host, &argv, false);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let answer = match cmd.spawn() {
+            Err(e) => Err(format!("could not run ssh: {e}")),
+            Ok(mut child) => {
+                if let Some(mut pipe) = child.stdin.take() {
+                    let _ = pipe.write_all(input.as_bytes());
+                }
+                match child.wait_with_output() {
+                    Err(e) => Err(e.to_string()),
+                    Ok(o) => {
+                        let text = String::from_utf8_lossy(&o.stdout);
+                        let v = text
+                            .lines()
+                            .rev()
+                            .find_map(|l| json::parse(l.trim()).ok())
+                            .unwrap_or(Value::Null);
+                        match (s(&v, "answer"), s(&v, "error")) {
+                            (Some(a), _) => Ok(a),
+                            (None, Some(e)) => Err(e),
+                            (None, None) => Err(String::from_utf8_lossy(&o.stderr)
+                                .lines()
+                                .rev()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("the container did not answer")
+                                .trim()
+                                .to_string()),
+                        }
+                    }
+                }
+            }
+        };
+        let _ = tx.send(Input::Side { epoch, answer });
+    });
 }
 
 #[cfg(test)]
@@ -858,6 +949,48 @@ mod tests {
             },
             Instant::now(),
         )
+    }
+
+    #[test]
+    fn a_side_question_runs_beside_the_conversation_on_its_model_and_answers_only_it() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let init = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-haiku-5-5","permissionMode":"default"}"#;
+        line(&mut r, epoch, 1, init);
+        let fx = client(&mut r, r#"{"t":"btw","x":"what was that?"}"#);
+        let Some(Effect::Side {
+            epoch: e,
+            host,
+            args,
+            input,
+        }) = fx.into_iter().last()
+        else {
+            panic!("no side question");
+        };
+        assert_eq!(
+            (e, host.as_str(), input.as_str()),
+            (epoch, "claude-sessions", "what was that?")
+        );
+        assert_eq!(args, ["remote", "btw", "claude-3", "claude-haiku-5-5"]);
+        let fx = r.handle(
+            Input::Side {
+                epoch,
+                answer: Ok("A greeting.".into()),
+            },
+            Instant::now(),
+        );
+        assert_eq!(sent(&fx), [r#"{"t":"btw","x":"A greeting."}"#]);
+        let fx = r.handle(
+            Input::Side {
+                epoch: epoch + 1,
+                answer: Err("late".into()),
+            },
+            Instant::now(),
+        );
+        assert!(
+            sent(&fx).is_empty(),
+            "an answer for a conversation left is dropped"
+        );
     }
 
     const PROMPT: &str =

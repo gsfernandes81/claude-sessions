@@ -219,6 +219,14 @@ pub enum Entry {
         /// Whether it succeeded, its first lines, and how many lines in all.
         result: Option<(bool, Vec<String>, usize)>,
     },
+    /// A subagent or workflow: its type or `Workflow`, its description, the lines under it
+    /// as the relay last sent them, and `running`, `completed`, `failed` or `stopped`.
+    Agent {
+        name: String,
+        arg: String,
+        lines: Vec<String>,
+        state: String,
+    },
     Perm {
         request_id: String,
         tool: String,
@@ -315,11 +323,27 @@ impl Convo {
     }
 
     /// The last thing the assistant said, for `/copy`.
-    pub fn last_text(&self) -> Option<&str> {
-        self.entries.iter().rev().find_map(|e| match e {
-            Entry::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
+    /// Claude's responses, oldest first: each turn's text blocks joined by a blank line, as
+    /// Claude Code's `/copy` takes a response, tool calls between them left out.
+    pub fn responses(&self) -> Vec<String> {
+        let mut out: Vec<Vec<&str>> = Vec::new();
+        let mut open = false;
+        for e in &self.entries {
+            match e {
+                Entry::Prompt(_) => open = false,
+                Entry::Text(t) if !t.trim().is_empty() => {
+                    if !open {
+                        out.push(Vec::new());
+                        open = true;
+                    }
+                    if let Some(g) = out.last_mut() {
+                        g.push(t.trim_end());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.into_iter().map(|g| g.join("\n\n")).collect()
     }
 
     pub fn apply(&mut self, v: &Value, now: Instant) -> Applied {
@@ -335,6 +359,12 @@ impl Convo {
                         name: s(v, "n"),
                         arg: s(v, "a"),
                         result: None,
+                    },
+                    "agent" => Entry::Agent {
+                        name: s(v, "n"),
+                        arg: s(v, "a"),
+                        lines: Vec::new(),
+                        state: "running".into(),
                     },
                     "perm" => Entry::Perm {
                         request_id: s(v, "r"),
@@ -364,6 +394,18 @@ impl Convo {
             "set" => {
                 if let Some(Entry::Text(t)) = self.at(id) {
                     *t = s(v, "x");
+                }
+            }
+            "prog" => {
+                if let Some(Entry::Agent { lines, state, .. }) = self.at(id) {
+                    *lines = v
+                        .get("p")
+                        .and_then(Value::as_arr)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect();
+                    *state = s(v, "st");
                 }
             }
             "res" => {
@@ -542,6 +584,55 @@ fn tools_summary(tools: &[(&str, &str)], running: bool) -> String {
     out
 }
 
+/// A subagent or workflow as Claude Code draws one: `● Explore(what it was asked)`, and
+/// under it what it is doing or how it ended. The dot is green once it has finished well,
+/// grey when it failed or was stopped, which the line under it says in words.
+fn agent_block(name: &str, arg: &str, lines: &[String], state: &str, w: usize) -> Vec<Line> {
+    let head = if arg.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}({arg})")
+    };
+    let mut out = wrapped(&head, "● ", "  ", w, PLAIN);
+    let dot = match state {
+        "completed" => fg(GREEN),
+        "running" => PLAIN,
+        _ => fg(GREY),
+    };
+    // The dot coloured, and the name in bold as Claude Code titles a tool call.
+    if let Some(l) = out.first_mut() {
+        let text = plain(l);
+        let body = text.strip_prefix("● ").unwrap_or(&text).to_string();
+        let cut_at = body.find('(').unwrap_or(body.len()).min(name.len());
+        let (n, rest) = body.split_at(cut_at);
+        let mut row: Line = vec![
+            ("● ".into(), dot),
+            (
+                n.to_string(),
+                St {
+                    bold: true,
+                    ..PLAIN
+                },
+            ),
+        ];
+        if !rest.is_empty() {
+            row.push((rest.to_string(), PLAIN));
+        }
+        *l = row;
+    }
+    for (i, text) in lines.iter().enumerate() {
+        let lead = if i == 0 { "  ⎿  " } else { "     " };
+        out.extend(wrapped_by(
+            text,
+            lead,
+            "     ",
+            w.saturating_sub(1),
+            fg(GREY),
+        ));
+    }
+    out
+}
+
 fn tool_line(name: &str, arg: &str) -> String {
     match name {
         "Bash" => format!("$ {arg}"),
@@ -633,6 +724,58 @@ pub enum Dialog {
     },
     /// `/effort`: the level the slider is on.
     Effort { sel: usize },
+    /// `/copy` of a response with code blocks: what to copy, each a label and its text, the
+    /// whole response first.
+    Copy {
+        sel: usize,
+        choices: Vec<(String, String)>,
+    },
+    /// `/btw`: the side question, its answer once it has come (or why there is none), and
+    /// how far the answer is scrolled.
+    Btw {
+        question: String,
+        answer: Option<Result<String, String>>,
+        top: usize,
+    },
+}
+
+/// A response's fenced code blocks, each its language (empty when the fence names none) and
+/// its body. An unclosed fence runs to the end, as markdown has it.
+pub fn code_blocks(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, String, Vec<&str>)> = None;
+    for l in text.lines() {
+        let t = l.trim_start();
+        let fence = ["```", "~~~"].into_iter().find(|f| t.starts_with(f));
+        match (&mut open, fence) {
+            (None, Some(f)) => {
+                open = Some((f.to_string(), t[3..].trim().to_string(), Vec::new()));
+            }
+            (Some((f, _, _)), Some(g)) if *f == g && t.trim_end() == g => {
+                if let Some((_, lang, body)) = open.take() {
+                    out.push((lang, body.join("\n")));
+                }
+            }
+            (Some((_, _, body)), _) => body.push(l),
+            (None, None) => {}
+        }
+    }
+    if let Some((_, lang, body)) = open {
+        out.push((lang, body.join("\n")));
+    }
+    out
+}
+
+/// What `/copy` offers for a response: the whole of it, then each code block, labelled by
+/// its language and first line.
+pub fn copy_choices(response: &str) -> Vec<(String, String)> {
+    let mut out = vec![("Full response".to_string(), response.to_string())];
+    for (lang, body) in code_blocks(response) {
+        let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let lang = if lang.is_empty() { "code" } else { &lang };
+        out.push((format!("{lang}: {}", first.trim()), body));
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -802,6 +945,15 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             Entry::Note(text) => {
                 out.push(Vec::new());
                 out.extend(wrapped(text, "  ⎿  ", "     ", w, fg(GREY)));
+            }
+            Entry::Agent {
+                name,
+                arg,
+                lines,
+                state,
+            } => {
+                out.push(Vec::new());
+                out.extend(agent_block(name, arg, lines, state, w));
             }
             Entry::Compacted => {
                 out.push(Vec::new());
@@ -1182,6 +1334,82 @@ pub fn is_current(model: &str, value: &str, name: &str) -> bool {
     !slug.is_empty() && model.contains(&slug)
 }
 
+/// `/btw`'s panel: the question, then the answer as markdown, scrolled when it is taller
+/// than the screen leaves room for.
+fn btw_dialog(
+    question: &str,
+    answer: &Option<Result<String, String>>,
+    top: usize,
+    w: usize,
+    h: usize,
+) -> Vec<Line> {
+    let mut out = vec![rule(w, "▔", fg(LAVENDER))];
+    out.extend(wrapped(
+        &format!("/btw {question}"),
+        "   ",
+        "   ",
+        w,
+        bold(LAVENDER),
+    ));
+    out.push(Vec::new());
+    let body: Vec<Line> = match answer {
+        None => vec![line("   Answering…", fg(GREY))],
+        Some(Err(why)) => wrapped(why, "   ", "   ", w, fg(GREY)),
+        Some(Ok(text)) => crate::markdown::render(text, w.saturating_sub(5))
+            .into_iter()
+            .map(|l| {
+                let mut row: Line = vec![("   ".into(), PLAIN)];
+                row.extend(l);
+                row
+            })
+            .collect(),
+    };
+    // What the transcript keeps above: a few rows, as a dialog leaves on a phone.
+    let room = h.saturating_sub(out.len() + 5).max(3);
+    let top = top.min(body.len().saturating_sub(room));
+    if top > 0 {
+        out.push(line(format!("   ↑ {top} more"), fg(GREY)));
+    }
+    let mut shown = room - usize::from(top > 0);
+    if body.len() > top + shown {
+        shown -= 1;
+    }
+    let below = body.len().saturating_sub(top + shown);
+    out.extend(body.into_iter().skip(top).take(shown));
+    if below > 0 {
+        out.push(line(format!("   ↓ {below} more"), fg(GREY)));
+    }
+    out.push(Vec::new());
+    out.extend(hints(&["Space, Enter or Esc to dismiss"], "   ", w));
+    out
+}
+
+fn copy_dialog(sel: usize, choices: &[(String, String)], w: usize) -> Vec<Line> {
+    const SHOWN: usize = 5;
+    let mut out = vec![rule(w, "▔", fg(LAVENDER))];
+    out.push(line("   Copy to clipboard", bold(LAVENDER)));
+    out.push(Vec::new());
+    let lo = sel
+        .saturating_sub(SHOWN - 2)
+        .min(choices.len().saturating_sub(SHOWN));
+    let hi = (lo + SHOWN).min(choices.len());
+    for (i, (label, _)) in choices.iter().enumerate().take(hi).skip(lo) {
+        let mark = if i == sel { "❯" } else { " " };
+        let st = if i == sel { fg(LAVENDER) } else { PLAIN };
+        let text = format!("   {mark} {}. {label}", i + 1);
+        out.push(line(cut(&text, w.saturating_sub(1)), st));
+    }
+    if hi < choices.len() {
+        out.push(line(
+            format!("      … +{} more", choices.len() - hi),
+            fg(GREY),
+        ));
+    }
+    out.push(Vec::new());
+    out.extend(hints(&["Enter to copy", "Esc to cancel"], "   ", w));
+    out
+}
+
 fn effort_dialog(sel: usize, w: usize) -> Vec<Line> {
     let level = EFFORTS[sel.min(EFFORTS.len() - 1)];
     let tag = format!(" {} {level} · /effort ", effort_glyph(level));
@@ -1252,6 +1480,15 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     let bottom: Vec<Line> = match (&ui.dialog, waiting) {
         (Some(Dialog::Model { sel, list }), _) => model_dialog(c, *sel, list, w),
         (Some(Dialog::Effort { sel }), _) => effort_dialog(*sel, w),
+        (Some(Dialog::Copy { sel, choices }), _) => copy_dialog(*sel, choices, w),
+        (
+            Some(Dialog::Btw {
+                question,
+                answer,
+                top,
+            }),
+            _,
+        ) => btw_dialog(question, answer, *top, w, h),
         (Some(d @ Dialog::Ask { q, .. }), Some(Entry::Ask { questions, .. })) => {
             ask_top = true;
             match questions.get(*q) {
@@ -1390,6 +1627,103 @@ mod tests {
         for o in ops {
             c.apply(&parse(o).unwrap(), now);
         }
+    }
+
+    #[test]
+    fn an_agent_is_drawn_on_its_own_with_its_progress_under_it() {
+        let mut c = Convo::new("h", "claude-3", "r");
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"tool","n":"Read","a":"a.txt"}"#,
+                r#"{"t":"res","id":1,"ok":true,"p":["x"],"l":1}"#,
+                r#"{"t":"add","id":2,"k":"agent","n":"Explore","a":"Count lines in .txt files"}"#,
+                r#"{"t":"prog","id":2,"p":["Glob(*.txt)","Bash(wc -l -- a.txt b.txt err.txt)","+1 more tool use"],"st":"running"}"#,
+            ],
+        );
+        let body: Vec<String> = transcript(&c, 40).0.iter().map(plain).collect();
+        let at = body
+            .iter()
+            .position(|l| l.starts_with("● Explore"))
+            .expect("drawn");
+        assert_eq!(
+            &body[at..],
+            [
+                "● Explore(Count lines in .txt files)",
+                "  ⎿  Glob(*.txt)",
+                "     Bash(wc -l -- a.txt b.txt err.txt)",
+                "     +1 more tool use",
+            ]
+        );
+        assert!(
+            body.iter().any(|l| l.contains("Read 1 file")),
+            "the tool before it is still summed up on its own: {body:?}"
+        );
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"prog","id":2,"p":["Done (3 tool uses · 21.6k tokens · 7.6s)"],"st":"completed"}"#,
+            ],
+        );
+        let lines = transcript(&c, 40).0;
+        let head = lines
+            .iter()
+            .find(|l| plain(l).starts_with("● Explore"))
+            .unwrap();
+        assert_eq!(head[0].1, fg(GREEN), "a green dot once it is done");
+        assert!(head[1].1.bold, "its name in bold");
+        let body: Vec<String> = lines.iter().map(plain).collect();
+        assert_eq!(
+            body[body.len() - 2..],
+            ["  ⎿  Done (3 tool uses · 21.6k tokens ·", "     7.6s)"]
+        );
+    }
+
+    #[test]
+    fn code_blocks_are_found_by_their_fences_and_offered_after_the_whole() {
+        let text = "Try:\n\n```rust\nfn main() {}\n```\n\nor\n\n~~~\nmake\n~~~\n\n```sh\nunclosed";
+        assert_eq!(
+            code_blocks(text),
+            [
+                ("rust".to_string(), "fn main() {}".to_string()),
+                (String::new(), "make".to_string()),
+                ("sh".to_string(), "unclosed".to_string()),
+            ]
+        );
+        let labels: Vec<String> = copy_choices(text).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(
+            labels,
+            [
+                "Full response",
+                "rust: fn main() {}",
+                "code: make",
+                "sh: unclosed"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_btw_answer_scrolls_inside_its_panel() {
+        let answer: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+        let d = btw_dialog("q", &Some(Ok(answer.join("\n\n"))), 0, 40, 24);
+        let t: Vec<String> = d.iter().map(plain).collect();
+        assert_eq!(t[1], "   /btw q");
+        assert!(
+            t.iter().any(|l| l.contains("↓") && l.contains("more")),
+            "{t:?}"
+        );
+        assert!(
+            d.len() < 24,
+            "it leaves the screen some transcript: {}",
+            d.len()
+        );
+        let d = btw_dialog("q", &Some(Ok(answer.join("\n\n"))), 5, 40, 24);
+        let t: Vec<String> = d.iter().map(plain).collect();
+        assert!(t.iter().any(|l| l.contains("↑ 5 more")), "{t:?}");
+        assert!(
+            t.iter()
+                .any(|l| l.contains("Space, Enter or Esc to dismiss"))
+        );
     }
 
     fn text(f: &Frame) -> Vec<String> {

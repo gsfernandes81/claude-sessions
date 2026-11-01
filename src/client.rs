@@ -31,6 +31,8 @@ const ACK_WAIT: Duration = Duration::from_secs(5);
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
+/// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
+const DETACH: char = '\x1c';
 /// R10's words, in place of the hint line until the next key.
 const TERMINAL_ONLY: &str =
     "Runs in a terminal: attach it from ssh dev, or end it there to open here";
@@ -319,6 +321,22 @@ impl App {
                 }
                 self.models = Some(list);
             }
+            "btw" => {
+                if let Screen::Conv { ui, .. } = &mut self.screen {
+                    if let Some(Dialog::Btw { answer, .. }) = &mut ui.dialog {
+                        if answer.is_none() {
+                            *answer = Some(match v.get("x").and_then(Value::as_str) {
+                                Some(a) => Ok(a.to_string()),
+                                None => Err(v
+                                    .get("e")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("no answer")
+                                    .to_string()),
+                            });
+                        }
+                    }
+                }
+            }
             "pong" | "full" => {}
             _ => {
                 // The conversation's ops.
@@ -393,6 +411,10 @@ impl App {
     }
 
     fn home_key(&mut self, k: Key) {
+        if k == Key::Char(DETACH) {
+            self.quit = true;
+            return;
+        }
         match self.menu.key(k) {
             Action::Quit => self.quit = true,
             Action::Open(i) => {
@@ -453,6 +475,59 @@ impl App {
         let mut out: Vec<Value> = Vec::new();
         let mut leave = false;
         match ui.dialog.take() {
+            // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
+            // detach key does in ssh dev: the session runs on, and the home comes back.
+            _ if k == Key::Char(DETACH) => leave = true,
+            Some(Dialog::Btw {
+                question,
+                answer,
+                top,
+            }) => match k {
+                Key::Esc | Key::Enter | Key::Char(' ') => {}
+                Key::Up | Key::WheelUp | Key::PageUp => {
+                    let step = if k == Key::PageUp { 10 } else { 1 };
+                    ui.dialog = Some(Dialog::Btw {
+                        question,
+                        answer,
+                        top: top.saturating_sub(step),
+                    });
+                }
+                Key::Down | Key::WheelDown | Key::PageDown => {
+                    let step = if k == Key::PageDown { 10 } else { 1 };
+                    ui.dialog = Some(Dialog::Btw {
+                        question,
+                        answer,
+                        top: top + step,
+                    });
+                }
+                _ => {
+                    ui.dialog = Some(Dialog::Btw {
+                        question,
+                        answer,
+                        top,
+                    })
+                }
+            },
+            Some(Dialog::Copy { sel, choices }) => match k {
+                Key::Up => {
+                    ui.dialog = Some(Dialog::Copy {
+                        sel: sel.saturating_sub(1),
+                        choices,
+                    })
+                }
+                Key::Down => {
+                    let sel = (sel + 1).min(choices.len().saturating_sub(1));
+                    ui.dialog = Some(Dialog::Copy { sel, choices });
+                }
+                Key::Enter => {
+                    if let Some((_, t)) = choices.into_iter().nth(sel) {
+                        ui.status = Some(copied(&t));
+                        self.clip = Some(t);
+                    }
+                }
+                Key::Esc => {}
+                _ => ui.dialog = Some(Dialog::Copy { sel, choices }),
+            },
             Some(d) => {
                 ui.dialog = dialog_key(c, d, k, &mut out);
             }
@@ -625,22 +700,59 @@ fn submit(
         }
         "/rename" => Submit::Send(vec![m("rename", vec![("x", Value::string(rest))])]),
         "/exit" | "/quit" => Submit::Send(vec![m("exit", vec![])]),
-        "/home" => Submit::Home,
-        "/copy" => match c.last_text() {
-            Some(t) => {
-                ui.status = Some(format!(
-                    "Copied {} characters to the clipboard",
-                    t.chars().count()
-                ));
-                Submit::Copy(t.to_string())
+        // Back to the home, the session left running: zmx's detach, as Ctrl+\\ is in ssh dev.
+        "/home" | "/disconnect" => Submit::Home,
+        "/btw" if rest.is_empty() => {
+            ui.status = Some("/btw takes a question".into());
+            Submit::Nothing
+        }
+        // A side question, answered beside the conversation and kept out of it: shown in its
+        // own panel until dismissed, as Claude Code's is.
+        "/btw" => {
+            ui.dialog = Some(Dialog::Btw {
+                question: rest.to_string(),
+                answer: None,
+                top: 0,
+            });
+            Submit::Send(vec![m("btw", vec![("x", Value::string(rest))])])
+        }
+        "/copy" => {
+            let back = if rest.is_empty() {
+                Some(1)
+            } else {
+                rest.parse::<usize>().ok().filter(|n| *n > 0)
+            };
+            let Some(back) = back else {
+                ui.status = Some("/copy takes how many responses back, 1 the latest".into());
+                return Submit::Nothing;
+            };
+            let all = c.responses();
+            let Some(text) = all.len().checked_sub(back).and_then(|i| all.get(i)) else {
+                ui.status = Some(if all.is_empty() {
+                    "Nothing to copy yet".into()
+                } else {
+                    format!("Only {} responses to copy from", all.len())
+                });
+                return Submit::Nothing;
+            };
+            let choices = convo::copy_choices(text);
+            if choices.len() > 1 {
+                ui.dialog = Some(Dialog::Copy { sel: 0, choices });
+                return Submit::Nothing;
             }
-            None => {
-                ui.status = Some("Nothing to copy yet".into());
-                Submit::Nothing
-            }
-        },
+            ui.status = Some(copied(text));
+            Submit::Copy(text.clone())
+        }
         _ => Submit::Send(vec![m("say", vec![("x", Value::string(text))])]),
     }
+}
+
+/// What the status line says once something is on the clipboard.
+fn copied(text: &str) -> String {
+    format!(
+        "Copied {} characters to the clipboard",
+        text.chars().count()
+    )
 }
 
 /// A key in the prompt: typing, moving and deleting.
@@ -909,6 +1021,8 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             }
             _ => Some(Dialog::Effort { sel }),
         },
+        // Taken by `conv_key` before it gets here, since what they do is the client's.
+        d @ (Dialog::Copy { .. } | Dialog::Btw { .. }) => Some(d),
     }
 }
 
@@ -1171,41 +1285,50 @@ fn connecting(frame: usize) -> Busy {
     }
 }
 
+impl App {
+    /// A client for the ssh name `name`, its home empty until the relay says hello, a wheel
+    /// report scrolling `wheel` lines.
+    fn new(name: &str, w: u16, h: u16, wheel: usize) -> App {
+        let hub = Header {
+            host: name.to_string(),
+            memory: None,
+            load: None,
+        };
+        let mut app = App {
+            name: name.to_string(),
+            wire: None,
+            epoch: 0,
+            down_since: None,
+            retry_at: None,
+            backoff: Duration::from_secs(1),
+            last_heard: Instant::now(),
+            awaiting: None,
+            hosts: Vec::new(),
+            places: HashMap::new(),
+            rows: HashMap::new(),
+            hub: hub.clone(),
+            menu: Menu::hub(w, h, hub, Vec::new(), Vec::new()),
+            menu_fresh: true,
+            screen: Screen::Home,
+            models: None,
+            history: Vec::new(),
+            history_at: None,
+            drawn: Vec::new(),
+            clip: None,
+            quit: false,
+            started: Instant::now(),
+            greeted: false,
+            wheel,
+        };
+        app.menu.remote = true;
+        app
+    }
+}
+
 pub fn run(name: &str) -> Result<(), String> {
     let (w, h) = term::size().ok_or("not a terminal")?;
     let (tx, rx): (Sender<Heard>, Receiver<Heard>) = mpsc::channel();
-    let hub = Header {
-        host: name.to_string(),
-        memory: None,
-        load: None,
-    };
-    let mut app = App {
-        name: name.to_string(),
-        wire: None,
-        epoch: 0,
-        down_since: None,
-        retry_at: None,
-        backoff: Duration::from_secs(1),
-        last_heard: Instant::now(),
-        awaiting: None,
-        hosts: Vec::new(),
-        places: HashMap::new(),
-        rows: HashMap::new(),
-        hub: hub.clone(),
-        menu: Menu::hub(w, h, hub, Vec::new(), Vec::new()),
-        menu_fresh: true,
-        screen: Screen::Home,
-        models: None,
-        history: Vec::new(),
-        history_at: None,
-        drawn: Vec::new(),
-        clip: None,
-        quit: false,
-        started: Instant::now(),
-        greeted: false,
-        wheel: wheel_step(|k| std::env::var(k).ok()),
-    };
-    app.menu.remote = true;
+    let mut app = App::new(name, w, h, wheel_step(|k| std::env::var(k).ok()));
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
     term.write_all(b"\x1b[2J").map_err(|e| e.to_string())?;
     app.dial(Instant::now(), &tx);
@@ -1521,6 +1644,114 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(submit(&mut c, &mut ui, "/copy", &None), Submit::Copy(t) if t == "hello"));
+    }
+
+    /// A client with a conversation open on `ops`, as if the relay had sent them.
+    fn app_in(ops: &[&str]) -> App {
+        let mut app = App::new("dev", 40, 24, 1);
+        app.screen = Screen::Conv {
+            c: Box::new(convo_with(ops)),
+            ui: Box::new(Ui::new()),
+            opening: false,
+        };
+        app
+    }
+
+    fn type_in(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        app.key(Key::Enter, Instant::now());
+    }
+
+    fn dialog(app: &App) -> Option<&Dialog> {
+        match &app.screen {
+            Screen::Conv { ui, .. } => ui.dialog.as_ref(),
+            Screen::Home => None,
+        }
+    }
+
+    #[test]
+    fn ctrl_backslash_and_disconnect_leave_for_the_home_and_from_the_home_quit() {
+        let mut app = app_in(&[]);
+        type_in(&mut app, "/effort");
+        assert!(matches!(dialog(&app), Some(Dialog::Effort { .. })));
+        app.key(Key::Char(DETACH), Instant::now());
+        assert!(
+            matches!(app.screen, Screen::Home),
+            "out, the dialog open or not"
+        );
+        assert!(!app.quit);
+        app.key(Key::Char(DETACH), Instant::now());
+        assert!(app.quit, "and from the home, out of the client");
+
+        let mut app = app_in(&[]);
+        type_in(&mut app, "/disconnect");
+        assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn copy_takes_a_whole_response_or_one_back_and_offers_its_code_blocks() {
+        let mut app = app_in(&[
+            r#"{"t":"add","id":1,"k":"user","x":"one"}"#,
+            r#"{"t":"add","id":2,"k":"text","x":"first"}"#,
+            r#"{"t":"add","id":3,"k":"tool","n":"Bash","a":"ls"}"#,
+            r#"{"t":"add","id":4,"k":"text","x":"still first"}"#,
+            r#"{"t":"add","id":5,"k":"user","x":"two"}"#,
+            r#"{"t":"add","id":6,"k":"text","x":"Run:\n\n```sh\nmake test\n```\n\nthen look."}"#,
+        ]);
+        type_in(&mut app, "/copy 2");
+        assert_eq!(
+            app.clip.take().as_deref(),
+            Some("first\n\nstill first"),
+            "a response is a turn's text, tool calls left out"
+        );
+        type_in(&mut app, "/copy 3");
+        assert!(app.clip.is_none(), "there is no third");
+        type_in(&mut app, "/copy");
+        let Some(Dialog::Copy { choices, .. }) = dialog(&app) else {
+            panic!("a response with code offers a choice");
+        };
+        let labels: Vec<&str> = choices.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Full response", "sh: make test"]);
+        app.key(Key::Down, Instant::now());
+        app.key(Key::Enter, Instant::now());
+        assert_eq!(app.clip.as_deref(), Some("make test"));
+        assert!(dialog(&app).is_none());
+    }
+
+    #[test]
+    fn btw_asks_beside_the_conversation_and_shows_the_answer_until_dismissed() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"text","x":"hello"}"#]);
+        let c_before = match &app.screen {
+            Screen::Conv { c, .. } => c.entries.len(),
+            Screen::Home => 0,
+        };
+        type_in(&mut app, "/btw what was that?");
+        assert!(matches!(
+            dialog(&app),
+            Some(Dialog::Btw { answer: None, question, .. }) if question == "what was that?"
+        ));
+        app.heard(
+            parse(r#"{"t":"btw","x":"A greeting."}"#).unwrap(),
+            Instant::now(),
+        );
+        assert!(matches!(
+            dialog(&app),
+            Some(Dialog::Btw { answer: Some(Ok(a)), .. }) if a == "A greeting."
+        ));
+        app.key(Key::Char('x'), Instant::now());
+        assert!(
+            dialog(&app).is_some(),
+            "only Space, Enter or Esc dismiss it"
+        );
+        app.key(Key::Esc, Instant::now());
+        assert!(dialog(&app).is_none());
+        let c_after = match &app.screen {
+            Screen::Conv { c, .. } => c.entries.len(),
+            Screen::Home => 0,
+        };
+        assert_eq!(c_before, c_after, "nothing of it joins the transcript");
     }
 
     #[test]

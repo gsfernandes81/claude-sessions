@@ -1531,6 +1531,119 @@ fn driven_by_holder(rec: &SlotRecord) -> Result<String, String> {
     }
 }
 
+/// What `/btw`'s claude is told beside its own system prompt: Claude Code's side question
+/// answers from the conversation so far, with no tools, and leaves it as it was.
+const BTW_PROMPT: &str = "This is a side question (/btw) about the conversation so far, asked \
+while the main conversation may still be working. Answer it briefly from what is already in \
+the conversation. You have no tools, and neither the question nor your answer is added to the \
+conversation.";
+/// How long a side question may take before it is given up on.
+const BTW_WAIT: Duration = Duration::from_secs(120);
+
+/// `claude` for `/btw`: the slot's conversation forked and left unsaved, so the original is
+/// untouched and no session file is left behind; no tools; no hooks, so the side claude is
+/// never taken for the slot's by `claude-sessions hook`; no MCP servers to start. `model` is
+/// the one the conversation runs, empty for claude's default.
+pub(crate) fn btw_args(session: &str, model: &str) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "-p",
+        "--resume",
+        session,
+        "--fork-session",
+        "--no-session-persistence",
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--settings",
+        r#"{"disableAllHooks":true}"#,
+        "--append-system-prompt",
+        BTW_PROMPT,
+    ]
+    .map(String::from)
+    .to_vec();
+    if !model.is_empty() {
+        a.extend(["--model".to_string(), model.to_string()]);
+    }
+    a
+}
+
+/// `/btw QUESTION` from the remote view: answered by a short-lived claude on a fork of the
+/// slot's conversation (`btw_args`), in the slot's directory, the question on its stdin. The
+/// answer, or why there is none.
+pub(crate) fn remote_btw(
+    slot: &str,
+    model: &str,
+    question: &str,
+    deps: &Deps,
+) -> Result<String, String> {
+    use std::io::{Read as _, Write as _};
+    let rec = match registry::load(slot) {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return Err(format!("{slot} is gone")),
+        Err(e) => return Err(format!("{slot}: {e}")),
+    };
+    if rec.harness != Harness::Claude {
+        return Err("/btw is claude's".into());
+    }
+    let Some(session) = rec.session_id.clone().filter(|s| !s.is_empty()) else {
+        return Err("nothing to ask about yet".into());
+    };
+    // A second claude for as long as it answers: the same room a new session needs.
+    match room_check(&[], deps) {
+        None => {}
+        Some(_) => return Err("no room for a side question here".into()),
+    }
+    let mut cmd = Command::new(&deps.claude);
+    cmd.args(btw_args(&session, model))
+        .env_remove("CLAUDE_SESSIONS_SLOT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = rec.cwd.as_deref().filter(|c| Path::new(c).is_dir()) {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("cannot run claude: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(question.as_bytes());
+    }
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        })
+    };
+    let out = read(child.stdout.take().map(|p| Box::new(p) as _));
+    let err = read(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = Instant::now() + BTW_WAIT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => break None,
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let said = out.join().unwrap_or_default();
+    let why = err.join().unwrap_or_default();
+    match status {
+        None => Err("the side question took too long".into()),
+        Some(st) if st.success() && !said.trim().is_empty() => Ok(said.trim().to_string()),
+        Some(_) => Err(why
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("claude did not answer")
+            .trim()
+            .to_string()),
+    }
+}
+
 /// The menu's no-room check, said as a refusal: the remote view has no offer dialog.
 fn remote_room(deps: &Deps) -> Result<(), String> {
     match room_check(&[], deps) {
@@ -2000,6 +2113,53 @@ exit 1"#,
     }
 
     /// An offloaded slot with its conversation on disk.
+    #[test]
+    fn a_side_question_forks_the_conversation_unsaved_with_no_tools_or_hooks() {
+        let a = btw_args("s-1", "claude-haiku-5-5");
+        let has = |pair: [&str; 2]| a.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1]);
+        assert!(has(["--resume", "s-1"]));
+        assert!(has(["--tools", ""]));
+        assert!(has(["--model", "claude-haiku-5-5"]));
+        assert!(has(["--settings", r#"{"disableAllHooks":true}"#]));
+        for flag in [
+            "-p",
+            "--fork-session",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+        ] {
+            assert!(a.iter().any(|x| x == flag), "{flag}");
+        }
+        assert!(
+            !btw_args("s-1", "").iter().any(|x| x == "--model"),
+            "no model said, claude's default"
+        );
+    }
+
+    #[test]
+    fn a_side_question_is_asked_of_a_claude_in_the_slots_directory_and_answered() {
+        let f = Fixture::new("btw");
+        let claude = f.script(
+            "claude",
+            r#"q=$(cat); echo "in $PWD for $3: $q"; [ -z "$CLAUDE_SESSIONS_SLOT" ] || echo "slot leaked""#,
+        );
+        let deps = f.deps(f.zmx(":"), claude);
+        registry::store(&offloaded("claude-3", "s-9", &f.work())).unwrap();
+        let said = remote_btw("claude-3", "", "what was that?", &deps);
+        assert_eq!(said, Ok(format!("in {} for s-9: what was that?", f.work())));
+
+        let fails = f.script("claude2", "echo 'No conversation found' >&2; exit 1");
+        let deps = f.deps(f.zmx(":"), fails);
+        assert_eq!(
+            remote_btw("claude-3", "", "q", &deps),
+            Err("No conversation found".into()),
+            "what claude said on its way out"
+        );
+        assert_eq!(
+            remote_btw("claude-8", "", "q", &deps),
+            Err("claude-8 is gone".into())
+        );
+    }
+
     fn offloaded(slot: &str, session: &str, cwd: &str) -> SlotRecord {
         let made = Moment::now();
         let mut r = SlotRecord::new(

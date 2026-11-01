@@ -423,7 +423,24 @@ fn cmd_remote(args: &[String]) -> ExitCode {
         (Some("resume"), Some(id), Some(cwd), title) => {
             launch::remote_resume(id, cwd, title.unwrap_or(id), &deps)
         }
-        _ => Err("remote takes new [DIR], open SLOT, or resume ID CWD TITLE".to_string()),
+        // `/btw`: the question on stdin, the answer (or `{"error"}`) as one JSON line.
+        (Some("btw"), Some(slot), model, None) => {
+            let mut question = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut question);
+            let answer = launch::remote_btw(slot, model.unwrap_or(""), question.trim(), &deps);
+            let mut v = json::Value::obj();
+            match answer {
+                Ok(a) => v.set("answer", json::Value::string(&a)),
+                Err(e) => v.set("error", json::Value::string(&e)),
+            }
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{}", json::to_line(&v)).and_then(|()| out.flush());
+            return ExitCode::SUCCESS;
+        }
+        _ => Err(
+            "remote takes new [DIR], open SLOT, resume ID CWD TITLE, or btw SLOT [MODEL]"
+                .to_string(),
+        ),
     };
     let mut first = json::Value::obj();
     let slot = match opened {

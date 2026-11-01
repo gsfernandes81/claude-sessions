@@ -52,6 +52,13 @@ pub enum Op {
         how: String,
         answers: Vec<(String, String)>,
     },
+    /// What runs under a subagent or workflow call now, and whether it is `running` or has
+    /// ended (`completed`, `failed`, `stopped`): replaces the lines sent before.
+    Progress {
+        id: u64,
+        lines: Vec<String>,
+        state: String,
+    },
     /// What claude is doing: `working`, `compacting`, `waiting` (on an answer) or `idle`.
     State(String),
     /// The conversation's model, permission mode, title and id, sent when one changes.
@@ -79,6 +86,10 @@ pub enum Item {
     Text(String),
     /// A tool call: its name and the one argument Claude Code shows beside it.
     Tool { name: String, arg: String },
+    /// A subagent or a workflow: drawn on its own, as Claude Code does, not folded into a run
+    /// of tool calls. `name` is the agent's type (`Explore`, `Agent`) or `Workflow`, `arg`
+    /// its description.
+    Agent { name: String, arg: String },
     /// A tool waiting on the owner's permission. `always` is the label of Claude Code's
     /// "Yes, and don't ask again" option, empty when claude suggested no rule to add.
     Permission {
@@ -126,10 +137,164 @@ pub struct Reducer {
     suggestions: HashMap<String, Vec<Value>>,
     /// Every tool result's full text, by item, for when the view asks.
     results: HashMap<u64, String>,
+    /// Subagents and workflows, by the tool-use id that started them.
+    tasks: HashMap<String, TaskView>,
     meta: Meta,
     state: String,
     /// The next user text is a compaction's summary, which Claude Code does not draw.
     after_compact: bool,
+}
+
+/// What the view is told of one subagent or workflow.
+#[derive(Debug, Default)]
+struct TaskView {
+    item: u64,
+    workflow: bool,
+    /// A subagent's own tool calls, as `Name(arg)`.
+    calls: Vec<String>,
+    usage: sdk::Usage,
+    phases: Vec<String>,
+    agents: Vec<sdk::WorkflowAgent>,
+    /// How it ended, once it has.
+    ended: Option<String>,
+    /// The lines and state last sent, so a progress line that changes nothing sends nothing.
+    sent: (Vec<String>, String),
+}
+
+impl TaskView {
+    fn state(&self) -> String {
+        self.ended.clone().unwrap_or_else(|| "running".into())
+    }
+
+    /// Claude Code's lines under an agent call: its last tool calls and how many more while
+    /// it runs, `Done (3 tool uses · 21.6k tokens · 7.6s)` once it has finished. A
+    /// workflow's say its phase, how many of that phase's agents are done, and what the
+    /// running ones are doing.
+    fn lines(&self) -> Vec<String> {
+        let u = self.usage;
+        if let Some(how) = &self.ended {
+            let word = match how.as_str() {
+                "completed" => "Done",
+                "failed" => "Failed",
+                _ => "Stopped",
+            };
+            let mut parts = Vec::new();
+            if self.workflow && !self.agents.is_empty() {
+                parts.push(plural(self.agents.len() as u64, "agent"));
+            }
+            parts.push(plural(u.tool_uses, "tool use"));
+            if u.tokens > 0 {
+                parts.push(format!("{} tokens", tokens(u.tokens)));
+            }
+            parts.push(duration(u.duration_ms));
+            return vec![format!("{word} ({})", parts.join(" · "))];
+        }
+        if self.workflow {
+            let Some(phase) = self.agents.iter().map(|a| a.phase).max() else {
+                return vec![match self.phases.first() {
+                    Some(p) => format!("{p} · starting…"),
+                    None => "Starting…".into(),
+                }];
+            };
+            let here: Vec<&sdk::WorkflowAgent> =
+                self.agents.iter().filter(|a| a.phase == phase).collect();
+            let done = here.iter().filter(|a| a.state == "done").count();
+            let title = (phase as usize)
+                .checked_sub(1)
+                .and_then(|i| self.phases.get(i))
+                .map(|t| format!("{t} · "))
+                .unwrap_or_default();
+            let mut out = vec![format!("{title}{done} of {} agents done", here.len())];
+            let running: Vec<&&sdk::WorkflowAgent> = here
+                .iter()
+                .filter(|a| !matches!(a.state.as_str(), "done" | "failed" | "queued"))
+                .collect();
+            for a in running.iter().take(2) {
+                out.push(if a.last_tool.is_empty() {
+                    a.label.clone()
+                } else {
+                    format!("{} · {}", a.label, a.last_tool)
+                });
+            }
+            if running.len() > 2 {
+                out.push(format!("+{} more running", running.len() - 2));
+            }
+            return out;
+        }
+        if self.calls.is_empty() {
+            return vec!["Initializing…".into()];
+        }
+        const SHOWN: usize = 2;
+        let shown = self.calls.len().min(SHOWN);
+        let mut out = self.calls[self.calls.len() - shown..].to_vec();
+        let more = (u.tool_uses as usize).max(self.calls.len()) - shown;
+        if more > 0 {
+            out.push(format!(
+                "+{more} more tool use{}",
+                if more == 1 { "" } else { "s" }
+            ));
+        }
+        out
+    }
+}
+
+fn plural(n: u64, what: &str) -> String {
+    format!("{n} {what}{}", if n == 1 { "" } else { "s" })
+}
+
+/// `512`, `21.6k`, `1.2m`, as Claude Code counts tokens.
+fn tokens(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}m", n as f64 / 1e6),
+    }
+}
+
+/// `7.6s`, `1m 23s`, `1h 2m`.
+fn duration(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=59 => format!("{:.1}s", ms as f64 / 1e3),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        _ => format!("{}h {}m", s / 3600, s / 60 % 60),
+    }
+}
+
+/// Whether a tool call starts a subagent or a workflow, which the view draws on its own.
+fn is_task_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task" | "Workflow")
+}
+
+/// The name an agent call is drawn under: its type, as Claude Code titles it, or `Agent` for
+/// the general-purpose one; `Workflow` for a workflow.
+fn agent_name(name: &str, input: &Value) -> String {
+    if name == "Workflow" {
+        return name.into();
+    }
+    match input.get("subagent_type").and_then(Value::as_str) {
+        Some(t) if !t.is_empty() && t != "general-purpose" => t.to_string(),
+        _ => "Agent".into(),
+    }
+}
+
+/// A workflow call's title: a saved workflow's name, or the description in its script's
+/// `meta`, which is a literal by the tool's own rule.
+fn workflow_title(input: &Value) -> String {
+    if let Some(n) = input.get("name").and_then(Value::as_str) {
+        return cut(n);
+    }
+    let script = input.get("script").and_then(Value::as_str).unwrap_or("");
+    let found = script.find("description:").and_then(|at| {
+        let rest = script[at + "description:".len()..].trim_start();
+        let q = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '\'' | '"' | '`'))?;
+        let body = &rest[1..];
+        body.find(q).map(|end| body[..end].to_string())
+    });
+    cut(&found.unwrap_or_else(|| "workflow".into()))
 }
 
 impl Reducer {
@@ -155,6 +320,22 @@ impl Reducer {
         if self.meta != meta {
             self.meta = meta.clone();
             out.ops.push(Op::Meta(meta));
+        }
+    }
+
+    /// A subagent's or workflow's lines, sent when they differ from the last sent.
+    fn show_task(&mut self, key: &str, out: &mut Out) {
+        let Some(t) = self.tasks.get_mut(key) else {
+            return;
+        };
+        let now = (t.lines(), t.state());
+        if t.sent != now {
+            t.sent = now.clone();
+            out.ops.push(Op::Progress {
+                id: t.item,
+                lines: now.0,
+                state: now.1,
+            });
         }
     }
 
@@ -207,13 +388,36 @@ impl Reducer {
     /// One line from claude.
     pub fn feed(&mut self, v: &Value) -> Out {
         let mut out = Out::default();
-        // A subagent's own messages are drawn by Claude Code as progress under its Task call,
-        // not as the conversation's; the call's result is what the view shows.
-        if sdk::parent_tool_use_id(v).is_some() {
-            if let Msg::Permission { .. } | Msg::Question { .. } = sdk::classify(v) {
+        // A subagent's own messages are drawn by Claude Code as progress under its agent call,
+        // its tool calls as the last few of them, not as the conversation's.
+        if let Some(parent) = sdk::parent_tool_use_id(v) {
+            match sdk::classify(v) {
                 // A subagent's permission prompt still needs the owner.
-            } else {
-                return out;
+                Msg::Permission { .. } | Msg::Question { .. } => {}
+                Msg::Assistant { blocks, .. } => {
+                    let parent = parent.to_string();
+                    if let Some(t) = self.tasks.get_mut(&parent) {
+                        for b in blocks {
+                            if let Block::ToolUse { name, input, .. } = b {
+                                // How a subagent hands its answer back, not work it did:
+                                // counted in its tool uses, not listed.
+                                if matches!(name.as_str(), "SubagentHandback" | "StructuredOutput")
+                                {
+                                    continue;
+                                }
+                                let arg = tool_arg(&name, &input);
+                                t.calls.push(if arg.is_empty() {
+                                    name
+                                } else {
+                                    format!("{name}({arg})")
+                                });
+                            }
+                        }
+                    }
+                    self.show_task(&parent, &mut out);
+                    return out;
+                }
+                _ => return out,
             }
         }
         match sdk::classify(v) {
@@ -272,6 +476,25 @@ impl Reducer {
                 for b in blocks {
                     match b {
                         Block::Text(text) => self.finish_text(&mut out, &message_id, text),
+                        Block::ToolUse { id, name, input } if is_task_tool(&name) => {
+                            let arg = if name == "Workflow" {
+                                workflow_title(&input)
+                            } else {
+                                tool_arg(&name, &input)
+                            };
+                            let shown = agent_name(&name, &input);
+                            let item = self.add(&mut out, Item::Agent { name: shown, arg });
+                            self.tools.insert(id.clone(), item);
+                            self.tasks.insert(
+                                id.clone(),
+                                TaskView {
+                                    item,
+                                    workflow: name == "Workflow",
+                                    ..TaskView::default()
+                                },
+                            );
+                            self.show_task(&id, &mut out);
+                        }
                         Block::ToolUse { id, name, input } => {
                             let arg = tool_arg(&name, &input);
                             let item = self.add(&mut out, Item::Tool { name, arg });
@@ -286,6 +509,17 @@ impl Reducer {
                     let Some(&id) = self.tools.get(&r.tool_use_id) else {
                         continue;
                     };
+                    // An agent's result is its report, kept for the view to ask for; what is
+                    // drawn is its progress and how it ended. A call that failed outright (a
+                    // workflow whose script would not run) ends there.
+                    if let Some(t) = self.tasks.get_mut(&r.tool_use_id) {
+                        if r.is_error && t.ended.is_none() {
+                            t.ended = Some("failed".into());
+                        }
+                        self.results.entry(id).or_insert(r.text);
+                        self.show_task(&r.tool_use_id, &mut out);
+                        continue;
+                    }
                     let (preview, lines) = preview(&r.text);
                     self.results.insert(id, r.text);
                     out.ops.push(Op::Result {
@@ -375,6 +609,46 @@ impl Reducer {
                     how: "answered".into(),
                     answers,
                 });
+            }
+            Msg::Task { tool_use_id, event } => {
+                let Some(t) = self.tasks.get_mut(&tool_use_id) else {
+                    // A background shell command's task, or one before this log began.
+                    return out;
+                };
+                match event {
+                    sdk::Task::Started { .. } => {}
+                    sdk::Task::Progress {
+                        usage,
+                        phases,
+                        agents,
+                    } => {
+                        t.usage = usage;
+                        if !phases.is_empty() {
+                            t.phases = phases;
+                        }
+                        if !agents.is_empty() {
+                            t.agents = agents;
+                        }
+                    }
+                    sdk::Task::Done {
+                        status,
+                        usage,
+                        report,
+                    } => {
+                        t.ended = Some(if status.is_empty() {
+                            "completed".into()
+                        } else {
+                            status
+                        });
+                        if usage != sdk::Usage::default() {
+                            t.usage = usage;
+                        }
+                        if let Some(r) = report {
+                            self.results.insert(t.item, r);
+                        }
+                    }
+                }
+                self.show_task(&tool_use_id, &mut out);
             }
             Msg::Cancelled { request_id } => {
                 if let Some(o) = self.answered(&request_id, "withdrawn", Vec::new()) {
@@ -539,10 +813,16 @@ pub fn always_label(suggestions: &[Value]) -> Option<String> {
     Some(label)
 }
 
-/// Merge a batch of ops for one write: consecutive appends to one item become one.
+/// Merge a batch of ops for one write: consecutive appends to one item become one, and only
+/// the last progress op of each agent is kept.
 pub fn coalesce(ops: Vec<Op>) -> Vec<Op> {
     let mut merged: Vec<Op> = Vec::with_capacity(ops.len());
     for op in ops {
+        // A progress op replaces what was under its agent, so an earlier one in the batch is
+        // already out of date.
+        if let Op::Progress { id, .. } = &op {
+            merged.retain(|m| !matches!(m, Op::Progress { id: was, .. } if was == id));
+        }
         if let (
             Some(Op::Append {
                 id: last,
@@ -698,6 +978,19 @@ impl Op {
                 }
                 v
             }
+            Op::Progress {
+                id: n,
+                lines,
+                state,
+            } => obj(vec![
+                ("t", Value::string("prog")),
+                id(n),
+                (
+                    "p",
+                    Value::Arr(lines.iter().cloned().map(Value::string).collect()),
+                ),
+                ("st", Value::string(state.clone())),
+            ]),
             Op::State(s) => obj(vec![
                 ("t", Value::string("st")),
                 ("s", Value::string(s.clone())),
@@ -725,6 +1018,11 @@ impl Item {
             Item::Note(x) => obj(vec![k("note"), ("x", Value::string(x.clone()))]),
             Item::Tool { name, arg } => obj(vec![
                 k("tool"),
+                ("n", Value::string(name.clone())),
+                ("a", Value::string(arg.clone())),
+            ]),
+            Item::Agent { name, arg } => obj(vec![
+                k("agent"),
                 ("n", Value::string(name.clone())),
                 ("a", Value::string(arg.clone())),
             ]),
@@ -1108,7 +1406,7 @@ mod tests {
         let lines = wire(&o.ops);
         assert_eq!(
             lines[0],
-            r#"{"a":"Find it","id":1,"k":"tool","n":"Task","t":"add"}"#
+            r#"{"a":"Find it","id":1,"k":"agent","n":"Agent","t":"add"}"#
         );
         assert!(
             !lines.iter().any(|l| l.contains("subagent talk")),
@@ -1118,6 +1416,143 @@ mod tests {
             lines.iter().any(|l| l.contains(r#""k":"perm""#)),
             "{lines:?}"
         );
+    }
+
+    // A foreground Explore agent as 2.1.311 wrote it on 2026-11-01, cut to the fields read:
+    // its call, the task's start and progress, its own tool calls under the call's id, its
+    // handback, the notification, then the call's result.
+    const AGENT: &[&str] = &[
+        r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_a","name":"Agent","input":{"description":"Count lines in .txt files","subagent_type":"Explore","prompt":"long"}}]},"parent_tool_use_id":null}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"t1","tool_use_id":"toolu_a","description":"Count lines in .txt files","subagent_type":"Explore","task_type":"local_agent"}"#,
+        r#"{"type":"system","subtype":"task_progress","task_id":"t1","tool_use_id":"toolu_a","usage":{"total_tokens":20012,"tool_uses":1,"duration_ms":2354},"last_tool_name":"Glob"}"#,
+        r#"{"type":"assistant","message":{"id":"i1","content":[{"type":"tool_use","id":"toolu_g","name":"Glob","input":{"pattern":"*.txt"}}]},"parent_tool_use_id":"toolu_a"}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_g","type":"tool_result","content":"a.txt\nb.txt"}]},"parent_tool_use_id":"toolu_a"}"#,
+        r#"{"type":"assistant","message":{"id":"i2","content":[{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"wc -l a.txt b.txt"}}]},"parent_tool_use_id":"toolu_a"}"#,
+        r#"{"type":"assistant","message":{"id":"i3","content":[{"type":"tool_use","id":"toolu_r","name":"Read","input":{"file_path":"a.txt"}}]},"parent_tool_use_id":"toolu_a"}"#,
+        r#"{"type":"assistant","message":{"id":"i4","content":[{"type":"tool_use","id":"toolu_h","name":"SubagentHandback","input":{"message":"a.txt: 2, b.txt: 1"}}]},"parent_tool_use_id":"toolu_a"}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_a","status":"completed","usage":{"total_tokens":21565,"tool_uses":4,"duration_ms":7594},"handback_report":{"text":"a.txt: 2, b.txt: 1"}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_a","type":"tool_result","content":[{"type":"text","text":"This agent's report was delivered to you as a message"}]}]},"parent_tool_use_id":null}"#,
+    ];
+
+    fn progress(ops: &[Op]) -> Vec<(Vec<String>, String)> {
+        ops.iter()
+            .filter_map(|o| match o {
+                Op::Progress { lines, state, .. } => Some((lines.clone(), state.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_agent_is_drawn_under_its_type_with_its_last_calls_then_how_it_ended() {
+        let mut r = Reducer::new();
+        let o = feed_all(&mut r, AGENT);
+        let lines = wire(&o.ops);
+        assert_eq!(
+            lines[0],
+            r#"{"a":"Count lines in .txt files","id":1,"k":"agent","n":"Explore","t":"add"}"#
+        );
+        let p = progress(&o.ops);
+        let got: Vec<Vec<&str>> = p
+            .iter()
+            .map(|(l, _)| l.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                vec!["Initializing…"],
+                vec!["Glob(*.txt)"],
+                vec!["Glob(*.txt)", "Bash(wc -l a.txt b.txt)"],
+                vec!["Bash(wc -l a.txt b.txt)", "Read(a.txt)", "+1 more tool use"],
+                vec!["Done (4 tool uses · 21.6k tokens · 7.6s)"],
+            ],
+            "the last two calls and a count of the rest; the handback is not one of them"
+        );
+        assert!(p[..4].iter().all(|(_, st)| st == "running"));
+        assert_eq!(p[4].1, "completed");
+        assert!(
+            !lines.iter().any(|l| l.contains(r#""t":"res""#)),
+            "its result is its report, not drawn: {lines:?}"
+        );
+        assert_eq!(r.full_result(1), Some("a.txt: 2, b.txt: 1"));
+    }
+
+    #[test]
+    fn a_workflow_says_its_phase_its_running_agents_and_its_totals() {
+        let mut r = Reducer::new();
+        let agent = |label: &str, state: &str, tool: &str| {
+            format!(
+                r#"{{"type":"workflow_agent","label":"{label}","phaseIndex":1,"state":"{state}","lastToolName":"{tool}"}}"#
+            )
+        };
+        let prog = |agents: &[String]| {
+            format!(
+                r#"{{"type":"system","subtype":"task_progress","tool_use_id":"toolu_w","usage":{{"total_tokens":0,"tool_uses":0,"duration_ms":40}},"workflow_progress":[{{"type":"workflow_phase","index":1,"title":"Read"}},{}]}}"#,
+                agents.join(",")
+            )
+        };
+        let start = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_w","name":"Workflow","input":{"script":"export const meta = {\n  name: 'r',\n  description: 'Read both files',\n}\n"}}]}}"#;
+        let a = prog(&[
+            agent("read:a", "running", "Read"),
+            agent("read:b", "queued", ""),
+        ]);
+        let b = prog(&[
+            agent("read:a", "done", "Read"),
+            agent("read:b", "running", ""),
+        ]);
+        let launched = r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_w","type":"tool_result","content":"Workflow launched in background."}]}}"#;
+        let done = r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_w","status":"completed","usage":{"total_tokens":43599,"tool_uses":4,"duration_ms":67575}}"#;
+        let o = feed_all(&mut r, &[start, &a, launched, &b, done]);
+        assert_eq!(
+            wire(&o.ops)[0],
+            r#"{"a":"Read both files","id":1,"k":"agent","n":"Workflow","t":"add"}"#
+        );
+        let p = progress(&o.ops);
+        let got: Vec<Vec<&str>> = p
+            .iter()
+            .map(|(l, _)| l.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                vec!["Starting…"],
+                vec!["Read · 0 of 2 agents done", "read:a · Read"],
+                vec!["Read · 1 of 2 agents done", "read:b"],
+                vec!["Done (2 agents · 4 tool uses · 43.6k tokens · 1m 7s)"],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_call_that_fails_outright_says_so() {
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"toolu_w","name":"Workflow","input":{"name":"audit"}}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_w","type":"tool_result","content":"script did not parse","is_error":true}]}}"#,
+            ],
+        );
+        let p = progress(&o.ops);
+        assert_eq!(p.last().map(|(_, st)| st.as_str()), Some("failed"));
+        assert!(p.last().unwrap().0[0].starts_with("Failed ("));
+        assert_eq!(r.full_result(1), Some("script did not parse"));
+    }
+
+    #[test]
+    fn only_the_last_progress_of_each_agent_in_a_batch_is_sent() {
+        let p = |id, l: &str| Op::Progress {
+            id,
+            lines: vec![l.into()],
+            state: "running".into(),
+        };
+        let merged = coalesce(vec![
+            p(1, "a"),
+            p(2, "x"),
+            p(1, "b"),
+            Op::State("idle".into()),
+        ]);
+        assert_eq!(merged, vec![p(2, "x"), p(1, "b"), Op::State("idle".into())]);
     }
 
     #[test]

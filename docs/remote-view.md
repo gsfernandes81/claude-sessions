@@ -275,14 +275,16 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
      | `esc` · `exit` · `models` · `full {id}` | interrupt, end the session, the model list, a tool result whole |
+     | `btw {x}` | a side question, answered by its own claude beside the conversation (`claude-sessions remote btw SLOT [MODEL]`, the question on its stdin) and never added to it |
 
      | From the relay | Means |
      |---|---|
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
+     | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.
@@ -304,9 +306,26 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      (`WT_SESSION` set, `TERMUX_VERSION` not), which sends one a notch; End or Esc goes back down. Scrolled
      back, the top moves from where it sat at the bottom, so the first step from a prompt
      drawn on top with room under it is a line, not that room; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
-     empty one goes home, as `/home` and Ctrl-D do. `/model`, `/effort [level]`, `/auto`,
-     `/rename TITLE`, `/copy` (OSC 52, and `termux-clipboard-set` under Termux), `/exit`;
-     anything else, `/compact` included, is claude's.
+     empty one goes home, as `/home` and Ctrl-D do. **Ctrl+\\ and `/disconnect`** go home from
+     anywhere in a conversation, a dialog open or not, the session left running, as zmx's
+     detach key does in `ssh dev`; Ctrl+\\ on the home quits the client. `/model`,
+     `/effort [level]`, `/auto`, `/rename TITLE`, `/exit`; **`/copy [N]`** copies the Nth
+     response back, 1 the latest, a response being a turn's text without its tool calls,
+     and offers its code blocks one by one when it has any (OSC 52, and
+     `termux-clipboard-set` under Termux); **`/btw QUESTION`** asks a side question, shown
+     in its own panel until Space, Enter or Esc, and kept out of the conversation, as
+     Claude Code's: its claude is the conversation forked unsaved, with no tools, no hooks
+     and no MCP servers, on the conversation's model, in the slot's directory, given two
+     minutes, and refused when the container has no room for another claude. Anything
+     else, `/compact` included, is claude's.
+   - **Subagents and workflows** are drawn on their own, as Claude Code draws them, not
+     summed into a run of tool calls: `● Explore(what it was asked)` and under it its last
+     two tool calls and how many more, then `Done (4 tool uses · 21.6k tokens · 7.6s)`; a
+     workflow says its phase, how many of that phase's agents are done, and what the
+     running ones are doing, then its totals. The dot is green once it ended well and grey
+     when it failed or was stopped, which the line under it says in words. A subagent's
+     handback and structured output are counted, not listed, and its report is what `full`
+     answers.
    - **A holder's live socket counts as `driver: holder`** (`holder::serving`) where the
      record's field is missing: the released hooks on this dev container rewrote it, and the
      fleet runs mixed releases for a while after a pin bump.
