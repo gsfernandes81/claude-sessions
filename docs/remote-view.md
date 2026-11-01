@@ -27,6 +27,21 @@ The owner's decisions, in the session of 2026-11-01:
   Fable advisor, then the owner.
 - **MVP**: model swapping, permissions, AskUserQuestion, effort changes, compaction, `/rename`,
   exit, and `/copy`.
+- **The client is its own program on the phone** (artifact comments, 2026-11-01). It is run as
+  `claude-remote dev`, takes an ssh name, and reaches the hub over an ssh tunnel that
+  reconnects on its own; nothing new is started from the hub's door. Its home is the door's
+  list, drawn on the phone:
+  - sessions running in a terminal are listed but cannot be opened there;
+  - sessions not running, and sessions already in remote mode, open on Enter;
+  - `n` starts a new remote-mode session, if that is not too hard for the MVP.
+
+  A session's content streams only while it is open. Scrollback may be fetched eagerly at
+  first and made lazy later.
+- **No key chords for the phone.** The mode line keeps Claude's name and icon, but its hint is
+  `/auto to cycle` instead of shift+tab, which is awkward in Termux.
+- **Question options may be long, and they scroll** around the cursor whatever Claude Code does.
+  Claude's preview layout is drawn side by side at 80 columns and stacked under the list at 40.
+- **Anything not essential is deferred** from the MVP, with a list kept for later.
 
 ## The pin
 
@@ -102,12 +117,12 @@ Hooks fire as they do for an interactive claude; the registry's events are uncha
 ## The pieces
 
 ```
-view (Termux / WSL)  --ssh -T dev claude-sessions relay-->  relay (hub)  --ssh -T <c> claude-sessions tap <slot>-->  tap  --unix socket-->  holder (in the slot's zmx session)  --pipes-->  claude -p
+claude-remote dev (Termux / WSL)  --ssh -T dev claude-sessions relay-->  relay (hub)  --ssh -T <c> claude-sessions tap <slot>-->  tap  --unix socket-->  holder (in the slot's zmx session)  --pipes-->  claude -p
 ```
 
 | Piece | Runs in | Job |
 |---|---|---|
-| `claude-sessions view` | the owner's phone or WSL | draws the conversation, edits the prompt locally, owns the scrollback |
+| `claude-remote <ssh name>` (proposed: a second name for this binary) | the owner's phone or WSL | the door's list and the conversation, drawn locally; edits the prompt locally, owns the scrollback, reconnects on its own |
 | `claude-sessions relay` | the hub, one per connected view | reaches each container, **reduces** Claude's lines to compact items, carries the view's actions back as Claude's control messages |
 | `claude-sessions tap <slot>` | the container, over the hub's `ssh -T` | streams the holder's log from a sequence number; carries lines in |
 | `claude-sessions holder <slot>` | the container, as a zmx session's program | owns headless claude's pipes, numbers and logs every line, serves taps, draws one status line |
