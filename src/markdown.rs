@@ -920,10 +920,9 @@ pub fn wrap_spans(spans: &[(String, St)], w: usize) -> Vec<Line> {
         }
         let mut cur: Line = Vec::new();
         let mut cur_w = 0;
-        let mut started = false;
         for (n, word) in words.into_iter().enumerate() {
             let ww = width(&plain_of(&word));
-            if started && cur_w + 1 + ww <= w {
+            if cur_w > 0 && cur_w + 1 + ww <= w {
                 let st = space_st[n - 1];
                 append(&mut cur, " ", st);
                 for (t, s) in &word {
@@ -932,10 +931,14 @@ pub fn wrap_spans(spans: &[(String, St)], w: usize) -> Vec<Line> {
                 cur_w += 1 + ww;
                 continue;
             }
-            if started {
+            // A line never starts with a space: the one a break falls on, and any run of them
+            // after it, hang at the end of the line before, as Claude Code trims them.
+            if ww == 0 {
+                continue;
+            }
+            if cur_w > 0 {
                 lines.push(std::mem::take(&mut cur));
             }
-            started = true;
             cur_w = 0;
             for (t, s) in word {
                 for ch in t.chars() {
@@ -1053,6 +1056,17 @@ mod tests {
             ),
             ["docs (https://x.dev) and https://y.dev"]
         );
+    }
+
+    #[test]
+    fn a_break_in_a_run_of_spaces_starts_no_line_with_one() {
+        // Two spaces after a full stop, the break between them: Claude Code trims the space.
+        assert_eq!(text("aaa bbb.  ccc", 8), ["aaa bbb.", "ccc"]);
+        assert_eq!(text("aaa bbb.  ccc ddd", 9), ["aaa bbb.", "ccc ddd"]);
+        assert_eq!(text("a  b", 40), ["a  b"], "inside a line, kept as written");
+        for l in text("one.  Two  three.  Four five six seven.  Eight", 10) {
+            assert!(!l.starts_with(' '), "{l:?}");
+        }
     }
 
     #[test]
