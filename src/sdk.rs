@@ -95,6 +95,12 @@ pub enum Msg {
     /// A line a view sent claude, as the holder logs it (`{"type":"_in","line":…}`): read
     /// back so every view sees what any of them answered or changed.
     Input(Input),
+    /// A question answered before this claude started, read from the transcript's
+    /// `toolUseResult` on a resume: no request comes for it, so it arrives settled.
+    Answered {
+        questions: Vec<Question>,
+        answers: Vec<(String, String)>,
+    },
     /// A line of a type this version does not know, kept by its name so a log can say so.
     Unknown(String),
 }
@@ -334,11 +340,62 @@ fn history(line: &Value) -> Msg {
                     l.set("isReplay", Value::Bool(true));
                     user(&l)
                 }
-                None => user(line),
+                None => match line.get("toolUseResult") {
+                    Some(r) if r.get("answers").is_some() && r.get("questions").is_some() => {
+                        Msg::Answered {
+                            questions: questions_of(r),
+                            answers: answers_of(r.get("answers")),
+                        }
+                    }
+                    _ => user(line),
+                },
             }
         }
         Some("assistant") => classify(line),
         _ => Msg::Noise,
+    }
+}
+
+/// An `AskUserQuestion` input's questions.
+fn questions_of(input: &Value) -> Vec<Question> {
+    input
+        .get("questions")
+        .and_then(Value::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .map(|q| Question {
+            question: s(q, "question"),
+            header: s(q, "header"),
+            multi_select: q
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            options: q
+                .get("options")
+                .and_then(Value::as_arr)
+                .unwrap_or(&[])
+                .iter()
+                .map(|o| (s(o, "label"), s(o, "description")))
+                .collect(),
+            previews: q
+                .get("options")
+                .and_then(Value::as_arr)
+                .unwrap_or(&[])
+                .iter()
+                .map(|o| s(o, "preview"))
+                .collect(),
+        })
+        .collect()
+}
+
+/// The `answers` of an `AskUserQuestion`, keyed by each question's text.
+fn answers_of(v: Option<&Value>) -> Vec<(String, String)> {
+    match v {
+        Some(Value::Obj(m)) => m
+            .iter()
+            .filter_map(|(q, a)| a.as_str().map(|a| (q.clone(), a.to_string())))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -360,34 +417,7 @@ fn request(v: &Value) -> Msg {
     let tool = s(r, "tool_name");
     let input = r.get("input").cloned().unwrap_or_else(Value::obj);
     if tool == "AskUserQuestion" {
-        let questions = input
-            .get("questions")
-            .and_then(Value::as_arr)
-            .unwrap_or(&[])
-            .iter()
-            .map(|q| Question {
-                question: s(q, "question"),
-                header: s(q, "header"),
-                multi_select: q
-                    .get("multiSelect")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                options: q
-                    .get("options")
-                    .and_then(Value::as_arr)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|o| (s(o, "label"), s(o, "description")))
-                    .collect(),
-                previews: q
-                    .get("options")
-                    .and_then(Value::as_arr)
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|o| s(o, "preview"))
-                    .collect(),
-            })
-            .collect();
+        let questions = questions_of(&input);
         return Msg::Question {
             request_id,
             input,
@@ -443,6 +473,8 @@ pub enum Input {
     Answer {
         request_id: String,
         how: String,
+        /// A question's answers, keyed by its text; empty for anything else.
+        answers: Vec<(String, String)>,
     },
     Model(String),
     /// `None` is back to the model's default.
@@ -461,11 +493,13 @@ fn input(line: &Value) -> Input {
             let r = line.get("response");
             let get = |k| r.map(|r| s(r, k)).unwrap_or_default();
             let outcome = r.and_then(|r| r.get("response"));
+            let mut given = Vec::new();
             let how = match (get("subtype").as_str(), outcome.map(|o| s(o, "behavior"))) {
                 ("success", Some(b)) if b == "allow" => {
                     let answers = outcome
                         .and_then(|o| o.get("updatedInput"))
                         .and_then(|i| i.get("answers"));
+                    given = answers_of(answers);
                     if answers.is_some() {
                         "answered"
                     } else {
@@ -478,6 +512,7 @@ fn input(line: &Value) -> Input {
             Input::Answer {
                 request_id: get("request_id"),
                 how: how.to_string(),
+                answers: given,
             }
         }
         ("control_request", "set_model") => {
@@ -700,6 +735,7 @@ mod input_tests {
                 Input::Answer {
                     request_id: "r1".into(),
                     how: "allowed".into(),
+                    answers: vec![],
                 },
             ),
             (
@@ -707,6 +743,7 @@ mod input_tests {
                 Input::Answer {
                     request_id: "r2".into(),
                     how: "answered".into(),
+                    answers: vec![("Which?".into(), "Red".into())],
                 },
             ),
             (
@@ -714,6 +751,7 @@ mod input_tests {
                 Input::Answer {
                     request_id: "r3".into(),
                     how: "denied".into(),
+                    answers: vec![],
                 },
             ),
             (
@@ -721,6 +759,7 @@ mod input_tests {
                 Input::Answer {
                     request_id: "r4".into(),
                     how: "refused".into(),
+                    answers: vec![],
                 },
             ),
             (set_model("c1", "opus"), Input::Model("opus".into())),

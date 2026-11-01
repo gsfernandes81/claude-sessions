@@ -190,6 +190,9 @@ fn hints(segs: &[&str], indent: &str, w: usize) -> Vec<Line> {
 
 // ── the conversation ────────────────────────────────────────────────────────
 
+/// The tool a question is, drawn as its answers rather than as a call.
+const ASK_TOOL: &str = "AskUserQuestion";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Question {
     pub question: String,
@@ -221,6 +224,9 @@ pub enum Entry {
         request_id: String,
         questions: Vec<Question>,
         resolved: Option<String>,
+        /// What was chosen, keyed by each question's text; empty from an older relay, which
+        /// did not say.
+        answers: Vec<(String, String)>,
     },
     Note(String),
     Compacted,
@@ -335,6 +341,7 @@ impl Convo {
                         request_id: s(v, "r"),
                         questions: questions(v.get("q")),
                         resolved: None,
+                        answers: Vec::new(),
                     },
                     // An item a later relay draws that this client does not know: skipped.
                     _ => return Applied::Nothing,
@@ -366,13 +373,21 @@ impl Convo {
                     *result = Some((ok, preview, lines));
                 }
             }
-            "done" => {
-                if let Some(Entry::Perm { resolved, .. } | Entry::Ask { resolved, .. }) =
-                    self.at(id)
-                {
+            "done" => match self.at(id) {
+                Some(Entry::Perm { resolved, .. }) => *resolved = Some(s(v, "x")),
+                Some(Entry::Ask {
+                    resolved, answers, ..
+                }) => {
                     *resolved = Some(s(v, "x"));
+                    if let Some(Value::Obj(m)) = v.get("a") {
+                        *answers = m
+                            .iter()
+                            .filter_map(|(q, a)| a.as_str().map(|a| (q.clone(), a.to_string())))
+                            .collect();
+                    }
                 }
-            }
+                _ => {}
+            },
             "st" => {
                 let st = s(v, "s");
                 let was = std::mem::replace(&mut self.state, st.clone());
@@ -707,15 +722,21 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
                 let mut tools: Vec<(&str, &str)> = Vec::new();
                 let mut open: Option<(&str, &str)> = None;
                 while let Some(Entry::Tool { name, arg, result }) = c.entries.get(i) {
-                    tools.push((name, arg));
-                    if result.is_none() {
-                        open = Some((name, arg));
+                    // Claude Code draws a question as what was answered, not as a tool call.
+                    if name != ASK_TOOL {
+                        tools.push((name, arg));
+                        if result.is_none() {
+                            open = Some((name, arg));
+                        }
                     }
                     i += 1;
                     // Permission prompts between tool calls belong to the run.
                     while let Some(Entry::Perm { .. }) = c.entries.get(i) {
                         i += 1;
                     }
+                }
+                if tools.is_empty() {
+                    continue;
                 }
                 let last = i >= c.entries.len();
                 out.push(Vec::new());
@@ -773,6 +794,29 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             Entry::Worked(text) => {
                 out.push(Vec::new());
                 out.extend(wrapped(text, "✻ ", "  ", w, fg(GREY)));
+            }
+            Entry::Ask {
+                questions,
+                resolved: Some(how),
+                answers,
+                ..
+            } if how == "answered" => {
+                out.push(Vec::new());
+                out.extend(wrapped(
+                    "User answered Claude's questions:",
+                    "● ",
+                    "  ",
+                    w,
+                    PLAIN,
+                ));
+                for (n, q) in questions.iter().enumerate() {
+                    let said = match answers.iter().find(|(t, _)| *t == q.question) {
+                        Some((_, a)) => format!("{} → {a}", q.question),
+                        None => q.question.clone(),
+                    };
+                    let first = if n == 0 { "  ⎿  · " } else { "     · " };
+                    out.extend(wrapped(&said, first, "       ", w, fg(GREY)));
+                }
             }
             Entry::Perm { .. } | Entry::Ask { .. } => {}
         }
@@ -1171,8 +1215,19 @@ pub struct Frame {
     pub cursor: Option<(usize, usize)>,
 }
 
-/// Draw the conversation at `w` by `h`.
-pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
+/// What a frame is made of: the transcript, what goes under it, the rows it has, and the
+/// line it starts at when not scrolled back.
+struct Parts {
+    body: Vec<Line>,
+    bottom: Vec<Line>,
+    spinner: Vec<Line>,
+    cursor: Option<(usize, usize)>,
+    ask_top: bool,
+    room: usize,
+    start: usize,
+}
+
+fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     let (body, last_prompt) = transcript(c, w);
     // The bottom: a dialog, or the input box.
     let waiting = c.waiting();
@@ -1222,21 +1277,47 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
     // a question waits or a dialog is open (R2 to R6); an idle screen that fits is drawn from
     // the top, logo and all (R1).
     let pin = c.state != "idle" || ui.dialog.is_some() || cursor.is_none();
+    let total = body.len();
+    let start = match last_prompt {
+        Some(p) if pin && total - p <= room => p,
+        _ if total <= room => 0,
+        Some(p) if total - p <= room => p,
+        _ => total - room,
+    };
+    Parts {
+        body,
+        bottom,
+        spinner,
+        cursor,
+        ask_top,
+        room,
+        start,
+    }
+}
+
+/// Draw the conversation at `w` by `h`.
+pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
+    let Parts {
+        body,
+        bottom,
+        spinner,
+        cursor,
+        ask_top,
+        room,
+        start,
+    } = parts(c, ui, w, h, now);
     let mut top: Vec<Line> = Vec::new();
     let total = body.len();
     if ui.scroll == 0 {
-        let start = match last_prompt {
-            Some(p) if pin && total - p <= room => p,
-            _ if total <= room => 0,
-            Some(p) if total - p <= room => p,
-            _ => total - room,
-        };
         top.extend(body.iter().skip(start).take(room).cloned());
     } else {
         // Scrolled back: the prompt this part answers pinned on top, the jump line under it.
+        // The top moves back from where it sat at the bottom, one line a step: measured from
+        // the end instead, a prompt drawn at the top with room to spare under it jumped by
+        // all that room on the first step.
         let content = room.saturating_sub(3);
-        let end = total.saturating_sub(ui.scroll).max(content.min(total));
-        let start = end.saturating_sub(content);
+        let start = start.saturating_sub(ui.scroll);
+        let end = (start + content).min(total);
         // The prompt's first line, and `…` when it ran on.
         let pinned = body[..start.min(total)]
             .iter()
@@ -1279,9 +1360,8 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
 }
 
 /// The furthest back the transcript scrolls at this size.
-pub fn max_scroll(c: &Convo, w: usize, h: usize) -> usize {
-    let (body, _) = transcript(c, w);
-    body.len().saturating_sub(h.saturating_sub(5 + 3))
+pub fn max_scroll(c: &Convo, ui: &Ui, w: usize, h: usize) -> usize {
+    parts(c, ui, w, h, Instant::now()).start
 }
 
 #[cfg(test)]
@@ -1449,6 +1529,82 @@ mod tests {
     }
 
     #[test]
+    fn an_answered_question_stays_in_the_transcript_as_what_was_chosen() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"user","x":"pick a colour"}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"AskUserQuestion","a":""}"#,
+                r#"{"t":"add","id":3,"k":"ask","r":"q1","q":[{"q":"Red or blue?","h":"Colour","m":false,"o":[["Red","r"],["Blue","b"]]}]}"#,
+                r#"{"t":"done","id":3,"x":"answered","a":{"Red or blue?":"Blue"}}"#,
+                r#"{"t":"res","id":2,"ok":true,"p":["User has answered"],"l":1}"#,
+                r#"{"t":"st","s":"idle"}"#,
+            ],
+        );
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        let at = got
+            .iter()
+            .position(|l| l == "● User answered Claude's questions:")
+            .expect("the answer is drawn");
+        assert_eq!(got[at + 1], "  ⎿  · Red or blue? → Blue");
+        assert!(
+            !got.iter().any(|l| l.contains("Used 1 tool")),
+            "the question is not a tool call: {got:?}"
+        );
+        // One withdrawn, or still waiting, draws nothing in the transcript.
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":3,"k":"ask","r":"q1","q":[{"q":"Red or blue?","h":"Colour","m":false,"o":[["Red","r"]]}]}"#,
+                r#"{"t":"done","id":3,"x":"withdrawn"}"#,
+            ],
+        );
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        assert!(!got.iter().any(|l| l.contains("answered")), "{got:?}");
+    }
+
+    #[test]
+    fn scrolling_back_from_a_prompt_on_top_moves_a_line_a_step() {
+        let mut c = convo();
+        let numbers: Vec<String> = (1..=30).map(|n| n.to_string()).collect();
+        let add = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            numbers.join("\\n")
+        );
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"user","x":"count"}"#,
+                &add,
+                r#"{"t":"add","id":3,"k":"user","x":"again"}"#,
+                r#"{"t":"add","id":4,"k":"text","x":"ok"}"#,
+                r#"{"t":"st","s":"idle"}"#,
+            ],
+        );
+        let mut ui = Ui::new();
+        let bottom = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert!(
+            bottom[0].starts_with("❯ again"),
+            "the prompt on top: {bottom:?}"
+        );
+        ui.scroll = 1;
+        let back = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        // Under the pinned line, the line above the prompt, then the prompt: not a screen of
+        // the count, which is where measuring from the end put it.
+        assert_eq!(back[1], "");
+        assert!(back[2].starts_with("❯ again"), "{back:?}");
+        assert_eq!(max_scroll(&c, &ui, 40, 24), {
+            let (body, last) = transcript(&c, 40);
+            assert!(body.len() > 1);
+            last.unwrap()
+        });
+    }
+
+    #[test]
     fn r5_and_r6_model_and_effort() {
         let mut c = convo();
         feed(&mut c, &[&meta("", "default")]);
@@ -1509,8 +1665,9 @@ mod tests {
         );
         let mut ui = Ui::new();
         ui.ram = "RAM 0.9G/2G".into();
-        // Seven rows back from the end, as the mockup has 53 at the bottom of 60.
-        ui.scroll = 7;
+        // Four rows back from the bottom: the mockup has 53 at the bottom of 60, three rows
+        // going to the pinned prompt and the jump line.
+        ui.scroll = 4;
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         let want = mockup("R7");
         assert_eq!(got[0], want[0]);

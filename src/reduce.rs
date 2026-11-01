@@ -45,8 +45,13 @@ pub enum Op {
         lines: usize,
     },
     /// A permission prompt or question is no longer waiting, and why: `allowed`, `denied`,
-    /// `answered`, `withdrawn` (claude cancelled it), or `answered elsewhere`.
-    Resolved { id: u64, how: String },
+    /// `answered`, `withdrawn` (claude cancelled it), or `answered elsewhere`; a question's
+    /// answers keyed by its text, for the transcript to say what was chosen.
+    Resolved {
+        id: u64,
+        how: String,
+        answers: Vec<(String, String)>,
+    },
     /// What claude is doing: `working`, `compacting`, `waiting` (on an answer) or `idle`.
     State(String),
     /// The conversation's model, permission mode, title and id, sent when one changes.
@@ -179,13 +184,19 @@ impl Reducer {
     /// A waiting prompt was answered by a view: it stops waiting, with `how` said. `None` when
     /// it was not waiting — answered already, by another view or by claude's withdrawal — so
     /// the relay sends claude nothing and tells that view `answered elsewhere`.
-    pub fn answered(&mut self, request_id: &str, how: &str) -> Option<Out> {
+    pub fn answered(
+        &mut self,
+        request_id: &str,
+        how: &str,
+        answers: Vec<(String, String)>,
+    ) -> Option<Out> {
         let (id, _) = self.waiting.remove(request_id)?;
         self.suggestions.remove(request_id);
         let mut out = Out::default();
         out.ops.push(Op::Resolved {
             id,
             how: how.to_string(),
+            answers,
         });
         if self.waiting.is_empty() && self.state == "waiting" {
             self.set_state(&mut out, "working");
@@ -351,8 +362,22 @@ impl Reducer {
                 self.waiting.insert(request_id, (id, input));
                 self.set_state(&mut out, "waiting");
             }
+            Msg::Answered { questions, answers } => {
+                let id = self.add(
+                    &mut out,
+                    Item::Ask {
+                        request_id: String::new(),
+                        questions,
+                    },
+                );
+                out.ops.push(Op::Resolved {
+                    id,
+                    how: "answered".into(),
+                    answers,
+                });
+            }
             Msg::Cancelled { request_id } => {
-                if let Some(o) = self.answered(&request_id, "withdrawn") {
+                if let Some(o) = self.answered(&request_id, "withdrawn", Vec::new()) {
                     out.ops.extend(o.ops);
                 }
             }
@@ -371,7 +396,7 @@ impl Reducer {
                 // Prompts still waiting when a turn ends were withdrawn with it.
                 let left: Vec<String> = self.waiting.keys().cloned().collect();
                 for r in left {
-                    if let Some(o) = self.answered(&r, "withdrawn") {
+                    if let Some(o) = self.answered(&r, "withdrawn", Vec::new()) {
                         out.ops.extend(o.ops);
                     }
                 }
@@ -387,8 +412,12 @@ impl Reducer {
             // for every view at once, and a change of model, mode or effort shows at once
             // rather than at the next turn's init.
             Msg::Input(input) => match input {
-                sdk::Input::Answer { request_id, how } => {
-                    if let Some(o) = self.answered(&request_id, &how) {
+                sdk::Input::Answer {
+                    request_id,
+                    how,
+                    answers,
+                } => {
+                    if let Some(o) = self.answered(&request_id, &how, answers) {
                         out.ops.extend(o.ops);
                     }
                 }
@@ -650,11 +679,25 @@ impl Op {
                 ),
                 ("l", Value::num(*lines as f64)),
             ]),
-            Op::Resolved { id: n, how } => obj(vec![
-                ("t", Value::string("done")),
-                id(n),
-                ("x", Value::string(how.clone())),
-            ]),
+            Op::Resolved {
+                id: n,
+                how,
+                answers,
+            } => {
+                let mut v = obj(vec![
+                    ("t", Value::string("done")),
+                    id(n),
+                    ("x", Value::string(how.clone())),
+                ]);
+                if !answers.is_empty() {
+                    let mut a = Value::obj();
+                    for (q, x) in answers {
+                        a.set(q, Value::string(x.clone()));
+                    }
+                    v.set("a", a);
+                }
+                v
+            }
             Op::State(s) => obj(vec![
                 ("t", Value::string("st")),
                 ("s", Value::string(s.clone())),
@@ -825,7 +868,9 @@ mod tests {
             "an answer must carry claude's input back"
         );
 
-        let answered = r.answered("req-1", "allowed").expect("it was waiting");
+        let answered = r
+            .answered("req-1", "allowed", vec![])
+            .expect("it was waiting");
         assert_eq!(
             wire(&answered.ops),
             [
@@ -834,7 +879,7 @@ mod tests {
             ]
         );
         assert!(
-            r.answered("req-1", "allowed").is_none(),
+            r.answered("req-1", "allowed", vec![]).is_none(),
             "a second answer is too late"
         );
 
@@ -917,6 +962,43 @@ mod tests {
     }
 
     #[test]
+    fn a_questions_answers_reach_the_view_live_and_from_a_transcript() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Red or blue?","header":"Color","options":[{"label":"Red","description":"r"}],"multiSelect":false}]}}}"#,
+            ],
+        );
+        // The view's answer, read back from the holder's log.
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"_in","line":{"type":"control_response","response":{"subtype":"success","request_id":"q1","response":{"behavior":"allow","updatedInput":{"questions":[],"answers":{"Red or blue?":"Red"}}}}}}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&o.ops)[0],
+            r#"{"a":{"Red or blue?":"Red"},"id":1,"t":"done","x":"answered"}"#
+        );
+        // A resume: no request comes, the transcript's tool result says what was chosen.
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"_history","line":{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"User has answered"}]},"toolUseResult":{"questions":[{"question":"Red or blue?","header":"Color","options":[{"label":"Red","description":"r"}],"multiSelect":false}],"answers":{"Red or blue?":"Red"}}}}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&o.ops),
+            [
+                r#"{"id":1,"k":"ask","q":[{"h":"Color","m":false,"o":[["Red","r"]],"q":"Red or blue?"}],"r":"","t":"add"}"#,
+                r#"{"a":{"Red or blue?":"Red"},"id":1,"t":"done","x":"answered"}"#,
+            ]
+        );
+    }
+
+    #[test]
     fn a_question_waits_and_a_withdrawn_one_says_so() {
         let mut r = Reducer::new();
         let o = feed_all(
@@ -944,7 +1026,7 @@ mod tests {
             ],
             "nothing waits any more, so claude is back at work"
         );
-        assert!(r.answered("q1", "answered").is_none());
+        assert!(r.answered("q1", "answered", vec![]).is_none());
     }
 
     #[test]
@@ -1196,7 +1278,7 @@ mod tests {
             wire(&out.ops)
         );
         assert_eq!(r.waiting_suggestions("p1"), [touch]);
-        r.answered("p1", "allowed");
+        r.answered("p1", "allowed", vec![]);
         assert!(r.waiting_suggestions("p1").is_empty());
     }
 }

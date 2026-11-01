@@ -280,7 +280,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      |---|---|
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` | the reducer's ops (`reduce.rs`) |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
@@ -298,8 +298,11 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
      with a conversation open, `re`.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
-     Ctrl-U; Up and Down step through what was sent; PageUp, PageDown and the wheel scroll,
-     End or Esc goes back down; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
+     Ctrl-U; `\` then Enter is a newline, as in Claude Code; Up and Down step through what
+     was sent; PageUp and PageDown scroll ten lines and a wheel report one, since Termux
+     sends a report for every line a finger travels; End or Esc goes back down. Scrolled
+     back, the top moves from where it sat at the bottom, so the first step from a prompt
+     drawn on top with room under it is a line, not that room; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
      empty one goes home, as `/home` and Ctrl-D do. `/model`, `/effort [level]`, `/auto`,
      `/rename TITLE`, `/copy` (OSC 52, and `termux-clipboard-set` under Termux), `/exit`;
      anything else, `/compact` included, is claude's.
@@ -312,6 +315,12 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      ticked, `/copy`, `/exit` back home with `claude-1 ended`; and the relay killed under the
      client mid-conversation, redialled in a second, the conversation resumed with nothing
      drawn twice and the next prompt answered.
+   - **An answered question stays in the transcript** as Claude Code draws it, `● User
+     answered Claude's questions:` and `⎿  · question → answer`, and its `AskUserQuestion`
+     call is not counted among the tool calls. Live, the answers come from the view's
+     answer as the holder logged it; on a resume, from the transcript's `toolUseResult`,
+     since no request comes for a question settled before. Until the relay's hello the home
+     is mockup 10's first frame, `⠋ connecting`, not an empty container.
    - **A resume shows what came before.** The launcher passes the conversation's transcript
      to the holder (`CLAUDE_SESSIONS_HISTORY`), which logs its prompts and replies as
      `_history` lines ahead of claude's own, ending with `_history_end`; the reducer reads
@@ -324,8 +333,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      since claude's lines never name the plan; the transcript's line over a permission prompt
      is the request's own description (`Create empty file named x`, where R3 has Claude's
      `Creating…`); R4b's preview beside the list at 80 columns is drawn under it, as R4c;
-     before the hello the home shows an empty container; the `?` screen still lists the
-     hub's keys. Not built: a newline in the prompt, and tool calls expanded (deferred by the
+     the `?` screen still lists the hub's keys. Not built: tool calls expanded (deferred by the
      owner).
    - **Still to measure on the phone**: cloudflared's idle timeout, Termux's OSC 52, and
      long-press selection with wheel reporting on.

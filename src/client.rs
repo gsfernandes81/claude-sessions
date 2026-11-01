@@ -20,7 +20,7 @@ use crate::json::{self, Value};
 use crate::menu::{Action, Menu, Place, Reach};
 use crate::proto;
 use crate::term::{self, Input, RawTerminal};
-use crate::ui::{Header, Key, Row, RowKey};
+use crate::ui::{Busy, Header, Key, Row, RowKey};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -123,6 +123,10 @@ struct App {
     /// Bytes the owner should have on the clipboard (OSC 52), written with the next frame.
     clip: Option<String>,
     quit: bool,
+    /// When the client started, and whether the relay has said hello since: until it has,
+    /// the home is mockup 10's first frame, not an empty container it knows nothing of.
+    started: Instant,
+    greeted: bool,
 }
 
 impl App {
@@ -214,6 +218,9 @@ impl App {
         let t = v.get("t").and_then(Value::as_str).unwrap_or("").to_string();
         match t.as_str() {
             "hi" => {
+                if !std::mem::replace(&mut self.greeted, true) {
+                    self.menu.set_busy(None);
+                }
                 let hosts: Vec<String> = v
                     .get("hosts")
                     .and_then(Value::as_arr)
@@ -460,6 +467,7 @@ impl App {
                         out.push(App::msg("esc", vec![]));
                     }
                 }
+                Key::Enter if backslash_newline(ui) => {}
                 Key::Enter => {
                     let text = std::mem::take(&mut ui.input);
                     ui.cursor = 0;
@@ -487,14 +495,16 @@ impl App {
                     ui.input = at.map(|i| self.history[i].clone()).unwrap_or_default();
                     ui.cursor = ui.input.chars().count();
                 }
+                // A wheel report is a line: Termux sends one for every line a finger travels,
+                // so three a report ran a swipe three times as far as the finger went.
                 Key::PageUp | Key::WheelUp => {
-                    let step = if k == Key::PageUp { 10 } else { 3 };
+                    let step = if k == Key::PageUp { 10 } else { 1 };
                     let (w, h) = term::size().unwrap_or((40, 24));
-                    let most = convo::max_scroll(c, w as usize, h as usize);
+                    let most = convo::max_scroll(c, ui, w as usize, h as usize);
                     ui.scroll = (ui.scroll + step).min(most);
                 }
                 Key::PageDown | Key::WheelDown => {
-                    let step = if k == Key::PageDown { 10 } else { 3 };
+                    let step = if k == Key::PageDown { 10 } else { 1 };
                     ui.scroll = ui.scroll.saturating_sub(step);
                 }
                 Key::End if ui.scroll > 0 => ui.scroll = 0,
@@ -634,6 +644,19 @@ fn submit(
 }
 
 /// A key in the prompt: typing, moving and deleting.
+/// `\` then Enter is a newline, as in Claude Code: the backslash before the cursor gives way
+/// to it, and nothing is sent. Whether there was one.
+fn backslash_newline(ui: &mut Ui) -> bool {
+    let mut chars: Vec<char> = ui.input.chars().collect();
+    let at = ui.cursor.min(chars.len());
+    if at == 0 || chars[at - 1] != '\\' {
+        return false;
+    }
+    chars[at - 1] = '\n';
+    ui.input = chars.into_iter().collect();
+    true
+}
+
 fn edit(ui: &mut Ui, k: Key) {
     let mut chars: Vec<char> = ui.input.chars().collect();
     let at = ui.cursor.min(chars.len());
@@ -1048,6 +1071,11 @@ impl App {
         match &mut self.screen {
             Screen::Home => {
                 self.menu.resize(w, h);
+                if !self.greeted {
+                    let n = now.saturating_duration_since(self.started).as_millis()
+                        / SPIN_EVERY.as_millis();
+                    self.menu.set_busy(Some(connecting(n as usize)));
+                }
                 match crate::render::render(&self.menu.view()) {
                     Ok(f) => ((0..f.lines.len()).map(|i| f.ansi_line(i)).collect(), None),
                     Err(_) => (vec!["\x1b[2Ktoo narrow".into()], None),
@@ -1101,6 +1129,9 @@ impl App {
                 soon(now + Duration::from_secs(1));
             }
         }
+        if matches!(self.screen, Screen::Home) && !self.greeted {
+            soon(now + SPIN_EVERY);
+        }
         if let Some(a) = self.awaiting {
             soon(a + ACK_WAIT);
         }
@@ -1109,6 +1140,16 @@ impl App {
 }
 
 /// `claude-remote <ssh name>`.
+/// Mockup 10's spinner and word, before the relay's hello.
+fn connecting(frame: usize) -> Busy {
+    Busy {
+        frame,
+        row: None,
+        what: "connecting".to_string(),
+        loading: true,
+    }
+}
+
 pub fn run(name: &str) -> Result<(), String> {
     let (w, h) = term::size().ok_or("not a terminal")?;
     let (tx, rx): (Sender<Heard>, Receiver<Heard>) = mpsc::channel();
@@ -1139,6 +1180,8 @@ pub fn run(name: &str) -> Result<(), String> {
         drawn: Vec::new(),
         clip: None,
         quit: false,
+        started: Instant::now(),
+        greeted: false,
     };
     app.menu.remote = true;
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
@@ -1209,6 +1252,51 @@ pub fn run(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn a_backslash_then_enter_is_a_newline_and_sends_nothing() {
+        let mut ui = Ui::new();
+        ui.input = "one\\".into();
+        ui.cursor = 4;
+        assert!(backslash_newline(&mut ui));
+        assert_eq!((ui.input.as_str(), ui.cursor), ("one\n", 4));
+        for k in "two".chars() {
+            edit(&mut ui, Key::Char(k));
+        }
+        assert_eq!(ui.input, "one\ntwo");
+        assert!(!backslash_newline(&mut ui), "no backslash: Enter sends");
+        // Only the one right before the cursor counts.
+        ui.input = "a\\b".into();
+        ui.cursor = 3;
+        assert!(!backslash_newline(&mut ui));
+    }
+
+    #[test]
+    fn before_the_relays_hello_the_home_says_connecting_not_empty() {
+        let hub = Header {
+            host: "zero".into(),
+            memory: None,
+            load: None,
+        };
+        let mut m = Menu::hub(40, 24, hub, Vec::new(), Vec::new());
+        m.remote = true;
+        let plain = |m: &Menu| {
+            let f = crate::render::render(&m.view()).unwrap();
+            f.plain().lines().map(str::to_string).collect::<Vec<_>>()
+        };
+        assert!(
+            plain(&m).iter().any(|l| l.contains("No claude session")),
+            "what it drew before: {:?}",
+            plain(&m)
+        );
+        m.set_busy(Some(connecting(0)));
+        let got = plain(&m);
+        assert!(got.iter().any(|l| l == "⠋ connecting"), "{got:?}");
+        assert!(
+            !got.iter().any(|l| l.contains("No claude session")),
+            "{got:?}"
+        );
+    }
 
     fn row(key: RowKey, remote: bool, offloaded: bool) -> Row {
         Row {
