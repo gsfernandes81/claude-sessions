@@ -20,6 +20,8 @@ pub enum Msg {
         session_id: String,
         model: String,
         permission_mode: String,
+        cwd: String,
+        version: String,
     },
     /// `system/status`: `requesting`, `compacting`, or none (back to idle or streaming).
     Status(Option<String>),
@@ -123,6 +125,9 @@ pub struct Question {
     pub multi_select: bool,
     /// Each option's label and description.
     pub options: Vec<(String, String)>,
+    /// Each option's preview, the same length as `options`: empty for one without, as most
+    /// are. Claude Code draws a preview beside the list, or under it when narrow (R4b, R4c).
+    pub previews: Vec<String>,
 }
 
 fn s(v: &Value, key: &str) -> String {
@@ -139,6 +144,8 @@ pub fn classify(v: &Value) -> Msg {
                 session_id: s(v, "session_id"),
                 model: s(v, "model"),
                 permission_mode: s(v, "permissionMode"),
+                cwd: s(v, "cwd"),
+                version: s(v, "claude_code_version"),
             },
             "status" => Msg::Status(v.get("status").and_then(Value::as_str).map(String::from)),
             "session_title_changed" => Msg::TitleChanged(s(v, "title")),
@@ -332,6 +339,13 @@ fn request(v: &Value) -> Msg {
                     .unwrap_or(&[])
                     .iter()
                     .map(|o| (s(o, "label"), s(o, "description")))
+                    .collect(),
+                previews: q
+                    .get("options")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|o| s(o, "preview"))
                     .collect(),
             })
             .collect();
@@ -670,12 +684,14 @@ mod tests {
     fn init_status_title_and_compaction_read_as_what_they_say() {
         assert_eq!(
             read(
-                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s1","tools":["Bash"],"model":"claude-haiku-5-5","permissionMode":"default"}"#
+                r#"{"type":"system","subtype":"init","cwd":"/w","session_id":"s1","tools":["Bash"],"model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.311"}"#
             ),
             Msg::Init {
                 session_id: "s1".into(),
                 model: "claude-haiku-5-5".into(),
-                permission_mode: "default".into()
+                permission_mode: "default".into(),
+                cwd: "/w".into(),
+                version: "2.1.311".into(),
             }
         );
         assert_eq!(
@@ -855,7 +871,8 @@ mod tests {
                 options: vec![
                     ("Red".into(), "Choose red".into()),
                     ("Blue".into(), "Choose blue".into())
-                ]
+                ],
+                previews: vec![String::new(), String::new()],
             }]
         );
 

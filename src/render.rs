@@ -97,8 +97,16 @@ fn hint_set(empty: bool, back: bool, down: bool) -> &'static [Hint] {
     }
 }
 
+/// The phone client's home (mockup R9): it opens and starts sessions, nothing else.
+const HINTS_REMOTE: [Hint; 3] = [("Enter", "open"), ("n", "new"), ("?", "keys")];
+const HINTS_REMOTE_EMPTY: [Hint; 2] = [("n", "new"), ("?", "keys")];
+
 fn view_hints(view: &View) -> &'static [Hint] {
-    hint_set(view.rows.is_empty(), view.back, view.down.is_some())
+    match (view.remote, view.rows.is_empty()) {
+        (true, false) => &HINTS_REMOTE,
+        (true, true) => &HINTS_REMOTE_EMPTY,
+        (false, _) => hint_set(view.rows.is_empty(), view.back, view.down.is_some()),
+    }
 }
 /// Between hint items, and between most dialog buttons: three spaces, as every mockup draws.
 const GAP: &str = "   ";
@@ -1250,6 +1258,7 @@ mod tests {
             status: None,
             busy: None,
             load: Some(load_of("infra-dev", used_mib, 1024)),
+            remote: false,
         }
     }
 

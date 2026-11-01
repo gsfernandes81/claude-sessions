@@ -244,6 +244,9 @@ pub struct View {
     /// The load line at the foot of every screen with a footer, under the hints, where Claude
     /// Code draws its own status line (owner, 2026-10-27): RAM and load across every container.
     pub load: Option<crate::statusline::Figures>,
+    /// Drawn by the phone client (`claude-remote`), whose home opens and starts sessions and
+    /// nothing else: its hint line is mockup R9's.
+    pub remote: bool,
 }
 
 /// Docker Compose's spinner (owner, 2026-10-04): ten braille frames, one every 100 ms. Braille
@@ -320,6 +323,11 @@ pub enum Key {
     PageDown,
     Home,
     End,
+    /// Left, Right and Delete move and edit in the remote view's prompt; the menu has no use
+    /// for them.
+    Left,
+    Right,
+    Delete,
     Enter,
     Esc,
     Char(char),

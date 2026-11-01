@@ -251,6 +251,8 @@ fn parse_escape(b: &[u8]) -> Parsed {
             Some(&f) if (0x40..=0x7e).contains(&f) => match f {
                 b'A' => Parsed::Key(Key::Up, 3),
                 b'B' => Parsed::Key(Key::Down, 3),
+                b'C' => Parsed::Key(Key::Right, 3),
+                b'D' => Parsed::Key(Key::Left, 3),
                 b'H' => Parsed::Key(Key::Home, 3),
                 b'F' => Parsed::Key(Key::End, 3),
                 _ => Parsed::Drop(3),
@@ -329,6 +331,8 @@ fn parse_csi(b: &[u8]) -> Parsed {
     let key = match fin {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
         b'H' => Some(Key::Home),
         b'F' => Some(Key::End),
         b'~' => match first {
@@ -336,6 +340,7 @@ fn parse_csi(b: &[u8]) -> Parsed {
             // 7 and 8 are rxvt's.
             Some(1 | 7) => Some(Key::Home),
             Some(4 | 8) => Some(Key::End),
+            Some(3) => Some(Key::Delete),
             Some(5) => Some(Key::PageUp),
             Some(6) => Some(Key::PageDown),
             _ => None,
@@ -1021,11 +1026,21 @@ mod tests {
     }
 
     #[test]
+    fn left_right_and_delete_are_keys_for_the_remote_views_prompt() {
+        assert_eq!(decode(b"\x1b[C\x1b[D"), vec![Key::Right, Key::Left]);
+        assert_eq!(decode(b"\x1bOC\x1bOD"), vec![Key::Right, Key::Left]);
+        assert_eq!(
+            decode(b"\x1b[1;5D"),
+            vec![Key::Left],
+            "a modified arrow is the arrow"
+        );
+        assert_eq!(decode(b"\x1b[3~"), vec![Key::Delete]);
+    }
+
+    #[test]
     fn unmapped_sequences_never_leak_as_characters() {
         for seq in [
-            &b"\x1b[C"[..],     // Right
-            b"\x1b[D",          // Left
-            b"\x1b[15~",        // F5
+            &b"\x1b[15~"[..],   // F5
             b"\x1b[2~",         // Insert
             b"\x1bOP",          // F1
             b"\x1b[?1;2c",      // device attributes reply

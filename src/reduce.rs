@@ -61,6 +61,9 @@ pub struct Meta {
     pub title: String,
     /// The effort a view set, empty for the model's default: claude's own lines never say it.
     pub effort: String,
+    /// Where claude runs, and its version, for the logo block Claude Code draws on top.
+    pub cwd: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,11 +210,15 @@ impl Reducer {
                 session_id,
                 model,
                 permission_mode,
+                cwd,
+                version,
             } => {
                 let meta = Meta {
                     session_id,
                     model,
                     permission_mode,
+                    cwd,
+                    version,
                     ..self.meta.clone()
                 };
                 self.set_meta(&mut out, meta);
@@ -659,6 +666,8 @@ impl Op {
                 ("pm", Value::string(m.permission_mode.clone())),
                 ("ti", Value::string(m.title.clone())),
                 ("e", Value::string(m.effort.clone())),
+                ("cwd", Value::string(m.cwd.clone())),
+                ("ver", Value::string(m.version.clone())),
             ]),
         }
     }
@@ -716,11 +725,22 @@ impl Item {
                                         Value::Arr(
                                             q.options
                                                 .iter()
-                                                .map(|(l, d)| {
-                                                    Value::Arr(vec![
+                                                .zip(
+                                                    q.previews
+                                                        .iter()
+                                                        .map(String::as_str)
+                                                        .chain(std::iter::repeat("")),
+                                                )
+                                                .map(|((l, d), p)| {
+                                                    let mut o = vec![
                                                         Value::string(l.clone()),
                                                         Value::string(d.clone()),
-                                                    ])
+                                                    ];
+                                                    // Only an option with a preview has a third.
+                                                    if !p.is_empty() {
+                                                        o.push(Value::string(p));
+                                                    }
+                                                    Value::Arr(o)
                                                 })
                                                 .collect(),
                                         ),
@@ -788,7 +808,7 @@ mod tests {
         assert_eq!(
             wire(&before.ops),
             [
-                r#"{"e":"","m":"claude-haiku-5-5","pm":"default","sid":"s1","t":"meta","ti":""}"#,
+                r#"{"cwd":"","e":"","m":"claude-haiku-5-5","pm":"default","sid":"s1","t":"meta","ti":"","ver":""}"#,
                 r#"{"id":1,"k":"user","t":"add","x":"Make a file."}"#,
                 r#"{"s":"working","t":"st"}"#,
                 r#"{"a":"touch spike-file && ls","id":2,"k":"tool","n":"Bash","t":"add"}"#,
@@ -1111,7 +1131,9 @@ mod tests {
         let out = r.feed(&line(sdk::set_model("c1", "claude-opus-5-5")));
         assert_eq!(
             wire(&out.ops),
-            [r#"{"e":"","m":"claude-opus-5-5","pm":"default","sid":"s1","t":"meta","ti":""}"#]
+            [
+                r#"{"cwd":"","e":"","m":"claude-opus-5-5","pm":"default","sid":"s1","t":"meta","ti":"","ver":""}"#
+            ]
         );
         r.feed(&line(sdk::set_effort("c2", Some("high"))));
         r.feed(&line(sdk::set_permission_mode("c3", "plan")));

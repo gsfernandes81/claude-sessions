@@ -281,6 +281,9 @@ impl Relay {
                 self.send_home(out);
             }
             "open" | "new" | "re" => self.open(&t, v, out),
+            // A probe after a long silence (`docs/remote-view.md` § *Decisions*): any answer
+            // says the link is alive.
+            "ping" => out.push(Effect::Send(msg("pong", vec![]))),
             "close" => {
                 if let Some(c) = self.conv.take() {
                     out.push(Effect::CloseConv { epoch: c.epoch });

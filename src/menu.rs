@@ -120,6 +120,8 @@ impl Place {
 pub struct Menu {
     pub width: u16,
     pub height: u16,
+    /// The phone client's home (`claude-remote`): R9's hint line.
+    pub remote: bool,
     /// Every container, in the order the hub was given them.
     places: Vec<Place>,
     /// The home screen's header: the hub's own name and, where the pool is readable, the
@@ -172,6 +174,7 @@ impl Menu {
         let mut m = Menu {
             width,
             height,
+            remote: false,
             places,
             home,
             focus,
@@ -524,6 +527,7 @@ impl Menu {
             status: self.status.clone(),
             busy: self.busy.clone(),
             load: Some(self.load()),
+            remote: self.remote,
         }
     }
 
