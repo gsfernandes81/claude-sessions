@@ -136,7 +136,10 @@ The registry is keyed by slot and records:
 
 `slot` · `pid` + process start time (so a reused pid is never mistaken for the original) ·
 `session_id` (current) · `cwd` · `title` (custom) · `ai_title` · `first_prompt` · `state` · `last_activity` · `last_attach` ·
-`needs_you` · `keep_until` (set by `claude-sessions keepalive`)
+`needs_you` · `keep_until` (set by `claude-sessions keepalive`, and by a remote view's tap
+while it is connected) · `driver` (only `"holder"` is written, for a slot the remote view
+opened, whose claude `claude-sessions holder` runs headless; absent, or anything else, is a
+terminal's slot, as every slot was before; see [`remote-view.md`](remote-view.md))
 
 **States:** `attached` / `detached` — read from `zmx list`, never stored — plus `offloaded` and
 `closed`. **Unread is derived, not stored:** a `Stop` later than `last_attach` means the

@@ -32,7 +32,7 @@ use crate::lockfile::{INTERACTIVE_WAIT, SlotLock};
 use crate::mem;
 use crate::offload;
 use crate::procinfo;
-use crate::registry::{self, SlotRecord, State};
+use crate::registry::{self, Driver, SlotRecord, State};
 use crate::ui::{Dialog, Outcome, Row, RowKey, Terminal};
 use crate::zmx;
 use std::io;
@@ -102,6 +102,8 @@ pub struct Deps {
     /// The pi to run (`CLAUDE_SESSIONS_PI`, default `pi`): one table with `claude`, so a
     /// test stands a program in for either harness the same way (`Harness::program_var`).
     pub pi: String,
+    /// This binary, which a remote-view slot runs as `<holder> holder …` (`holder.rs`).
+    pub holder: String,
     /// `$SHELL`, because some containers set bash and some fish.
     pub shell: String,
     /// The memory reading behind the no-room check.
@@ -126,6 +128,9 @@ impl Deps {
             zmx: zmx::program(),
             claude: program(Harness::Claude),
             pi: program(Harness::Pi),
+            holder: std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "claude-sessions".to_string()),
             shell: env_or("SHELL", "/bin/sh"),
             memory: mem::read,
             oom_kills: mem::oom_kills,
@@ -613,7 +618,7 @@ fn resume(
         .iter()
         .find(|r| matches!(&r.key, RowKey::Slot(s) if s == slot))
         .map_or(slot, |r| r.title.as_str());
-    let (session, cwd, harness, back_to) = match plan_resume(slot, n) {
+    let (session, cwd, harness, back_to) = match plan_resume(slot, n, Driver::Terminal) {
         Plan::Start {
             session,
             cwd,
@@ -650,7 +655,7 @@ fn resume(
 }
 
 /// The resume's decision, under the slot's lock, and the record marked before it is let go.
-fn plan_resume(slot: &str, n: &str) -> Plan {
+fn plan_resume(slot: &str, n: &str, driver: Driver) -> Plan {
     let _lock = match lock_slot(slot, n) {
         Ok(l) => l,
         Err(why) => return Plan::Refuse(why),
@@ -735,6 +740,8 @@ fn plan_resume(slot: &str, n: &str) -> Plan {
     rec.busy = false;
     rec.needs_you = false;
     rec.registered = true;
+    // Resumed at a terminal, a holder's slot is a terminal's again, and the other way round.
+    rec.driver = driver;
     rec.updated_ms = now;
     if let Err(e) = registry::store(&rec) {
         return Plan::Refuse(format!("{n}: {e}"));
@@ -858,7 +865,7 @@ fn resume_conversation(
              ran in"
         ));
     }
-    let slot = match allocate_for(harness, cwd, Some((id, Some(title)))) {
+    let slot = match allocate_for(harness, cwd, Some((id, Some(title))), Driver::Terminal) {
         Ok(Ok(slot)) => slot,
         Ok(Err(Elsewhere::Slot(other))) => return attach_slot(rows, &other, term, deps),
         Ok(Err(Elsewhere::Unattachable(why))) => {
@@ -950,7 +957,12 @@ pub(crate) fn allocate(
     // pi is told its id, so the record names the conversation before pi runs: requirement 2
     // of the brief, and what lets the slot be resumed even if nothing ever binds it.
     let fresh = (harness == Harness::Pi).then(fresh_session_id);
-    match allocate_for(harness, workspace, fresh.as_deref().map(|id| (id, None)))? {
+    match allocate_for(
+        harness,
+        workspace,
+        fresh.as_deref().map(|id| (id, None)),
+        Driver::Terminal,
+    )? {
         Ok(slot) => Ok((slot, fresh)),
         Err(_) => unreachable!("only a resume checks for a running conversation"),
     }
@@ -976,6 +988,7 @@ fn allocate_for(
     harness: Harness,
     cwd: &str,
     naming: Option<(&str, Option<&str>)>,
+    driver: Driver,
 ) -> Result<Result<String, Elsewhere>, String> {
     let _all = SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT)
         .map_err(|e| match e.kind() {
@@ -1016,6 +1029,7 @@ fn allocate_for(
         let mut rec = SlotRecord::new(&slot, Moment::now());
         rec.harness = harness;
         rec.cwd = Some(cwd.to_string());
+        rec.driver = driver;
         if let Some((id, title)) = naming {
             rec.session_id = Some(id.to_string());
             // Shown on the row until the resumed conversation's own hooks read its titles.
@@ -1392,6 +1406,226 @@ fn printable(line: &str) -> String {
     out.trim().to_string()
 }
 
+// ── the remote view ─────────────────────────────────────────────────────────
+//
+// `claude-sessions remote` (main.rs) opens a slot for the phone client: it starts or resumes
+// one whose claude the holder drives (`holder.rs`), through the same plans as the menu — the
+// allocation lock, the slot's lock, and never resuming a conversation already running — and
+// answers with the slot a tap can reach. Nothing here takes a terminal: zmx creates the
+// session from a client with none (`docs/remote-view.md` § *Build order*, step 0).
+
+/// `n` in the remote view: a new claude slot in `workspace`, driven by the holder.
+pub(crate) fn remote_new(workspace: &str, deps: &Deps) -> Result<String, String> {
+    remote_room(deps)?;
+    if !Path::new(workspace).is_dir() {
+        return Err(format!("{workspace} is not a directory"));
+    }
+    let slot = match allocate_for(Harness::Claude, workspace, None, Driver::Holder)? {
+        Ok(slot) => slot,
+        Err(_) => unreachable!("only a resume checks for a running conversation"),
+    };
+    remote_start(&slot, workspace, &[], State::Closed, deps)?;
+    Ok(slot)
+}
+
+/// `Enter` on a slot's row in the remote view: the slot itself when the holder is running it,
+/// a resume under the holder when it is offloaded or closed, and a refusal when a terminal has
+/// it, since its claude's pipes are not ours to reach (mockup R10).
+pub(crate) fn remote_open(slot: &str, deps: &Deps) -> Result<String, String> {
+    let rec = match registry::load(slot) {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return Err(format!("{slot} is gone")),
+        Err(e) => return Err(format!("{slot}: {e}")),
+    };
+    match classify(&rec, clock::now()) {
+        Kind::Running => return driven_by_holder(&rec),
+        Kind::Starting => return Err(starting(slot)),
+        Kind::Resumable | Kind::Closed => {}
+    }
+    if rec.harness != Harness::Claude {
+        return Err(format!(
+            "{slot} runs {}, which opens only in a terminal",
+            rec.harness.as_str()
+        ));
+    }
+    remote_room(deps)?;
+    match plan_resume(slot, slot, Driver::Holder) {
+        Plan::Start {
+            session,
+            cwd,
+            back_to,
+            ..
+        } => {
+            let args = start_args(Harness::Claude, Some(&session));
+            remote_start(slot, &cwd, &args, back_to, deps)?;
+            Ok(slot.to_string())
+        }
+        Plan::Attach(other) => running_slot(&other),
+        Plan::Refuse(why) => Err(why),
+    }
+}
+
+/// `Enter` on a conversation from Claude Code's store in the remote view: resumed under the
+/// holder in the slot that names it, or in a new one, as `resume_conversation` does for the
+/// menu.
+pub(crate) fn remote_resume(
+    id: &str,
+    cwd: &str,
+    title: &str,
+    deps: &Deps,
+) -> Result<String, String> {
+    let now = clock::now();
+    let holders: Vec<SlotRecord> = registry::all()
+        .map_err(|e| format!("{id}: {e}"))?
+        .into_iter()
+        .filter(|r| r.session_id.as_deref() == Some(id))
+        .collect();
+    if let Some(r) = holders.iter().find(|r| classify(r, now) == Kind::Running) {
+        return driven_by_holder(r);
+    }
+    if holders.iter().any(|r| classify(r, now) == Kind::Starting) {
+        return Err(starting(title));
+    }
+    if let Some(r) = holders.first() {
+        return remote_open(&r.slot, deps);
+    }
+    remote_room(deps)?;
+    if !Path::new(cwd).is_dir() {
+        return Err(format!(
+            "{title} ran in {cwd}, which is gone — claude finds a conversation by the directory \
+             it ran in"
+        ));
+    }
+    let slot = match allocate_for(
+        Harness::Claude,
+        cwd,
+        Some((id, Some(title))),
+        Driver::Holder,
+    )? {
+        Ok(slot) => slot,
+        Err(Elsewhere::Slot(other)) => return running_slot(&other),
+        Err(Elsewhere::Unattachable(why)) => return Err(format!("{title} is not resumed: {why}")),
+    };
+    let args = start_args(Harness::Claude, Some(id));
+    remote_start(&slot, cwd, &args, State::Closed, deps)?;
+    Ok(slot)
+}
+
+fn running_slot(slot: &str) -> Result<String, String> {
+    match registry::load(slot) {
+        Ok(Some(rec)) => driven_by_holder(&rec),
+        _ => Err(format!("{slot} is running in a terminal")),
+    }
+}
+
+/// A running slot is the remote view's only if the holder drives it.
+fn driven_by_holder(rec: &SlotRecord) -> Result<String, String> {
+    match rec.driver {
+        Driver::Holder => Ok(rec.slot.clone()),
+        Driver::Terminal => Err(format!(
+            "{} is running in a terminal: attach to it from ssh, or end it there to open it here",
+            rec.slot
+        )),
+    }
+}
+
+/// The menu's no-room check, said as a refusal: the remote view has no offer dialog.
+fn remote_room(deps: &Deps) -> Result<(), String> {
+    match room_check(&[], deps) {
+        None => Ok(()),
+        Some(_) => Err("no room for another session here: offload one from ssh first".to_string()),
+    }
+}
+
+/// The remote twin of `start_command`, with no terminal:
+///
+/// `zmx attach <slot> env CLAUDE_SESSIONS_SLOT=<slot> CLAUDE_SESSIONS_CLAUDE=<claude> sh -c START_WRAP sh <stderr> <holder> holder <args…>`
+///
+/// The holder takes claude from `CLAUDE_SESSIONS_CLAUDE` (`Harness::program_var`), so the
+/// launcher's choice reaches it whatever the login set. No scrollback variables: headless
+/// claude draws nothing. Claude inherits the holder's stderr, so a failed start is in the
+/// capture file as it is for a terminal slot.
+fn remote_command(slot: &str, stderr: &Path, args: &[String], deps: &Deps) -> Command {
+    let (claude_var, _) = Harness::Claude.program_var();
+    let mut cmd = zmx::command(&deps.zmx);
+    cmd.arg("attach")
+        .arg(slot)
+        .arg("env")
+        .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
+        .arg(format!("{claude_var}={}", deps.claude))
+        .arg("sh")
+        .arg("-c")
+        .arg(START_WRAP)
+        .arg("sh")
+        .arg(stderr)
+        .arg(&deps.holder)
+        .arg("holder")
+        .args(args);
+    cmd
+}
+
+/// Start `slot` under the holder and wait until its socket is there and the session has
+/// stayed up for `deps.settle`. A start that does not take puts the record back to `back_to`
+/// and says why, with the first thing claude said on stderr.
+fn remote_start(
+    slot: &str,
+    cwd: &str,
+    args: &[String],
+    back_to: State,
+    deps: &Deps,
+) -> Result<(), String> {
+    let stderr = stderr_path(slot);
+    let fail = |why: String| {
+        put_back(slot, back_to);
+        Err(why)
+    };
+    if let Some(dir) = stderr.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return fail(format!("{}: {e}", dir.display()));
+        }
+    }
+    if let Err(e) = std::fs::File::create(&stderr) {
+        return fail(format!("{}: {e}", stderr.display()));
+    }
+    // A socket a killed holder left would read as this one being up.
+    let sock = crate::holder::paths(slot).sock;
+    let _ = std::fs::remove_file(&sock);
+    let mut cmd = remote_command(slot, &stderr, args, deps);
+    cmd.current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(e) = cmd.status() {
+        return fail(format!("could not run {}: {e}", deps.zmx));
+    }
+    let deadline = Instant::now() + deps.quick;
+    let mut up_since: Option<Instant> = None;
+    loop {
+        let gone = listed(slot) == Some(false);
+        if gone {
+            let said = stderr_tail(&stderr, 1);
+            return fail(format!(
+                "{slot} did not start: claude ended at once{}",
+                said.first().map(|l| format!(": {l}")).unwrap_or_default()
+            ));
+        }
+        if sock.symlink_metadata().is_ok() {
+            let since = *up_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= deps.settle {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            // Still listed, so left running: the offloader and the menu both see it.
+            return Err(format!(
+                "{slot} has not opened its socket after {}s — attach to it from ssh to see why",
+                deps.quick.as_secs()
+            ));
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Against stand-in programs: a `zmx` shell script that keeps a file per session, lists
@@ -1566,6 +1800,7 @@ exit 1"#,
                 zmx,
                 claude,
                 pi: "pi".into(),
+                holder: "/bin/false".into(),
                 shell: "/bin/false".into(),
                 memory: room,
                 oom_kills: || Some(0),
@@ -2136,7 +2371,7 @@ exit 1"#,
         }
         let _all =
             SlotLock::acquire(&registry::dir().join("allocate.lock"), INTERACTIVE_WAIT).unwrap();
-        match allocate_for(Harness::Claude, &f.work(), None) {
+        match allocate_for(Harness::Claude, &f.work(), None, Driver::Terminal) {
             Err(why) => assert!(why.contains("another menu is starting"), "{why}"),
             Ok(got) => panic!("allocated under a held lock: {got:?}"),
         }
@@ -2913,6 +3148,7 @@ exit 1"#,
             zmx: "zmx".into(),
             claude: "claude".into(),
             pi: "pi".into(),
+            holder: "/bin/false".into(),
             shell: String::new(),
             memory: room,
             oom_kills: || Some(0),
@@ -2946,6 +3182,7 @@ exit 1"#,
             zmx: "zmx".into(),
             claude: "claude".into(),
             pi: "/opt/npm-global/bin/pi".into(),
+            holder: "/bin/false".into(),
             shell: String::new(),
             memory: room,
             oom_kills: || Some(0),
@@ -3112,6 +3349,7 @@ exit 1"#,
             zmx: "zmx".into(),
             claude: "claude".into(),
             pi: "pi".into(),
+            holder: "/bin/false".into(),
             shell: String::new(),
             memory: room,
             oom_kills: || Some(0),
@@ -3151,5 +3389,182 @@ exit 1"#,
                 "c",
             ]
         );
+    }
+
+    // ── the remote view ─────────────────────────────────────────────────────
+
+    /// A holder that stays up: it opens its "socket" (a file where the holder would bind it),
+    /// records what it was started with, and waits as `claude_ok` does, killed by `drop`.
+    fn holder_ok(f: &Fixture) -> String {
+        f.script(
+            "holder",
+            &format!(
+                r#"touch "$CLAUDE_SESSIONS_DIR/$CLAUDE_SESSIONS_SLOT.sock"
+echo "$$ $PWD $CLAUDE_SESSIONS_SLOT $CLAUDE_SESSIONS_CLAUDE $*" >> "{}"
+echo "$$ $(cut -d' ' -f22 /proc/$$/stat)" >> "{}"
+while [ -d "{}" ] && kill -0 {}; do sleep 0.2; done"#,
+                f.path("claude.log").display(),
+                f.path("claude.started").display(),
+                f.root.display(),
+                std::process::id()
+            ),
+        )
+    }
+
+    /// A holder whose claude ends at once, saying why on stderr, before any socket opens.
+    fn holder_fails(f: &Fixture) -> String {
+        f.script(
+            "holder",
+            r#"echo "Invalid API key · Please run /login" >&2
+exit 1"#,
+        )
+    }
+
+    #[test]
+    fn a_remote_new_slot_runs_the_holder_with_no_terminal_and_says_so_in_its_record() {
+        let f = Fixture::new("remote-new");
+        let mut deps = f.deps(f.zmx("exit 9"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        assert_eq!(remote_new(&f.work(), &deps), Ok("claude-1".into()));
+        let started = wait_for("the stand-in holder", || f.claude_log().pop());
+        let fields: Vec<&str> = started.split_whitespace().collect();
+        assert_eq!(
+            &fields[1..],
+            [&f.work(), "claude-1", &deps.claude, "holder"],
+            "in the workspace, named, told which claude, and nothing to resume"
+        );
+        let calls = f.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(
+            !calls[0].contains("CLAUDE_CODE_DISABLE"),
+            "headless claude draws nothing, so no scrollback variables: {calls:?}"
+        );
+        let rec = load("claude-1");
+        assert_eq!(rec.driver, Driver::Holder);
+        assert_eq!(rec.state, State::Live);
+        assert_eq!(
+            rec.last_attach_ms, 0,
+            "the tap, not the start, records a look"
+        );
+    }
+
+    #[test]
+    fn a_remote_open_resumes_an_offloaded_slot_under_the_holder_and_a_terminal_resume_takes_it_back()
+     {
+        let f = Fixture::new("remote-open");
+        registry::store(&offloaded("claude-2", "conv-2", &f.work())).unwrap();
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        assert_eq!(remote_open("claude-2", &deps), Ok("claude-2".into()));
+        let started = wait_for("the stand-in holder", || f.claude_log().pop());
+        assert!(started.ends_with("holder --resume conv-2"), "{started}");
+        assert_eq!(load("claude-2").driver, Driver::Holder);
+        // Open again while it runs: the same slot, and nothing started twice.
+        assert_eq!(remote_open("claude-2", &deps), Ok("claude-2".into()));
+        assert_eq!(f.calls().len(), 1);
+
+        // Offloaded again, then resumed from the menu: a terminal's slot once more.
+        let mut rec = offloaded("claude-2", "conv-2", &f.work());
+        rec.driver = Driver::Holder;
+        registry::store(&rec).unwrap();
+        std::fs::remove_file(f.path("zmx/claude-2")).unwrap();
+        assert!(matches!(
+            plan_resume("claude-2", "claude-2", Driver::Terminal),
+            Plan::Start { .. }
+        ));
+        assert_eq!(load("claude-2").driver, Driver::Terminal);
+    }
+
+    #[test]
+    fn a_slot_a_terminal_is_running_is_not_opened_in_the_remote_view() {
+        let mut f = Fixture::new("remote-term");
+        let (pid, start) = f.process();
+        let mut rec = SlotRecord::new("claude-3", Moment::now());
+        rec.pid = Some(pid);
+        rec.proc_start = Some(start);
+        rec.session_id = Some("conv-3".into());
+        registry::store(&rec).unwrap();
+        f.session("claude-3", true);
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        let why = remote_open("claude-3", &deps).unwrap_err();
+        assert!(why.contains("running in a terminal"), "{why}");
+        assert!(f.calls().is_empty(), "nothing started");
+        // Nor by its conversation from the store.
+        let why = remote_resume("conv-3", &f.work(), "t", &deps).unwrap_err();
+        assert!(why.contains("running in a terminal"), "{why}");
+
+        // Calibration: the same record driven by the holder is opened as it is.
+        rec.driver = Driver::Holder;
+        registry::store(&rec).unwrap();
+        assert_eq!(remote_open("claude-3", &deps), Ok("claude-3".into()));
+        assert_eq!(
+            remote_resume("conv-3", &f.work(), "t", &deps),
+            Ok("claude-3".into())
+        );
+        assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn a_remote_start_that_dies_says_why_and_puts_the_slot_back() {
+        let f = Fixture::new("remote-fails");
+        registry::store(&offloaded("claude-4", "conv-4", &f.work())).unwrap();
+        let mut deps = f.deps(f.zmx(":"), f.claude_fails());
+        deps.holder = holder_fails(&f);
+        let why = remote_open("claude-4", &deps).unwrap_err();
+        assert!(why.contains("Invalid API key"), "{why}");
+        let rec = load("claude-4");
+        assert_eq!(rec.state, State::Offloaded, "left to retry");
+        assert_eq!(rec.session_id.as_deref(), Some("conv-4"));
+        let why = remote_new(&f.work(), &deps).unwrap_err();
+        assert!(why.contains("did not start"), "{why}");
+        assert_eq!(
+            load("claude-1").state,
+            State::Closed,
+            "a new slot that never ran is closed"
+        );
+    }
+
+    #[test]
+    fn a_stored_conversation_is_resumed_under_the_holder_in_a_new_slot() {
+        let f = Fixture::new("remote-store");
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        assert_eq!(
+            remote_resume("conv-9", &f.work(), "fix the door", &deps),
+            Ok("claude-1".into())
+        );
+        let started = wait_for("the stand-in holder", || f.claude_log().pop());
+        assert!(started.ends_with("holder --resume conv-9"), "{started}");
+        let rec = load("claude-1");
+        assert_eq!(rec.driver, Driver::Holder);
+        assert_eq!(rec.session_id.as_deref(), Some("conv-9"));
+        assert_eq!(rec.ai_title.as_deref(), Some("fix the door"));
+    }
+
+    #[test]
+    fn a_connected_view_keeps_its_slot_and_counts_as_a_look_without_shortening_a_keepalive() {
+        let _f = Fixture::new("remote-stamp");
+        let mut rec = SlotRecord::new("claude-1", Moment::now());
+        rec.driver = Driver::Holder;
+        registry::store(&rec).unwrap();
+        let before = clock::now();
+        crate::holder::stamp("claude-1", false);
+        let r = load("claude-1");
+        let keep = r.keep_until_ms.expect("kept");
+        assert!(keep >= before + 2 * 60 * 1000, "a few minutes ahead");
+        assert_eq!(r.last_attach_ms, 0, "a re-stamp is not a look");
+        crate::holder::stamp("claude-1", true);
+        assert!(load("claude-1").last_attach_ms >= before);
+
+        // A keepalive for hours asked from inside the slot stands.
+        let mut r = load("claude-1");
+        r.keep_until_ms = Some(before + 7_200_000);
+        registry::store(&r).unwrap();
+        crate::holder::stamp("claude-1", false);
+        assert_eq!(load("claude-1").keep_until_ms, Some(before + 7_200_000));
+        // And a slot with no record is left alone, not made.
+        crate::holder::stamp("claude-9", true);
+        assert!(registry::load("claude-9").unwrap().is_none());
     }
 }

@@ -210,8 +210,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 1. `src/sdk.rs`: read and write Claude's lines. **Done.**
 2. `src/reduce.rs`: Claude's lines into numbered items with short keys, as a pure function tested on 2.1.311 fixtures. **Done.**
 3. The holder, its log, the `driver` field and the binding, tested under the real zmx.
-   **Done except the `driver` field**, which lands with the launcher change that starts
-   remote slots:
+   **Done.**
    - `src/holder.rs` is the holder and `claude-sessions tap`. One run end to end on
      2026-11-01: zmx → `claude-sessions holder` → a real `claude -p`, a tap sending a prompt
      and reading back numbered lines and the answer, and the zmx screen saying starting,
@@ -221,7 +220,30 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      released binary.
    - A holder killed outright (`zmx kill`) leaves its socket file, and the next start removes
      it.
+   - **The `driver` field** is in the record (`registry::Driver`), written only as
+     `"driver":"holder"`. The launcher's plans take a driver: the menu's resume and
+     allocation write `Terminal`, so a holder's slot resumed at a terminal is a terminal's
+     again, and the remote view's write `Holder`.
+   - **`claude-sessions remote new [DIR] | open SLOT | resume ID CWD TITLE`** is what the
+     relay runs in a container, over one `ssh -T`. It opens the slot for the view through the
+     launcher's own plans (the allocation lock, the slot's lock, never resuming a running
+     conversation), with `zmx attach <slot> env … <holder> holder [--resume ID]` from no
+     terminal, and waits for the holder's socket and a second's settling. Its first line out
+     is `{"slot":"claude-4"}` or `{"error":"why"}`, and then it is the slot's tap. A slot a
+     terminal is running is refused with words to say so (mockup R10); so is a pi slot. A
+     start that dies puts the record back where it was, and the error carries claude's first
+     line of stderr. One run end to end on 2026-11-01 under an isolated zmx and registry: a new
+     slot, a prompt through it, `pong` back.
+   - **Mixed releases lose the field.** The installed hooks on this dev container run the
+     released binary, which rewrote that run's record without `driver` and did not bind the
+     holder's claude. On the fleet, hooks and `remote` are the one installed binary, so this
+     holds only until the release that carries the holder.
 4. The tap: streaming from a sequence number, lines in, `keep_until` and `last_attach`.
+   **Done.** While a tap is connected it stamps `keep_until` three minutes ahead every minute
+   (never shortening a longer keep-alive asked for from inside the slot), and writes
+   `last_attach` when it connects and when it goes, each under the slot's lock with the
+   interactive timeout, skipped rather than waited on. The end of its input is the relay
+   gone, and the tap leaves at once, both ways.
 5. The relay.
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in

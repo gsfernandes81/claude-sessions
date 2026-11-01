@@ -298,6 +298,9 @@ fn main() -> ExitCode {
             }
             None => fail("tap needs a slot"),
         },
+        // The relay's way to open a session for the phone client: start or resume it under
+        // the holder if need be, say which slot, then be its tap (`launch::remote_new`…).
+        "remote" => cmd_remote(&args[1..]),
         "install" => match args.get(1) {
             Some(dir) => match install::run(std::path::Path::new(dir)) {
                 Ok(done) => {
@@ -333,6 +336,9 @@ fn usage() -> String {
                                served to taps (proposed: docs/remote-view.md)
   claude-sessions tap SLOT [FROM] [RUN]
                                the hub's way into a remote-view slot, run over ssh
+  claude-sessions remote new [DIR] | open SLOT | resume ID CWD TITLE
+                               open a session for the remote view, under the holder, then
+                               be its tap; its first line names the slot, or why not
   claude-sessions mail who|send|list|read|reply|wait|status
                                agent mail, from a session to others; `mail` alone says how
   claude-sessions mail-hook    fed by Claude Code's hooks on stdin; one line per message new
@@ -362,6 +368,51 @@ The registry is {} — override with CLAUDE_SESSIONS_DIR.
 ",
         registry::dir().display()
     )
+}
+
+/// `claude-sessions remote …`: open a slot for the remote view and stream it. The first line
+/// out is `{"slot":"claude-4"}` or `{"error":"why"}`, so the relay knows which slot it has
+/// without a second round trip over the metered link.
+fn cmd_remote(args: &[String]) -> ExitCode {
+    let deps = launch::Deps::from_env();
+    let a = |i: usize| args.get(i).map(String::as_str);
+    let opened = match (a(0), a(1), a(2), a(3)) {
+        (Some("new"), dir, None, None) => {
+            let here = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".into());
+            launch::remote_new(dir.unwrap_or(&here), &deps)
+        }
+        (Some("open"), Some(slot), None, None) => launch::remote_open(slot, &deps),
+        (Some("resume"), Some(id), Some(cwd), title) => {
+            launch::remote_resume(id, cwd, title.unwrap_or(id), &deps)
+        }
+        _ => Err("remote takes new [DIR], open SLOT, or resume ID CWD TITLE".to_string()),
+    };
+    let mut first = json::Value::obj();
+    let slot = match opened {
+        Ok(slot) => {
+            first.set("slot", json::Value::string(&slot));
+            Some(slot)
+        }
+        Err(why) => {
+            first.set("error", json::Value::string(&why));
+            None
+        }
+    };
+    {
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{}", json::to_line(&first))
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+    }
+    match slot {
+        Some(slot) => report(holder::tap(&slot, 1, "")),
+        None => ExitCode::FAILURE,
+    }
 }
 
 fn report(r: std::io::Result<()>) -> ExitCode {

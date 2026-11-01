@@ -218,6 +218,21 @@ pub struct SlotRecord {
     /// invisible without this.
     pub last_event_ms: BTreeMap<String, Millis>,
     pub written: Written,
+    /// What drives the slot's claude: a terminal, as always, or the remote view's holder
+    /// (`holder.rs`). Written only for the holder, as `"driver":"holder"`, so a record
+    /// without it, an older one included, is a terminal slot, and an older release reading
+    /// a holder's record sees a plain claude row.
+    pub driver: Driver,
+}
+
+/// Who has a slot's claude on its pipes (`docs/remote-view.md` § *Decisions*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Driver {
+    /// A terminal through zmx: every slot before the remote view, and any without the field.
+    #[default]
+    Terminal,
+    /// `claude-sessions holder`, which the remote view reaches through `claude-sessions tap`.
+    Holder,
 }
 
 impl SlotRecord {
@@ -244,6 +259,7 @@ impl SlotRecord {
             updated_ms: made.at,
             last_event_ms: BTreeMap::new(),
             written: Written::new(made.tick),
+            driver: Driver::Terminal,
         }
     }
 
@@ -352,6 +368,9 @@ impl SlotRecord {
         }
         o.set("last_event_ms", ev);
         o.set("written", self.written.to_json());
+        if self.driver == Driver::Holder {
+            o.set("driver", Value::string("holder"));
+        }
         o
     }
 
@@ -407,6 +426,12 @@ impl SlotRecord {
             updated_ms: v.get("updated_ms").and_then(Value::as_u64).unwrap_or(0),
             last_event_ms,
             written: Written::from_json(v.get("written")),
+            // A value this release does not know is read as a terminal slot: one the menu
+            // lists and attaches to as it always has.
+            driver: match v.get("driver").and_then(Value::as_str) {
+                Some("holder") => Driver::Holder,
+                _ => Driver::Terminal,
+            },
         })
     }
 }
@@ -580,6 +605,34 @@ mod tests {
             Harness::Pi
         );
         assert_eq!(SlotRecord::new("pi-1", Moment::ms(0)).harness, Harness::Pi);
+    }
+
+    #[test]
+    fn only_a_holder_slot_says_its_driver_and_anything_else_reads_as_a_terminal() {
+        let mut rec = SlotRecord::new("claude-3", Moment::ms(0));
+        assert_eq!(rec.driver, Driver::Terminal);
+        assert!(
+            rec.to_json().get("driver").is_none(),
+            "a terminal slot's record is what older releases wrote"
+        );
+        rec.driver = Driver::Holder;
+        let v = rec.to_json();
+        assert_eq!(v.get("driver").and_then(Value::as_str), Some("holder"));
+        assert_eq!(
+            SlotRecord::from_json(&v, "claude-3").unwrap().driver,
+            Driver::Holder
+        );
+        for odd in [
+            r#"{"slot":"claude-3","driver":"phone"}"#,
+            r#"{"slot":"claude-3","driver":7}"#,
+        ] {
+            let v = crate::json::parse(odd).unwrap();
+            assert_eq!(
+                SlotRecord::from_json(&v, "claude-3").unwrap().driver,
+                Driver::Terminal,
+                "{odd}"
+            );
+        }
     }
 
     #[test]

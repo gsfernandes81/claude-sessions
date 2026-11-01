@@ -22,7 +22,9 @@
 //! showing a blank screen. Whatever is typed into the session is read and dropped: the mail
 //! nudge types into idle detached sessions, and a remote slot always reads as detached.
 //!
-//! The holder takes no registry lock: the tap's writes to the slot's record do, with a timeout.
+//! The holder takes no registry lock: the tap's writes to the slot's record do, with a timeout
+//! (`Viewing`): `keep_until` re-stamped while a view is connected, and `last_attach` when it
+//! connects and when it goes.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -33,7 +35,9 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::clock::{self, Millis};
 use crate::json::{self, Value};
+use crate::lockfile::{INTERACTIVE_WAIT, SlotLock};
 use crate::registry;
 use crate::sdk::{self, Msg};
 
@@ -285,26 +289,106 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
 pub fn tap(slot: &str, from: u64, run: &str) -> io::Result<()> {
     let p = paths(slot);
     let conn = UnixStream::connect(&p.sock)?;
+    let _viewing = Viewing::start(slot);
     let mut hello = Value::obj();
     hello.set("from", Value::num(from as f64));
     hello.set("run", Value::string(run));
     (&conn).write_all(format!("{}\n", json::to_line(&hello)).as_bytes())?;
     let mut to_holder = conn.try_clone()?;
+    // The end of input is the relay gone, and with it the view: the tap goes too, both ways,
+    // or it would keep the slot loaded for nobody (`Viewing`).
     std::thread::spawn(move || {
         let _ = io::copy(&mut io::stdin().lock(), &mut to_holder);
-        let _ = to_holder.shutdown(std::net::Shutdown::Write);
+        let _ = to_holder.shutdown(std::net::Shutdown::Both);
     });
     let mut from_holder = conn;
     let mut buf = [0u8; 16 * 1024];
     let mut stdout = io::stdout().lock();
     loop {
-        let n = from_holder.read(&mut buf)?;
+        let n = match from_holder.read(&mut buf) {
+            Ok(n) => n,
+            // Shut down from the input side while a read was waiting.
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => 0,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(());
         }
         stdout.write_all(&buf[..n])?;
         stdout.flush()?;
     }
+}
+
+/// How long past its last stamp a connected view keeps the slot from being offloaded, and how
+/// often it stamps again: a tap killed outright leaves at most this much keep-alive behind.
+const KEEP_FOR: Millis = 3 * 60 * 1000;
+const RESTAMP: Duration = Duration::from_secs(60);
+
+/// A view connected to a slot, as the registry hears of it (`docs/remote-view.md` §
+/// *Decisions*: a connected view keeps the slot loaded). zmx never counts a remote slot as
+/// attached, so while a tap runs it re-stamps `keep_until` as `keepalive` would, and
+/// `last_attach` is written when it connects and when it goes, which keeps unread right:
+/// whatever stopped while it was connected, the owner saw.
+struct Viewing {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    slot: String,
+}
+
+impl Viewing {
+    fn start(slot: &str) -> Viewing {
+        stamp(slot, true);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let (s, theirs) = (slot.to_string(), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let (done, cv) = &*theirs;
+            let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
+            while !*done {
+                done = cv
+                    .wait_timeout(done, RESTAMP)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                if !*done {
+                    stamp(&s, false);
+                }
+            }
+        });
+        Viewing {
+            stop,
+            slot: slot.to_string(),
+        }
+    }
+}
+
+impl Drop for Viewing {
+    fn drop(&mut self) {
+        let (done, cv) = &*self.stop;
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+        stamp(&self.slot, true);
+    }
+}
+
+/// Keep the slot for `KEEP_FOR` from now, and, with `attach`, record the owner as having seen
+/// it now. Under the slot's lock with the interactive timeout; a lock not had or a record not
+/// there is skipped, never waited on, since the stream matters more than the stamp.
+pub(crate) fn stamp(slot: &str, attach: bool) {
+    let Ok(_lock) = SlotLock::acquire(&registry::lock_path(slot), INTERACTIVE_WAIT) else {
+        return;
+    };
+    let Ok(Some(mut rec)) = registry::load(slot) else {
+        return;
+    };
+    let now = clock::now();
+    let keep = now + KEEP_FOR;
+    // A longer keep-alive asked for from inside the slot stands.
+    if rec.keep_until_ms.is_none_or(|k| k < keep) {
+        rec.keep_until_ms = Some(keep);
+    }
+    if attach {
+        rec.last_attach_ms = now;
+    }
+    rec.updated_ms = now;
+    let _ = registry::store(&rec);
 }
 
 #[cfg(test)]
