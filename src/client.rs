@@ -294,7 +294,13 @@ impl App {
                         };
                         self.home(Some(said));
                     }
-                    Screen::Conv { ui, .. } => ui.status = Some(why),
+                    // A relay from before `/btw` refuses it: the panel says so, not waits.
+                    Screen::Conv { ui, .. } => match &mut ui.dialog {
+                        Some(Dialog::Btw {
+                            answer: a @ None, ..
+                        }) => *a = Some(Err(why)),
+                        _ => ui.status = Some(why),
+                    },
                     Screen::Home => self.menu.set_status(Some(why)),
                 }
             }
@@ -1763,6 +1769,22 @@ mod tests {
         assert!(
             dialog(&app).is_some(),
             "only Space, Enter or Esc dismiss it"
+        );
+        app.key(Key::Esc, Instant::now());
+        type_in(&mut app, "/btw again?");
+        app.heard(
+            parse(r#"{"t":"err","x":"\"btw\" is not something the relay knows"}"#).unwrap(),
+            Instant::now(),
+        );
+        assert!(
+            matches!(
+                dialog(&app),
+                Some(Dialog::Btw {
+                    answer: Some(Err(_)),
+                    ..
+                })
+            ),
+            "an older relay's refusal ends the wait"
         );
         app.key(Key::Esc, Instant::now());
         assert!(dialog(&app).is_none());
