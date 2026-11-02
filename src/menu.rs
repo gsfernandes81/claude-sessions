@@ -631,6 +631,11 @@ impl Menu {
     /// What a key does. Every key the design lists, and nothing else: an unknown key does
     /// nothing at all rather than something surprising.
     pub fn key(&mut self, key: Key) -> Action {
+        // A button let go, or dragged: not a key the menu reads, nor the owner moving on. A
+        // terminal reporting clicks reports their releases too, one straight after each.
+        if matches!(key, Key::Release { .. } | Key::Drag { .. }) {
+            return Action::None;
+        }
         // A status line is news about the last thing that happened; the next key is the
         // owner moving on.
         let had_status = self.status.take().is_some();

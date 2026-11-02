@@ -329,6 +329,16 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        Down choose, Tab puts it in the prompt with its argument hint grey after it, Enter
        sends it, Esc puts the list away. Claude Code also orders by what was used lately,
        which the phone does not know.
+     - **A drag over the conversation selects** and letting go copies, as Claude Code's
+       fullscreen mode does with "copy on select": it holds the mouse, so the terminal's own
+       selection cannot work, and nor can the phone's while it reads the wheel. The phone asks
+       for motion while a button is held (`?1002`, its terminal only), lights the cells in
+       Claude Code's `selectionBg`, `264f78`, until the next key, and copies through
+       `termux-clipboard-set` and OSC 52 as `/copy` does, saying so in Claude Code's words:
+       `copied N chars to clipboard`, or `sent N chars via OSC 52 · if paste fails, hold
+       shift while selecting for native copy`. The menu ignores a release or a drag.
+     - A name typed whole in the suggestion list is that command on Enter: headless claude
+       lists `design:ux-copy` and no `copy`, so `/copy` once became it.
      - A slash command claude or the phone knows is lavender in the prompt, wherever it is,
        as Claude Code draws it (`b1b9f9`, its `permission` colour); `/` before an unknown name
        is text. claude's commands come in the meta op's `sc`, from its init's `slash_commands`.

@@ -339,6 +339,17 @@ pub enum Key {
         row: u16,
         col: u16,
     },
+    /// The left button moved while held, and let go: a selection being dragged, which the
+    /// phone client asks the terminal for (`?1002`) and copies, as Claude Code does. The
+    /// menu reads neither.
+    Drag {
+        row: u16,
+        col: u16,
+    },
+    Release {
+        row: u16,
+        col: u16,
+    },
     WheelUp,
     WheelDown,
     /// The window changed size.

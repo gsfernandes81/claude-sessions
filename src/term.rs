@@ -454,6 +454,9 @@ fn mouse(button: u32, col: u32, row: u32, press: bool, len: usize) -> Parsed {
     };
     let key = match (press, button & !(4 | 8 | 16)) {
         (true, 0) => Key::Click { row, col },
+        // Motion with the left button held (32 is the motion bit), and its release.
+        (true, 32) => Key::Drag { row, col },
+        (false, 0) => Key::Release { row, col },
         (true, 64) => Key::WheelUp,
         (true, 65) => Key::WheelDown,
         _ => return Parsed::Drop(len),
@@ -1069,18 +1072,26 @@ mod tests {
     }
 
     #[test]
-    fn sgr_mouse_releases_other_buttons_and_motion_are_dropped() {
+    fn sgr_mouse_other_buttons_and_bare_motion_are_dropped() {
         // Calibration: the same report as a press is a click, so the drops below are the
         // decoder choosing to drop, not failing to parse.
         assert_eq!(
             decode(b"\x1b[<0;10;3M"),
             vec![Key::Click { row: 2, col: 9 }]
         );
-        assert_eq!(decode(b"\x1b[<0;10;3m"), vec![], "left release");
+        // The left button's release and drag are the phone's selection (`?1002`).
+        assert_eq!(
+            decode(b"\x1b[<0;10;3m\x1b[<32;11;3M"),
+            vec![
+                Key::Release { row: 2, col: 9 },
+                Key::Drag { row: 2, col: 10 }
+            ]
+        );
+        assert_eq!(decode(b"\x1b[<2;10;3m"), vec![], "right release");
         assert_eq!(decode(b"\x1b[<2;10;3M"), vec![], "right press");
         assert_eq!(decode(b"\x1b[<1;10;3M"), vec![], "middle press");
-        assert_eq!(decode(b"\x1b[<32;10;3M"), vec![], "drag");
-        assert_eq!(decode(b"\x1b[<35;10;3M"), vec![], "motion");
+        assert_eq!(decode(b"\x1b[<34;10;3M"), vec![], "right drag");
+        assert_eq!(decode(b"\x1b[<35;10;3M"), vec![], "motion, no button");
         assert_eq!(decode(b"\x1b[<0;99999;3M"), vec![], "off any screen");
         assert_eq!(decode(b"\x1b[<0;10M"), vec![], "two fields");
         assert_eq!(decode(b"\x1b[<0;10;3;4M"), vec![], "four fields");
@@ -1251,6 +1262,7 @@ mod tests {
         ]);
         want.extend([Key::Home, Key::End, Key::Up]);
         want.push(Key::Click { row: 2, col: 9 });
+        want.push(Key::Release { row: 2, col: 9 });
         want.extend([Key::WheelUp, Key::WheelDown]);
         want.push(Key::Click { row: 2, col: 9 });
         want.extend([Key::Enter, Key::Enter]);
@@ -1424,8 +1436,9 @@ mod tests {
         );
         assert!(start.elapsed() >= ESC_WAIT, "{:?}", start.elapsed());
 
-        // A mouse release decodes to nothing, so it does not end the wait.
-        p.write(b"\x1b[<0;1;1m");
+        // A report decoding to nothing does not end the wait: a right button's release. (The
+        // left's is a key now, the phone's selection, which the menu ignores.)
+        p.write(b"\x1b[<2;1;1m");
         assert_eq!(
             t.wait(Some(Duration::from_millis(200))).unwrap(),
             Input::Timeout

@@ -1281,7 +1281,15 @@ pub struct Command {
 
 /// The commands this client serves that claude's list may not have, said as the phone does
 /// them.
-const CLIENT_ABOUT: [(&str, &str); 6] = [
+const CLIENT_ABOUT: [(&str, &str); 11] = [
+    ("model", "Set the AI model for Claude Code"),
+    ("effort", "Set the effort level"),
+    ("rename", "Rename the conversation"),
+    (
+        "copy",
+        "Copy Claude's last response to clipboard (or /copy N for the Nth-latest)",
+    ),
+    ("exit", "End the session"),
     (
         "auto",
         "Cycle the permission mode (shift+tab in Claude Code)",

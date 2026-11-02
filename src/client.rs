@@ -146,6 +146,9 @@ struct App {
     /// claude's slash commands with what each does, from `initialize` (the relay's `models`):
     /// asked for when a conversation opens, for its suggestion list.
     catalog: Vec<convo::Command>,
+    /// A selection dragged over the conversation, in screen cells: where the button went
+    /// down, where it is now, and whether it has moved. Highlighted, and copied on release.
+    select: Option<Selection>,
 }
 
 impl App {
@@ -493,6 +496,24 @@ impl App {
         ));
     }
 
+    /// What a selection covers on the screen as drawn, to the clipboard, and Claude Code's
+    /// words for how it went there.
+    fn copy_selection(&mut self, sel: Selection) {
+        let (w, h) = term::size().unwrap_or((40, 24));
+        let Screen::Conv { c, ui, .. } = &mut self.screen else {
+            return;
+        };
+        let f = convo::draw(c, ui, w as usize, h as usize, Instant::now());
+        let rows: Vec<String> = f.lines.iter().map(convo::plain).collect();
+        let text = selected_text(&rows, sel);
+        if text.trim().is_empty() {
+            self.select = None;
+            return;
+        }
+        ui.status = Some(selection_copied(&text));
+        self.clip = Some(text);
+    }
+
     fn home(&mut self, status: Option<String>) {
         self.screen = Screen::Home;
         self.menu.set_status(status);
@@ -505,6 +526,42 @@ impl App {
         // A key after a long silence: make sure the link is there before relying on it.
         if self.up() && now.duration_since(self.last_heard) > QUIET_PROBE {
             self.send(App::msg("ping", vec![]));
+        }
+        // A drag over the conversation selects, and letting go copies, as in Claude Code: its
+        // fullscreen mode holds the mouse, so the terminal's own selection cannot.
+        let conv = matches!(self.screen, Screen::Conv { .. });
+        match k {
+            Key::Click { row, col } if conv => {
+                self.select = Some(Selection {
+                    from: (row, col),
+                    to: (row, col),
+                    moved: false,
+                });
+                return;
+            }
+            Key::Drag { row, col } => {
+                if let Some(s) = &mut self.select {
+                    s.to = (row, col);
+                    s.moved = true;
+                }
+                return;
+            }
+            Key::Release { row, col } => {
+                match self.select.as_mut() {
+                    Some(s) if s.moved && (s.from != (row, col) || s.from != s.to) => {
+                        s.to = (row, col);
+                        let sel = *s;
+                        self.copy_selection(sel);
+                    }
+                    _ => self.select = None,
+                }
+                return;
+            }
+            // A key puts a selection away.
+            _ if self.select.is_some() && !matches!(k, Key::PasteStart | Key::PasteEnd) => {
+                self.select = None;
+            }
+            _ => {}
         }
         // A paste is gathered whole first, so nothing in it is read as a key: on the home, a
         // pasted `n` would start a session.
@@ -671,7 +728,9 @@ impl App {
                     ui.suggest_off = true;
                     suggested = true;
                 }
-                Key::Enter => {
+                // A name typed whole is that command, whatever the list has chosen: `/copy` is
+                // `/copy`, not the first command with `copy` in it.
+                Key::Enter if !list.iter().any(|c| ui.input == format!("/{}", c.name)) => {
                     ui.input = format!("/{}", list[sel].name);
                     ui.cursor = ui.input.chars().count();
                 }
@@ -1092,6 +1151,110 @@ fn history_step(
     if let Some(i) = next {
         ui.input = history[i].clone();
         ui.cursor = if up { ui.input.chars().count() } else { 0 };
+    }
+}
+
+/// A selection dragged over the screen, in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    from: (u16, u16),
+    to: (u16, u16),
+    moved: bool,
+}
+
+impl Selection {
+    /// Its first and last cell, in reading order, both in it.
+    fn span(&self) -> ((usize, usize), (usize, usize)) {
+        let a = (self.from.0 as usize, self.from.1 as usize);
+        let b = (self.to.0 as usize, self.to.1 as usize);
+        if a <= b { (a, b) } else { (b, a) }
+    }
+
+    /// The cells of `row` it covers, `[from, to)`.
+    fn cols(&self, row: usize, width: usize) -> Option<(usize, usize)> {
+        let ((r0, c0), (r1, c1)) = self.span();
+        if row < r0 || row > r1 {
+            return None;
+        }
+        let from = if row == r0 { c0 } else { 0 };
+        let to = if row == r1 {
+            (c1 + 1).min(width)
+        } else {
+            width
+        };
+        (from < to).then_some((from, to))
+    }
+}
+
+/// Claude Code's selection colour in its dark theme (`selectionBg`).
+const SELECTION_BG: u32 = 0x26_4f78;
+
+/// The cells a selection covers, behind its colour.
+fn highlight(lines: &mut [convo::Line], sel: Selection) {
+    for (row, line) in lines.iter_mut().enumerate() {
+        let width: usize = convo::plain(line).chars().map(convo::cw).sum();
+        let Some((from, to)) = sel.cols(row, width.max(1)) else {
+            continue;
+        };
+        let mut out: convo::Line = Vec::new();
+        let mut at = 0;
+        for (text, st) in line.iter() {
+            for ch in text.chars() {
+                let on = at >= from && at < to;
+                let st = if on {
+                    convo::St {
+                        bg: Some(SELECTION_BG),
+                        ..*st
+                    }
+                } else {
+                    *st
+                };
+                match out.last_mut() {
+                    Some((t, s)) if *s == st => t.push(ch),
+                    _ => out.push((ch.to_string(), st)),
+                }
+                at += convo::cw(ch);
+            }
+        }
+        *line = out;
+    }
+}
+
+/// What a selection covers of rows of text: each row's cells in it, its trailing spaces
+/// dropped, a line each.
+fn selected_text(rows: &[String], sel: Selection) -> String {
+    let ((r0, _), (r1, _)) = sel.span();
+    let mut out = Vec::new();
+    for (row, text) in rows.iter().enumerate().take(r1 + 1).skip(r0) {
+        let width: usize = text.chars().map(convo::cw).sum();
+        let Some((from, to)) = sel.cols(row, width) else {
+            out.push(String::new());
+            continue;
+        };
+        let mut at = 0;
+        let mut piece = String::new();
+        for ch in text.chars() {
+            if at >= from && at < to {
+                piece.push(ch);
+            }
+            at += convo::cw(ch);
+        }
+        out.push(piece.trim_end().to_string());
+    }
+    out.join("\n")
+}
+
+/// Claude Code's words for a selection copied: to the clipboard where there is one to set
+/// (`termux-clipboard-set`), else sent as OSC 52, which the terminal may not honour.
+fn selection_copied(text: &str) -> String {
+    let n = text.chars().count();
+    let chars = if n == 1 { "char" } else { "chars" };
+    if std::env::var_os("TERMUX_VERSION").is_some() {
+        format!("copied {n} {chars} to clipboard")
+    } else {
+        format!(
+            "sent {n} {chars} via OSC 52 · if paste fails, hold shift while selecting for native copy"
+        )
     }
 }
 
@@ -1657,7 +1820,10 @@ impl App {
                 }
             }
             Screen::Conv { c, ui, .. } => {
-                let f = convo::draw(c, ui, w as usize, h as usize, now);
+                let mut f = convo::draw(c, ui, w as usize, h as usize, now);
+                if let Some(sel) = self.select.filter(|s| s.moved) {
+                    highlight(&mut f.lines, sel);
+                }
                 (f.lines.iter().map(ansi).collect(), f.cursor)
             }
         }
@@ -1765,6 +1931,7 @@ impl App {
             working: None,
             pasting: None,
             catalog: Vec::new(),
+            select: None,
         };
         app.menu.remote = true;
         app
@@ -1777,7 +1944,9 @@ pub fn run(name: &str) -> Result<(), String> {
     let mut app = App::new(name, w, h, wheel_step(|k| std::env::var(k).ok()));
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
     // And bracketed paste, so a paste arrives as one (`Key::PasteStart`), as in Claude Code.
-    term.write_all(b"\x1b[2J\x1b[?2004h")
+    // And motion while a button is held (`?1002`), for a selection dragged over the
+    // conversation; the menu's own terminal never asks for it.
+    term.write_all(b"\x1b[2J\x1b[?2004h\x1b[?1002h")
         .map_err(|e| e.to_string())?;
     app.dial(Instant::now(), &tx);
     let mut hosts_seen: Vec<String> = Vec::new();
@@ -1837,7 +2006,7 @@ pub fn run(name: &str) -> Result<(), String> {
         let _ = w.child.kill();
         let _ = w.child.wait();
     }
-    let _ = term.write_all(b"\x1b[?2004l");
+    let _ = term.write_all(b"\x1b[?1002l\x1b[?2004l");
     drop(term);
     Ok(())
 }
@@ -1846,6 +2015,69 @@ pub fn run(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn copy_is_copy_though_claudes_list_has_only_ux_copy() {
+        // headless claude lists `design:ux-copy` and no `copy`: the phone's own comes first,
+        // and a name typed whole is kept on Enter (`conv_key`).
+        let mut ui = Ui::new();
+        ui.catalog = vec![convo::Command {
+            name: "design:ux-copy".into(),
+            about: "Write or review UX copy".into(),
+            hint: String::new(),
+        }];
+        ui.input = "/copy".into();
+        let names: Vec<String> = convo::suggestions(&ui)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["copy", "design:ux-copy"]);
+        for cmd in [
+            "model", "effort", "rename", "copy", "exit", "btw", "expand", "home",
+        ] {
+            ui.input = format!("/{cmd}");
+            assert!(
+                convo::suggestions(&ui).iter().any(|c| c.name == cmd),
+                "/{cmd} is in the list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drag_selects_what_it_covers_and_lights_it() {
+        let rows: Vec<String> = [
+            "● the quick brown fox",
+            "  jumps over",
+            "",
+            "  the lazy dog  ",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let sel = |from: (u16, u16), to: (u16, u16)| Selection {
+            from,
+            to,
+            moved: true,
+        };
+        assert_eq!(selected_text(&rows, sel((0, 2), (0, 10))), "the quick");
+        // Backwards is the same; across rows, each row from its start; trailing spaces go.
+        assert_eq!(
+            selected_text(&rows, sel((3, 9), (0, 12))),
+            "brown fox\n  jumps over\n\n  the lazy"
+        );
+        let mut lines: Vec<convo::Line> = rows
+            .iter()
+            .map(|r| vec![(r.clone(), convo::PLAIN)])
+            .collect();
+        highlight(&mut lines, sel((0, 2), (0, 4)));
+        assert_eq!(lines[0][0], ("● ".to_string(), convo::PLAIN));
+        assert_eq!(lines[0][1].0, "the");
+        assert_eq!(lines[0][1].1.bg, Some(SELECTION_BG));
+        assert_eq!(lines[0][2].1.bg, None);
+        assert_eq!(lines[1], vec![("  jumps over".to_string(), convo::PLAIN)]);
+        assert!(selection_copied("abc").contains("3 chars"));
+        assert!(selection_copied("a").contains("1 char "));
+    }
 
     #[test]
     fn scrolled_back_the_view_holds_while_lines_arrive_and_follows_at_the_bottom() {
