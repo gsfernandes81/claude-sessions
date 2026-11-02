@@ -66,7 +66,11 @@ pub enum Op {
     /// An interrupt caught a prompt a view sent (`command_lifecycle` `cancelled`): its text,
     /// and whether another prompt was waiting behind it. The view decides, as Claude Code
     /// does, whether that hands the prompt back to its input (`convo.rs`).
-    Back { text: String, queued: bool },
+    Back {
+        text: String,
+        uuid: String,
+        queued: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -80,6 +84,8 @@ pub struct Meta {
     /// Where claude runs, and its version, for the logo block Claude Code draws on top.
     pub cwd: String,
     pub version: String,
+    /// The slash commands claude has, for the view to colour as Claude Code colours them.
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,6 +440,7 @@ impl Reducer {
                 permission_mode,
                 cwd,
                 version,
+                commands,
             } => {
                 let meta = Meta {
                     session_id,
@@ -441,6 +448,7 @@ impl Reducer {
                     permission_mode,
                     cwd,
                     version,
+                    commands,
                     ..self.meta.clone()
                 };
                 self.set_meta(&mut out, meta);
@@ -739,7 +747,7 @@ impl Reducer {
                         // A prompt behind it is what the interrupt makes way for (Claude Code
                         // keeps the interrupted one, with its note, when one waits).
                         let queued = self.said.values().any(|(_, st)| st == "queued");
-                        out.ops.push(Op::Back { text, queued });
+                        out.ops.push(Op::Back { text, uuid, queued });
                     }
                 }
                 _ => {
@@ -1023,21 +1031,32 @@ impl Op {
                 ("t", Value::string("st")),
                 ("s", Value::string(s.clone())),
             ]),
-            Op::Back { text, queued } => obj(vec![
+            Op::Back { text, uuid, queued } => obj(vec![
                 ("t", Value::string("back")),
                 ("x", Value::string(text.clone())),
+                ("u", Value::string(uuid.clone())),
                 ("q", Value::Bool(*queued)),
             ]),
-            Op::Meta(m) => obj(vec![
-                ("t", Value::string("meta")),
-                ("sid", Value::string(m.session_id.clone())),
-                ("m", Value::string(m.model.clone())),
-                ("pm", Value::string(m.permission_mode.clone())),
-                ("ti", Value::string(m.title.clone())),
-                ("e", Value::string(m.effort.clone())),
-                ("cwd", Value::string(m.cwd.clone())),
-                ("ver", Value::string(m.version.clone())),
-            ]),
+            Op::Meta(m) => {
+                let mut v = obj(vec![
+                    ("t", Value::string("meta")),
+                    ("sid", Value::string(m.session_id.clone())),
+                    ("m", Value::string(m.model.clone())),
+                    ("pm", Value::string(m.permission_mode.clone())),
+                    ("ti", Value::string(m.title.clone())),
+                    ("e", Value::string(m.effort.clone())),
+                    ("cwd", Value::string(m.cwd.clone())),
+                    ("ver", Value::string(m.version.clone())),
+                ]);
+                // Only when there are some: an older client reads the op without it.
+                if !m.commands.is_empty() {
+                    v.set(
+                        "sc",
+                        Value::Arr(m.commands.iter().map(Value::string).collect()),
+                    );
+                }
+                v
+            }
         }
     }
 }
@@ -1345,11 +1364,17 @@ mod tests {
         r.feed(&line(sdk::prompt("second", "u2")));
         r.feed(&parse(&life("u2", "queued")).unwrap());
         let o = r.feed(&parse(&life("u1", "cancelled")).unwrap());
-        assert_eq!(wire(&o.ops), [r#"{"q":true,"t":"back","x":"first"}"#]);
+        assert_eq!(
+            wire(&o.ops),
+            [r#"{"q":true,"t":"back","u":"u1","x":"first"}"#]
+        );
         // The second, caught alone, waits on nothing.
         r.feed(&parse(&life("u2", "started")).unwrap());
         let o = r.feed(&parse(&life("u2", "cancelled")).unwrap());
-        assert_eq!(wire(&o.ops), [r#"{"q":false,"t":"back","x":"second"}"#]);
+        assert_eq!(
+            wire(&o.ops),
+            [r#"{"q":false,"t":"back","u":"u2","x":"second"}"#]
+        );
         // Once answered, a prompt is forgotten; one no view sent is not said back.
         r.feed(&line(sdk::prompt("third", "u3")));
         r.feed(&parse(&life("u3", "completed")).unwrap());

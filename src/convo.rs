@@ -263,6 +263,8 @@ pub struct Meta {
     pub effort: String,
     pub cwd: String,
     pub version: String,
+    /// claude's slash commands, without their `/`: coloured in the prompt (`slash_runs`).
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -300,6 +302,8 @@ pub struct Pending {
     pub since: Instant,
     /// Sent while a turn ran, so it waits behind it: Claude Code offers send-now under it.
     pub queued: bool,
+    /// The uuid it went to claude with, which `back` names and Up withdraws it by.
+    pub uuid: String,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -330,13 +334,27 @@ impl Convo {
     }
 
     /// A prompt just sent: shown at once, turning, until claude echoes it.
-    pub fn sent(&mut self, text: &str, now: Instant) {
+    /// Returns the uuid to send it with: the one claude's lifecycle lines will name.
+    pub fn sent(&mut self, text: &str, now: Instant) -> String {
         let queued = self.state != "idle" || !self.pending.is_empty();
+        let uuid = crate::launch::fresh_session_id();
         self.pending.push(Pending {
             text: text.to_string(),
             since: now,
             queued,
+            uuid: uuid.clone(),
         });
+        uuid
+    }
+
+    /// Up in an empty prompt with prompts waiting behind the turn: they leave the queue, as
+    /// Claude Code takes them back to edit. Their texts, and the uuids to withdraw them by.
+    pub fn unqueue(&mut self) -> (Vec<String>, Vec<String>) {
+        let (back, keep): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.pending)
+            .into_iter()
+            .partition(|p| p.queued);
+        self.pending = keep;
+        back.into_iter().map(|p| (p.text, p.uuid)).unzip()
     }
 
     /// Something the client adds itself, such as the `❯ /model` it ran.
@@ -484,12 +502,17 @@ impl Convo {
             "back" => {
                 let text = s(v, "x");
                 let queued = v.get("q").and_then(Value::as_bool) == Some(true);
-                // Never echoed: it is still on the phone, spinning.
-                if let Some(i) = self
-                    .pending
-                    .iter()
-                    .position(|p| p.text.trim() == text.trim())
-                {
+                // Never echoed: it is still on the phone, spinning. By its uuid where the relay
+                // says it, by its text from one that does not.
+                let uuid = s(v, "u");
+                let mine = |p: &Pending| {
+                    if uuid.is_empty() {
+                        p.text.trim() == text.trim()
+                    } else {
+                        p.uuid == uuid
+                    }
+                };
+                if let Some(i) = self.pending.iter().position(mine) {
                     self.pending.remove(i);
                     return if self.live && !queued {
                         Applied::Back(text)
@@ -551,6 +574,13 @@ impl Convo {
                     effort: s(v, "e"),
                     cwd: s(v, "cwd"),
                     version: s(v, "ver"),
+                    commands: v
+                        .get("sc")
+                        .and_then(Value::as_arr)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect(),
                 };
             }
             "n" => {
@@ -1231,6 +1261,47 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     out
 }
 
+/// The slash commands this client serves itself (`client::submit`); claude's own come in its
+/// meta.
+pub const CLIENT_COMMANDS: [&str; 11] = [
+    "model",
+    "effort",
+    "auto",
+    "rename",
+    "exit",
+    "quit",
+    "home",
+    "disconnect",
+    "expand",
+    "btw",
+    "copy",
+];
+
+/// Where `chars` names a slash command: `/` at the start or after whitespace, then a name
+/// claude or this client knows, up to whitespace. A `/` before an unknown name is text.
+pub fn slash_runs(chars: &[char], commands: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let starts = chars[i] == '/' && (i == 0 || chars[i - 1].is_whitespace());
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let end = (i + 1..chars.len())
+            .find(|&k| chars[k].is_whitespace())
+            .unwrap_or(chars.len());
+        let name: String = chars[i + 1..end].iter().collect();
+        if !name.is_empty()
+            && (commands.contains(&name) || CLIENT_COMMANDS.contains(&name.as_str()))
+        {
+            out.push(i..end);
+        }
+        i = end;
+    }
+    out
+}
+
 /// Typed text wrapped at words to `room` cells, as an editor soft-wraps: a row breaks after
 /// the spaces before a word that does not fit, the spaces hanging at its end, so no row but
 /// the first of a line starts with one; a word wider than a row is broken; a newline ends a
@@ -1349,24 +1420,37 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     let room = w.saturating_sub(2).max(1);
     let chars: Vec<char> = ui.input.chars().collect();
     let (rows, cur) = soft_wrap(&chars, ui.cursor, room);
-    let rows: Vec<String> = rows
-        .iter()
-        .map(|&(a, b)| {
-            // Spaces hanging past the edge are not drawn: they are the break.
-            let mut used = 0;
-            chars[a..b]
-                .iter()
-                .take_while(|&&c| {
-                    used += cw(c);
-                    used <= room
-                })
-                .collect()
-        })
-        .collect();
+    // A slash command claude or this client knows, anywhere in the prompt, in Claude Code's
+    // lavender (its `permission` colour, read off its screen on 2026-11-02).
+    let slash = slash_runs(&chars, &c.meta.commands);
     let first = out.len();
-    for (i, r) in rows.iter().enumerate() {
+    for (i, &(a, b)) in rows.iter().enumerate() {
         let lead = if i == 0 { "❯ " } else { "  " };
-        out.push(line(format!("{lead}{r}"), PLAIN));
+        let mut l: Line = vec![(lead.into(), PLAIN)];
+        // Spaces hanging past the edge are not drawn: they are the break.
+        let mut used = 0;
+        for (k, &ch) in chars[a..b].iter().enumerate() {
+            used += cw(ch);
+            if used > room {
+                break;
+            }
+            let st = if slash.iter().any(|r| r.contains(&(a + k))) {
+                fg(LAVENDER)
+            } else {
+                PLAIN
+            };
+            match l.last_mut() {
+                Some((t, s)) if *s == st => t.push(ch),
+                _ => l.push((ch.to_string(), st)),
+            }
+        }
+        out.push(l);
+    }
+    if chars.is_empty() && c.pending.iter().any(|p| p.queued) {
+        // What Claude Code says in an empty prompt with prompts waiting behind the turn.
+        if let Some(l) = out.last_mut() {
+            l.push(("Press up to edit queued messages".into(), fg(GREY)));
+        }
     }
     let cursor = (first + cur.0, 2 + cur.1);
     out.push(rule(w, "─", fg(RULE)));
@@ -2537,6 +2621,57 @@ mod tests {
         let mut c = convo();
         c.sent("hi", Instant::now());
         assert!(!c.pending[0].queued);
+    }
+
+    #[test]
+    fn a_known_slash_command_is_lavender_wherever_it_is_in_the_prompt() {
+        let runs = |t: &str| {
+            let chars: Vec<char> = t.chars().collect();
+            slash_runs(&chars, &["compact".to_string()])
+        };
+        assert_eq!(runs("/compact keep the tests"), vec![(0..8)]);
+        assert_eq!(runs("please run /compact later"), vec![(11..19)]);
+        assert_eq!(runs("/model"), vec![(0..6)], "the client's own");
+        assert!(runs("/notacommand x").is_empty(), "an unknown one is text");
+        assert!(runs("a/compact").is_empty(), "inside a word is text");
+        assert!(runs("/").is_empty());
+        // Drawn: the command lavender, the rest plain, as Claude Code's screen had it.
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        c.meta.commands = vec!["compact".into()];
+        let mut ui = Ui::new();
+        ui.input = "/compact keep the tests".into();
+        ui.cursor = ui.input.chars().count();
+        let f = draw(&c, &ui, 40, 24, Instant::now());
+        let row = f
+            .lines
+            .iter()
+            .find(|l| plain(l).starts_with("❯ /compact"))
+            .unwrap();
+        assert_eq!(row[1], ("/compact".to_string(), fg(LAVENDER)));
+        assert_eq!(row[2], (" keep the tests".to_string(), PLAIN));
+    }
+
+    #[test]
+    fn up_takes_queued_prompts_back_to_edit_as_claude_code_does() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[&meta("", "default"), r#"{"t":"st","s":"working"}"#],
+        );
+        let a = c.sent("then lakes", Instant::now());
+        let b = c.sent("and seas", Instant::now());
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        assert!(
+            got.iter()
+                .any(|l| l == "❯ Press up to edit queued messages"),
+            "{got:?}"
+        );
+        assert_eq!(
+            c.unqueue(),
+            (vec!["then lakes".into(), "and seas".into()], vec![a, b])
+        );
+        assert!(c.pending.is_empty());
     }
 
     #[test]

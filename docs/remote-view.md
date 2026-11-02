@@ -271,7 +271,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `re {c, s, run, n}` | after a reconnect: slot `s`, the holder's run, and the last `n` the client holds |
      | `close` | back home; the conversation keeps running |
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
-     | `say {x}` | a prompt or slash command, `/compact` included; sent to claude with a uuid of its own |
+     | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client |
+     | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
      | `now` | Ctrl+X Ctrl+S: claude's `interrupt` with `send_now`, so the prompts waiting behind the turn go now |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
@@ -283,7 +284,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      |---|---|
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
-     | `back {x, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid): its text, and whether another waited behind it; an older client skips it |
+     | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
      | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
@@ -312,8 +313,13 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        which prompt was caught and whether one waited (`back`), and the phone decides by what
        it has drawn. A conversation read back from the log shows the rewind but fills no input.
      - A prompt sent while a turn runs waits behind it, with `ctrl+x ctrl+s to send now` under
-       it; Ctrl+X then Ctrl+S sends `send_now`. Claude Code's Esc Esc rewind picker is not
-       built.
+       it; Ctrl+X then Ctrl+S sends `send_now`. Up in an empty prompt — which says `Press up
+       to edit queued messages` — takes every waiting prompt back into it, a line each, and
+       withdraws them from claude's queue; the turn runs on. Claude Code's Esc Esc rewind
+       picker is not built.
+     - A slash command claude or the phone knows is lavender in the prompt, wherever it is,
+       as Claude Code draws it (`b1b9f9`, its `permission` colour); `/` before an unknown name
+       is text. claude's commands come in the meta op's `sc`, from its init's `slash_commands`.
      - A bracketed paste (`?2004`, the phone's terminal only) past 800 characters or two line
        breaks — fewer on a screen under 13 rows — stands in the prompt as
        `[Pasted text #N +L lines]`, L its line breaks; Backspace after one takes it whole, and

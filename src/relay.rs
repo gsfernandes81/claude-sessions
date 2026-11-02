@@ -511,10 +511,20 @@ impl Relay {
         let epoch = c.epoch;
         let mut to = |line: Value| out.push(Effect::ToConv { epoch, line });
         match t {
-            "say" => to(sdk::prompt(
-                &s(v, "x").unwrap_or_default(),
-                &crate::launch::fresh_session_id(),
-            )),
+            // With the phone's uuid for it where it sent one, so Up can withdraw it by that.
+            "say" => {
+                let uuid = s(v, "u")
+                    .filter(|u| u.len() == 36)
+                    .unwrap_or_else(crate::launch::fresh_session_id);
+                to(sdk::prompt(&s(v, "x").unwrap_or_default(), &uuid))
+            }
+            // Up on the phone: prompts waiting behind the turn leave claude's queue.
+            "unqueue" => {
+                let uuids = v.get("u").and_then(Value::as_arr).unwrap_or(&[]);
+                for (n, u) in uuids.iter().filter_map(Value::as_str).enumerate() {
+                    to(sdk::cancel_async_message(&format!("{id}-{n}"), u));
+                }
+            }
             // Ctrl+X Ctrl+S: the prompts waiting behind the turn go now.
             "now" => to(sdk::interrupt_send_now(&id)),
             "perm" | "ans" => {
@@ -968,6 +978,29 @@ mod tests {
 
     fn client(r: &mut Relay, line: &str) -> Vec<Effect> {
         r.handle(Input::Client(parse(line).unwrap()), Instant::now())
+    }
+
+    #[test]
+    fn up_withdraws_the_phones_queued_prompts_by_the_uuids_it_sent_them_with() {
+        let mut r = relay();
+        opened(&mut r, 1);
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let fx = client(
+            &mut r,
+            &format!(r#"{{"t":"say","x":"lakes","u":"{uuid}"}}"#),
+        );
+        assert!(
+            to_claude(&fx)[0].contains(&format!(r#""uuid":"{uuid}""#)),
+            "{fx:?}"
+        );
+        let fx = client(&mut r, &format!(r#"{{"t":"unqueue","u":["{uuid}"]}}"#));
+        let lines = to_claude(&fx);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(r#""subtype":"cancel_async_message""#),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains(&format!(r#""message_uuid":"{uuid}""#)));
     }
 
     #[test]

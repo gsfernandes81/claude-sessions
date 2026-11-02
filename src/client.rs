@@ -690,6 +690,20 @@ impl App {
                         Submit::Nothing => {}
                     }
                 }
+                // Claude Code's "Press up to edit queued messages": out of the queue, into the
+                // prompt, a line each.
+                Key::Up if ui.input.is_empty() && c.pending.iter().any(|p| p.queued) => {
+                    let (texts, uuids) = c.unqueue();
+                    ui.input = texts.join("\n");
+                    ui.cursor = ui.input.chars().count();
+                    out.push(App::msg(
+                        "unqueue",
+                        vec![(
+                            "u",
+                            Value::Arr(uuids.into_iter().map(Value::string).collect()),
+                        )],
+                    ));
+                }
                 Key::Up | Key::Down if !self.history.is_empty() => {
                     let n = self.history.len();
                     let at = match (k, self.history_at) {
@@ -885,8 +899,11 @@ fn submit(
             Submit::Copy(text.clone())
         }
         _ => {
-            c.sent(text, Instant::now());
-            Submit::Send(vec![m("say", vec![("x", Value::string(text))])])
+            let uuid = c.sent(text, Instant::now());
+            Submit::Send(vec![m(
+                "say",
+                vec![("x", Value::string(text)), ("u", Value::string(uuid))],
+            )])
         }
     }
 }
@@ -1959,9 +1976,12 @@ mod tests {
             sent(submit(&mut c, &mut ui, "/rename fix the door", &None)),
             [r#"{"t":"rename","x":"fix the door"}"#]
         );
+        // claude's own, with the uuid the phone keeps it pending by.
+        let said = sent(submit(&mut c, &mut ui, "/compact", &None));
+        let uuid = &c.pending.last().unwrap().uuid;
         assert_eq!(
-            sent(submit(&mut c, &mut ui, "/compact", &None)),
-            [r#"{"t":"say","x":"/compact"}"#]
+            said,
+            [format!(r#"{{"t":"say","u":"{uuid}","x":"/compact"}}"#)]
         );
         assert!(matches!(
             submit(&mut c, &mut ui, "/home", &None),

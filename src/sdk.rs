@@ -22,6 +22,8 @@ pub enum Msg {
         permission_mode: String,
         cwd: String,
         version: String,
+        /// The slash commands claude has, without their `/`: its own, skills and plugins'.
+        commands: Vec<String>,
     },
     /// `system/status`: `requesting`, `compacting`, or none (back to idle or streaming).
     Status(Option<String>),
@@ -257,6 +259,13 @@ pub fn classify(v: &Value) -> Msg {
                 permission_mode: s(v, "permissionMode"),
                 cwd: s(v, "cwd"),
                 version: s(v, "claude_code_version"),
+                commands: v
+                    .get("slash_commands")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|c| c.as_str().map(String::from))
+                    .collect(),
             },
             "status" => Msg::Status(v.get("status").and_then(Value::as_str).map(String::from)),
             "session_title_changed" => Msg::TitleChanged(s(v, "title")),
@@ -734,6 +743,18 @@ pub fn interrupt(request_id: &str) -> Value {
     control(request_id, subtype("interrupt", vec![]))
 }
 
+/// A prompt still waiting in claude's queue, withdrawn by its uuid; nothing if claude has
+/// taken it in already.
+pub fn cancel_async_message(request_id: &str, uuid: &str) -> Value {
+    control(
+        request_id,
+        subtype(
+            "cancel_async_message",
+            vec![("message_uuid", Value::string(uuid))],
+        ),
+    )
+}
+
 /// Ctrl+X Ctrl+S, Claude Code's send-now: the prompts waiting behind the running turn reach
 /// the model now. A claude without `interrupt_send_now_v1` reads it as a plain interrupt,
 /// after which the waiting prompts run anyway.
@@ -957,6 +978,7 @@ mod tests {
                 permission_mode: "default".into(),
                 cwd: "/w".into(),
                 version: "2.1.311".into(),
+                commands: Vec::new(),
             }
         );
         assert_eq!(
