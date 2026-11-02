@@ -1906,7 +1906,7 @@ mod tests {
         let mut ui = Ui::new();
         ui.input = "alpha beta  gamma".into();
         ui.cursor = 17;
-        let mut at = |ui: &mut Ui, k: Key| {
+        let at = |ui: &mut Ui, k: Key| {
             edit(ui, k);
             ui.cursor
         };
