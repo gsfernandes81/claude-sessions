@@ -321,6 +321,25 @@ impl Reducer {
         Reducer::default()
     }
 
+    /// A reducer whose items are numbered from `first`: for a stretch of history read on its
+    /// own, whose numbers must not meet the conversation's.
+    pub fn numbered_from(first: u64) -> Reducer {
+        Reducer {
+            next_id: first.saturating_sub(1),
+            ..Reducer::default()
+        }
+    }
+
+    /// The number the next item would take.
+    pub fn next_number(&self) -> u64 {
+        self.next_id + 1
+    }
+
+    /// Every tool call's whole result, by item, taken out of the reducer.
+    pub fn take_results(&mut self) -> HashMap<u64, String> {
+        std::mem::take(&mut self.results)
+    }
+
     fn add(&mut self, out: &mut Out, item: Item) -> u64 {
         self.next_id += 1;
         let id = self.next_id;

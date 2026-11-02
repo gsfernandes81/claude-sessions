@@ -17,6 +17,14 @@
 //! sends are claude's input; each must be one JSON object, and they reach claude whole and one
 //! at a time, whichever tap they came from.
 //!
+//! **A resumed conversation's history is not copied into the log.** The holder notes how long
+//! the transcript was when it started (claude appends to the same file from there) and serves
+//! it backwards on request, whole turns at a time: a tap's `{"type":"_older","before":B,
+//! "want":N}` is answered, never passed to claude, with one line `H<TAB>{"type":"_older",
+//! "before":B2,"more":…,"lines":[…]}` holding at least N of its prompt and reply lines before
+//! byte B, back to the prompt that starts a turn. The header says `"older":true` when there
+//! is history to ask for (`docs/remote-view.md` § *Lazy history*).
+//!
 //! **What the zmx session shows**: one plain line at start and at each change of what claude
 //! is doing, never on a timer, so attaching from the old menu explains the slot rather than
 //! showing a blank screen. Whatever is typed into the session is read and dropped: the mail
@@ -76,29 +84,67 @@ pub fn paths(slot: &str) -> Paths {
     }
 }
 
-/// Log a transcript's prompts and replies as `{"type":"_history","line":…}`, then
-/// `{"type":"_history_end"}`, read a line at a time. A transcript that cannot be read leaves
-/// the log as a new conversation's.
-fn seed(log: &mut Log, transcript: &Path) -> io::Result<()> {
-    let Ok(f) = File::open(transcript) else {
-        return Ok(());
-    };
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        let Ok(v) = json::parse(line.trim()) else {
-            continue;
-        };
-        if !matches!(
-            v.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
-            continue;
+/// How many bytes the transcript is read backwards at a time.
+const BACK_BLOCK: u64 = 64 * 1024;
+
+/// A resumed conversation's transcript lines before byte `before`, oldest first: its prompts
+/// and replies, at least `want` of them when there are, back to a prompt that starts a turn,
+/// so a tool call is never cut from its result. Returns them, the byte the first one starts at,
+/// and whether anything is left before it.
+pub fn older(transcript: &Path, before: u64, want: usize) -> io::Result<(Vec<Value>, u64, bool)> {
+    let f = File::open(transcript)?;
+    let before = before.min(f.metadata()?.len());
+    let mut lines: Vec<Value> = Vec::new();
+    let mut pos = before;
+    // The bytes after `pos` not yet split off as a whole line: the start of a line whose
+    // beginning is further back.
+    let mut tail: Vec<u8> = Vec::new();
+    loop {
+        let from = pos.saturating_sub(BACK_BLOCK);
+        let mut block = vec![0u8; (pos - from) as usize];
+        f.read_exact_at(&mut block, from)?;
+        block.extend_from_slice(&tail);
+        tail.clear();
+        // Every line that ends in this block, newest first; the first piece, unless the file
+        // starts here, is a line still going further back.
+        let mut end = block.len();
+        loop {
+            let start = match block[..end].iter().rposition(|&b| b == b'\n') {
+                Some(nl) => nl + 1,
+                None if from == 0 => 0,
+                None => {
+                    tail = block[..end].to_vec();
+                    break;
+                }
+            };
+            let at = from + start as u64;
+            if let Ok(v) = std::str::from_utf8(&block[start..end])
+                .map_err(|_| ())
+                .and_then(|t| json::parse(t.trim()).map_err(|_| ()))
+            {
+                if matches!(
+                    v.get("type").and_then(Value::as_str),
+                    Some("user" | "assistant")
+                ) {
+                    let turn = sdk::starts_turn(&v);
+                    lines.push(v);
+                    if turn && lines.len() >= want {
+                        lines.reverse();
+                        return Ok((lines, at, at > 0));
+                    }
+                }
+            }
+            if start == 0 {
+                break;
+            }
+            end = start - 1;
         }
-        let mut h = Value::obj();
-        h.set("type", Value::string("_history"));
-        h.set("line", v);
-        log.append(json::to_line(&h).as_bytes())?;
+        if from == 0 {
+            lines.reverse();
+            return Ok((lines, 0, false));
+        }
+        pos = from;
     }
-    log.append(br#"{"type":"_history_end"}"#)
 }
 
 /// Whether a holder is serving `slot` now: its socket answers. What the record's `driver`
@@ -136,6 +182,9 @@ impl Log {
 
 struct Shared {
     log: Mutex<Log>,
+    /// A resumed conversation's transcript, and how long it was when this holder started:
+    /// what came before, served backwards (`older`).
+    history: Option<(PathBuf, u64)>,
     grew: Condvar,
     log_path: PathBuf,
     run: String,
@@ -162,18 +211,19 @@ pub fn serve(
     // slot's name is free when it starts.
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
-    let mut log = Log {
+    let log = Log {
         file: log_file,
         offsets: Vec::new(),
         end: 0,
         closed: false,
         answered: HashSet::new(),
     };
-    // A resume: the conversation so far, from its transcript, since claude sends none of it
-    // again (`docs/remote-view.md` § *Decisions*, history from two sources).
-    if let Some(path) = history {
-        seed(&mut log, path)?;
-    }
+    // A resume: the conversation so far is its transcript up to here, since claude sends none
+    // of it again; claude appends to the same file from now on.
+    let history = history.and_then(|p| {
+        let len = std::fs::metadata(p).ok()?.len();
+        (len > 0).then(|| (p.to_path_buf(), len))
+    });
 
     let mut child: Child = Command::new(program)
         .args(HEADLESS)
@@ -186,6 +236,7 @@ pub fn serve(
     let run = format!("{}-{}", std::process::id(), crate::clock::now());
     let shared = Arc::new(Shared {
         log: Mutex::new(log),
+        history,
         grew: Condvar::new(),
         log_path: paths.log.clone(),
         run,
@@ -269,7 +320,8 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
     } else {
         1
     };
-    let mut out = conn.try_clone()?;
+    // Written to by this thread and by the one answering `_older`: a line at a time.
+    let out = Arc::new(Mutex::new(conn.try_clone()?));
     {
         let next = shared
             .log
@@ -281,11 +333,13 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
         let mut header = Value::obj();
         header.set("run", Value::string(shared.run.clone()));
         header.set("next", Value::num(next as f64));
-        out.write_all(format!("{}\n", json::to_line(&header)).as_bytes())?;
+        header.set("older", Value::Bool(shared.history.is_some()));
+        lock(&out).write_all(format!("{}\n", json::to_line(&header)).as_bytes())?;
     }
 
     {
         let shared = Arc::clone(shared);
+        let out = Arc::clone(&out);
         std::thread::spawn(move || {
             let mut line = String::new();
             loop {
@@ -298,6 +352,13 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
                 let Ok(v @ Value::Obj(_)) = json::parse(line.trim()) else {
                     continue;
                 };
+                // The holder's own, not claude's: history before a point.
+                if v.get("type").and_then(Value::as_str) == Some("_older") {
+                    if answer_older(&v, &shared, &out).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if from_view(&v, &shared).is_err() {
                     break;
                 }
@@ -323,19 +384,61 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
             (range, log.closed)
         };
         for (start, end) in range {
-            let mut buf = vec![0u8; (end - start) as usize];
-            log_file.read_exact_at(&mut buf, start)?;
+            let mut buf = format!("{}\t", sent + 1).into_bytes();
+            let head = buf.len();
+            buf.resize(head + (end - start) as usize, 0);
+            log_file.read_exact_at(&mut buf[head..], start)?;
             sent += 1;
-            out.write_all(format!("{sent}\t").as_bytes())?;
-            out.write_all(&buf)?;
+            lock(&out).write_all(&buf)?;
         }
         if closed {
             // Both ways: the thread reading this tap's lines holds the socket too, and the tap
             // must see the end now, not when it next writes.
-            let _ = out.shutdown(std::net::Shutdown::Both);
+            let _ = lock(&out).shutdown(std::net::Shutdown::Both);
             return Ok(());
         }
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many transcript lines a tap may ask for at once.
+const OLDER_MAX: usize = 2000;
+
+/// A tap's `{"type":"_older","before":B,"want":N}`: the history before byte B (before the end
+/// of what this holder started with, without B), as one `H<TAB>` line.
+fn answer_older(v: &Value, shared: &Shared, out: &Mutex<UnixStream>) -> io::Result<()> {
+    let mut reply = Value::obj();
+    reply.set("type", Value::string("_older"));
+    match &shared.history {
+        Some((path, len)) => {
+            let before = v.get("before").and_then(Value::as_u64).unwrap_or(*len);
+            let want = v
+                .get("want")
+                .and_then(Value::as_u64)
+                .unwrap_or(40)
+                .clamp(1, OLDER_MAX as u64) as usize;
+            match older(path, before.min(*len), want) {
+                Ok((lines, at, more)) => {
+                    reply.set("before", Value::num(at as f64));
+                    reply.set("more", Value::Bool(more));
+                    reply.set("lines", Value::Arr(lines));
+                }
+                Err(e) => {
+                    reply.set("more", Value::Bool(false));
+                    reply.set("lines", Value::Arr(Vec::new()));
+                    reply.set("error", Value::string(e.to_string()));
+                }
+            }
+        }
+        None => {
+            reply.set("more", Value::Bool(false));
+            reply.set("lines", Value::Arr(Vec::new()));
+        }
+    }
+    lock(out).write_all(format!("H\t{}\n", json::to_line(&reply)).as_bytes())
 }
 
 /// A line a view sent: to claude, and into the log as `{"type":"_in","line":…}`, so every
@@ -640,6 +743,75 @@ mod tests {
         let mut rest = String::new();
         while b.read_line(&mut rest).unwrap() > 0 {}
         assert!(rest.ends_with(&format!("\t{}\n", inp(quit))), "{rest}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_is_read_backwards_a_whole_turn_at_a_time() {
+        let dir = scratch("older");
+        let path = dir.join("t.jsonl");
+        let prompt =
+            |t: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":"{t}"}}}}"#);
+        let call = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+            )
+        };
+        let result = |id: &str| {
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok"}}]}}}}"#
+            )
+        };
+        let reply = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"r{t}","content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        // Three turns, with lines that are not prompts or replies between, and a long one to
+        // cross a block boundary.
+        let long = "x".repeat(100_000);
+        let lines = [
+            prompt("one"),
+            reply("first"),
+            r#"{"type":"summary","summary":"s"}"#.to_string(),
+            prompt("two"),
+            call("t1"),
+            result("t1"),
+            reply(&long),
+            prompt("three"),
+            call("t2"),
+            result("t2"),
+            reply("third"),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let texts = |v: &[Value]| -> Vec<String> {
+            v.iter()
+                .map(|l| json::to_line(l).chars().take(40).collect())
+                .collect()
+        };
+        // One line wanted: the last turn whole, from its prompt.
+        let (got, at, more) = older(&path, len, 1).unwrap();
+        assert_eq!(got.len(), 4, "{:?}", texts(&got));
+        assert!(sdk::starts_turn(&got[0]));
+        assert!(more);
+        // Then the one before it, across the long line.
+        let (got, at2, more) = older(&path, at, 1).unwrap();
+        assert_eq!(got.len(), 4, "{:?}", texts(&got));
+        assert!(json::to_line(&got[3]).contains(&long));
+        assert!(more);
+        // And the first, which is all there is.
+        let (got, at3, more) = older(&path, at2, 1).unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "the summary line is left out: {:?}",
+            texts(&got)
+        );
+        assert_eq!((at3, more), (0, false));
+        // Asked for more than a turn: turns until there are that many.
+        let (got, _, _) = older(&path, len, 5).unwrap();
+        assert_eq!(got.len(), 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

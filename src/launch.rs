@@ -1674,7 +1674,7 @@ fn remote_command(
         .arg("env")
         .arg(format!("CLAUDE_SESSIONS_SLOT={slot}"))
         .arg(format!("{claude_var}={}", deps.claude));
-    // A resume's transcript, for the holder to show what came before (`holder::seed`).
+    // A resume's transcript, for the holder to serve what came before (`holder::older`).
     if let Some(h) = history {
         cmd.arg(format!("CLAUDE_SESSIONS_HISTORY={}", h.display()));
     }

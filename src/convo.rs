@@ -291,8 +291,12 @@ pub struct Convo {
     /// the transcript, the spinner where `❯` goes, until claude's own line for it arrives.
     pub pending: Vec<Pending>,
     /// Entries a rewind took out of the transcript: a prompt an interrupt caught unanswered,
-    /// and its note. By position, which never changes: entries are only ever added.
+    /// and its note. By position, moved on when older entries are put in front.
     pub hidden: std::collections::HashSet<usize>,
+    /// The relay has more before the first entry (`more`), and it has been asked for and not
+    /// yet come (`old`).
+    pub more: bool,
+    pub asking: bool,
 }
 
 /// A prompt sent and not yet echoed.
@@ -355,6 +359,24 @@ impl Convo {
             .partition(|p| p.queued);
         self.pending = keep;
         back.into_iter().map(|p| (p.text, p.uuid)).unzip()
+    }
+
+    /// `older`'s entries in front of these.
+    fn prepend(&mut self, older: Convo) {
+        let k = older.entries.len();
+        for at in self.index.values_mut() {
+            *at += k;
+        }
+        self.hidden = self
+            .hidden
+            .iter()
+            .map(|h| h + k)
+            .chain(older.hidden)
+            .collect();
+        self.index.extend(older.index);
+        let mut entries = older.entries;
+        entries.append(&mut self.entries);
+        self.entries = entries;
     }
 
     /// Something the client adds itself, such as the `❯ /model` it ran.
@@ -582,6 +604,18 @@ impl Convo {
                         .filter_map(|c| c.as_str().map(String::from))
                         .collect(),
                 };
+            }
+            "more" => {
+                self.more = v.get("m").and_then(Value::as_bool) == Some(true);
+                self.asking = false;
+            }
+            // The stretch before the first entry: drawn above it, the view staying where it is.
+            "old" => {
+                let mut older = Convo::new(&self.host, &self.slot, &self.run);
+                for op in v.get("o").and_then(Value::as_arr).unwrap_or(&[]) {
+                    older.apply(op, now);
+                }
+                self.prepend(older);
             }
             "n" => {
                 self.n = v.get("n").and_then(Value::as_u64).unwrap_or(self.n);
@@ -1055,6 +1089,11 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
     out.push(vec![("▝▜██████▀  ".into(), fg(ORANGE)), (model, fg(GREY))]);
     let cwd = cut(&cwd, w.saturating_sub(13));
     out.push(vec![(" ▝▝   ▝▝   ".into(), fg(ORANGE)), (cwd, fg(GREY))]);
+    // Seen only at the top of what has come: the rest is on its way as it is scrolled to.
+    if c.more {
+        out.push(Vec::new());
+        out.push(line("  Loading earlier messages…", fg(GREY)));
+    }
     let mut last_prompt = None;
     let waiting_perm = c.entries.iter().rev().find_map(|e| match e {
         Entry::Perm {
@@ -2680,6 +2719,58 @@ mod tests {
             ]
         );
         assert_eq!(f.cursor, Some((at + 3, 6)), "after the last word");
+    }
+
+    #[test]
+    fn an_older_stretch_goes_above_what_is_there_and_the_view_stays_put() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":30,"k":"user","x":"newer"}"#,
+                r#"{"t":"add","id":31,"k":"text","x":"newer reply"}"#,
+                r#"{"t":"n","n":2}"#,
+                r#"{"t":"more","m":true}"#,
+            ],
+        );
+        c.hidden.insert(1);
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        assert!(
+            got.iter().any(|l| l == "  Loading earlier messages…"),
+            "{got:?}"
+        );
+        for n in 0..20 {
+            feed(
+                &mut c,
+                &[&format!(
+                    r#"{{"t":"add","id":{},"k":"text","x":"line {n}"}}"#,
+                    40 + n
+                )],
+            );
+        }
+        let mut ui = Ui::new();
+        ui.scroll = 5;
+        let before = text(&draw(&c, &ui, 40, 12, Instant::now()));
+        assert!(before.iter().any(|l| l.contains("line 1")), "{before:?}");
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"old","o":[{"t":"add","id":1,"k":"user","x":"older"},{"t":"add","id":2,"k":"text","x":"older reply"}]}"#,
+                r#"{"t":"more","m":false}"#,
+            ],
+        );
+        assert_eq!(c.entries.len(), 24);
+        assert!(matches!(&c.entries[0], Entry::Prompt(p) if p == "older"));
+        assert!(
+            c.hidden.contains(&3),
+            "a rewind's mark moves with its entry"
+        );
+        // Its ops still find their items.
+        feed(&mut c, &[r#"{"t":"set","id":2,"x":"older reply, set"}"#]);
+        assert!(matches!(&c.entries[1], Entry::Text(t) if t.ends_with("set")));
+        assert!(!c.more);
+        // Measured from the bottom, the view is where it was.
+        assert_eq!(text(&draw(&c, &ui, 40, 12, Instant::now())), before);
     }
 
     #[test]

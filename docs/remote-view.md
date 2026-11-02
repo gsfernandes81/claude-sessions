@@ -35,8 +35,9 @@ The owner's decisions, in the session of 2026-11-01:
   - sessions not running, and sessions already in remote mode, open on Enter;
   - `n` starts a new remote-mode session, if that is not too hard for the MVP.
 
-  A session's content streams only while it is open. Scrollback may be fetched eagerly at
-  first and made lazy later.
+  A session's content streams only while it is open. Scrollback was fetched eagerly at
+  first; since 0.13.7 it is lazy end to end (§ *Lazy history*, the owner's ask of
+  2026-11-02).
 - **No key chords for the phone.** The mode line keeps Claude's name and icon, but its hint is
   `/auto to cycle` instead of shift+tab, which is awkward in Termux.
 - **Question options may be long, and they scroll** around the cursor whatever Claude Code does.
@@ -132,6 +133,43 @@ protocol to the hub, and the hub speaks Claude's protocol to the containers. The
 argued for reducing in the container instead (one parser, beside the pinned claude). The
 owner's words decide it. The cost is small because both halves are this one binary and read
 lines through the same `src/sdk.rs`.
+
+## Lazy history
+
+What the phone is sent is a few screens, not the conversation: the owner's ask of
+2026-11-02, "we only load parts of the transcript as we scroll (without interrupting the user
+unless they hit the edge of what's loaded). The amount loaded should be a multiple of the
+screen's rows", and, asked whether the container must still read the whole history, "Seems
+wasteful no?". It need not: only claude reads it whole, as its context, which took 1.75 s for
+this 12 MB conversation; everything the view added on top — the holder copying the transcript
+into its log, the tap streaming all of it to the hub, the relay reducing every line, the phone
+receiving every item — is gone.
+
+- **The phone** says its columns and rows (`w`, `r`) in `open`, `new` and `re`. It is sent
+  about three screens of rows, the newest, then `{"t":"more","m":…}`: whether anything is
+  before them. Scrolled to within a screen of the top of what it has, it sends `older`, once
+  until the answer, and gets `{"t":"old","o":[ops…]}`, the stretch before, drawn above what
+  it has; the view is measured from the bottom, so it does not move. Only at the very top,
+  before a stretch has come, does it stop, with `Loading earlier messages…` under the logo.
+- **The relay** keeps every item with the ops that made it, a text's pieces folded into it and
+  a result or progress replacing the one before, so any stretch can be sent as it now stands.
+  Ops of items the phone has go on as before; of items it has not been sent, nowhere until
+  it scrolls to them. A reconnect sends the end again (`reset`), since what the phone held of
+  the middle is not known. Its estimate of an item's rows is for loading by, not drawing.
+- **The holder** keeps the transcript's length at its start — claude appends to the same file
+  from there — and says `"older":true` in its header when there is any. A tap's
+  `{"type":"_older","before":B,"want":N}` is the holder's, never claude's: it reads the file
+  backwards from byte B and answers on one line, `H<TAB>{"type":"_older","before":B2,
+  "more":…,"lines":[…]}`, with at least N prompt and reply lines, back to a prompt that starts
+  a turn, so a tool call is never cut from its result. The relay reduces each stretch on its
+  own, its items numbered from 2^40 so they never meet the log's.
+- Measured on this conversation's transcript (12 MB, 5,341 lines): 18 stretches of whole
+  turns, each read in 10 to 80 ms, 4 to 7 KB to the phone each, 322 KB in all for the whole
+  history scrolled back to its first line.
+- **Older pieces.** A holder from before 0.13.7 has copied its history into its log and says
+  no `older`: the relay keeps it all and sends the phone the end, as above. A client from
+  before 0.13.7 sends no size and is sent everything in the log as before, which no longer
+  holds a resumed conversation's history: install the client with the hub.
 
 ## Decisions, by the order of authority
 
@@ -427,9 +465,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      since no request comes for a question settled before. Until the relay's hello the home
      is mockup 10's first frame, `⠋ connecting`, not an empty container.
    - **A resume shows what came before.** The launcher passes the conversation's transcript
-     to the holder (`CLAUDE_SESSIONS_HISTORY`), which logs its prompts and replies as
-     `_history` lines ahead of claude's own, ending with `_history_end`; the reducer reads
-     them as turns already finished. Measured the same day: an archived conversation opened
+     to the holder (`CLAUDE_SESSIONS_HISTORY`). Until 0.13.7 the holder copied its prompts and
+     replies into its log as `_history` lines ahead of claude's own; now it serves them
+     backwards on request (§ *Lazy history*), and the relay reads each stretch as turns
+     already finished. Measured the same day: an archived conversation opened
      from the phone's home showed its two earlier turns and answered a third. Also measured:
      a live permission prompt drawn as R3 with Claude's own "don't ask again" rule, `1`
      running the command; and a running remote session left with Ctrl-C and opened again

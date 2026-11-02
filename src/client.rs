@@ -259,6 +259,8 @@ impl App {
                                 ("s", Value::string(&c.slot)),
                                 ("run", Value::string(&c.run)),
                                 ("n", Value::num(c.n as f64)),
+                                ("w", Value::num(size().0 as f64)),
+                                ("r", Value::num(size().1 as f64)),
                             ],
                         );
                         self.send(re);
@@ -558,6 +560,32 @@ impl App {
         self.clip = Some(text);
     }
 
+    /// Scrolled to within a screen of the top of what has come, with more before it: the
+    /// next stretch is asked for, so it is there before the top is reached.
+    fn want_older(&mut self) {
+        if !self.up() {
+            return;
+        }
+        let Screen::Conv {
+            c,
+            ui,
+            opening: false,
+        } = &mut self.screen
+        else {
+            return;
+        };
+        if !c.more || c.asking {
+            return;
+        }
+        let (w, h) = size();
+        let top = convo::max_scroll(c, ui, w, h);
+        if top.saturating_sub(ui.scroll) >= h {
+            return;
+        }
+        c.asking = true;
+        self.send(App::msg("older", vec![]));
+    }
+
     fn home(&mut self, status: Option<String>) {
         self.screen = Screen::Home;
         self.menu.set_status(status);
@@ -702,7 +730,12 @@ impl App {
         }
     }
 
-    fn open_conv(&mut self, host: &str, msg: Value) {
+    fn open_conv(&mut self, host: &str, mut msg: Value) {
+        // The screen's size: the relay sends a few screens of the conversation, and the rest
+        // as it is scrolled back to.
+        let (w, r) = size();
+        msg.set("w", Value::num(w as f64));
+        msg.set("r", Value::num(r as f64));
         if !self.up() {
             self.menu
                 .set_status(Some("not connected: try again once it is".into()));
@@ -1129,6 +1162,11 @@ fn copied(text: &str) -> String {
 }
 
 /// A key in the prompt: typing, moving and deleting.
+/// The terminal's columns and rows, or the narrow mockups' when it cannot say.
+fn size() -> (usize, usize) {
+    term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize))
+}
+
 /// `\` then Enter is a newline, as in Claude Code: the backslash before the cursor gives way
 /// to it, and nothing is sent. Whether there was one.
 fn backslash_newline(ui: &mut Ui) -> bool {
@@ -2021,6 +2059,7 @@ pub fn run(name: &str) -> Result<(), String> {
             let (w, h) = term::size().unwrap_or((40, 24));
             app.rebuild_menu(w, h);
         }
+        app.want_older();
         if app.paint(&mut term, now).is_err() {
             break;
         }

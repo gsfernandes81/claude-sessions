@@ -479,6 +479,12 @@ fn user(v: &Value) -> Msg {
     }
 }
 
+/// Whether a transcript line is a prompt typed, which starts a turn: where history may be cut
+/// without parting a tool call from its result.
+pub fn starts_turn(line: &Value) -> bool {
+    matches!(history(line), Msg::Prompt(_))
+}
+
 /// A line of the conversation's transcript from before this claude, as the holder logs it on
 /// a resume: claude does not send history again. A prompt typed then reads as a prompt;
 /// Claude Code's own bookkeeping (meta lines, compaction summaries, command wrappers,

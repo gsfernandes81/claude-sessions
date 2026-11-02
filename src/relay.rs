@@ -27,7 +27,7 @@
 use crate::hub::{self, Event};
 use crate::json::{self, Value};
 use crate::proto;
-use crate::reduce::{self, Op, Reducer};
+use crate::reduce::{self, Item, Op, Reducer};
 use crate::sdk::{self, Msg};
 use crate::ui::{Row, RowKey};
 use std::collections::HashMap;
@@ -130,6 +130,168 @@ struct Conv {
     pending: Vec<Op>,
     pending_n: u64,
     pending_since: Option<Instant>,
+    /// The client's width and rows, when it loads lazily: it is sent the last few screens of
+    /// the conversation, and older ones as it scrolls back (`docs/remote-view.md` § *Lazy
+    /// history*). `None` for a client that wants everything at once.
+    size: Option<(usize, usize)>,
+    /// Every item so far, each with its ops, oldest first; the client has `shown.items[from..]`.
+    shown: Shown,
+    from: usize,
+    /// The newest state and meta ops, for a client sent only the end of the conversation.
+    state_op: Option<Op>,
+    meta_op: Option<Op>,
+    /// Whether the end of the log as it stood has been sent.
+    started: bool,
+    /// The history the holder serves backwards, before the log.
+    history: History,
+}
+
+/// A resumed conversation's history as the holder serves it (`holder::older`).
+#[derive(Default)]
+struct History {
+    /// The holder has some to serve.
+    can: bool,
+    /// Where the next stretch ends, `None` for the end of what the holder started with.
+    before: Option<u64>,
+    /// All of it is in.
+    done: bool,
+    /// A stretch is asked for and not yet in; the client waits on it.
+    asking: bool,
+    waiting: bool,
+    /// The number the next stretch's items start at: well above any the log will reach.
+    next: u64,
+    /// Tool calls' whole results from stretches read, for `full`.
+    results: HashMap<u64, String>,
+}
+
+/// The first number a stretch of history's items take.
+const HISTORY_IDS: u64 = 1 << 40;
+
+/// How many screens the client is sent at once: on opening, and each time it scrolls near the
+/// top of what it has.
+const SCREENS: usize = 3;
+
+/// How many transcript lines to ask the holder for at a time (whole turns, so often more).
+const HISTORY_LINES: u64 = 40;
+
+/// Items and the ops that made each, kept so a client can be sent any stretch of them later.
+/// A text item's streamed pieces are folded into its `Add`, and a result or progress op
+/// replaces the one before it, so what is kept is the item as it now stands.
+#[derive(Default)]
+struct Shown {
+    items: Vec<(u64, Vec<Op>)>,
+    at: HashMap<u64, usize>,
+}
+
+fn op_id(op: &Op) -> Option<u64> {
+    match op {
+        Op::Add { id, .. }
+        | Op::Append { id, .. }
+        | Op::SetText { id, .. }
+        | Op::Result { id, .. }
+        | Op::Resolved { id, .. }
+        | Op::Progress { id, .. } => Some(*id),
+        Op::State(_) | Op::Meta(_) | Op::Back { .. } => None,
+    }
+}
+
+impl Shown {
+    /// Keep `op`; where its item is, `None` for an op of no item.
+    fn record(&mut self, op: &Op) -> Option<usize> {
+        let id = op_id(op)?;
+        if let Op::Add { .. } = op {
+            self.items.push((id, vec![op.clone()]));
+            self.at.insert(id, self.items.len() - 1);
+            return Some(self.items.len() - 1);
+        }
+        let i = *self.at.get(&id)?;
+        let ops = &mut self.items[i].1;
+        match op {
+            Op::Append { text, .. } => match ops.first_mut() {
+                Some(Op::Add {
+                    item: Item::Text(t),
+                    ..
+                }) => t.push_str(text),
+                _ => ops.push(op.clone()),
+            },
+            Op::SetText { text, .. } => match ops.first_mut() {
+                Some(Op::Add {
+                    item: Item::Text(t),
+                    ..
+                }) => *t = text.clone(),
+                _ => ops.push(op.clone()),
+            },
+            Op::Result { .. } => {
+                ops.retain(|o| !matches!(o, Op::Result { .. }));
+                ops.push(op.clone());
+            }
+            Op::Progress { .. } => {
+                ops.retain(|o| !matches!(o, Op::Progress { .. }));
+                ops.push(op.clone());
+            }
+            _ => ops.push(op.clone()),
+        }
+        Some(i)
+    }
+
+    /// Older items, in front of these.
+    fn prepend(&mut self, older: Shown) {
+        let mut items = older.items;
+        items.append(&mut self.items);
+        self.items = items;
+        self.at = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, i))
+            .collect();
+    }
+
+    /// Where a stretch ending before `end` starts, to fill about `rows` rows at `w` columns.
+    fn back_from(&self, end: usize, rows: usize, w: usize) -> usize {
+        let mut from = end;
+        let mut got = 0;
+        while from > 0 && got < rows {
+            from -= 1;
+            got += item_rows(&self.items[from].1, w);
+        }
+        from
+    }
+
+    fn ops(&self, range: std::ops::Range<usize>) -> Vec<Op> {
+        self.items[range]
+            .iter()
+            .flat_map(|(_, ops)| ops.iter().cloned())
+            .collect()
+    }
+}
+
+/// About how many rows an item takes at `w` columns: enough to load by, not to draw by.
+fn item_rows(ops: &[Op], w: usize) -> usize {
+    let room = w.saturating_sub(4).max(10);
+    let text_rows = |t: &str| -> usize {
+        t.split('\n')
+            .map(|l| l.chars().count().div_ceil(room).max(1))
+            .sum::<usize>()
+    };
+    let mut rows = match ops.first() {
+        Some(Op::Add { item, .. }) => match item {
+            Item::Prompt(t) | Item::Text(t) | Item::Note(t) => 1 + text_rows(t),
+            Item::Tool { .. } => 1,
+            Item::Agent { .. } => 3,
+            Item::Permission { .. } | Item::Ask { .. } => 4,
+            Item::Compacted { .. } => 2,
+        },
+        _ => 1,
+    };
+    for op in &ops[1..] {
+        rows += match op {
+            Op::Result { preview, .. } => preview.len().min(3),
+            Op::Progress { lines, .. } => lines.len(),
+            _ => 0,
+        };
+    }
+    rows
 }
 
 pub struct Relay {
@@ -423,6 +585,22 @@ impl Relay {
             pending: Vec::new(),
             pending_n: 0,
             pending_since: None,
+            size: match (
+                v.get("w").and_then(Value::as_u64),
+                v.get("r").and_then(Value::as_u64),
+            ) {
+                (Some(w), Some(r)) if w > 0 && r > 0 => Some((w as usize, r as usize)),
+                _ => None,
+            },
+            shown: Shown::default(),
+            from: 0,
+            state_op: None,
+            meta_op: None,
+            started: false,
+            history: History {
+                next: HISTORY_IDS,
+                ..History::default()
+            },
         });
         // Answered at once: starting a holder and reading a long history into it takes
         // seconds, and a client that hears nothing for 5 thinks the link dead.
@@ -457,7 +635,11 @@ impl Relay {
             let v = json::parse(line.trim()).unwrap_or(Value::Null);
             let run = s(&v, "run").unwrap_or_default();
             c.live_from = v.get("next").and_then(Value::as_u64).unwrap_or(1);
+            c.history.can = v.get("older").and_then(Value::as_bool) == Some(true);
             match c.had.take() {
+                // A lazy client is sent the end again, whatever it had: what it held of the
+                // middle is not known here.
+                Some(_) if c.size.is_some() => out.push(Effect::Send(msg("reset", vec![]))),
                 Some(h) if h.run == run => c.skip_to = h.n,
                 Some(_) => out.push(Effect::Send(msg("reset", vec![]))),
                 None => {}
@@ -471,6 +653,10 @@ impl Relay {
                 ],
             )));
             c.run = Some(run);
+            // Nothing logged yet: the end of the log is here already.
+            if c.size.is_some() && c.live_from <= 1 {
+                start(c, out);
+            }
             let held = std::mem::take(&mut c.held);
             for (t, v) in held {
                 self.action(&t, &v, out);
@@ -480,6 +666,12 @@ impl Relay {
         let Some((n, body)) = line.split_once('\t') else {
             return;
         };
+        if n == "H" {
+            if let Ok(v) = json::parse(body.trim()) {
+                history_in(c, &v, out);
+            }
+            return;
+        }
         let Ok(n) = n.parse::<u64>() else { return };
         let Ok(v) = json::parse(body.trim()) else {
             return;
@@ -517,7 +709,28 @@ impl Relay {
                 }
             }
         }
-        if n > c.skip_to {
+        if c.size.is_some() {
+            // Lazy: everything is kept; the client is sent the end of the log as it stood once
+            // it is in, and from then on what changes in what it has.
+            for op in fed.ops {
+                let at = c.shown.record(&op);
+                match &op {
+                    Op::State(_) => c.state_op = Some(op.clone()),
+                    Op::Meta(_) => c.meta_op = Some(op.clone()),
+                    _ => {}
+                }
+                if c.started && at.is_none_or(|i| i >= c.from) {
+                    c.pending.push(op);
+                }
+            }
+            c.pending_n = n;
+            if !c.started {
+                if n + 1 >= c.live_from {
+                    start(c, out);
+                }
+                return;
+            }
+        } else if n > c.skip_to {
             c.pending.extend(fed.ops);
         }
         c.pending_n = n;
@@ -541,6 +754,11 @@ impl Relay {
         // here once lost every prompt typed while a long conversation opened.
         if c.run.is_none() {
             c.held.push((t.to_string(), v.clone()));
+            return;
+        }
+        // Scrolled near the top of what it has: the stretch before it.
+        if t == "older" {
+            older(c, out);
             return;
         }
         let epoch = c.epoch;
@@ -629,7 +847,12 @@ impl Relay {
             }
             "full" => {
                 let item = v.get("id").and_then(Value::as_u64).unwrap_or(0);
-                let text = c.reducer.full_result(item).unwrap_or("").to_string();
+                let text = c
+                    .reducer
+                    .full_result(item)
+                    .or_else(|| c.history.results.get(&item).map(String::as_str))
+                    .unwrap_or("")
+                    .to_string();
                 out.push(Effect::Send(msg(
                     "full",
                     vec![("id", Value::num(item as f64)), ("x", Value::string(text))],
@@ -641,6 +864,100 @@ impl Relay {
 }
 
 /// Send what is waiting, merged, then the line number the client now holds every op up to.
+/// The end of the log as it stood is in: a lazy client is sent its last few screens, then
+/// whether there is more before them.
+fn start(c: &mut Conv, out: &mut Vec<Effect>) {
+    let Some((w, rows)) = c.size else { return };
+    c.started = true;
+    c.from = c.shown.back_from(c.shown.items.len(), rows * SCREENS, w);
+    let mut ops: Vec<Op> = c.meta_op.iter().cloned().collect();
+    ops.extend(c.shown.ops(c.from..c.shown.items.len()));
+    ops.extend(c.state_op.iter().cloned());
+    c.pending = ops;
+    flush(c, out);
+    // `flush` says nothing for nothing; the client still needs to hear the log is in.
+    if c.shown.items.is_empty() && c.meta_op.is_none() && c.state_op.is_none() {
+        out.push(Effect::Send(msg(
+            "n",
+            vec![("n", Value::num(c.pending_n as f64))],
+        )));
+    }
+    out.push(more(c));
+}
+
+/// Whether there is anything before what the client has.
+fn more(c: &Conv) -> Effect {
+    let m = c.from > 0 || (c.history.can && !c.history.done);
+    Effect::Send(msg("more", vec![("m", Value::Bool(m))]))
+}
+
+/// The client wants the stretch before what it has: from what is kept, or asked of the holder.
+fn older(c: &mut Conv, out: &mut Vec<Effect>) {
+    let Some((w, rows)) = c.size else { return };
+    if c.from > 0 {
+        let from = c.shown.back_from(c.from, rows * SCREENS, w);
+        let ops = reduce::coalesce(c.shown.ops(from..c.from));
+        c.from = from;
+        out.push(Effect::Send(msg(
+            "old",
+            vec![("o", Value::Arr(ops.iter().map(Op::to_value).collect()))],
+        )));
+        out.push(more(c));
+    } else if c.history.can && !c.history.done {
+        c.history.waiting = true;
+        if !c.history.asking {
+            c.history.asking = true;
+            let mut ask = Value::obj();
+            ask.set("type", Value::string("_older"));
+            if let Some(b) = c.history.before {
+                ask.set("before", Value::num(b as f64));
+            }
+            ask.set("want", Value::num(HISTORY_LINES as f64));
+            out.push(Effect::ToConv {
+                epoch: c.epoch,
+                line: ask,
+            });
+        }
+    } else {
+        out.push(more(c));
+    }
+}
+
+/// A stretch of history from the holder: reduced on its own, put before everything kept, and
+/// sent on if the client waits for it.
+fn history_in(c: &mut Conv, v: &Value, out: &mut Vec<Effect>) {
+    c.history.asking = false;
+    let mut r = Reducer::numbered_from(c.history.next);
+    let mut stretch = Shown::default();
+    let lines = v.get("lines").and_then(Value::as_arr).unwrap_or(&[]);
+    for l in lines {
+        let mut h = Value::obj();
+        h.set("type", Value::string("_history"));
+        h.set("line", l.clone());
+        for op in r.feed(&h).ops {
+            stretch.record(&op);
+        }
+    }
+    for op in r
+        .feed(&json::parse(r#"{"type":"_history_end"}"#).unwrap_or(Value::Null))
+        .ops
+    {
+        stretch.record(&op);
+    }
+    c.history.next = r.next_number();
+    c.history.results.extend(r.take_results());
+    c.history.before = v.get("before").and_then(Value::as_u64).or(c.history.before);
+    c.history.done = v.get("more").and_then(Value::as_bool) != Some(true);
+    let got = stretch.items.len();
+    c.shown.prepend(stretch);
+    c.from += got;
+    // Sent on to a client waiting for it; a stretch with nothing to draw asks for the one
+    // before it.
+    if std::mem::take(&mut c.history.waiting) {
+        older(c, out);
+    }
+}
+
 fn flush(c: &mut Conv, out: &mut Vec<Effect>) {
     c.pending_since = None;
     if c.pending.is_empty() {
@@ -1279,6 +1596,94 @@ mod tests {
             },
             Instant::now(),
         )
+    }
+
+    #[test]
+    fn a_lazy_client_gets_the_last_screens_then_older_ones_then_the_holders_history() {
+        let mut r = relay();
+        // 40 columns, 5 rows: three screens is 15 rows, and a two-line reply takes 2.
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":5}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let conv = |r: &mut Relay, l: &str| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: l.into(),
+                },
+                Instant::now(),
+            )
+        };
+        conv(&mut r, r#"{"slot":"claude-3"}"#);
+        let fx = conv(&mut r, r#"{"next":21,"run":"run-1","older":true}"#);
+        assert_eq!(
+            sent(&fx)[0],
+            r#"{"c":"claude-sessions","run":"run-1","s":"claude-3","t":"open"}"#
+        );
+        // The log as it stood: twenty replies, nothing sent until the last is in.
+        let reply = |n: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{n}","content":[{{"type":"text","text":"reply {n}"}}]}}}}"#
+            )
+        };
+        for n in 1..20 {
+            assert!(sent(&line(&mut r, epoch, n, &reply(n))).is_empty());
+        }
+        let ids = |fx: &[Effect]| -> Vec<u64> {
+            let mut ids = Vec::new();
+            for m in sent(fx) {
+                let v = parse(&m).unwrap();
+                let ops = match v.get("o").and_then(Value::as_arr) {
+                    Some(o) => o.to_vec(),
+                    None => vec![v],
+                };
+                for o in ops {
+                    if o.get("t").and_then(Value::as_str) == Some("add") {
+                        ids.push(o.get("id").and_then(Value::as_u64).unwrap());
+                    }
+                }
+            }
+            ids
+        };
+        let fx = line(&mut r, epoch, 20, &reply(20));
+        assert_eq!(ids(&fx), (13..=20).collect::<Vec<_>>(), "{:?}", sent(&fx));
+        let said = sent(&fx);
+        assert_eq!(said[said.len() - 2], r#"{"n":20,"t":"n"}"#);
+        assert_eq!(said[said.len() - 1], r#"{"m":true,"t":"more"}"#);
+        // Live, a new item goes straight on.
+        line(&mut r, epoch, 21, &reply(21));
+        let fx = r.tick(Instant::now() + Duration::from_secs(1));
+        assert_eq!(ids(&fx), [21]);
+        // Scrolled back: the stretch before, from what the relay kept, then the rest of it.
+        let fx = client(&mut r, r#"{"t":"older"}"#);
+        assert_eq!(ids(&fx), (5..=12).collect::<Vec<_>>());
+        assert_eq!(sent(&fx).last().unwrap(), r#"{"m":true,"t":"more"}"#);
+        let fx = client(&mut r, r#"{"t":"older"}"#);
+        assert_eq!(ids(&fx), (1..=4).collect::<Vec<_>>());
+        assert_eq!(
+            sent(&fx).last().unwrap(),
+            r#"{"m":true,"t":"more"}"#,
+            "the holder has history"
+        );
+        // Then the holder's history, asked for once however often the client asks.
+        let fx = client(&mut r, r#"{"t":"older"}"#);
+        assert_eq!(to_claude(&fx), [r#"{"type":"_older","want":40}"#]);
+        assert_eq!(sent(&fx), [r#"{"t":"pong"}"#]);
+        assert!(to_claude(&client(&mut r, r#"{"t":"older"}"#)).is_empty());
+        let fx = conv(
+            &mut r,
+            r#"H	{"type":"_older","before":0,"more":false,"lines":[{"type":"user","message":{"role":"user","content":"long ago"}},{"type":"assistant","message":{"id":"h1","content":[{"type":"text","text":"an old reply"}]}}]}"#,
+        );
+        assert_eq!(ids(&fx), [HISTORY_IDS, HISTORY_IDS + 1]);
+        let said = sent(&fx);
+        assert!(said[0].contains(r#""x":"long ago""#), "{said:?}");
+        assert_eq!(said.last().unwrap(), r#"{"m":false,"t":"more"}"#);
+        let fx = client(&mut r, r#"{"t":"older"}"#);
+        assert_eq!(sent(&fx), [r#"{"m":false,"t":"more"}"#]);
     }
 
     #[test]
