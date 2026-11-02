@@ -755,6 +755,12 @@ pub fn cancel_async_message(request_id: &str, uuid: &str) -> Value {
     )
 }
 
+/// Ctrl+B: the running Bash commands and subagents go on in the background, and the turn
+/// goes on without them, so a prompt waiting behind it is taken in at once.
+pub fn background_tasks(request_id: &str) -> Value {
+    control(request_id, subtype("background_tasks", vec![]))
+}
+
 /// Ctrl+X Ctrl+S, Claude Code's send-now: the prompts waiting behind the running turn reach
 /// the model now. A claude without `interrupt_send_now_v1` reads it as a plain interrupt,
 /// after which the waiting prompts run anyway.

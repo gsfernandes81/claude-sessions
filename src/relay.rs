@@ -525,7 +525,12 @@ impl Relay {
                     to(sdk::cancel_async_message(&format!("{id}-{n}"), u));
                 }
             }
-            // Ctrl+X Ctrl+S: the prompts waiting behind the turn go now.
+            // Ctrl+X Ctrl+S: the prompts waiting behind the turn go now, as Claude Code's go.
+            // A tool call running goes to the background and the turn takes them in (2.1.311's
+            // terminal, read 2026-11-02; headless claude's own `send_now` would stop the turn
+            // and its call instead). With none running, `send_now` drops the turn quietly, as
+            // the terminal does.
+            "now" if c.reducer.tool_running() => to(sdk::background_tasks(&id)),
             "now" => to(sdk::interrupt_send_now(&id)),
             "perm" | "ans" => {
                 let r = s(v, "r").unwrap_or_default();
@@ -997,6 +1002,30 @@ mod tests {
 
     fn client(r: &mut Relay, line: &str) -> Vec<Effect> {
         r.handle(Input::Client(parse(line).unwrap()), Instant::now())
+    }
+
+    #[test]
+    fn send_now_backgrounds_a_running_call_and_otherwise_drops_the_turn_as_claude_code_does() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        // Nothing running: claude's send_now, which drops the turn quietly.
+        let fx = client(&mut r, r#"{"t":"now"}"#);
+        let said = to_claude(&fx);
+        assert!(said[0].contains(r#""send_now":true"#), "{said:?}");
+        // A call running: Ctrl+B's background_tasks, so the turn takes the prompt in.
+        line(
+            &mut r,
+            epoch,
+            1,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 20"}}]}}"#,
+        );
+        let fx = client(&mut r, r#"{"t":"now"}"#);
+        let said = to_claude(&fx);
+        assert!(
+            said[0].contains(r#""subtype":"background_tasks""#),
+            "{said:?}"
+        );
+        assert!(!said[0].contains("send_now"));
     }
 
     #[test]

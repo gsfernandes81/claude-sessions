@@ -156,6 +156,9 @@ pub struct Reducer {
     /// Prompts views sent with a uuid, read back from the holder's log, and where each has got
     /// to by claude's `command_lifecycle`: until it ends, one way or another.
     said: HashMap<String, (String, String)>,
+    /// Tool calls of the turn under way with no result yet: what Ctrl+X Ctrl+S puts in the
+    /// background, as Claude Code's does, rather than stopping the turn (`relay.rs`).
+    running: std::collections::HashSet<u64>,
 }
 
 /// What the view is told of one subagent or workflow.
@@ -363,6 +366,11 @@ impl Reducer {
     }
 
     /// The input claude sent with a waiting request, which an answer carries back.
+    /// Whether a tool call of the turn under way is still running.
+    pub fn tool_running(&self) -> bool {
+        !self.running.is_empty()
+    }
+
     pub fn waiting_input(&self, request_id: &str) -> Option<&Value> {
         self.waiting.get(request_id).map(|(_, input)| input)
     }
@@ -500,6 +508,8 @@ impl Reducer {
                             let shown = agent_name(&name, &input);
                             let item = self.add(&mut out, Item::Agent { name: shown, arg });
                             self.tools.insert(id.clone(), item);
+                            // A subagent is a foreground task too, which Ctrl+B backgrounds.
+                            self.running.insert(item);
                             self.tasks.insert(
                                 id.clone(),
                                 TaskView {
@@ -514,6 +524,7 @@ impl Reducer {
                             let arg = tool_arg(&name, &input);
                             let item = self.add(&mut out, Item::Tool { name, arg });
                             self.tools.insert(id, item);
+                            self.running.insert(item);
                         }
                         Block::Other(_) => {}
                     }
@@ -524,6 +535,7 @@ impl Reducer {
                     let Some(&id) = self.tools.get(&r.tool_use_id) else {
                         continue;
                     };
+                    self.running.remove(&id);
                     // An agent's result is its report, kept for the view to ask for; what is
                     // drawn is its progress and how it ended. A call that failed outright (a
                     // workflow whose script would not run) ends there.
@@ -693,6 +705,7 @@ impl Reducer {
                     self.add(&mut out, Item::Note(format!("Error: {subtype}")));
                 }
                 self.streaming.clear();
+                self.running.clear();
                 self.by_message.clear();
                 self.texts.clear();
                 self.set_state(&mut out, "idle");
@@ -1421,6 +1434,35 @@ mod tests {
             kinds,
             ["add:user", "add:tool", "res:", "add:user", "add:tool"]
         );
+    }
+
+    #[test]
+    fn a_tool_call_runs_from_its_use_to_its_result_or_the_turns_end() {
+        let mut r = Reducer::new();
+        let use_ = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"sleep 20"}}}}]}}}}"#
+            )
+        };
+        assert!(!r.tool_running());
+        feed_all(&mut r, &[&use_("t1")]);
+        assert!(r.tool_running(), "Ctrl+X Ctrl+S backgrounds it");
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Command was manually backgrounded"}]}}"#,
+            ],
+        );
+        assert!(!r.tool_running(), "its result came, backgrounded or done");
+        // One the turn ended without a result for: not running into the next turn.
+        feed_all(&mut r, &[&use_("t2")]);
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s"}"#,
+            ],
+        );
+        assert!(!r.tool_running());
     }
 
     #[test]

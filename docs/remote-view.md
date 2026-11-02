@@ -273,7 +273,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
      | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client |
      | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
-     | `now` | Ctrl+X Ctrl+S: claude's `interrupt` with `send_now`, so the prompts waiting behind the turn go now |
+     | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in, else its `interrupt` with `send_now` |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
@@ -313,7 +313,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        which prompt was caught and whether one waited (`back`), and the phone decides by what
        it has drawn. A conversation read back from the log shows the rewind but fills no input.
      - A prompt sent while a turn runs waits behind it, with `ctrl+x ctrl+s to send now` under
-       it; Ctrl+X then Ctrl+S sends `send_now`. Up in an empty prompt — which says `Press up
+       it; Ctrl+X then Ctrl+S sends it now, as the terminal does: a tool call running goes to
+       the background and the same turn takes the prompt in — `background_tasks`, since headless
+       claude's own `send_now` stops the turn and its call instead (`"send_now":"stopped"`,
+       measured 2026-11-02) — and with none running, `send_now` drops the turn quietly. Up in an empty prompt — which says `Press up
        to edit queued messages` — takes every waiting prompt back into it, a line each, and
        withdraws them from claude's queue; the turn runs on. Claude Code's Esc Esc rewind
        picker is not built.
