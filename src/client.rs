@@ -34,6 +34,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
 /// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
 const DETACH: char = '\x1c';
+/// Ctrl+X, then Ctrl+S: Claude Code's send-now chord. Raw mode turns off XON/XOFF, so Ctrl+S
+/// arrives as a byte rather than stopping the terminal.
+const CTRL_X: char = '\x18';
+const CTRL_S: char = '\x13';
 /// R10's words, in place of the hint line until the next key.
 const TERMINAL_ONLY: &str =
     "Runs in a terminal: attach it from ssh dev, or end it there to open here";
@@ -134,6 +138,8 @@ struct App {
     wheel: usize,
     /// A home action under way: since when, its row, and what the spinner says (mockup 11).
     working: Option<(Instant, usize, String)>,
+    /// A bracketed paste arriving: its text so far, until its end (`Key::PasteEnd`).
+    pasting: Option<String>,
 }
 
 impl App {
@@ -370,12 +376,14 @@ impl App {
             _ => {
                 // The conversation's ops.
                 if let Screen::Conv { c, ui, .. } = &mut self.screen {
-                    if let Applied::TurnEnded(d) = c.apply(&v, now) {
-                        c.local(Entry::Worked(format!(
+                    match c.apply(&v, now) {
+                        Applied::TurnEnded(d) => c.local(Entry::Worked(format!(
                             "Worked for {} · done {}",
                             took(d),
                             clock_time()
-                        )));
+                        ))),
+                        Applied::Back(text) => give_back(ui, &text),
+                        Applied::Nothing => {}
                     }
                     follow_prompts(c, ui);
                 }
@@ -454,6 +462,35 @@ impl App {
         // A key after a long silence: make sure the link is there before relying on it.
         if self.up() && now.duration_since(self.last_heard) > QUIET_PROBE {
             self.send(App::msg("ping", vec![]));
+        }
+        // A paste is gathered whole first, so nothing in it is read as a key: on the home, a
+        // pasted `n` would start a session.
+        match (k, &mut self.pasting) {
+            (Key::PasteStart, _) => {
+                self.pasting = Some(String::new());
+                return;
+            }
+            (Key::PasteEnd, _) => {
+                let text = self.pasting.take().unwrap_or_default();
+                if let Screen::Conv { ui, .. } = &mut self.screen {
+                    if ui.dialog.is_some() {
+                        // A dialog's text field takes it typed, on one line.
+                        for c in text.chars() {
+                            self.conv_key(Key::Char(if c == '\n' { ' ' } else { c }));
+                        }
+                    } else {
+                        let rows = term::size().map_or(24, |(_, h)| h as usize);
+                        paste(ui, &text, rows);
+                    }
+                }
+                return;
+            }
+            (Key::Char(c), Some(text)) => {
+                text.push(c);
+                return;
+            }
+            (_, Some(_)) => return,
+            _ => {}
         }
         match &mut self.screen {
             Screen::Home => self.home_key(k),
@@ -545,10 +582,27 @@ impl App {
         ui.status = None;
         let mut out: Vec<Value> = Vec::new();
         let mut leave = false;
+        // Ctrl+X Ctrl+S, Claude Code's send-now: what waits behind the turn goes now. Ctrl+X
+        // alone starts the chord; any other key after it is itself.
+        let mut chorded = false;
+        if ui.dialog.is_none() {
+            if std::mem::take(&mut ui.chord) {
+                if k == Key::Char(CTRL_S) {
+                    chorded = true;
+                    if c.pending.iter().any(|p| p.queued) {
+                        out.push(App::msg("now", vec![]));
+                    }
+                }
+            } else if k == Key::Char(CTRL_X) {
+                ui.chord = true;
+                return;
+            }
+        }
         match ui.dialog.take() {
             // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
             // detach key does in ssh dev: the session runs on, and the home comes back.
             _ if k == Key::Char(DETACH) => leave = true,
+            _ if chorded => {}
             Some(Dialog::Btw {
                 question,
                 answer,
@@ -613,13 +667,16 @@ impl App {
                 Key::Esc => {
                     if ui.scroll > 0 {
                         ui.scroll = 0;
-                    } else if c.state != "idle" {
+                    } else if c.state != "idle" || !c.pending.is_empty() {
+                        // A turn, or a prompt not yet taken in: claude says what came of it,
+                        // and a prompt it caught unanswered comes back to the input (`back`).
                         out.push(App::msg("esc", vec![]));
                     }
                 }
                 Key::Enter if backslash_newline(ui) => {}
                 Key::Enter => {
-                    let text = std::mem::take(&mut ui.input);
+                    let text = expand_pastes(&std::mem::take(&mut ui.input), &ui.pastes);
+                    ui.pastes.clear();
                     ui.cursor = 0;
                     ui.scroll = 0;
                     if !text.trim().is_empty() {
@@ -856,9 +913,82 @@ fn backslash_newline(ui: &mut Ui) -> bool {
     true
 }
 
+/// A prompt an interrupt caught unanswered, back in the input as Claude Code hands it back:
+/// the input itself if empty, else ahead of what has been typed since.
+fn give_back(ui: &mut Ui, text: &str) {
+    if ui.input.is_empty() {
+        ui.input = text.to_string();
+    } else {
+        ui.input = format!("{text}\n{}", ui.input);
+    }
+    ui.cursor = ui.input.chars().count();
+}
+
+/// The longest a paste goes into the prompt as itself, and how many line breaks: past either
+/// it stands in as `[Pasted text #N +L lines]`. Claude Code 2.1.311's numbers, read from its
+/// paste handler on 2026-11-02: 800 characters, and two breaks, fewer on a screen under 13 rows.
+const PASTE_CHARS: usize = 800;
+const PASTE_BREAKS: usize = 2;
+
+/// Claude Code's stand-in for a paste: its number and how many line breaks it holds.
+fn paste_label(id: u32, breaks: usize) -> String {
+    if breaks == 0 {
+        format!("[Pasted text #{id}]")
+    } else {
+        format!("[Pasted text #{id} +{breaks} lines]")
+    }
+}
+
+/// A paste into the prompt, as Claude Code takes one: as itself when short, its tabs four
+/// spaces; past [`PASTE_CHARS`] or [`PASTE_BREAKS`], as a numbered stand-in.
+fn paste(ui: &mut Ui, text: &str, rows: usize) {
+    let text = text.replace('\t', "    ");
+    let breaks = text.matches('\n').count();
+    let most = PASTE_BREAKS.min(rows.saturating_sub(10));
+    let insert = if text.chars().count() > PASTE_CHARS || breaks > most {
+        let id = ui.pastes.iter().map(|(n, _)| *n).max().unwrap_or(0) + 1;
+        ui.pastes.push((id, text.clone()));
+        paste_label(id, breaks)
+    } else {
+        text
+    };
+    let mut chars: Vec<char> = ui.input.chars().collect();
+    let at = ui.cursor.min(chars.len());
+    let n = insert.chars().count();
+    chars.splice(at..at, insert.chars());
+    ui.input = chars.into_iter().collect();
+    ui.cursor = at + n;
+}
+
+/// The prompt as sent: every stand-in still in it replaced by its paste.
+fn expand_pastes(input: &str, pastes: &[(u32, String)]) -> String {
+    let mut out = input.to_string();
+    for (id, text) in pastes {
+        let label = paste_label(*id, text.matches('\n').count());
+        out = out.replacen(&label, text, 1);
+    }
+    out
+}
+
 fn edit(ui: &mut Ui, k: Key) {
     let mut chars: Vec<char> = ui.input.chars().collect();
     let at = ui.cursor.min(chars.len());
+    // Backspace right after a paste's stand-in takes the whole of it, and the paste.
+    if matches!(k, Key::Char('\x7f') | Key::Char('\x08')) {
+        let before: String = chars[..at].iter().collect();
+        let hit = ui
+            .pastes
+            .iter()
+            .position(|(id, text)| before.ends_with(&paste_label(*id, text.matches('\n').count())));
+        if let Some(i) = hit {
+            let (id, text) = ui.pastes.remove(i);
+            let n = paste_label(id, text.matches('\n').count()).chars().count();
+            chars.drain(at - n..at);
+            ui.cursor = at - n;
+            ui.input = chars.into_iter().collect();
+            return;
+        }
+    }
     match k {
         Key::Char('\x7f') | Key::Char('\x08') if at > 0 => {
             chars.remove(at - 1);
@@ -1415,6 +1545,7 @@ impl App {
             greeted: false,
             wheel,
             working: None,
+            pasting: None,
         };
         app.menu.remote = true;
         app
@@ -1426,7 +1557,9 @@ pub fn run(name: &str) -> Result<(), String> {
     let (tx, rx): (Sender<Heard>, Receiver<Heard>) = mpsc::channel();
     let mut app = App::new(name, w, h, wheel_step(|k| std::env::var(k).ok()));
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
-    term.write_all(b"\x1b[2J").map_err(|e| e.to_string())?;
+    // And bracketed paste, so a paste arrives as one (`Key::PasteStart`), as in Claude Code.
+    term.write_all(b"\x1b[2J\x1b[?2004h")
+        .map_err(|e| e.to_string())?;
     app.dial(Instant::now(), &tx);
     let mut hosts_seen: Vec<String> = Vec::new();
     loop {
@@ -1485,6 +1618,7 @@ pub fn run(name: &str) -> Result<(), String> {
         let _ = w.child.kill();
         let _ = w.child.wait();
     }
+    let _ = term.write_all(b"\x1b[?2004l");
     drop(term);
     Ok(())
 }
@@ -1493,6 +1627,47 @@ pub fn run(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn a_paste_goes_in_as_itself_or_as_claude_codes_stand_in() {
+        let mut ui = Ui::new();
+        // Two line breaks or fewer, as typed: Claude Code's three-line paste stays inline.
+        paste(&mut ui, "first\nsecond\nthird", 32);
+        assert_eq!(ui.input, "first\nsecond\nthird");
+        assert!(ui.pastes.is_empty());
+        // Three breaks, or past 800 characters, a stand-in at the cursor.
+        let mut ui = Ui::new();
+        ui.input = "look: ".into();
+        ui.cursor = 6;
+        paste(&mut ui, "a\nb\nc\nd", 32);
+        assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
+        paste(&mut ui, &"x".repeat(801), 32);
+        assert_eq!(ui.input, "look: [Pasted text #1 +3 lines][Pasted text #2]");
+        // On a short screen fewer breaks are too many: one at 11 rows, none at 10.
+        let mut short = Ui::new();
+        paste(&mut short, "a\nb", 11);
+        assert_eq!(short.input, "a\nb");
+        let mut shorter = Ui::new();
+        paste(&mut shorter, "a\nb", 10);
+        assert_eq!(shorter.input, "[Pasted text #1 +1 lines]");
+        // Sent, each is itself again.
+        assert_eq!(
+            expand_pastes(&ui.input, &ui.pastes),
+            format!("look: a\nb\nc\nd{}", "x".repeat(801))
+        );
+        // Backspace after one takes it whole, and the paste.
+        edit(&mut ui, Key::Char('\x7f'));
+        assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
+        assert_eq!(ui.pastes.len(), 1);
+        edit(&mut ui, Key::Char('\x7f'));
+        assert_eq!(ui.input, "look: ");
+        edit(&mut ui, Key::Char('\x7f'));
+        assert_eq!(ui.input, "look:", "then a character at a time");
+        // Tabs are four spaces, as Claude Code pastes them.
+        let mut ui = Ui::new();
+        paste(&mut ui, "a\tb", 32);
+        assert_eq!(ui.input, "a    b");
+    }
 
     #[test]
     fn a_backslash_then_enter_is_a_newline_and_sends_nothing() {

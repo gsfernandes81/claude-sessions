@@ -343,6 +343,11 @@ pub enum Key {
     WheelDown,
     /// The window changed size.
     Resize,
+    /// A bracketed paste begins: what follows, to [`Key::PasteEnd`], is pasted text — each
+    /// character a `Char`, a line break `Char('\n')`, never `Enter`. Only the phone client
+    /// asks the terminal for bracketed paste (`?2004`), so the menu never sees one.
+    PasteStart,
+    PasteEnd,
 }
 
 /// Handing the terminal to a child process and taking it back. `launch.rs` suspends before

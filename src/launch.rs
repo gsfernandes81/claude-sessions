@@ -187,7 +187,7 @@ fn start_args(h: Harness, session: Option<&str>) -> Vec<String> {
 /// A fresh session id for a harness that takes one at launch: 32 hex digits from the
 /// kernel's randomness, in a UUID's shape so it reads like pi's own (`randomUUID()`), and
 /// within what pi accepts. Falls back to the clock and pid, which cannot collide on one box.
-fn fresh_session_id() -> String {
+pub(crate) fn fresh_session_id() -> String {
     let mut bytes = [0u8; 16];
     let read = std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))

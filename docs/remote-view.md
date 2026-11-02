@@ -271,7 +271,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `re {c, s, run, n}` | after a reconnect: slot `s`, the holder's run, and the last `n` the client holds |
      | `close` | back home; the conversation keeps running |
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
-     | `say {x}` | a prompt or slash command, `/compact` included |
+     | `say {x}` | a prompt or slash command, `/compact` included; sent to claude with a uuid of its own |
+     | `now` | Ctrl+X Ctrl+S: claude's `interrupt` with `send_now`, so the prompts waiting behind the turn go now |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
@@ -282,6 +283,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      |---|---|
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
+     | `back {x, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid): its text, and whether another waited behind it; an older client skips it |
      | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
@@ -300,6 +302,22 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      backoff from 1 to 30 seconds; dead too when something sent has no answer in 5 seconds,
      and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
      with a conversation open, `re`.
+   - **Esc, send-now and pastes, as Claude Code 2.1.311 does them** — driven in a pty and
+     read off its screen on 2026-11-02, since the owner asked for its behaviour:
+     - Esc on a prompt nothing has answered yet — still spinning, or taken in and thinking —
+       with nothing queued behind it, hands it back: off the transcript, its text in the
+       input. Once anything is drawn, or with a prompt waiting behind it, the prompt stays,
+       under `⎿  Interrupted · What should Claude do instead?`, and the waiting one runs.
+       claude's own `cancelled` lifecycle cannot tell these apart, so the reducer says
+       which prompt was caught and whether one waited (`back`), and the phone decides by what
+       it has drawn. A conversation read back from the log shows the rewind but fills no input.
+     - A prompt sent while a turn runs waits behind it, with `ctrl+x ctrl+s to send now` under
+       it; Ctrl+X then Ctrl+S sends `send_now`. Claude Code's Esc Esc rewind picker is not
+       built.
+     - A bracketed paste (`?2004`, the phone's terminal only) past 800 characters or two line
+       breaks — fewer on a screen under 13 rows — stands in the prompt as
+       `[Pasted text #N +L lines]`, L its line breaks; Backspace after one takes it whole, and
+       sending puts each back. A shorter one goes in as itself, tabs as four spaces.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
      Ctrl-U; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
      no row starts with one, as editors and Claude Code do; `\` then Enter is a newline, as in Claude Code; Up and Down step through what

@@ -95,6 +95,9 @@ pub enum Msg {
     /// A line a view sent claude, as the holder logs it (`{"type":"_in","line":…}`): read
     /// back so every view sees what any of them answered or changed.
     Input(Input),
+    /// `command_lifecycle`: where a prompt sent with a uuid has got to — `queued`, `started`,
+    /// `cancelled` (an interrupt caught it, answered or not), and so on.
+    Lifecycle { uuid: String, state: String },
     /// A question answered before this claude started, read from the transcript's
     /// `toolUseResult` on a resume: no request comes for it, so it arrives settled.
     Answered {
@@ -306,6 +309,10 @@ pub fn classify(v: &Value) -> Msg {
             }
         }
         "user" => user(v),
+        "command_lifecycle" => Msg::Lifecycle {
+            uuid: s(v, "command_uuid"),
+            state: s(v, "state"),
+        },
         "_in" => Msg::Input(input(v.get("line").unwrap_or(&Value::Null))),
         "_history" => history(v.get("line").unwrap_or(&Value::Null)),
         // The history is in: whatever it left open was settled before this claude started.
@@ -588,7 +595,12 @@ pub enum Input {
     /// `None` is back to the model's default.
     Effort(Option<String>),
     Mode(String),
-    /// A prompt, an interrupt, an end, a rename: claude says what came of each itself.
+    /// A prompt sent with a uuid (`prompt`), so its lifecycle can be told back to the view.
+    Say {
+        uuid: String,
+        text: String,
+    },
+    /// An interrupt, an end, a rename: claude says what came of each itself.
     Other,
 }
 
@@ -629,6 +641,15 @@ fn input(line: &Value) -> Input {
         ("control_request", "set_permission_mode") => {
             Input::Mode(req.map(|r| s(r, "mode")).unwrap_or_default())
         }
+        ("user", _) if !s(line, "uuid").is_empty() => Input::Say {
+            uuid: s(line, "uuid"),
+            text: line
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        },
         ("control_request", "apply_flag_settings") => Input::Effort(
             req.and_then(|r| r.get("settings"))
                 .and_then(|st| st.get("effortLevel"))
@@ -649,6 +670,14 @@ pub fn set_permission_mode(request_id: &str, mode: &str) -> Value {
 
 pub fn initialize(request_id: &str) -> Value {
     control(request_id, subtype("initialize", vec![]))
+}
+
+/// A prompt as a view sends it: `user_text` with a uuid, which claude's `command_lifecycle`
+/// lines name, so an interrupt that catches it unanswered can hand it back to the view.
+pub fn prompt(text: &str, uuid: &str) -> Value {
+    let mut v = user_text(text);
+    v.set("uuid", Value::string(uuid));
+    v
 }
 
 /// A prompt, or a slash command typed as one (`/compact`, `/clear`).
@@ -703,6 +732,16 @@ pub fn rename(request_id: &str, title: &str, session_id: &str) -> Value {
 
 pub fn interrupt(request_id: &str) -> Value {
     control(request_id, subtype("interrupt", vec![]))
+}
+
+/// Ctrl+X Ctrl+S, Claude Code's send-now: the prompts waiting behind the running turn reach
+/// the model now. A claude without `interrupt_send_now_v1` reads it as a plain interrupt,
+/// after which the waiting prompts run anyway.
+pub fn interrupt_send_now(request_id: &str) -> Value {
+    control(
+        request_id,
+        subtype("interrupt", vec![("send_now", Value::Bool(true))]),
+    )
 }
 
 pub fn end_session(request_id: &str) -> Value {

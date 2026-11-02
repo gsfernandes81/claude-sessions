@@ -163,7 +163,13 @@ pub fn readable_within(fd: c_int, wait: std::time::Duration) -> bool {
 #[derive(Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    /// Inside a bracketed paste: bytes are text until `ESC [ 201 ~`, however long it takes to
+    /// arrive — a large paste over a phone's link can pause longer than [`ESC_WAIT`].
+    pasting: bool,
 }
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 enum Parsed {
     /// A key, from this many bytes.
@@ -200,6 +206,28 @@ impl Decoder {
         let mut keys = Vec::new();
         let mut i = 0;
         while i < self.buf.len() {
+            if self.pasting {
+                match pasted(&self.buf[i..], timed_out) {
+                    (text, n, true) => {
+                        keys.extend(text.chars().map(Key::Char));
+                        keys.push(Key::PasteEnd);
+                        self.pasting = false;
+                        i += n;
+                        continue;
+                    }
+                    (text, n, false) => {
+                        keys.extend(text.chars().map(Key::Char));
+                        i += n;
+                        break;
+                    }
+                }
+            }
+            if self.buf[i..].starts_with(PASTE_START) {
+                keys.push(Key::PasteStart);
+                self.pasting = true;
+                i += PASTE_START.len();
+                continue;
+            }
             match parse(&self.buf[i..]) {
                 Parsed::Key(k, n) => {
                     keys.push(k);
@@ -218,6 +246,43 @@ impl Decoder {
         }
         self.buf.drain(..i);
         keys
+    }
+}
+
+/// Pasted text from the start of `b`: what can be said of it now, how many bytes that took, and
+/// whether the paste ended there. Held back for the next read: a tail that may be the start of
+/// the end marker, of a UTF-8 character, or a `\r` whose `\n` is still to come. A line break,
+/// `\r\n`, `\r` or `\n`, is one `\n`.
+fn pasted(b: &[u8], timed_out: bool) -> (String, usize, bool) {
+    let (body, ended) = match b.windows(PASTE_END.len()).position(|w| w == PASTE_END) {
+        Some(k) => (&b[..k], Some(k + PASTE_END.len())),
+        None => {
+            // The longest tail that could still become the end marker.
+            let hold = (1..PASTE_END.len())
+                .rev()
+                .find(|&n| b.len() >= n && PASTE_END.starts_with(&b[b.len() - n..]))
+                .unwrap_or(0);
+            (&b[..b.len() - hold], None)
+        }
+    };
+    let mut take = body.len();
+    if ended.is_none() {
+        // A character cut by the read, and a `\r` that may be half of `\r\n`.
+        if let Err(e) = std::str::from_utf8(body) {
+            if e.error_len().is_none() {
+                take = e.valid_up_to();
+            }
+        }
+        if !timed_out && take > 0 && body[take - 1] == b'\r' {
+            take -= 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&body[..take])
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    match ended {
+        Some(n) => (text, n, true),
+        None => (text, take, false),
     }
 }
 
@@ -1038,6 +1103,35 @@ mod tests {
     }
 
     #[test]
+    fn a_bracketed_paste_is_text_however_it_is_split_and_whatever_it_holds() {
+        let paste = "\x1b[200~one\r\ntwo\rthré\x1b[Aé\x1b[201~n".as_bytes();
+        let mut want = vec![Key::PasteStart];
+        want.extend("one\ntwo\nthré\x1b[Aé".chars().map(Key::Char));
+        want.extend([Key::PasteEnd, Key::Char('n')]);
+        assert_eq!(
+            decode(paste),
+            want,
+            "an arrow inside a paste is text, a line break \\n"
+        );
+        // Every split into two reads, the end marker, a UTF-8 character and `\r\n` cut too.
+        for cut in 0..=paste.len() {
+            let mut d = Decoder::new();
+            let mut got = d.feed(&paste[..cut]);
+            got.extend(d.feed(&paste[cut..]));
+            assert_eq!(got, want, "split at {cut}");
+        }
+        // A pause longer than ESC_WAIT does not end it.
+        let mut d = Decoder::new();
+        let mut got = d.feed(b"\x1b[200~half");
+        got.extend(d.timeout());
+        got.extend(d.feed(b" more\x1b[201~"));
+        let mut want = vec![Key::PasteStart];
+        want.extend("half more".chars().map(Key::Char));
+        want.push(Key::PasteEnd);
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn unmapped_sequences_never_leak_as_characters() {
         for seq in [
             &b"\x1b[15~"[..],   // F5
@@ -1047,7 +1141,6 @@ mod tests {
             b"\x1b[>0;95;0c",   // secondary DA reply
             b"\x1b[I",          // focus in
             b"\x1b[O",          // focus out
-            b"\x1b[200~",       // bracketed paste start
             b"\x1b[12;40R",     // cursor position report
             b"\x1b[1 q",        // an intermediate byte
             b"\x1bx",           // Alt-x

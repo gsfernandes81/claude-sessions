@@ -511,7 +511,12 @@ impl Relay {
         let epoch = c.epoch;
         let mut to = |line: Value| out.push(Effect::ToConv { epoch, line });
         match t {
-            "say" => to(sdk::user_text(&s(v, "x").unwrap_or_default())),
+            "say" => to(sdk::prompt(
+                &s(v, "x").unwrap_or_default(),
+                &crate::launch::fresh_session_id(),
+            )),
+            // Ctrl+X Ctrl+S: the prompts waiting behind the turn go now.
+            "now" => to(sdk::interrupt_send_now(&id)),
             "perm" | "ans" => {
                 let r = s(v, "r").unwrap_or_default();
                 let Some(input) = c.reducer.waiting_input(&r).cloned() else {
@@ -1315,10 +1320,17 @@ mod tests {
         assert!(to_claude(&fx).is_empty());
         assert_eq!(sent(&fx), [r#"{"t":"err","x":"answered elsewhere"}"#]);
 
+        // A prompt goes with a uuid of its own, which claude's lifecycle lines name.
         let fx = client(&mut r, r#"{"t":"say","x":"/compact"}"#);
+        let said = to_claude(&fx);
+        let line = parse(&said[0]).unwrap();
         assert_eq!(
-            to_claude(&fx),
-            [r#"{"message":{"content":"/compact","role":"user"},"type":"user"}"#]
+            json::to_line(line.get("message").unwrap()),
+            r#"{"content":"/compact","role":"user"}"#
+        );
+        assert_eq!(
+            line.get("uuid").and_then(Value::as_str).map(str::len),
+            Some(36)
         );
         let fx = client(&mut r, r#"{"t":"model","m":"opus"}"#);
         assert!(to_claude(&fx)[0].contains(r#""subtype":"set_model""#));

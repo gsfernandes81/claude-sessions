@@ -63,6 +63,10 @@ pub enum Op {
     State(String),
     /// The conversation's model, permission mode, title and id, sent when one changes.
     Meta(Meta),
+    /// An interrupt caught a prompt a view sent (`command_lifecycle` `cancelled`): its text,
+    /// and whether another prompt was waiting behind it. The view decides, as Claude Code
+    /// does, whether that hands the prompt back to its input (`convo.rs`).
+    Back { text: String, queued: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -143,6 +147,9 @@ pub struct Reducer {
     state: String,
     /// The next user text is a compaction's summary, which Claude Code does not draw.
     after_compact: bool,
+    /// Prompts views sent with a uuid, read back from the holder's log, and where each has got
+    /// to by claude's `command_lifecycle`: until it ends, one way or another.
+    said: HashMap<String, (String, String)>,
 }
 
 /// What the view is told of one subagent or workflow.
@@ -716,7 +723,28 @@ impl Reducer {
                     };
                     self.set_meta(&mut out, meta);
                 }
+                sdk::Input::Say { uuid, text } => {
+                    self.said.insert(uuid, (text, "sent".into()));
+                }
                 sdk::Input::Other => {}
+            },
+            Msg::Lifecycle { uuid, state } => match state.as_str() {
+                "queued" | "started" => {
+                    if let Some(said) = self.said.get_mut(&uuid) {
+                        said.1 = state;
+                    }
+                }
+                "cancelled" => {
+                    if let Some((text, _)) = self.said.remove(&uuid) {
+                        // A prompt behind it is what the interrupt makes way for (Claude Code
+                        // keeps the interrupted one, with its note, when one waits).
+                        let queued = self.said.values().any(|(_, st)| st == "queued");
+                        out.ops.push(Op::Back { text, queued });
+                    }
+                }
+                _ => {
+                    self.said.remove(&uuid);
+                }
             },
             Msg::Response { .. } | Msg::Noise | Msg::Unknown(_) => {}
         }
@@ -994,6 +1022,11 @@ impl Op {
             Op::State(s) => obj(vec![
                 ("t", Value::string("st")),
                 ("s", Value::string(s.clone())),
+            ]),
+            Op::Back { text, queued } => obj(vec![
+                ("t", Value::string("back")),
+                ("x", Value::string(text.clone())),
+                ("q", Value::Bool(*queued)),
             ]),
             Op::Meta(m) => obj(vec![
                 ("t", Value::string("meta")),
@@ -1293,6 +1326,42 @@ mod tests {
                 r#"{"id":1,"k":"ask","q":[{"h":"Color","m":false,"o":[["Red","r"]],"q":"Red or blue?"}],"r":"","t":"add"}"#,
                 r#"{"a":{"Red or blue?":"Red"},"id":1,"t":"done","x":"answered"}"#,
             ]
+        );
+    }
+
+    #[test]
+    fn an_interrupt_that_catches_a_prompt_hands_it_back_saying_whether_another_waited() {
+        let life = |uuid: &str, state: &str| {
+            format!(r#"{{"type":"command_lifecycle","command_uuid":"{uuid}","state":"{state}"}}"#)
+        };
+        let line =
+            |v: Value| parse(&format!(r#"{{"type":"_in","line":{}}}"#, to_line(&v))).unwrap();
+        let mut r = Reducer::new();
+        r.feed(&line(sdk::prompt("first", "u1")));
+        for st in ["queued", "started"] {
+            assert!(r.feed(&parse(&life("u1", st)).unwrap()).ops.is_empty());
+        }
+        // A second sent while the first runs.
+        r.feed(&line(sdk::prompt("second", "u2")));
+        r.feed(&parse(&life("u2", "queued")).unwrap());
+        let o = r.feed(&parse(&life("u1", "cancelled")).unwrap());
+        assert_eq!(wire(&o.ops), [r#"{"q":true,"t":"back","x":"first"}"#]);
+        // The second, caught alone, waits on nothing.
+        r.feed(&parse(&life("u2", "started")).unwrap());
+        let o = r.feed(&parse(&life("u2", "cancelled")).unwrap());
+        assert_eq!(wire(&o.ops), [r#"{"q":false,"t":"back","x":"second"}"#]);
+        // Once answered, a prompt is forgotten; one no view sent is not said back.
+        r.feed(&line(sdk::prompt("third", "u3")));
+        r.feed(&parse(&life("u3", "completed")).unwrap());
+        assert!(
+            r.feed(&parse(&life("u3", "cancelled")).unwrap())
+                .ops
+                .is_empty()
+        );
+        assert!(
+            r.feed(&parse(&life("u9", "cancelled")).unwrap())
+                .ops
+                .is_empty()
         );
     }
 

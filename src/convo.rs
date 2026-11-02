@@ -287,7 +287,19 @@ pub struct Convo {
     pub expanded: bool,
     /// Prompts sent and not yet echoed by claude, and when each was sent: drawn at once under
     /// the transcript, the spinner where `❯` goes, until claude's own line for it arrives.
-    pub pending: Vec<(String, Instant)>,
+    pub pending: Vec<Pending>,
+    /// Entries a rewind took out of the transcript: a prompt an interrupt caught unanswered,
+    /// and its note. By position, which never changes: entries are only ever added.
+    pub hidden: std::collections::HashSet<usize>,
+}
+
+/// A prompt sent and not yet echoed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub text: String,
+    pub since: Instant,
+    /// Sent while a turn ran, so it waits behind it: Claude Code offers send-now under it.
+    pub queued: bool,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -300,6 +312,10 @@ pub enum Applied {
     Nothing,
     /// A turn ended that this client saw start: say how long it took.
     TurnEnded(Duration),
+    /// An interrupt caught a prompt before anything answered it, with nothing waiting
+    /// behind: it is out of the transcript, and its text goes back to the input, as Claude
+    /// Code hands it back.
+    Back(String),
 }
 
 impl Convo {
@@ -315,7 +331,12 @@ impl Convo {
 
     /// A prompt just sent: shown at once, turning, until claude echoes it.
     pub fn sent(&mut self, text: &str, now: Instant) {
-        self.pending.push((text.to_string(), now));
+        let queued = self.state != "idle" || !self.pending.is_empty();
+        self.pending.push(Pending {
+            text: text.to_string(),
+            since: now,
+            queued,
+        });
     }
 
     /// Something the client adds itself, such as the `❯ /model` it ran.
@@ -369,7 +390,7 @@ impl Convo {
                 let e = match s(v, "k").as_str() {
                     "user" => {
                         let x = s(v, "x");
-                        if let Some(i) = self.pending.iter().position(|(p, _)| p.trim() == x.trim())
+                        if let Some(i) = self.pending.iter().position(|p| p.text.trim() == x.trim())
                         {
                             self.pending.remove(i);
                         }
@@ -460,6 +481,48 @@ impl Convo {
                 }
                 _ => {}
             },
+            "back" => {
+                let text = s(v, "x");
+                let queued = v.get("q").and_then(Value::as_bool) == Some(true);
+                // Never echoed: it is still on the phone, spinning.
+                if let Some(i) = self
+                    .pending
+                    .iter()
+                    .position(|p| p.text.trim() == text.trim())
+                {
+                    self.pending.remove(i);
+                    return if self.live && !queued {
+                        Applied::Back(text)
+                    } else {
+                        Applied::Nothing
+                    };
+                }
+                if queued {
+                    return Applied::Nothing;
+                }
+                // Echoed, and nothing answered it: what came after it is notes alone.
+                let Some(p) = self
+                    .entries
+                    .iter()
+                    .rposition(|e| matches!(e, Entry::Prompt(_)))
+                else {
+                    return Applied::Nothing;
+                };
+                let answered = self.entries[p + 1..]
+                    .iter()
+                    .any(|e| !matches!(e, Entry::Note(_) | Entry::Worked(_)));
+                if answered
+                    || !matches!(&self.entries[p], Entry::Prompt(t) if t.trim() == text.trim())
+                {
+                    return Applied::Nothing;
+                }
+                self.hidden.extend(p..self.entries.len());
+                return if self.live {
+                    Applied::Back(text)
+                } else {
+                    Applied::Nothing
+                };
+            }
             "st" => {
                 let st = s(v, "s");
                 let was = std::mem::replace(&mut self.state, st.clone());
@@ -878,6 +941,11 @@ pub struct Ui {
     pub load: Option<crate::statusline::Figures>,
     /// A word in place of the footer's first line until the next key: `/copy`'s, an error.
     pub status: Option<String>,
+    /// Ctrl+X was pressed: the first half of a chord, Ctrl+X Ctrl+S being send-now.
+    pub chord: bool,
+    /// Pastes standing in the prompt as `[Pasted text #N +L lines]`, by number, as Claude
+    /// Code's are: put back whole when the prompt is sent.
+    pub pastes: Vec<(u32, String)>,
 }
 
 impl Ui {
@@ -890,6 +958,8 @@ impl Ui {
             link: Link::Up,
             load: None,
             status: None,
+            chord: false,
+            pastes: Vec::new(),
         }
     }
 }
@@ -958,6 +1028,10 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
     let busy = matches!(c.state.as_str(), "working" | "waiting" | "compacting");
     let mut i = 0;
     while i < c.entries.len() {
+        if c.hidden.contains(&i) {
+            i += 1;
+            continue;
+        }
         let e = &c.entries[i];
         match e {
             Entry::Tool { name, arg, result } if c.expanded => {
@@ -1033,6 +1107,16 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
                     row.extend(l);
                     out.push(row);
                 }
+            }
+            // Under what it interrupted, as Claude Code draws it, and in its words.
+            Entry::Note(text) if text == "Interrupted" => {
+                out.extend(wrapped(
+                    "Interrupted · What should Claude do instead?",
+                    "  ⎿  ",
+                    "     ",
+                    w,
+                    fg(RED),
+                ));
             }
             Entry::Note(text) => {
                 out.push(Vec::new());
@@ -1716,11 +1800,15 @@ struct Parts {
 
 fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     let (mut body, _) = transcript(c, w);
-    for (text, since) in &c.pending {
-        let frame = now.saturating_duration_since(*since).as_millis() / 120;
+    for p in &c.pending {
+        let frame = now.saturating_duration_since(p.since).as_millis() / 120;
         let glyph = crate::ui::SPINNER[frame as usize % crate::ui::SPINNER.len()];
         body.push(Vec::new());
-        body.extend(prompt_lines(text, &format!("{glyph} "), w));
+        body.extend(prompt_lines(&p.text, &format!("{glyph} "), w));
+        // One waiting behind a turn can go now, as Claude Code says under it.
+        if p.queued {
+            body.push(line("  ctrl+x ctrl+s to send now", fg(GREY)));
+        }
     }
     // The bottom: a dialog, or the input box.
     let waiting = c.waiting();
@@ -2356,6 +2444,99 @@ mod tests {
             ]
         );
         assert_eq!(f.cursor, Some((at + 3, 6)), "after the last word");
+    }
+
+    #[test]
+    fn esc_hands_back_a_prompt_nothing_answered_as_claude_code_does() {
+        let live = |c: &mut Convo| {
+            // The first batch is the log as it stood; ops after it are live.
+            c.apply(&parse(r#"{"t":"n","n":1}"#).unwrap(), Instant::now());
+        };
+        let back = |c: &mut Convo, x: &str, q: bool| {
+            c.apply(
+                &parse(&format!(r#"{{"t":"back","x":"{x}","q":{q}}}"#)).unwrap(),
+                Instant::now(),
+            )
+        };
+        let shown = |c: &Convo| text(&draw(c, &Ui::new(), 40, 24, Instant::now()));
+        // Caught before claude took it in: off the screen and back to the input.
+        let mut c = convo();
+        live(&mut c);
+        c.sent("hello", Instant::now());
+        assert_eq!(back(&mut c, "hello", false), Applied::Back("hello".into()));
+        assert!(c.pending.is_empty());
+        // Taken in, thinking, nothing drawn: the prompt and its note go, the text comes back.
+        let mut c = convo();
+        live(&mut c);
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"essay"}"#,
+                r#"{"t":"add","id":2,"k":"note","x":"Interrupted"}"#,
+            ],
+        );
+        assert_eq!(back(&mut c, "essay", false), Applied::Back("essay".into()));
+        assert!(
+            !shown(&c)
+                .iter()
+                .any(|l| l.contains("essay") || l.contains("Interrupted"))
+        );
+        // Answered in part: it stays, under Claude Code's note.
+        let mut c = convo();
+        live(&mut c);
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"count"}"#,
+                r#"{"t":"add","id":2,"k":"text","x":"1 2 3"}"#,
+                r#"{"t":"add","id":3,"k":"note","x":"Interrupted"}"#,
+            ],
+        );
+        assert_eq!(back(&mut c, "count", false), Applied::Nothing);
+        let got = shown(&c);
+        let at = got.iter().position(|l| l == "● 1 2 3").unwrap();
+        assert_eq!(got[at + 1], "  ⎿  Interrupted · What should Claude");
+        // Another waiting behind it: the interrupt makes way for that, and this one stays.
+        let mut c = convo();
+        live(&mut c);
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"rivers"}"#,
+                r#"{"t":"add","id":2,"k":"note","x":"Interrupted"}"#,
+            ],
+        );
+        assert_eq!(back(&mut c, "rivers", true), Applied::Nothing);
+        assert!(shown(&c).iter().any(|l| l == "❯ rivers"));
+        // Read back from the log, the rewind still shows, but nothing comes to the input.
+        let mut c = Convo::new("claude-sessions", "claude-3", "run");
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"essay"}"#,
+                r#"{"t":"add","id":2,"k":"note","x":"Interrupted"}"#,
+            ],
+        );
+        assert_eq!(back(&mut c, "essay", false), Applied::Nothing);
+        assert!(!shown(&c).iter().any(|l| l.contains("essay")));
+    }
+
+    #[test]
+    fn a_prompt_sent_behind_a_turn_offers_send_now() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[&meta("", "default"), r#"{"t":"st","s":"working"}"#],
+        );
+        c.sent("and lakes", Instant::now());
+        assert!(c.pending[0].queued);
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        let at = got.iter().position(|l| l.ends_with("and lakes")).unwrap();
+        assert_eq!(got[at + 1], "  ctrl+x ctrl+s to send now");
+        // Sent at rest, it is the next turn itself, not one waiting.
+        let mut c = convo();
+        c.sent("hi", Instant::now());
+        assert!(!c.pending[0].queued);
     }
 
     #[test]
