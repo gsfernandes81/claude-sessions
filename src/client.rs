@@ -211,6 +211,15 @@ impl App {
                     not_sent: false,
                 };
             }
+            // Its answer went to the relay that just went: the next one never heard it.
+            if let Some(Dialog::Btw {
+                answer: a @ None, ..
+            }) = &mut ui.dialog
+            {
+                *a = Some(Err(
+                    "the link dropped before the answer came: ask again".into()
+                ));
+            }
         }
     }
 
@@ -868,11 +877,11 @@ impl App {
                     }
                 }
                 // Claude Code's "Press up to edit queued messages": out of the queue, into the
-                // prompt, a line each.
-                Key::Up if ui.input.is_empty() && c.pending.iter().any(|p| p.queued) => {
+                // prompt, a line each, above anything typed meanwhile (2.1.311, driven in a pty
+                // on 2026-11-02).
+                Key::Up if c.pending.iter().any(|p| p.queued) => {
                     let (texts, uuids) = c.unqueue();
-                    ui.input = texts.join("\n");
-                    ui.cursor = ui.input.chars().count();
+                    give_back(ui, &texts.join("\n"));
                     out.push(App::msg(
                         "unqueue",
                         vec![(
@@ -2756,6 +2765,36 @@ mod tests {
             Screen::Home => 0,
         };
         assert_eq!(c_before, c_after, "nothing of it joins the transcript");
+    }
+
+    #[test]
+    fn up_takes_a_queued_prompt_back_above_what_is_being_typed() {
+        // Claude Code 2.1.311, driven in a pty: "then one about lakes" queued, "draft here"
+        // typed, Up gives both, the queued one first.
+        let mut app = app_in(&[r#"{"t":"st","s":"working"}"#]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("then one about lakes", Instant::now());
+        }
+        for ch in "draft here".chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        app.key(Key::Up, Instant::now());
+        let Screen::Conv { c, ui, .. } = &app.screen else {
+            panic!("left the conversation");
+        };
+        assert_eq!(ui.input, "then one about lakes\ndraft here");
+        assert!(c.pending.is_empty(), "withdrawn from the queue");
+    }
+
+    #[test]
+    fn a_side_question_whose_link_drops_says_so_rather_than_waiting_for_ever() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"text","x":"hello"}"#]);
+        type_in(&mut app, "/btw what was that?");
+        app.link_down(Instant::now());
+        assert!(matches!(
+            dialog(&app),
+            Some(Dialog::Btw { answer: Some(Err(e)), .. }) if e.contains("ask again")
+        ));
     }
 
     #[test]

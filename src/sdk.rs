@@ -42,7 +42,13 @@ pub enum Msg {
     Assistant {
         message_id: String,
         blocks: Vec<Block>,
+        /// Written by claude itself, not the model: a slash command's reply, such as
+        /// `/usage`'s, which comes before the command's own echo.
+        synthetic: bool,
     },
+    /// A background task's `<task-notification>`, which claude hands the model as a prompt
+    /// and so starts a turn with: its summary.
+    Notice(String),
     /// Tool results, from a `user` line whose content is `tool_result` blocks.
     ToolResults(Vec<ToolResult>),
     /// A local command's output, `<local-command-stdout>…</local-command-stdout>`: what
@@ -315,6 +321,7 @@ pub fn classify(v: &Value) -> Msg {
             Msg::Assistant {
                 message_id: msg.map(|m| s(m, "id")).unwrap_or_default(),
                 blocks,
+                synthetic: msg.is_some_and(|m| s(m, "model") == "<synthetic>"),
             }
         }
         "user" => user(v),
@@ -408,15 +415,47 @@ fn result_text(c: Option<&Value>) -> String {
 const LOCAL_OPEN: &str = "<local-command-stdout>";
 const LOCAL_CLOSE: &str = "</local-command-stdout>";
 
+/// What is between `<name>` and `</name>` in `t`, trimmed.
+fn tag(t: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let from = t.find(&open)? + open.len();
+    let to = from + t[from..].find(&close)?;
+    Some(t[from..to].trim().to_string())
+}
+
+/// A slash command as it was typed, from the wrapper claude echoes it in:
+/// `<command-name>/usage</command-name> … <command-args>a b</command-args>` is `/usage a b`.
+pub(crate) fn command_typed(t: &str) -> Option<String> {
+    if !t.starts_with("<command-name>") {
+        return None;
+    }
+    let name = tag(t, "command-name")?;
+    let name = if name.starts_with('/') {
+        name
+    } else {
+        format!("/{name}")
+    };
+    Some(match tag(t, "command-args").filter(|a| !a.is_empty()) {
+        Some(args) => format!("{name} {args}"),
+        None => name,
+    })
+}
+
 fn user(v: &Value) -> Msg {
     let content = v.get("message").and_then(|m| m.get("content"));
     match content {
+        // A background task's notice, which claude hands the model as a prompt: its summary,
+        // as a note, not the markup.
+        Some(Value::Str(t)) if t.trim_start().starts_with("<task-notification>") => {
+            Msg::Notice(tag(t, "summary").unwrap_or_else(|| "Background task finished".into()))
+        }
         Some(Value::Str(t)) => match t.strip_prefix(LOCAL_OPEN) {
             Some(rest) => {
                 Msg::LocalOutput(rest.strip_suffix(LOCAL_CLOSE).unwrap_or(rest).to_string())
             }
             None if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
-                Msg::Prompt(t.clone())
+                Msg::Prompt(command_typed(t).unwrap_or_else(|| t.clone()))
             }
             None => Msg::UserText(t.clone()),
         },
@@ -1058,9 +1097,12 @@ mod tests {
                 text: "spi".into()
             }
         );
-        let Msg::Assistant { message_id, blocks } = read(
+        let Msg::Assistant {
+            message_id, blocks, ..
+        } = read(
             r#"{"type":"assistant","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo spike-ok"}},{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}}"#,
-        ) else {
+        )
+        else {
             panic!("an assistant line is an Assistant");
         };
         assert_eq!(message_id, "msg_1");

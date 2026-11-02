@@ -301,7 +301,11 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    - **The link** is `ssh -T -C -o BatchMode=yes <name> claude-sessions relay`
      (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
      backoff from 1 to 30 seconds; dead too when something sent has no answer in 5 seconds,
-     and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
+     and a key after 2 minutes of silence sends a `ping` first. So the relay answers every
+     message at once, with `pong` when it has nothing else to say yet: a side question takes
+     6 to 11 seconds, and through 0.13.6 a quiet conversation's link was dropped before its
+     answer came, which went to the dead link's relay (owner, 2026-11-02, "/btw never gets
+     back to me"); a side question whose link drops anyway says so in its panel. Back up, it says `hi` and,
      with a conversation open, `re`. An open waits 60 seconds, not 5,
      and the relay answers it at once with `opening`: starting a holder and reading a long
      conversation's history into it takes seconds, and until 0.13.6 the 5-second wait cut the
@@ -325,9 +329,11 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        it; Ctrl+X then Ctrl+S sends it now, as the terminal does: a tool call running goes to
        the background and the same turn takes the prompt in — `background_tasks`, since headless
        claude's own `send_now` stops the turn and its call instead (`"send_now":"stopped"`,
-       measured 2026-11-02) — and with none running, `send_now` drops the turn quietly. Up in an empty prompt — which says `Press up
-       to edit queued messages` — takes every waiting prompt back into it, a line each, and
-       withdraws them from claude's queue; the turn runs on. Claude Code's Esc Esc rewind
+       measured 2026-11-02) — and with none running, `send_now` drops the turn quietly. Up —
+       which an empty prompt hints at with `Press up to edit queued messages` — takes every
+       waiting prompt back into the prompt, a line each, above anything typed meanwhile, as
+       Claude Code 2.1.311 does (driven in a pty, 2026-11-02), and withdraws them from
+       claude's queue; the turn runs on. Claude Code's Esc Esc rewind
        picker is not built.
      - A prompt queued behind a turn of tool calls is taken in by claude between two of them,
        on its own: 2.1.311 headless, as the holder runs it, echoes it and marks it `started`
@@ -361,7 +367,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
      Ctrl-U; Ctrl or Alt with Left or Right a word at a time, back to a word's start and on to
      its end, as Claude Code's prompt goes; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
-     no row starts with one, as editors and Claude Code do; `\` then Enter is a newline, as in Claude Code; Up and Down move between the prompt's rows, and off its top or bottom row step through what
+     no row starts with one, as editors and Claude Code do, and a prompt taller than half the
+     screen shows half the screen's rows, scrolled to keep the cursor in them, `↑` or `↓`
+     leading a row with more past it; `\` then Enter is a newline, as in Claude Code; Up and Down move between the prompt's rows, and off its top or bottom row step through what
      was sent, keeping what was being typed: Down past the newest gives it back, as Claude Code
      does (read off its screen on 2026-11-02); PageUp and PageDown scroll ten lines and a wheel report one, since Termux
      sends a report for every line a finger travels, or three under Windows Terminal
@@ -379,7 +387,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      Claude Code's: its claude is the conversation forked unsaved, with no tools, no hooks
      and no MCP servers, on the conversation's model, in the slot's directory, given two
      minutes, and refused when the container has no room for another claude. Anything
-     else, `/compact` included, is claude's.
+     else, `/compact` and `/usage` included, is claude's. Claude echoes a command it runs
+     itself in a `<command-name>` wrapper, after its reply: the view draws it as typed, its
+     reply under it. A background task's `<task-notification>`, which claude hands the model
+     as a prompt, is drawn as its summary, grey under `⎿`, not as its markup.
    - **Ctrl+O and `/expand`** switch the transcript between runs of tool calls summed up, as
      the mockups draw them, and every call on its own with the first lines of its result
      and how many more, as Claude Code's Ctrl+O transcript does; a failed call says `Error`.

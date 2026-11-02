@@ -1525,8 +1525,9 @@ fn reconnecting_line(
     said(vec![("  ".into(), PLAIN)])
 }
 
-/// The input box and footer: R1's last five rows.
-fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
+/// The input box and footer: R1's last five rows. A prompt taller than half the screen shows
+/// that many rows, scrolled to keep the cursor in them, `↑`/`↓` leading a row with more past it.
+fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usize)) {
     let mut out = Vec::new();
     let title = c.meta.title.trim();
     if title.is_empty() || width(title) + 4 > w {
@@ -1547,9 +1548,16 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
     // lavender (its `permission` colour, read off its screen on 2026-11-02).
     let slash = slash_runs(&chars, &c.meta.commands);
     let first = out.len();
-    for (i, &(a, b)) in rows.iter().enumerate() {
-        let lead = if i == 0 { "❯ " } else { "  " };
-        let mut l: Line = vec![(lead.into(), PLAIN)];
+    let shown = (h / 2).max(1);
+    let top = (cur.0 + 1).saturating_sub(shown);
+    let end = (top + shown).min(rows.len());
+    for (i, &(a, b)) in rows.iter().enumerate().take(end).skip(top) {
+        let mut l: Line = match i {
+            0 => vec![("❯ ".into(), PLAIN)],
+            _ if i == top => vec![("↑ ".into(), fg(GREY))],
+            _ if i + 1 == end && end < rows.len() => vec![("↓ ".into(), fg(GREY))],
+            _ => vec![("  ".into(), PLAIN)],
+        };
         // Spaces hanging past the edge are not drawn: they are the break.
         let mut used = 0;
         for (k, &ch) in chars[a..b].iter().enumerate() {
@@ -1588,7 +1596,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
             l.push(("Press up to edit queued messages".into(), fg(GREY)));
         }
     }
-    let cursor = (first + cur.0, 2 + cur.1);
+    let cursor = (first + cur.0 - top, 2 + cur.1);
     out.push(rule(w, "─", fg(RULE)));
     let place = format!("{}/{}", c.host, c.slot);
     let first_foot = match (&ui.link, &ui.status, &ui.load) {
@@ -2062,7 +2070,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
             } else {
                 suggest_lines(&list, ui.suggest, w)
             };
-            let (boxed, cur) = input_box(c, ui, w);
+            let (boxed, cur) = input_box(c, ui, w, h);
             cursor = Some((cur.0 + b.len(), cur.1));
             b.extend(boxed);
             b
@@ -2672,6 +2680,31 @@ mod tests {
             ]
         );
         assert_eq!(f.cursor, Some((at + 3, 6)), "after the last word");
+    }
+
+    #[test]
+    fn a_prompt_taller_than_half_the_screen_scrolls_with_the_cursor() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let mut ui = Ui::new();
+        ui.input = (1..=20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.cursor = ui.input.chars().count();
+        let f = draw(&c, &ui, 40, 24, Instant::now());
+        let got = text(&f);
+        // Twelve rows of 24, the cursor's last among them, the rows above it marked.
+        let at = got.iter().position(|l| l == "↑ line 9").unwrap();
+        assert_eq!(got[at + 11], "  line 20");
+        assert!(got[at + 12].starts_with('─'), "{got:?}");
+        assert_eq!(f.cursor, Some((at + 11, 9)));
+        // At the start: the first rows, the rows below marked.
+        ui.cursor = 0;
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        let at = got.iter().position(|l| l == "❯ line 1").unwrap();
+        assert_eq!(got[at + 11], "↓ line 12");
+        assert!(got[at + 12].starts_with('─'), "{got:?}");
     }
 
     #[test]

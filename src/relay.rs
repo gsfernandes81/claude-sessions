@@ -219,7 +219,15 @@ impl Relay {
                 "did",
                 vec![("ok", Value::Bool(ok)), ("x", Value::string(said))],
             ))),
-            Input::Client(v) => self.client(&v, &mut out),
+            // Everything the client sends is answered at once: it takes a link that says nothing
+            // for 5 seconds after a send for dead, and a side question, a rename or an offload
+            // can take longer than that to say anything of its own.
+            Input::Client(v) => {
+                self.client(&v, &mut out);
+                if !out.iter().any(|e| matches!(e, Effect::Send(_))) {
+                    out.insert(0, Effect::Send(msg("pong", vec![])));
+                }
+            }
             Input::Hub(ev) => {
                 let (host, m) = match ev {
                     Event::Snapshot(host, snap) => {
@@ -1072,9 +1080,13 @@ mod tests {
             &mut r,
             r#"{"t":"say","x":"held","u":"11111111-2222-4333-8444-555555555555"}"#,
         );
-        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(
+            sent(&fx),
+            [r#"{"t":"pong"}"#],
+            "only answered, so the link holds"
+        );
         let fx = client(&mut r, r#"{"t":"rename","x":"held title"}"#);
-        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(sent(&fx), [r#"{"t":"pong"}"#]);
         r.handle(
             Input::Conv {
                 epoch,
@@ -1148,7 +1160,7 @@ mod tests {
             r#"{"t":"offload","c":"or3-dev","k":{"slot":"claude-3"}}"#,
         );
         match fx.as_slice() {
-            [Effect::Home { host, op }] => {
+            [Effect::Send(_), Effect::Home { host, op }] => {
                 assert_eq!(host, "or3-dev");
                 assert_eq!(
                     json::to_line(op),
@@ -1163,7 +1175,7 @@ mod tests {
             r#"{"t":"archive","c":"claude-sessions","k":{"slot":"claude-4"}}"#,
         );
         assert!(
-            matches!(fx.as_slice(), [Effect::Home { op, .. }] if op.get("op").and_then(Value::as_str) == Some("close")),
+            matches!(fx.as_slice(), [Effect::Send(_), Effect::Home { op, .. }] if op.get("op").and_then(Value::as_str) == Some("close")),
             "{fx:?}"
         );
         // A container the hub does not have is refused, not sent anywhere.
@@ -1276,6 +1288,8 @@ mod tests {
         let init = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-haiku-5-5","permissionMode":"default"}"#;
         line(&mut r, epoch, 1, init);
         let fx = client(&mut r, r#"{"t":"btw","x":"what was that?"}"#);
+        // Answered at once: the side question takes longer than the client waits for a word.
+        assert_eq!(sent(&fx), [r#"{"t":"pong"}"#]);
         let Some(Effect::Side {
             epoch: e,
             host,

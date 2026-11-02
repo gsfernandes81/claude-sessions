@@ -132,6 +132,9 @@ pub struct Out {
 #[derive(Debug, Default)]
 pub struct Reducer {
     next_id: u64,
+    /// A slash command's reply, written by claude itself: claude sends it before the command's
+    /// echo, so it waits to be drawn under the command.
+    local: Vec<String>,
     /// Text items being streamed, by (message, block index).
     streaming: HashMap<(String, u64), u64>,
     /// Each streamed item's text so far, and whether its finished block has arrived.
@@ -441,7 +444,30 @@ impl Reducer {
                 _ => return out,
             }
         }
-        match sdk::classify(v) {
+        let msg = sdk::classify(v);
+        let quiet = matches!(
+            msg,
+            Msg::Prompt(_)
+                | Msg::Noise
+                | Msg::Unknown(_)
+                | Msg::Lifecycle { .. }
+                | Msg::Response { .. }
+        );
+        if !quiet {
+            self.flush_local(&mut out);
+        }
+        match msg {
+            Msg::Assistant {
+                blocks,
+                synthetic: true,
+                ..
+            } if blocks.iter().all(|b| matches!(b, Block::Text(_))) => {
+                for b in blocks {
+                    if let Block::Text(t) = b {
+                        self.local.push(t);
+                    }
+                }
+            }
             Msg::Init {
                 session_id,
                 model,
@@ -473,9 +499,16 @@ impl Reducer {
                 Some(_) => self.set_state(&mut out, "working"),
                 None => {}
             },
+            // A command's echo comes after its reply, which is drawn under it; any other
+            // prompt is drawn after what was waiting.
             Msg::Prompt(text) => {
+                let command = text.starts_with('/');
+                if !command {
+                    self.flush_local(&mut out);
+                }
                 self.add(&mut out, Item::Prompt(text));
                 self.set_state(&mut out, "working");
+                self.flush_local(&mut out);
             }
             Msg::TextDelta {
                 message_id,
@@ -495,7 +528,9 @@ impl Reducer {
                     self.by_message.entry(message_id).or_default().push(id);
                 }
             }
-            Msg::Assistant { message_id, blocks } => {
+            Msg::Assistant {
+                message_id, blocks, ..
+            } => {
                 for b in blocks {
                     match b {
                         Block::Text(text) => self.finish_text(&mut out, &message_id, text),
@@ -556,6 +591,10 @@ impl Reducer {
                         lines,
                     });
                 }
+            }
+            Msg::Notice(text) => {
+                self.add(&mut out, Item::Note(text));
+                self.set_state(&mut out, "working");
             }
             Msg::LocalOutput(text) => {
                 let text = strip_ansi(&text);
@@ -775,6 +814,15 @@ impl Reducer {
     /// A finished text block: the first of its message's streamed items not yet finished, put
     /// right if what streamed differs; or a new item, when nothing streamed (no partial
     /// messages, or a line read back from a log).
+    /// The slash command reply that waited for its echo, drawn now.
+    fn flush_local(&mut self, out: &mut Out) {
+        for t in std::mem::take(&mut self.local) {
+            if !t.is_empty() {
+                self.add(out, Item::Text(t));
+            }
+        }
+    }
+
     fn finish_text(&mut self, out: &mut Out, message_id: &str, text: String) {
         let open = self.by_message.get(message_id).and_then(|ids| {
             ids.iter()
@@ -1514,6 +1562,55 @@ mod tests {
                 r#"{"s":"idle","t":"st"}"#,
             ],
             "an interrupted turn is not an error worth a note"
+        );
+    }
+
+    #[test]
+    fn a_slash_commands_reply_is_drawn_under_the_command_as_it_was_typed() {
+        // What headless claude 2.1.311 sent for `/usage` on 2026-11-02: its reply first, then
+        // the command's echo in its wrapper, then the result.
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"7ce1922b","model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Current week (all models): 23% used"}]},"parent_tool_use_id":null}"#,
+                r#"{"type":"user","message":{"role":"user","content":"<command-name>/usage</command-name>\n            <command-message>usage</command-message>\n            <command-args></command-args>"},"parent_tool_use_id":null,"isReplay":true}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Current week (all models): 23% used"}"#,
+            ],
+        );
+        let w = wire(&o.ops);
+        assert_eq!(
+            &w[..3],
+            [
+                r#"{"id":1,"k":"user","t":"add","x":"/usage"}"#,
+                r#"{"s":"working","t":"st"}"#,
+                r#"{"id":2,"k":"text","t":"add","x":"Current week (all models): 23% used"}"#,
+            ],
+            "{w:?}"
+        );
+        assert_eq!(
+            sdk::command_typed("<command-name>/btw</command-name><command-args>a b</command-args>")
+                .as_deref(),
+            Some("/btw a b")
+        );
+    }
+
+    #[test]
+    fn a_background_tasks_notification_is_its_summary_not_its_markup() {
+        // As claude replays it on the phone (owner, 2026-11-02), and as a transcript keeps it.
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Review\" finished</summary>\n<result>see the handback</result>\n</task-notification>"},"parent_tool_use_id":null,"isReplay":true}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&o.ops),
+            [
+                r#"{"id":1,"k":"note","t":"add","x":"Agent \"Review\" finished"}"#,
+                r#"{"s":"working","t":"st"}"#,
+            ]
         );
     }
 
