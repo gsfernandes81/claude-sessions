@@ -125,6 +125,9 @@ struct App {
     models: Option<Vec<(String, String)>>,
     history: Vec<String>,
     history_at: Option<usize>,
+    /// What was being typed when Up went back into what was sent: Down past the newest gives
+    /// it back, as Claude Code does, so no keypress loses it.
+    draft: Option<String>,
     /// What was on each row of the screen, so only what changed is written.
     drawn: Vec<String>,
     /// Bytes the owner should have on the clipboard (OSC 52), written with the next frame.
@@ -753,6 +756,7 @@ impl App {
                         self.history.push(text.clone());
                     }
                     self.history_at = None;
+                    self.draft = None;
                     match submit(c, ui, text.trim(), &self.models) {
                         Submit::Send(v) => out.extend(v),
                         Submit::Copy(t) => self.clip = Some(t),
@@ -774,17 +778,19 @@ impl App {
                         )],
                     ));
                 }
-                Key::Up | Key::Down if !self.history.is_empty() => {
-                    let n = self.history.len();
-                    let at = match (k, self.history_at) {
-                        (Key::Up, None) => Some(n - 1),
-                        (Key::Up, Some(i)) => Some(i.saturating_sub(1)),
-                        (Key::Down, Some(i)) if i + 1 < n => Some(i + 1),
-                        _ => None,
-                    };
-                    self.history_at = at;
-                    ui.input = at.map(|i| self.history[i].clone()).unwrap_or_default();
-                    ui.cursor = ui.input.chars().count();
+                // Up and Down move between the prompt's rows first; off its top or bottom row
+                // they step through what was sent, as Claude Code's do.
+                Key::Up | Key::Down => {
+                    let room = term::size().map_or(38, |(w, _)| (w as usize).saturating_sub(2));
+                    if !row_step(ui, k == Key::Up, room) {
+                        history_step(
+                            ui,
+                            k == Key::Up,
+                            &self.history,
+                            &mut self.history_at,
+                            &mut self.draft,
+                        );
+                    }
                 }
                 Key::PageUp | Key::WheelUp => {
                     let step = if k == Key::PageUp { 10 } else { self.wheel };
@@ -1005,6 +1011,70 @@ fn backslash_newline(ui: &mut Ui) -> bool {
     chars[at - 1] = '\n';
     ui.input = chars.into_iter().collect();
     true
+}
+
+/// The cursor a row up or down the prompt as it is wrapped, at the same column or the end of a
+/// shorter row. Whether there was a row to go to.
+fn row_step(ui: &mut Ui, up: bool, room: usize) -> bool {
+    let chars: Vec<char> = ui.input.chars().collect();
+    let (rows, (row, col)) = convo::soft_wrap(&chars, ui.cursor, room);
+    let to = match (up, row) {
+        (true, 0) => return false,
+        (true, r) => r - 1,
+        (false, r) if r + 1 >= rows.len() => return false,
+        (false, r) => r + 1,
+    };
+    let (a, b) = rows[to];
+    // Where `col` falls in that row; not past its end, nor onto the next row's first place
+    // when the row was wrapped.
+    let wrapped = to + 1 < rows.len() && chars.get(b) != Some(&'\n');
+    let last = if wrapped {
+        b.saturating_sub(1).max(a)
+    } else {
+        b
+    };
+    let mut used = 0;
+    let mut at = a;
+    while at < last && used + convo::cw(chars[at]) <= col {
+        used += convo::cw(chars[at]);
+        at += 1;
+    }
+    ui.cursor = at;
+    true
+}
+
+/// A step back (Up) or on (Down) through what was sent. Going back from the prompt keeps what
+/// was being typed; Down past the newest gives it back, the cursor at its start, as Claude
+/// Code does. Up puts the cursor at an entry's end, Down at its start.
+fn history_step(
+    ui: &mut Ui,
+    up: bool,
+    history: &[String],
+    at: &mut Option<usize>,
+    draft: &mut Option<String>,
+) {
+    let n = history.len();
+    let next = match (up, *at) {
+        (true, None) if n > 0 => {
+            *draft = Some(std::mem::take(&mut ui.input));
+            Some(n - 1)
+        }
+        (true, Some(i)) => Some(i.saturating_sub(1)),
+        (false, Some(i)) if i + 1 < n => Some(i + 1),
+        (false, Some(_)) => {
+            *at = None;
+            ui.input = draft.take().unwrap_or_default();
+            ui.cursor = 0;
+            return;
+        }
+        // Down with nothing to step on to, or Up with nothing sent: the prompt as it is.
+        _ => return,
+    };
+    *at = next;
+    if let Some(i) = next {
+        ui.input = history[i].clone();
+        ui.cursor = if up { ui.input.chars().count() } else { 0 };
+    }
 }
 
 /// The HTML entities claude's command descriptions carry (`&lt;duration&gt;`), as text.
@@ -1641,6 +1711,7 @@ impl App {
             models: None,
             history: Vec::new(),
             history_at: None,
+            draft: None,
             drawn: Vec::new(),
             clip: None,
             quit: false,
@@ -1731,6 +1802,67 @@ pub fn run(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn up_and_down_keep_what_was_being_typed_as_claude_code_does() {
+        let history = vec!["Say one".to_string(), "Say two".to_string()];
+        let (mut at, mut draft) = (None, None);
+        let mut ui = Ui::new();
+        ui.input = "my draft".into();
+        ui.cursor = 8;
+        let mut key = |ui: &mut Ui, up: bool| {
+            if !row_step(ui, up, 38) {
+                history_step(ui, up, &history, &mut at, &mut draft);
+            }
+            (ui.input.clone(), ui.cursor)
+        };
+        // As Claude Code 2.1.311 did on 2026-11-02, a one-line draft, the cursor at its end.
+        assert_eq!(
+            key(&mut ui, true),
+            ("Say two".into(), 7),
+            "Up: the newest, cursor at end"
+        );
+        assert_eq!(key(&mut ui, true), ("Say one".into(), 7));
+        assert_eq!(
+            key(&mut ui, true),
+            ("Say one".into(), 7),
+            "the oldest stays"
+        );
+        assert_eq!(
+            key(&mut ui, false),
+            ("Say two".into(), 0),
+            "Down: cursor at the start"
+        );
+        assert_eq!(
+            key(&mut ui, false),
+            ("my draft".into(), 0),
+            "past the newest: the draft"
+        );
+        assert_eq!(
+            key(&mut ui, false),
+            ("my draft".into(), 0),
+            "and Down again keeps it"
+        );
+        // A draft of three rows: Up climbs them first, then goes back; Down returns it whole.
+        ui.input = "a\nbb\nccc".into();
+        ui.cursor = ui.input.chars().count();
+        assert_eq!(key(&mut ui, true).1, 4, "row two, at the end of `bb`");
+        assert_eq!(key(&mut ui, true).1, 1, "row one, at the end of `a`");
+        assert_eq!(key(&mut ui, true).0, "Say two", "then what was sent");
+        assert_eq!(key(&mut ui, false), ("a\nbb\nccc".into(), 0));
+        assert_eq!(
+            key(&mut ui, false).1,
+            2,
+            "Down moves through its rows: row two"
+        );
+        // Nothing sent yet: Up leaves the prompt as it is.
+        let (mut at, mut draft) = (None, None);
+        let mut ui = Ui::new();
+        ui.input = "keep me".into();
+        history_step(&mut ui, true, &[], &mut at, &mut draft);
+        history_step(&mut ui, false, &[], &mut at, &mut draft);
+        assert_eq!(ui.input, "keep me");
+    }
 
     #[test]
     fn a_paste_goes_in_as_itself_or_as_claude_codes_stand_in() {
