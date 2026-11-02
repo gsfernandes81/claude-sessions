@@ -140,6 +140,9 @@ struct App {
     working: Option<(Instant, usize, String)>,
     /// A bracketed paste arriving: its text so far, until its end (`Key::PasteEnd`).
     pasting: Option<String>,
+    /// claude's slash commands with what each does, from `initialize` (the relay's `models`):
+    /// asked for when a conversation opens, for its suggestion list.
+    catalog: Vec<convo::Command>,
 }
 
 impl App {
@@ -297,6 +300,10 @@ impl App {
                         .to_string();
                     *opening = false;
                 }
+                // The command list for the suggestion list, once per client.
+                if self.catalog.is_empty() {
+                    self.send(App::msg("models", vec![]));
+                }
             }
             "reset" => {
                 if let Screen::Conv { c, .. } = &mut self.screen {
@@ -355,6 +362,32 @@ impl App {
                     }
                 }
                 self.models = Some(list);
+                let catalog: Vec<convo::Command> = v
+                    .get("c")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|c| {
+                        let f = |i: usize| {
+                            c.as_arr()
+                                .and_then(|a| a.get(i))
+                                .and_then(Value::as_str)
+                                .map(entities)
+                        };
+                        Some(convo::Command {
+                            name: f(0)?,
+                            about: f(1).unwrap_or_default(),
+                            hint: f(2).unwrap_or_default(),
+                        })
+                    })
+                    .filter(|c| !c.name.is_empty())
+                    .collect();
+                if !catalog.is_empty() {
+                    if let Screen::Conv { ui, .. } = &mut self.screen {
+                        ui.catalog = catalog.clone();
+                    }
+                    self.catalog = catalog;
+                }
             }
             "btw" => {
                 if let Screen::Conv { ui, .. } = &mut self.screen {
@@ -567,6 +600,7 @@ impl App {
         self.send(msg);
         let mut ui = Ui::new();
         ui.status = Some("Opening…".into());
+        ui.catalog = self.catalog.clone();
         self.screen = Screen::Conv {
             c: Box::new(Convo::new(host, "", "")),
             ui: Box::new(ui),
@@ -598,11 +632,47 @@ impl App {
                 return;
             }
         }
+        // The suggestion list, while it shows, has the arrows, Tab, Esc and Enter, as Claude
+        // Code's does: Enter takes the chosen command and sends it.
+        let before = ui.input.clone();
+        let list = if chorded {
+            Vec::new()
+        } else {
+            convo::suggestions(ui)
+        };
+        let mut suggested = false;
+        if !list.is_empty() {
+            let sel = ui.suggest.min(list.len() - 1);
+            match k {
+                Key::Up => {
+                    ui.suggest = sel.saturating_sub(1);
+                    suggested = true;
+                }
+                Key::Down => {
+                    ui.suggest = (sel + 1).min(list.len() - 1);
+                    suggested = true;
+                }
+                Key::Char('\t') => {
+                    ui.input = format!("/{} ", list[sel].name);
+                    ui.cursor = ui.input.chars().count();
+                    suggested = true;
+                }
+                Key::Esc => {
+                    ui.suggest_off = true;
+                    suggested = true;
+                }
+                Key::Enter => {
+                    ui.input = format!("/{}", list[sel].name);
+                    ui.cursor = ui.input.chars().count();
+                }
+                _ => {}
+            }
+        }
         match ui.dialog.take() {
             // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
             // detach key does in ssh dev: the session runs on, and the home comes back.
             _ if k == Key::Char(DETACH) => leave = true,
-            _ if chorded => {}
+            _ if chorded || suggested => {}
             Some(Dialog::Btw {
                 question,
                 answer,
@@ -729,6 +799,13 @@ impl App {
                 Key::End if ui.scroll > 0 => ui.scroll = 0,
                 k => edit(ui, k),
             },
+        }
+        // A changed prompt: the list starts again from its top, and shows again after Esc.
+        if let Screen::Conv { ui, .. } = &mut self.screen {
+            if ui.input != before {
+                ui.suggest = 0;
+                ui.suggest_off = false;
+            }
         }
         if leave {
             self.send(App::msg("close", vec![]));
@@ -928,6 +1005,15 @@ fn backslash_newline(ui: &mut Ui) -> bool {
     chars[at - 1] = '\n';
     ui.input = chars.into_iter().collect();
     true
+}
+
+/// The HTML entities claude's command descriptions carry (`&lt;duration&gt;`), as text.
+fn entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// A prompt an interrupt caught unanswered, back in the input as Claude Code hands it back:
@@ -1563,6 +1649,7 @@ impl App {
             wheel,
             working: None,
             pasting: None,
+            catalog: Vec::new(),
         };
         app.menu.remote = true;
         app

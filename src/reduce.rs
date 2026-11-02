@@ -1391,6 +1391,39 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_claude_takes_in_between_tool_calls_is_drawn_between_them() {
+        // The order 2.1.311 sent on 2026-11-02: a prompt queued during the first call is
+        // echoed after its result, and the same turn goes on to the next call.
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"sleep three times"},"isReplay":true}"#,
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 4"}}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":""}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":"Also say BANANA"},"isReplay":true}"#,
+                r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"sleep 4"}}]}}"#,
+            ],
+        );
+        let kinds: Vec<String> = wire(&o.ops)
+            .iter()
+            .filter(|l| l.contains(r#""t":"add""#) || l.contains(r#""t":"res""#))
+            .map(|l| {
+                let v = parse(l).unwrap();
+                format!(
+                    "{}:{}",
+                    v.get("t").and_then(Value::as_str).unwrap(),
+                    v.get("k").and_then(Value::as_str).unwrap_or("")
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["add:user", "add:tool", "res:", "add:user", "add:tool"]
+        );
+    }
+
+    #[test]
     fn a_question_waits_and_a_withdrawn_one_says_so() {
         let mut r = Reducer::new();
         let o = feed_all(

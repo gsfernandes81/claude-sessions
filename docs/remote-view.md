@@ -287,7 +287,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
      | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
-     | `models {m}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
+     | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
@@ -317,6 +317,18 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        to edit queued messages` — takes every waiting prompt back into it, a line each, and
        withdraws them from claude's queue; the turn runs on. Claude Code's Esc Esc rewind
        picker is not built.
+     - A prompt queued behind a turn of tool calls is taken in by claude between two of them,
+       on its own: 2.1.311 headless, as the holder runs it, echoes it and marks it `started`
+       after the call it waited behind, and the same turn answers it, as the TUI does. The
+       phone draws it where claude takes it, between the calls; nothing is sent for it.
+     - Typing a command's name, the **suggestion list** stands over the prompt as Claude
+       Code's does: claude's commands (`initialize`'s, with what each does, asked for when a
+       conversation opens) and the phone's, those that start with what is typed first, then
+       those that have it further in; the name in a column 40% of the width, what it does in
+       two lines at most, five lines of list at most, the chosen one `❯` and lavender. Up and
+       Down choose, Tab puts it in the prompt with its argument hint grey after it, Enter
+       sends it, Esc puts the list away. Claude Code also orders by what was used lately,
+       which the phone does not know.
      - A slash command claude or the phone knows is lavender in the prompt, wherever it is,
        as Claude Code draws it (`b1b9f9`, its `permission` colour); `/` before an unknown name
        is text. claude's commands come in the meta op's `sc`, from its init's `slash_commands`.

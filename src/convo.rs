@@ -976,6 +976,12 @@ pub struct Ui {
     /// Pastes standing in the prompt as `[Pasted text #N +L lines]`, by number, as Claude
     /// Code's are: put back whole when the prompt is sent.
     pub pastes: Vec<(u32, String)>,
+    /// claude's slash commands with what each does, for the suggestion list (`suggestions`).
+    pub catalog: Vec<Command>,
+    /// The suggestion list's selected entry, and whether Esc put the list away until the
+    /// prompt next changes.
+    pub suggest: usize,
+    pub suggest_off: bool,
 }
 
 impl Ui {
@@ -990,6 +996,9 @@ impl Ui {
             status: None,
             chord: false,
             pastes: Vec::new(),
+            catalog: Vec::new(),
+            suggest: 0,
+            suggest_off: false,
         }
     }
 }
@@ -1261,6 +1270,112 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     out
 }
 
+/// A slash command as the suggestion list shows it: its name without the `/`, what it does,
+/// and the argument hint drawn after it once chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub name: String,
+    pub about: String,
+    pub hint: String,
+}
+
+/// The commands this client serves that claude's list may not have, said as the phone does
+/// them.
+const CLIENT_ABOUT: [(&str, &str); 6] = [
+    (
+        "auto",
+        "Cycle the permission mode (shift+tab in Claude Code)",
+    ),
+    ("home", "Back to the home; the session keeps running"),
+    ("disconnect", "Back to the home; the session keeps running"),
+    ("expand", "Show every tool call with its result (ctrl+o)"),
+    ("quit", "End the session"),
+    ("btw", "Ask a side question without interrupting"),
+];
+
+/// What the suggestion list offers for the prompt now: while its first word is a `/` and the
+/// start of a name, claude's commands and this client's that start with it, then those that
+/// have it further in, each in claude's order. Nothing once a space is typed, in a dialog, or
+/// after Esc.
+pub fn suggestions(ui: &Ui) -> Vec<Command> {
+    let Some(query) = ui.input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if ui.suggest_off || ui.dialog.is_some() || query.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let mut all = ui.catalog.clone();
+    for (name, about) in CLIENT_ABOUT {
+        if !all.iter().any(|c| c.name == name) {
+            all.push(Command {
+                name: name.into(),
+                about: about.into(),
+                hint: String::new(),
+            });
+        }
+    }
+    let q = query.to_lowercase();
+    let (starts, rest): (Vec<Command>, Vec<Command>) = all
+        .into_iter()
+        .filter(|c| c.name.to_lowercase().contains(&q))
+        .partition(|c| c.name.to_lowercase().starts_with(&q));
+    starts.into_iter().chain(rest).collect()
+}
+
+/// The suggestion list, as Claude Code draws it over the prompt: the name in a column 40% of
+/// the width (cut from the left when long), what it does beside it in two lines at most, the
+/// chosen one `❯` and lavender, the rest grey; five lines at most, scrolled to the chosen one.
+fn suggest_lines(list: &[Command], sel: usize, w: usize) -> Vec<Line> {
+    const MOST: usize = 5;
+    let col = (w * 2 / 5).max(8);
+    let room = w.saturating_sub(4 + col + 2).max(8);
+    let entry = |c: &Command, chosen: bool| -> Vec<Line> {
+        let st = if chosen { fg(LAVENDER) } else { fg(GREY) };
+        let mut name = format!("/{}", c.name);
+        // Two spaces at least before what it does: a longer name keeps its end.
+        if width(&name) > col - 2 {
+            let keep = col - 3;
+            let tail: String = name.chars().skip(name.chars().count() - keep).collect();
+            name = format!("…{tail}");
+        }
+        let lead = if chosen { "  ❯ " } else { "    " };
+        let pad = " ".repeat(col - width(&name));
+        let about = c.about.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lines = wrap(&about, room);
+        let first = lines.first().cloned().unwrap_or_default();
+        let rest = lines[1.min(lines.len())..].join(" ");
+        let mut out = vec![line(format!("{lead}{name}{pad}{first}"), st)];
+        if !rest.is_empty() {
+            out.push(line(
+                format!("{}{}", " ".repeat(4 + col), cut(&rest, room)),
+                st,
+            ));
+        }
+        out
+    };
+    let sel = sel.min(list.len().saturating_sub(1));
+    // From the chosen one back, as many whole entries as fit; then on down while they fit.
+    let mut start = sel;
+    let mut used = entry(&list[sel], true).len();
+    while start > 0 {
+        let n = entry(&list[start - 1], false).len();
+        if used + n > MOST {
+            break;
+        }
+        used += n;
+        start -= 1;
+    }
+    let mut out = Vec::new();
+    for (i, c) in list.iter().enumerate().skip(start) {
+        let e = entry(c, i == sel);
+        if out.len() + e.len() > MOST {
+            break;
+        }
+        out.extend(e);
+    }
+    out
+}
+
 /// The slash commands this client serves itself (`client::submit`); claude's own come in its
 /// meta.
 pub const CLIENT_COMMANDS: [&str; 11] = [
@@ -1445,6 +1560,19 @@ fn input_box(c: &Convo, ui: &Ui, w: usize) -> (Vec<Line>, (usize, usize)) {
             }
         }
         out.push(l);
+    }
+    // A command chosen from the list, a space after it: its argument hint, grey, as Claude
+    // Code shows it.
+    if let Some(cmd) = ui.input.strip_prefix('/').and_then(|r| r.strip_suffix(' ')) {
+        let hint = ui
+            .catalog
+            .iter()
+            .find(|k| k.name == cmd)
+            .map(|k| k.hint.as_str());
+        if let (Some(hint), Some(l)) = (hint.filter(|h| !h.is_empty()), out.last_mut()) {
+            let room = w.saturating_sub(width(&plain(l)) + 2);
+            l.push((format!(" {}", cut(hint, room)), fg(GREY)));
+        }
     }
     if chars.is_empty() && c.pending.iter().any(|p| p.queued) {
         // What Claude Code says in an empty prompt with prompts waiting behind the turn.
@@ -1919,8 +2047,16 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
         }
         (Some(Dialog::Perm { sel }), Some(e @ Entry::Perm { .. })) => perm_dialog(e, *sel, w),
         _ => {
-            let (b, cur) = input_box(c, ui, w);
-            cursor = Some(cur);
+            // The suggestion list over the prompt, as Claude Code puts it.
+            let list = suggestions(ui);
+            let mut b = if list.is_empty() {
+                Vec::new()
+            } else {
+                suggest_lines(&list, ui.suggest, w)
+            };
+            let (boxed, cur) = input_box(c, ui, w);
+            cursor = Some((cur.0 + b.len(), cur.1));
+            b.extend(boxed);
             b
         }
     };
@@ -2672,6 +2808,177 @@ mod tests {
             (vec!["then lakes".into(), "and seas".into()], vec![a, b])
         );
         assert!(c.pending.is_empty());
+    }
+
+    #[test]
+    fn a_queued_prompt_taken_in_mid_turn_lands_between_the_tool_calls() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"user","x":"sleep three times"}"#,
+                r#"{"t":"st","s":"working"}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"Bash","a":"sleep 4"}"#,
+            ],
+        );
+        c.sent("Also say BANANA", Instant::now());
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"res","id":2,"ok":true,"p":[],"l":0}"#,
+                r#"{"t":"add","id":3,"k":"user","x":"Also say BANANA"}"#,
+                r#"{"t":"add","id":4,"k":"tool","n":"Bash","a":"sleep 4"}"#,
+            ],
+        );
+        assert!(c.pending.is_empty(), "taken in: no longer waiting");
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        let ran = got
+            .iter()
+            .position(|l| l.trim() == "Ran 1 shell command")
+            .unwrap();
+        let said = got.iter().position(|l| l == "❯ Also say BANANA").unwrap();
+        let running = got
+            .iter()
+            .position(|l| l.contains("Running 1 shell command"))
+            .unwrap();
+        assert!(ran < said && said < running, "{got:?}");
+        assert!(!got.iter().any(|l| l.contains("send now")));
+    }
+
+    fn catalog() -> Vec<Command> {
+        // As Claude Code 2.1.311 listed them for `/co` and `/` on 2026-11-02.
+        [
+            ("keepalive", "Use in a claude-sessions slot before you start or wait on something that will sit quiet", ""),
+            ("mail-send", "Use when you need to tell another session's agent something, ask it a question", ""),
+            ("copy", "Copy Claude's last response to clipboard (or /copy N for the Nth-latest)", ""),
+            ("color", "Set the prompt bar color for this session", "[red|blue|green|yellow|purple|orange|pink|cyan|default]"),
+            ("config", "Open settings", ""),
+            ("model", "Set the AI model for Claude Code (currently Haiku 5.5)", ""),
+            ("auto-mode-setup", "Teach auto mode about your environment, plus optional rule tweaks", ""),
+        ]
+        .iter()
+        .map(|(n, a, h)| Command {
+            name: n.to_string(),
+            about: a.to_string(),
+            hint: h.to_string(),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_suggestion_list_is_drawn_as_claude_codes_at_40_and_70() {
+        let list: Vec<Command> = catalog().into_iter().skip(2).take(3).collect();
+        let at = |w: usize, sel: usize| {
+            suggest_lines(&list, sel, w)
+                .iter()
+                .map(|l| plain(l).trim_end().to_string())
+                .collect::<Vec<_>>()
+        };
+        // Read off Claude Code's screen, `/co` typed.
+        assert_eq!(
+            at(40, 0),
+            [
+                "  ❯ /copy           Copy Claude's last",
+                "                    response to clipb…",
+                "    /color          Set the prompt bar",
+                "                    color for this se…",
+                "    /config         Open settings",
+            ]
+        );
+        assert_eq!(
+            at(70, 0),
+            [
+                "  ❯ /copy                       Copy Claude's last response to",
+                "                                clipboard (or /copy N for the Nth-l…",
+                "    /color                      Set the prompt bar color for this",
+                "                                session",
+                "    /config                     Open settings",
+            ]
+        );
+        // The chosen one lavender, the rest grey.
+        let lines = suggest_lines(&list, 1, 40);
+        assert_eq!(lines[0][0].1, fg(GREY));
+        assert_eq!(lines[2][0].1, fg(LAVENDER));
+        // Five lines at most, scrolled to the chosen one; a long name keeps its end.
+        let all = catalog();
+        let got: Vec<String> = suggest_lines(&all, 6, 40)
+            .iter()
+            .map(|l| plain(l).trim_end().to_string())
+            .collect();
+        assert!(got.len() <= 5, "{got:?}");
+        assert!(
+            got.iter().any(|l| l.starts_with("  ❯ …to-mode-setup  ")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn the_list_offers_what_starts_with_the_name_then_what_has_it() {
+        let mut ui = Ui::new();
+        ui.catalog = catalog();
+        let names = |ui: &Ui| {
+            suggestions(ui)
+                .into_iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        };
+        ui.input = "/mod".into();
+        assert_eq!(
+            names(&ui),
+            ["model", "auto-mode-setup"],
+            "as Claude Code's `/mod`"
+        );
+        ui.input = "/co".into();
+        assert_eq!(names(&ui), ["copy", "color", "config", "disconnect"]);
+        ui.input = "/exp".into();
+        assert_eq!(names(&ui), ["expand"], "the phone's own");
+        // A space ends it, Esc puts it away, a dialog has its own keys.
+        ui.input = "/co ".into();
+        assert!(names(&ui).is_empty());
+        ui.input = "/co".into();
+        ui.suggest_off = true;
+        assert!(names(&ui).is_empty());
+        ui.suggest_off = false;
+        ui.dialog = Some(Dialog::Effort { sel: 0 });
+        assert!(names(&ui).is_empty());
+        ui.input = "plain".into();
+        ui.dialog = None;
+        assert!(names(&ui).is_empty());
+    }
+
+    #[test]
+    fn the_list_sits_over_the_prompt_and_a_chosen_command_shows_its_hint() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let mut ui = Ui::new();
+        ui.catalog = catalog();
+        ui.input = "/co".into();
+        ui.cursor = 3;
+        let f = draw(&c, &ui, 40, 24, Instant::now());
+        let got = text(&f);
+        let at = got
+            .iter()
+            .position(|l| l == "  ❯ /copy           Copy Claude's last")
+            .unwrap();
+        assert!(
+            got[at + 5].starts_with("────"),
+            "the box's rule under the list: {got:?}"
+        );
+        assert_eq!(got[at + 6], "❯ /co");
+        assert_eq!(
+            f.cursor,
+            Some((at + 6, 5)),
+            "the cursor in the box, past the list"
+        );
+        ui.input = "/color ".into();
+        ui.cursor = 7;
+        let got = text(&draw(&c, &ui, 70, 24, Instant::now()));
+        assert!(
+            got.iter()
+                .any(|l| l == "❯ /color  [red|blue|green|yellow|purple|orange|pink|cyan|default]"),
+            "{got:?}"
+        );
     }
 
     #[test]

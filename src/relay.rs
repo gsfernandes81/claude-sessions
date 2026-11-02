@@ -630,7 +630,26 @@ fn models(body: &Value) -> Value {
             o
         })
         .collect();
-    msg("models", vec![("m", Value::Arr(list))])
+    // The slash commands too, for the prompt's suggestion list: name, description, argument
+    // hint. An older client reads `m` alone.
+    let commands = body
+        .get("commands")
+        .and_then(Value::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .map(|c| {
+            Value::Arr(
+                ["name", "description", "argumentHint"]
+                    .iter()
+                    .map(|k| Value::string(s(c, k).unwrap_or_default()))
+                    .collect(),
+            )
+        })
+        .collect();
+    msg(
+        "models",
+        vec![("m", Value::Arr(list)), ("c", Value::Arr(commands))],
+    )
 }
 
 // ── the pipes ───────────────────────────────────────────────────────────────
