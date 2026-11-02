@@ -83,10 +83,18 @@ to infra by agent mail on 2026-11-01. **A bump is a checklist**, run before the 
 The command line:
 
 ```sh
+CLAUDE_CODE_ENTRYPOINT=ssh-remote \
 claude -p --input-format stream-json --output-format stream-json --verbose \
   --include-partial-messages --permission-prompt-tool stdio \
   [--model M] [--effort L] [--resume ID | --session-id UUID]
 ```
+
+**`CLAUDE_CODE_ENTRYPOINT=ssh-remote`** is Claude Desktop's name for a claude it drives over
+ssh, which is what the holder's is. With `-p`'s own `sdk-cli`, headless claude leaves the
+Artifact tools out; with `ssh-remote` it lists `Artifact`, `ArtifactComments` and
+`ArtifactData`, and `list` answered (2.1.311, 2026-11-02; the owner found artifacts missing
+from remote sessions). `cli` leaves them out too; `claude-desktop` and `remote` add them as
+well, but name surfaces this is not.
 
 **`--permission-prompt-tool stdio` is required.** Without it, a tool that needs permission is
 denied on the spot (`system/permission_denied`, no request reaches the host), and

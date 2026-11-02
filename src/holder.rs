@@ -67,6 +67,13 @@ pub const HEADLESS: [&str; 10] = [
     "--replay-user-messages",
 ];
 
+/// What claude is told it is run by: Claude Desktop's own name for a claude it drives over ssh,
+/// which is what this is. Headless claude leaves the Artifact tools out for `sdk-cli`, the
+/// entrypoint `-p` gives itself, and offers them for this one (2.1.311, tried 2026-11-02:
+/// `Artifact`, `ArtifactComments` and `ArtifactData` listed, and `list` answered); the owner
+/// found artifacts missing from remote sessions.
+pub const ENTRYPOINT: &str = "ssh-remote";
+
 /// How long a tap has to say where it got to before the holder drops it.
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 
@@ -228,6 +235,7 @@ pub fn serve(
     let mut child: Child = Command::new(program)
         .args(HEADLESS)
         .args(args)
+        .env("CLAUDE_CODE_ENTRYPOINT", ENTRYPOINT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -595,7 +603,8 @@ mod tests {
             &p,
             "#!/bin/sh\n\
              while IFS= read -r l; do\n\
-               case \"$l\" in *quit*) exit 3;; esac\n\
+               case \"$l\" in *quit*) exit 3;; \
+                 *entrypoint*) printf '{\"ep\":\"%s\"}\\n' \"$CLAUDE_CODE_ENTRYPOINT\"; continue;; esac\n\
                printf '%s\\n' \"$l\"\n\
              done\n",
         )
@@ -743,6 +752,28 @@ mod tests {
         let mut rest = String::new();
         while b.read_line(&mut rest).unwrap() > 0 {}
         assert!(rest.ends_with(&format!("\t{}\n", inp(quit))), "{rest}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_is_run_as_one_driven_over_ssh_so_it_has_the_artifact_tools() {
+        let dir = scratch("entry");
+        let program = stand_in(&dir);
+        let paths = Paths {
+            sock: dir.join("s.sock"),
+            log: dir.join("s.log"),
+        };
+        let sock = paths.sock.clone();
+        let holder = std::thread::spawn(move || {
+            serve(&program, &[], &paths, None, "claude-9", &mut |_: &str| {}).unwrap()
+        });
+        let (mut a, mut a_out) = connect(&sock, 0, "");
+        line(&mut a);
+        a_out.write_all(b"{\"entrypoint\":1}\n").unwrap();
+        line(&mut a);
+        assert_eq!(line(&mut a), "2\t{\"ep\":\"ssh-remote\"}");
+        a_out.write_all(b"{\"quit\":1}\n").unwrap();
+        holder.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
