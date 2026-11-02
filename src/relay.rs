@@ -167,9 +167,9 @@ struct History {
 /// The first number a stretch of history's items take.
 const HISTORY_IDS: u64 = 1 << 40;
 
-/// How many screens the client is sent at once: on opening, and each time it scrolls near the
-/// top of what it has.
-const SCREENS: usize = 3;
+/// How many screens the client is sent at once: on opening, and each time it has fewer than
+/// its five screens above the view (`client.rs`'s `AHEAD`).
+const SCREENS: usize = 5;
 
 /// How many transcript lines to ask the holder for at a time (whole turns, so often more).
 const HISTORY_LINES: u64 = 40;
@@ -1601,7 +1601,7 @@ mod tests {
     #[test]
     fn a_lazy_client_gets_the_last_screens_then_older_ones_then_the_holders_history() {
         let mut r = relay();
-        // 40 columns, 5 rows: three screens is 15 rows, and a two-line reply takes 2.
+        // 40 columns, 5 rows: five screens is 25 rows, and a two-line reply takes 2.
         let fx = client(
             &mut r,
             r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":5}"#,
@@ -1650,7 +1650,7 @@ mod tests {
             ids
         };
         let fx = line(&mut r, epoch, 20, &reply(20));
-        assert_eq!(ids(&fx), (13..=20).collect::<Vec<_>>(), "{:?}", sent(&fx));
+        assert_eq!(ids(&fx), (8..=20).collect::<Vec<_>>(), "{:?}", sent(&fx));
         let said = sent(&fx);
         assert_eq!(said[said.len() - 2], r#"{"n":20,"t":"n"}"#);
         assert_eq!(said[said.len() - 1], r#"{"m":true,"t":"more"}"#);
@@ -1660,10 +1660,7 @@ mod tests {
         assert_eq!(ids(&fx), [21]);
         // Scrolled back: the stretch before, from what the relay kept, then the rest of it.
         let fx = client(&mut r, r#"{"t":"older"}"#);
-        assert_eq!(ids(&fx), (5..=12).collect::<Vec<_>>());
-        assert_eq!(sent(&fx).last().unwrap(), r#"{"m":true,"t":"more"}"#);
-        let fx = client(&mut r, r#"{"t":"older"}"#);
-        assert_eq!(ids(&fx), (1..=4).collect::<Vec<_>>());
+        assert_eq!(ids(&fx), (1..=7).collect::<Vec<_>>());
         assert_eq!(
             sent(&fx).last().unwrap(),
             r#"{"m":true,"t":"more"}"#,

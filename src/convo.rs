@@ -297,6 +297,21 @@ pub struct Convo {
     /// yet come (`old`).
     pub more: bool,
     pub asking: bool,
+    /// Counts every op applied and every stretch put in front: with the width and what the
+    /// client changes itself, what the transcript's layout is cached under.
+    changes: u64,
+    layout: std::cell::RefCell<Option<(LayoutKey, std::rc::Rc<Vec<Line>>)>>,
+}
+
+/// What the transcript's layout depends on, besides the time.
+#[derive(Debug, Clone, PartialEq)]
+struct LayoutKey {
+    changes: u64,
+    w: usize,
+    expanded: bool,
+    entries: usize,
+    hidden: usize,
+    state: String,
 }
 
 /// A prompt sent and not yet echoed.
@@ -363,6 +378,7 @@ impl Convo {
 
     /// `older`'s entries in front of these.
     fn prepend(&mut self, older: Convo) {
+        self.changes += 1;
         let k = older.entries.len();
         for at in self.index.values_mut() {
             *at += k;
@@ -424,6 +440,7 @@ impl Convo {
     }
 
     pub fn apply(&mut self, v: &Value, now: Instant) -> Applied {
+        self.changes += 1;
         let id = v.get("id").and_then(Value::as_u64).unwrap_or(0);
         match s(v, "t").as_str() {
             "add" => {
@@ -2055,8 +2072,58 @@ pub struct Frame {
 
 /// What a frame is made of: the transcript, what goes under it, the rows it has, and the
 /// line it starts at when not scrolled back.
+/// The transcript laid out, from the cache while nothing it depends on has changed: scrolling
+/// a long conversation laid it all out twice a wheel step, 50 ms each on a Pi, and Termux
+/// sends a step for every line a finger travels (owner, 2026-11-02: "stutter when flick
+/// scrolling in long conversations").
+fn laid_out(c: &Convo, w: usize) -> std::rc::Rc<Vec<Line>> {
+    let key = LayoutKey {
+        changes: c.changes,
+        w,
+        expanded: c.expanded,
+        entries: c.entries.len(),
+        hidden: c.hidden.len(),
+        state: c.state.clone(),
+    };
+    if let Some((k, lines)) = c.layout.borrow().as_ref() {
+        if *k == key {
+            return std::rc::Rc::clone(lines);
+        }
+    }
+    let lines = std::rc::Rc::new(transcript(c, w).0);
+    *c.layout.borrow_mut() = Some((key, std::rc::Rc::clone(&lines)));
+    lines
+}
+
+/// The transcript's lines, then the prompts on their way under them.
+struct Body {
+    laid: std::rc::Rc<Vec<Line>>,
+    extra: Vec<Line>,
+}
+
+impl Body {
+    fn len(&self) -> usize {
+        self.laid.len() + self.extra.len()
+    }
+
+    fn get(&self, i: usize) -> Option<&Line> {
+        self.laid
+            .get(i)
+            .or_else(|| self.extra.get(i.checked_sub(self.laid.len())?))
+    }
+
+    fn at(&self, i: usize) -> &Line {
+        self.get(i).expect("in range")
+    }
+
+    /// Lines `a..b`, cut to what there is, copied.
+    fn slice(&self, a: usize, b: usize) -> Vec<Line> {
+        (a..b.min(self.len())).map(|i| self.at(i).clone()).collect()
+    }
+}
+
 struct Parts {
-    body: Vec<Line>,
+    body: Body,
     bottom: Vec<Line>,
     spinner: Vec<Line>,
     cursor: Option<(usize, usize)>,
@@ -2066,15 +2133,20 @@ struct Parts {
 }
 
 fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
-    let (mut body, _) = transcript(c, w);
+    let mut body = Body {
+        laid: laid_out(c, w),
+        extra: Vec::new(),
+    };
     for p in &c.pending {
         let frame = now.saturating_duration_since(p.since).as_millis() / 120;
         let glyph = crate::ui::SPINNER[frame as usize % crate::ui::SPINNER.len()];
-        body.push(Vec::new());
-        body.extend(prompt_lines(&p.text, &format!("{glyph} "), w));
+        body.extra.push(Vec::new());
+        body.extra
+            .extend(prompt_lines(&p.text, &format!("{glyph} "), w));
         // One waiting behind a turn can go now, as Claude Code says under it.
         if p.queued {
-            body.push(line("  ctrl+x ctrl+s to send now", fg(GREY)));
+            body.extra
+                .push(line("  ctrl+x ctrl+s to send now", fg(GREY)));
         }
     }
     // The bottom: a dialog, or the input box.
@@ -2169,7 +2241,7 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
     let mut top: Vec<Line> = Vec::new();
     let total = body.len();
     if ui.scroll == 0 {
-        top.extend(body.iter().skip(start).take(room).cloned());
+        top.extend(body.slice(start, start + room));
     } else {
         // Scrolled back: the prompt this part answers pinned on top, the jump line under it.
         // The top moves back from where it sat at the bottom, one line a step: measured from
@@ -2179,11 +2251,11 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
         let start = start.saturating_sub(ui.scroll);
         let end = (start + content).min(total);
         // The prompt's first line, and `…` when it ran on.
-        let pinned = body[..start.min(total)]
-            .iter()
-            .rposition(|l| plain(l).starts_with("❯ "))
+        let pinned = (0..start.min(total))
+            .rev()
+            .find(|&i| plain(body.at(i)).starts_with("❯ "))
             .map(|i| {
-                let first = plain(&body[i]).trim_end().to_string();
+                let first = plain(body.at(i)).trim_end().to_string();
                 let more = body
                     .get(i + 1)
                     .is_some_and(|l| l.first().is_some_and(|r| r.1.bg == Some(BAND)));
@@ -2191,7 +2263,7 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
             })
             .unwrap_or_default();
         top.push(line(cut(&pinned, w), PLAIN));
-        top.extend(body[start..end].iter().cloned());
+        top.extend(body.slice(start, end));
         while top.len() < room.saturating_sub(2) {
             top.push(Vec::new());
         }
@@ -2719,6 +2791,34 @@ mod tests {
             ]
         );
         assert_eq!(f.cursor, Some((at + 3, 6)), "after the last word");
+    }
+
+    #[test]
+    fn the_cached_layout_follows_every_change_it_depends_on() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"tool","n":"Read","a":"a.txt"}"#,
+                r#"{"t":"add","id":2,"k":"text","x":"first"}"#,
+            ],
+        );
+        let shown = |c: &Convo, w: usize| text(&draw(c, &Ui::new(), w, 24, Instant::now()));
+        assert!(shown(&c, 40).iter().any(|l| l.contains("first")));
+        // An op, streamed or set.
+        feed(&mut c, &[r#"{"t":"app","id":2,"x":" and more"}"#]);
+        assert!(shown(&c, 40).iter().any(|l| l.contains("first and more")));
+        feed(&mut c, &[r#"{"t":"set","id":2,"x":"replaced"}"#]);
+        assert!(shown(&c, 40).iter().any(|l| l.contains("replaced")));
+        // What the client changes itself, and the width.
+        let folded = shown(&c, 40);
+        c.expanded = true;
+        assert_ne!(shown(&c, 40), folded);
+        assert_eq!(*laid_out(&c, 40), transcript(&c, 40).0);
+        assert_eq!(*laid_out(&c, 20), transcript(&c, 20).0, "the width");
+        c.hidden.insert(1);
+        assert!(!shown(&c, 40).iter().any(|l| l.contains("replaced")));
+        assert_eq!(*laid_out(&c, 40), transcript(&c, 40).0);
     }
 
     #[test]

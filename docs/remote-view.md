@@ -146,11 +146,20 @@ into its log, the tap streaming all of it to the hub, the relay reducing every l
 receiving every item — is gone.
 
 - **The phone** says its columns and rows (`w`, `r`) in `open`, `new` and `re`. It is sent
-  about three screens of rows, the newest, then `{"t":"more","m":…}`: whether anything is
-  before them. Scrolled to within a screen of the top of what it has, it sends `older`, once
-  until the answer, and gets `{"t":"old","o":[ops…]}`, the stretch before, drawn above what
-  it has; the view is measured from the bottom, so it does not move. Only at the very top,
-  before a stretch has come, does it stop, with `Loading earlier messages…` under the logo.
+  about five screens of rows, the newest, then `{"t":"more","m":…}`: whether anything is
+  before them. With fewer than five screens above the view, it sends `older`, once until the
+  answer, and gets `{"t":"old","o":[ops…]}`, five screens more, drawn above what it has; the
+  view is measured from the bottom, so it does not move. Five, not one, so a flick back
+  seldom reaches the top (owner, 2026-11-02). Only at the very top, before a stretch has
+  come, does it stop, with `Loading earlier messages…` under the logo.
+- **Scrolling lays nothing out.** The transcript's layout is cached until an op, a stretch, the
+  width, `/expand` or a rewind changes it, and a frame copies only the rows it shows. A flick
+  through a long conversation stuttered (owner, 2026-11-02): every wheel step laid out the
+  whole of it twice, 50 ms on a Pi for this conversation, and Termux sends a step for every
+  line a finger travels; cached, a step is 0.04 ms. The owner suggested keeping only five
+  screens each way on the phone; with the cache that is not needed for speed, and for memory
+  the whole of this 12 MB conversation is 313 KB of ops on the phone, so everything loaded is
+  kept.
 - **The relay** keeps every item with the ops that made it, a text's pieces folded into it and
   a result or progress replacing the one before, so any stretch can be sent as it now stands.
   Ops of items the phone has go on as before; of items it has not been sent, nowhere until

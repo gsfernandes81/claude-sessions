@@ -33,6 +33,8 @@ const ACK_WAIT: Duration = Duration::from_secs(5);
 /// long conversation's history into it can take many seconds, and the 5 that any other answer
 /// gets cut the link mid-open, which left the conversation opening for ever.
 const OPEN_WAIT: Duration = Duration::from_secs(60);
+/// How many screens above the view the client keeps loaded ahead of a scroll back.
+const AHEAD: usize = 5;
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
@@ -560,8 +562,8 @@ impl App {
         self.clip = Some(text);
     }
 
-    /// Scrolled to within a screen of the top of what has come, with more before it: the
-    /// next stretch is asked for, so it is there before the top is reached.
+    /// Fewer than `AHEAD` screens above the view, with more before them: the next stretch is
+    /// asked for, so a flick back seldom reaches the top of what has come (owner, 2026-11-02).
     fn want_older(&mut self) {
         if !self.up() {
             return;
@@ -579,7 +581,7 @@ impl App {
         }
         let (w, h) = size();
         let top = convo::max_scroll(c, ui, w, h);
-        if top.saturating_sub(ui.scroll) >= h {
+        if top.saturating_sub(ui.scroll) >= AHEAD * h {
             return;
         }
         c.asking = true;
