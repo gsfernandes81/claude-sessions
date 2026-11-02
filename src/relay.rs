@@ -125,6 +125,8 @@ struct Conv {
     reducer: Reducer,
     /// The id of an `initialize` sent for the client's model list.
     models_req: Option<String>,
+    /// What the client sent before the conversation was open (`action`), in its order.
+    held: Vec<(String, Value)>,
     pending: Vec<Op>,
     pending_n: u64,
     pending_since: Option<Instant>,
@@ -409,10 +411,14 @@ impl Relay {
             skip_to: 0,
             reducer: Reducer::new(),
             models_req: None,
+            held: Vec::new(),
             pending: Vec::new(),
             pending_n: 0,
             pending_since: None,
         });
+        // Answered at once: starting a holder and reading a long history into it takes
+        // seconds, and a client that hears nothing for 5 thinks the link dead.
+        out.push(Effect::Send(msg("opening", vec![])));
         out.push(Effect::Open {
             epoch: self.epoch,
             host,
@@ -457,6 +463,10 @@ impl Relay {
                 ],
             )));
             c.run = Some(run);
+            let held = std::mem::take(&mut c.held);
+            for (t, v) in held {
+                self.action(&t, &v, out);
+            }
             return;
         }
         let Some((n, body)) = line.split_once('\t') else {
@@ -471,6 +481,21 @@ impl Relay {
         if live {
             for line in fed.to_claude {
                 out.push(Effect::ToConv { epoch, line });
+            }
+        }
+        // claude refusing something this relay asked of it — a rename, a model — is said to the
+        // client, which would otherwise see nothing happen.
+        if live {
+            if let Msg::Response {
+                request_id,
+                ok: false,
+                body,
+            } = sdk::classify(&v)
+            {
+                if request_id.starts_with(&format!("rv{}-", std::process::id())) {
+                    let why = body.as_str().unwrap_or("claude refused it").to_string();
+                    out.push(err(&why));
+                }
             }
         }
         if c.models_req.is_some() {
@@ -504,8 +529,10 @@ impl Relay {
             out.push(err("no conversation is open"));
             return;
         };
+        // Still opening: held, and done the moment it is open, rather than refused. A refusal
+        // here once lost every prompt typed while a long conversation opened.
         if c.run.is_none() {
-            out.push(err("the conversation is still opening"));
+            c.held.push((t.to_string(), v.clone()));
             return;
         }
         let epoch = c.epoch;
@@ -1026,6 +1053,68 @@ mod tests {
             "{said:?}"
         );
         assert!(!said[0].contains("send_now"));
+    }
+
+    #[test]
+    fn what_is_sent_while_a_conversation_opens_waits_for_it_and_a_refusal_is_said() {
+        let mut r = relay();
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"}}"#,
+        );
+        // Answered at once, so a slow open does not look like a dead link.
+        assert_eq!(sent(&fx), [r#"{"t":"opening"}"#]);
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        // Typed before the holder answers: held, not refused.
+        let fx = client(
+            &mut r,
+            r#"{"t":"say","x":"held","u":"11111111-2222-4333-8444-555555555555"}"#,
+        );
+        assert!(fx.is_empty(), "{fx:?}");
+        let fx = client(&mut r, r#"{"t":"rename","x":"held title"}"#);
+        assert!(fx.is_empty(), "{fx:?}");
+        r.handle(
+            Input::Conv {
+                epoch,
+                line: r#"{"slot":"claude-3"}"#.into(),
+            },
+            Instant::now(),
+        );
+        let fx = r.handle(
+            Input::Conv {
+                epoch,
+                line: r#"{"next":1,"run":"run-1"}"#.into(),
+            },
+            Instant::now(),
+        );
+        let said = to_claude(&fx);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(
+            said[0].contains(r#""content":"held""#),
+            "in order: {said:?}"
+        );
+        // The rename before claude has said its session: no empty session_id to refuse.
+        assert!(said[1].contains(r#""subtype":"rename_session""#));
+        assert!(!said[1].contains("session_id"), "{said:?}");
+        // claude refusing something the relay asked: the client is told why.
+        let id = format!("rv{}-9", std::process::id());
+        let fx = line(
+            &mut r,
+            epoch,
+            1,
+            &format!(
+                r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"session_id is not the current session"}}}}"#
+            ),
+        );
+        assert!(
+            sent(&fx)
+                .iter()
+                .any(|l| l.contains("session_id is not the current session")),
+            "{:?}",
+            sent(&fx)
+        );
     }
 
     #[test]

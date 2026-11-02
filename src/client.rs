@@ -29,6 +29,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const ACK_WAIT: Duration = Duration::from_secs(5);
+/// How long an open may take before the link is thought dead: starting a holder and reading a
+/// long conversation's history into it can take many seconds, and the 5 that any other answer
+/// gets cut the link mid-open, which left the conversation opening for ever.
+const OPEN_WAIT: Duration = Duration::from_secs(60);
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
@@ -146,6 +150,13 @@ struct App {
     /// claude's slash commands with what each does, from `initialize` (the relay's `models`):
     /// asked for when a conversation opens, for its suggestion list.
     catalog: Vec<convo::Command>,
+    /// The request that is opening a conversation, until the relay says it is open: sent again
+    /// on a new link if the old one drops meanwhile, when that is safe (`dial`).
+    open_msg: Option<Value>,
+    /// What was sent to a conversation still opening, held until the relay says it is open:
+    /// before then the relay can do nothing with it, and a 0.13.5 relay refuses it, which this
+    /// client read as the open failing.
+    held: Vec<Value>,
     /// A selection dragged over the conversation, in screen cells: where the button went
     /// down, where it is now, and whether it has moved. Highlighted, and copied on release.
     select: Option<Selection>,
@@ -211,6 +222,25 @@ impl App {
                 self.wire = Some(w);
                 self.last_heard = now;
                 self.send(App::msg("hi", vec![("v", Value::num(1.0))]));
+                // Dropped while a conversation opened: the new link's relay knows nothing of it.
+                // Opening an existing one again is safe — a second open of a conversation the
+                // first started attaches to it — but a new one could start twice, so that goes
+                // home, where it is listed if it started.
+                if matches!(self.screen, Screen::Conv { opening: true, .. }) {
+                    match self.open_msg.clone() {
+                        Some(m) if m.get("t").and_then(Value::as_str) == Some("open") => {
+                            self.send(m);
+                        }
+                        _ => {
+                            self.open_msg = None;
+                            self.held.clear();
+                            self.home(Some(
+                                "the link dropped while it started: it is listed if it did".into(),
+                            ));
+                        }
+                    }
+                    return;
+                }
                 if let Screen::Conv { c, opening, .. } = &self.screen {
                     if !*opening && !c.slot.is_empty() {
                         let re = App::msg(
@@ -306,9 +336,14 @@ impl App {
                         .to_string();
                     *opening = false;
                 }
+                self.open_msg = None;
                 // The command list for the suggestion list, once per client.
                 if self.catalog.is_empty() {
                     self.send(App::msg("models", vec![]));
+                }
+                // And what was typed while it opened.
+                for v in std::mem::take(&mut self.held) {
+                    self.send(v);
                 }
             }
             "reset" => {
@@ -664,7 +699,9 @@ impl App {
                 .set_status(Some("not connected: try again once it is".into()));
             return;
         }
-        self.send(msg);
+        self.send(msg.clone());
+        self.open_msg = Some(msg);
+        self.held.clear();
         let mut ui = Ui::new();
         ui.status = Some("Opening…".into());
         ui.catalog = self.catalog.clone();
@@ -904,6 +941,12 @@ impl App {
                     }
                 }
             }
+            return;
+        }
+        // A conversation still opening takes nothing yet: what was typed waits, spinning, and
+        // goes the moment it is open.
+        if matches!(self.screen, Screen::Conv { opening: true, .. }) {
+            self.held.extend(out);
             return;
         }
         for v in out {
@@ -1855,6 +1898,16 @@ impl App {
         Ok(())
     }
 
+    /// How long something sent may go unanswered before the link is thought dead: longer while
+    /// a conversation opens.
+    fn ack_wait(&self) -> Duration {
+        if matches!(self.screen, Screen::Conv { opening: true, .. }) {
+            OPEN_WAIT
+        } else {
+            ACK_WAIT
+        }
+    }
+
     /// When the screen next changes by itself: the spinner, the seconds while down, a retry.
     fn next_wake(&self, now: Instant) -> Option<Duration> {
         let mut at: Option<Instant> = self.retry_at;
@@ -1876,7 +1929,7 @@ impl App {
             soon(now + SPIN_EVERY);
         }
         if let Some(a) = self.awaiting {
-            soon(a + ACK_WAIT);
+            soon(a + self.ack_wait());
         }
         at.map(|a| a.saturating_duration_since(now))
     }
@@ -1932,6 +1985,8 @@ impl App {
             pasting: None,
             catalog: Vec::new(),
             select: None,
+            held: Vec::new(),
+            open_msg: None,
         };
         app.menu.remote = true;
         app
@@ -1995,7 +2050,7 @@ pub fn run(name: &str) -> Result<(), String> {
                 _ => {}
             }
         }
-        if app.awaiting.is_some_and(|a| now >= a + ACK_WAIT) {
+        if app.awaiting.is_some_and(|a| now >= a + app.ack_wait()) {
             app.link_down(now);
         }
         if app.retry_at.is_some_and(|r| now >= r) {

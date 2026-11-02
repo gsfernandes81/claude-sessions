@@ -726,17 +726,17 @@ pub fn set_effort(request_id: &str, level: Option<&str>) -> Value {
 /// `session_id` makes claude refuse it if the process has moved to another conversation
 /// since (a `/clear`), rather than rename the wrong one.
 pub fn rename(request_id: &str, title: &str, session_id: &str) -> Value {
-    control(
-        request_id,
-        subtype(
-            "rename_session",
-            vec![
-                ("title", Value::string(title)),
-                ("source", Value::string("host")),
-                ("session_id", Value::string(session_id)),
-            ],
-        ),
-    )
+    let mut fields = vec![
+        ("title", Value::string(title)),
+        ("source", Value::string("host")),
+    ];
+    // Only when known: headless claude says its session in `init`, which comes with its first
+    // reply, and refuses an empty one ("session_id is not the current session"). The field is
+    // optional, and without it the rename is for the session claude runs.
+    if !session_id.is_empty() {
+        fields.push(("session_id", Value::string(session_id)));
+    }
+    control(request_id, subtype("rename_session", fields))
 }
 
 pub fn interrupt(request_id: &str) -> Value {

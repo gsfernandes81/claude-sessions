@@ -302,7 +302,16 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
      backoff from 1 to 30 seconds; dead too when something sent has no answer in 5 seconds,
      and a key after 2 minutes of silence sends a `ping` first. Back up, it says `hi` and,
-     with a conversation open, `re`.
+     with a conversation open, `re`. An open waits 60 seconds, not 5,
+     and the relay answers it at once with `opening`: starting a holder and reading a long
+     conversation's history into it takes seconds, and until 0.13.6 the 5-second wait cut the
+     link mid-open, the new link's relay knew nothing of the conversation, and every prompt
+     typed into it was refused (owner, 2026-11-02, on this very conversation). What is typed
+     while a conversation opens waits, spinning, in the client and in the relay, and goes the
+     moment it is open; a link that drops mid-open opens the conversation again, or for a new
+     session goes home, where it is listed if it started, rather than start a second. A
+     rename before claude has said its session leaves `session_id` out, which claude reads as
+     its own, and a request claude refuses is said to the client.
    - **Esc, send-now and pastes, as Claude Code 2.1.311 does them** — driven in a pty and
      read off its screen on 2026-11-02, since the owner asked for its behaviour:
      - Esc on a prompt nothing has answered yet — still spinning, or taken in and thinking —
