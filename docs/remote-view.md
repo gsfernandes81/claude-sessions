@@ -337,13 +337,15 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        `[Pasted text #N +L lines]`, L its line breaks; Backspace after one takes it whole, and
        sending puts each back. A shorter one goes in as itself, tabs as four spaces.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
-     Ctrl-U; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
+     Ctrl-U; Ctrl or Alt with Left or Right a word at a time, back to a word's start and on to
+     its end, as Claude Code's prompt goes; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
      no row starts with one, as editors and Claude Code do; `\` then Enter is a newline, as in Claude Code; Up and Down move between the prompt's rows, and off its top or bottom row step through what
      was sent, keeping what was being typed: Down past the newest gives it back, as Claude Code
      does (read off its screen on 2026-11-02); PageUp and PageDown scroll ten lines and a wheel report one, since Termux
      sends a report for every line a finger travels, or three under Windows Terminal
      (`WT_SESSION` set, `TERMUX_VERSION` not), which sends one a notch; End or Esc goes back down. Scrolled
-     back, the top moves from where it sat at the bottom, a line a step; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
+     back, the top moves from where it sat at the bottom, a line a step, and stays on what it shows
+     while lines arrive under it; back at the bottom it follows them again; Esc interrupts a turn; Ctrl-C clears the prompt, and on an
      empty one goes home, as `/home` and Ctrl-D do. **Ctrl+\\ and `/disconnect`** go home from
      anywhere in a conversation, a dialog open or not, the session left running, as zmx's
      detach key does in `ssh dev`; Ctrl+\\ on the home quits the client. `/model`,

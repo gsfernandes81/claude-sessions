@@ -386,16 +386,24 @@ fn parse_csi(b: &[u8]) -> Parsed {
     {
         return Parsed::Drop(len);
     }
-    // Modifiers ride in a second parameter (`ESC [ 1 ; 5 A` is Ctrl-Up); a modified arrow is
-    // still that arrow.
-    let first = params
-        .split(|&p| p == b';')
+    // Modifiers ride in a second parameter (`ESC [ 1 ; 5 A` is Ctrl-Up), xterm's 1 plus Shift
+    // 1, Alt 2, Ctrl 4. A modified arrow is still that arrow, but Left or Right with Ctrl or Alt
+    // is a word, as in Claude Code.
+    let mut fields = params.split(|&p| p == b';').map(|p| {
+        std::str::from_utf8(p)
+            .ok()
+            .and_then(|p| p.parse::<u32>().ok())
+    });
+    let first = fields.next().flatten();
+    let word = fields
         .next()
-        .and_then(|p| std::str::from_utf8(p).ok())
-        .and_then(|p| p.parse::<u32>().ok());
+        .flatten()
+        .is_some_and(|m| m > 1 && (m - 1) & 0b110 != 0);
     let key = match fin {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
+        b'C' if word => Some(Key::WordRight),
+        b'D' if word => Some(Key::WordLeft),
         b'C' => Some(Key::Right),
         b'D' => Some(Key::Left),
         b'H' => Some(Key::Home),
@@ -1095,9 +1103,14 @@ mod tests {
         assert_eq!(decode(b"\x1b[C\x1b[D"), vec![Key::Right, Key::Left]);
         assert_eq!(decode(b"\x1bOC\x1bOD"), vec![Key::Right, Key::Left]);
         assert_eq!(
-            decode(b"\x1b[1;5D"),
-            vec![Key::Left],
-            "a modified arrow is the arrow"
+            decode(b"\x1b[1;2D\x1b[1;2A"),
+            vec![Key::Left, Key::Up],
+            "a Shift-modified arrow is the arrow"
+        );
+        assert_eq!(
+            decode(b"\x1b[1;5D\x1b[1;3C\x1b[1;7D\x1b[1;5A"),
+            vec![Key::WordLeft, Key::WordRight, Key::WordLeft, Key::Up],
+            "Ctrl or Alt with Left or Right is a word; with Up, still Up"
         );
         assert_eq!(decode(b"\x1b[3~"), vec![Key::Delete]);
     }

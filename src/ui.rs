@@ -343,6 +343,10 @@ pub enum Key {
     WheelDown,
     /// The window changed size.
     Resize,
+    /// Ctrl (or Alt) with Left or Right: a word at a time in the remote view's prompt, as in
+    /// Claude Code. The menu has no use for them.
+    WordLeft,
+    WordRight,
     /// A bracketed paste begins: what follows, to [`Key::PasteEnd`], is pasted text — each
     /// character a `Char`, a line break `Char('\n')`, never `Enter`. Only the phone client
     /// asks the terminal for bracketed paste (`?2004`), so the menu never sees one.

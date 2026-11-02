@@ -412,6 +412,10 @@ impl App {
             _ => {
                 // The conversation's ops.
                 if let Screen::Conv { c, ui, .. } = &mut self.screen {
+                    // Scrolled back, the view stays on what it shows while lines arrive under
+                    // it; at the bottom it follows them.
+                    let (w, h) = term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize));
+                    let held = (ui.scroll > 0).then(|| convo::max_scroll(c, ui, w, h));
                     match c.apply(&v, now) {
                         Applied::TurnEnded(d) => c.local(Entry::Worked(format!(
                             "Worked for {} · done {}",
@@ -422,6 +426,9 @@ impl App {
                         Applied::Nothing => {}
                     }
                     follow_prompts(c, ui);
+                    if let Some(before) = held {
+                        ui.scroll = hold_scroll(ui.scroll, before, convo::max_scroll(c, ui, w, h));
+                    }
                 }
             }
         }
@@ -847,6 +854,17 @@ impl App {
 }
 
 /// A prompt or question has arrived, or been answered elsewhere: open or close its dialog.
+/// The scroll that keeps the same lines on screen when the bottom of the transcript moved from
+/// `before` to `after` lines: as many more lines back as arrived, fewer as went. Never past
+/// the top, and not back to following unless the lines it showed are gone.
+fn hold_scroll(scroll: usize, before: usize, after: usize) -> usize {
+    if after == 0 {
+        return 0;
+    }
+    let moved = scroll as i64 + after as i64 - before as i64;
+    moved.clamp(1, after as i64) as usize
+}
+
 fn follow_prompts(c: &Convo, ui: &mut Ui) {
     let waiting = c.waiting();
     match (&ui.dialog, waiting) {
@@ -1143,6 +1161,10 @@ fn expand_pastes(input: &str, pastes: &[(u32, String)]) -> String {
     out
 }
 
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 fn edit(ui: &mut Ui, k: Key) {
     let mut chars: Vec<char> = ui.input.chars().collect();
     let at = ui.cursor.min(chars.len());
@@ -1171,6 +1193,28 @@ fn edit(ui: &mut Ui, k: Key) {
             chars.remove(at);
         }
         Key::Left => ui.cursor = at.saturating_sub(1),
+        // A word at a time, as Claude Code's prompt: back to the start of a word, on to the
+        // end of one, a word being letters, digits and `_`.
+        Key::WordLeft => {
+            let mut i = at;
+            while i > 0 && !is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word(chars[i - 1]) {
+                i -= 1;
+            }
+            ui.cursor = i;
+        }
+        Key::WordRight => {
+            let mut i = at;
+            while i < chars.len() && !is_word(chars[i]) {
+                i += 1;
+            }
+            while i < chars.len() && is_word(chars[i]) {
+                i += 1;
+            }
+            ui.cursor = i;
+        }
         Key::Right => ui.cursor = (at + 1).min(chars.len()),
         Key::Home | Key::Char('\x01') => ui.cursor = 0,
         Key::End | Key::Char('\x05') => ui.cursor = chars.len(),
@@ -1802,6 +1846,79 @@ pub fn run(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn scrolled_back_the_view_holds_while_lines_arrive_and_follows_at_the_bottom() {
+        let mut c = Convo::new("h", "s", "r");
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let add = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        for o in [r#"{"t":"add","id":1,"k":"user","x":"count"}"#, add.as_str()] {
+            c.apply(&parse(o).unwrap(), Instant::now());
+        }
+        let mut ui = Ui::new();
+        ui.scroll = 10;
+        let shown = |c: &Convo, ui: &Ui| convo::draw(c, ui, 40, 24, Instant::now()).lines;
+        let before_view = shown(&c, &ui);
+        let before = convo::max_scroll(&c, &ui, 40, 24);
+        c.apply(
+            &parse(r#"{"t":"add","id":3,"k":"text","x":"more\nand more\nand more"}"#).unwrap(),
+            Instant::now(),
+        );
+        ui.scroll = hold_scroll(ui.scroll, before, convo::max_scroll(&c, &ui, 40, 24));
+        assert_eq!(
+            shown(&c, &ui),
+            before_view,
+            "the same lines, though four arrived"
+        );
+        // At the bottom it follows.
+        let mut ui = Ui::new();
+        let bottom = shown(&c, &ui);
+        c.apply(
+            &parse(r#"{"t":"add","id":4,"k":"text","x":"newest"}"#).unwrap(),
+            Instant::now(),
+        );
+        ui.scroll = 0;
+        assert_ne!(shown(&c, &ui), bottom);
+        assert_eq!(
+            hold_scroll(3, 10, 0),
+            0,
+            "nothing left to scroll: following"
+        );
+    }
+
+    #[test]
+    fn ctrl_or_alt_with_an_arrow_goes_a_word_as_claude_codes_prompt_does() {
+        let mut d = term::Decoder::new();
+        assert_eq!(
+            d.feed(b"\x1b[1;5D\x1b[1;5C\x1b[1;3D\x1b[1;2D\x1b[D"),
+            [
+                Key::WordLeft,
+                Key::WordRight,
+                Key::WordLeft,
+                Key::Left,
+                Key::Left
+            ]
+        );
+        // As Claude Code 2.1.311 moved on `alpha beta  gamma` on 2026-11-02.
+        let mut ui = Ui::new();
+        ui.input = "alpha beta  gamma".into();
+        ui.cursor = 17;
+        let mut at = |ui: &mut Ui, k: Key| {
+            edit(ui, k);
+            ui.cursor
+        };
+        assert_eq!(at(&mut ui, Key::WordLeft), 12);
+        assert_eq!(at(&mut ui, Key::WordLeft), 6);
+        assert_eq!(at(&mut ui, Key::WordLeft), 0);
+        assert_eq!(at(&mut ui, Key::WordLeft), 0);
+        assert_eq!(at(&mut ui, Key::WordRight), 5);
+        assert_eq!(at(&mut ui, Key::WordRight), 10);
+        assert_eq!(at(&mut ui, Key::WordRight), 17);
+        assert_eq!(at(&mut ui, Key::WordRight), 17);
+    }
 
     #[test]
     fn up_and_down_keep_what_was_being_typed_as_claude_code_does() {
