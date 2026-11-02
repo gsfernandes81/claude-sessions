@@ -125,6 +125,10 @@ struct Conv {
     reducer: Reducer,
     /// The id of an `initialize` sent for the client's model list.
     models_req: Option<String>,
+    /// A `/rc` sent to claude: its id and whether it turns Remote Control on; and whether it
+    /// is on, as claude last said (`bridge_state`, or the answer to one).
+    rc_req: Option<(String, bool)>,
+    rc_on: bool,
     /// What the client sent before the conversation was open (`action`), in its order.
     held: Vec<(String, Value)>,
     pending: Vec<Op>,
@@ -581,6 +585,8 @@ impl Relay {
             skip_to: 0,
             reducer: Reducer::new(),
             models_req: None,
+            rc_req: None,
+            rc_on: false,
             held: Vec::new(),
             pending: Vec::new(),
             pending_n: 0,
@@ -695,6 +701,34 @@ impl Relay {
                 if request_id.starts_with(&format!("rv{}-", std::process::id())) {
                     let why = body.as_str().unwrap_or("claude refused it").to_string();
                     out.push(err(&why));
+                }
+            }
+        }
+        if v.get("type").and_then(Value::as_str) == Some("system")
+            && v.get("subtype").and_then(Value::as_str) == Some("bridge_state")
+        {
+            c.rc_on = !matches!(
+                v.get("state").and_then(Value::as_str),
+                Some("disconnected" | "off" | "failed" | "error")
+            );
+        }
+        if let Some((rc_id, on)) = c.rc_req.clone() {
+            if let Msg::Response {
+                request_id,
+                ok,
+                body,
+            } = sdk::classify(&v)
+            {
+                if request_id == rc_id {
+                    c.rc_req = None;
+                    if ok {
+                        c.rc_on = on;
+                        let mut m = msg("rc", vec![("on", Value::Bool(on))]);
+                        if let Some(url) = s(&body, "session_url") {
+                            m.set("x", Value::string(url));
+                        }
+                        out.push(Effect::Send(m));
+                    }
                 }
             }
         }
@@ -839,6 +873,13 @@ impl Relay {
                     input: s(v, "x").unwrap_or_default(),
                 });
             }
+            // `/rc`: on, or off when it is on, as Claude Code's toggles.
+            "rc" => {
+                let on = !c.rc_on;
+                c.rc_req = Some((id.clone(), on));
+                let title = c.reducer.meta().title.clone();
+                to(sdk::remote_control(&id, on, &title));
+            }
             "esc" => to(sdk::interrupt(&id)),
             "exit" => to(sdk::end_session(&id)),
             "models" => {
@@ -883,6 +924,24 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
         )));
     }
     out.push(more(c));
+    // Prompts sent, by this client before it reconnected or by another, that claude has not
+    // echoed: a queued one is echoed only when the turn takes it in, and until then the
+    // client showed the turn working and nothing of the prompt (owner, 2026-11-02).
+    let waiting: Vec<Value> = c
+        .reducer
+        .waiting_prompts()
+        .into_iter()
+        .map(|(u, x, q)| {
+            let mut p = Value::obj();
+            p.set("u", Value::string(u));
+            p.set("x", Value::string(x));
+            p.set("q", Value::Bool(q));
+            p
+        })
+        .collect();
+    if !waiting.is_empty() {
+        out.push(Effect::Send(msg("wait", vec![("p", Value::Arr(waiting))])));
+    }
 }
 
 /// Whether there is anything before what the client has.
@@ -1681,6 +1740,86 @@ mod tests {
         assert_eq!(said.last().unwrap(), r#"{"m":false,"t":"more"}"#);
         let fx = client(&mut r, r#"{"t":"older"}"#);
         assert_eq!(sent(&fx), [r#"{"m":false,"t":"more"}"#]);
+    }
+
+    #[test]
+    fn rc_turns_remote_control_on_with_its_link_and_off_again() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let fx = client(&mut r, r#"{"t":"rc"}"#);
+        let said = to_claude(&fx);
+        assert!(
+            said[0].contains(r#""subtype":"remote_control""#),
+            "{said:?}"
+        );
+        assert!(said[0].contains(r#""enabled":true"#), "{said:?}");
+        let id = parse(&said[0])
+            .unwrap()
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        // As 2.1.311 answered it on 2026-11-02.
+        let fx = line(
+            &mut r,
+            epoch,
+            1,
+            &format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"session_url":"https://claude.ai/code/session_x","bridge_session_id":"cse_x"}}}}}}"#
+            ),
+        );
+        assert!(
+            sent(&fx).contains(
+                &r#"{"on":true,"t":"rc","x":"https://claude.ai/code/session_x"}"#.to_string()
+            ),
+            "{:?}",
+            sent(&fx)
+        );
+        let said = to_claude(&client(&mut r, r#"{"t":"rc"}"#));
+        assert!(said[0].contains(r#""enabled":false"#), "{said:?}");
+    }
+
+    #[test]
+    fn a_client_that_connects_is_told_of_prompts_still_on_their_way() {
+        let mut r = relay();
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":10}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let conv = |r: &mut Relay, l: &str| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: l.into(),
+                },
+                Instant::now(),
+            )
+        };
+        conv(&mut r, r#"{"slot":"claude-3"}"#);
+        conv(&mut r, r#"{"next":3,"run":"run-1"}"#);
+        let u = "aaaaaaaa-1111-4111-8111-111111111111";
+        line(
+            &mut r,
+            epoch,
+            1,
+            &format!(
+                r#"{{"type":"_in","line":{}}}"#,
+                json::to_line(&sdk::prompt("then this", u))
+            ),
+        );
+        let fx = line(
+            &mut r,
+            epoch,
+            2,
+            &format!(r#"{{"type":"command_lifecycle","command_uuid":"{u}","state":"queued"}}"#),
+        );
+        assert_eq!(
+            sent(&fx).last().unwrap(),
+            &format!(r#"{{"p":[{{"q":true,"u":"{u}","x":"then this"}}],"t":"wait"}}"#)
+        );
     }
 
     #[test]

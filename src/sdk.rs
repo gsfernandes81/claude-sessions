@@ -784,6 +784,16 @@ pub fn rename(request_id: &str, title: &str, session_id: &str) -> Value {
     control(request_id, subtype("rename_session", fields))
 }
 
+/// `/rc`, Claude Code's `/remote-control`: the session reachable from claude.ai/code and the
+/// Claude app, or not. Answered with `session_url` when on (2.1.311, tried 2026-11-02).
+pub fn remote_control(request_id: &str, enabled: bool, name: &str) -> Value {
+    let mut fields = vec![("enabled", Value::Bool(enabled))];
+    if enabled && !name.is_empty() {
+        fields.push(("name", Value::string(name)));
+    }
+    control(request_id, subtype("remote_control", fields))
+}
+
 pub fn interrupt(request_id: &str) -> Value {
     control(request_id, subtype("interrupt", vec![]))
 }

@@ -160,6 +160,12 @@ receiving every item — is gone.
   screens each way on the phone; with the cache that is not needed for speed, and for memory
   the whole of this 12 MB conversation is 313 KB of ops on the phone, so everything loaded is
   kept.
+- **Prompts on their way.** A prompt sent while a turn runs is echoed only when the turn
+  takes it in, so a view that connects meanwhile — the same phone after a disconnect, or
+  another — saw the turn working and nothing of the prompt (owner, 2026-11-02). The relay
+  knows it from the log (`_in` and claude's `command_lifecycle`) and, with the end of the log,
+  sends `{"t":"wait","p":[{"u","x","q"}]}`: each prompt not yet echoed, which the view draws
+  as its own, spinning, until claude echoes it.
 - **The relay** keeps every item with the ops that made it, a text's pieces folded into it and
   a result or progress replacing the one before, so any stretch can be sent as it now stands.
   Ops of items the phone has go on as before; of items it has not been sent, nowhere until
@@ -434,7 +440,13 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      Claude Code's: its claude is the conversation forked unsaved, with no tools, no hooks
      and no MCP servers, on the conversation's model, in the slot's directory, given two
      minutes, and refused when the container has no room for another claude. Anything
-     else, `/compact` and `/usage` included, is claude's. Claude echoes a command it runs
+     else, `/compact` and `/usage` included, is claude's. **`/rc`** (or `/remote-control`)
+     is Claude Code's: headless claude's `remote_control` request turns it on and answers
+     with the session's claude.ai/code link, which the view says in the transcript
+     (`Remote Control active · <link>`) and copies, to open in the Claude app, where a
+     screenshot can be attached (owner, 2026-11-02); again, it turns it off. Whether it is on
+     comes from claude's own answers and its `bridge_state` lines, so a relay that
+     reconnects knows. Claude echoes a command it runs
      itself in a `<command-name>` wrapper, after its reply: the view draws it as typed, its
      reply under it. A background task's `<task-notification>`, which claude hands the model
      as a prompt, is drawn as its summary, grey under `⎿`, not as its markup.

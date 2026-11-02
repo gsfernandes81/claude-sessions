@@ -622,6 +622,22 @@ impl Convo {
                         .collect(),
                 };
             }
+            // Prompts on their way that this view did not see sent, or no longer remembers:
+            // drawn as its own would be, until claude echoes them.
+            "wait" => {
+                for p in v.get("p").and_then(Value::as_arr).unwrap_or(&[]) {
+                    let uuid = s(p, "u");
+                    if self.pending.iter().any(|q| q.uuid == uuid) {
+                        continue;
+                    }
+                    self.pending.push(Pending {
+                        text: s(p, "x"),
+                        since: now,
+                        queued: p.get("q").and_then(Value::as_bool) == Some(true),
+                        uuid,
+                    });
+                }
+            }
             "more" => {
                 self.more = v.get("m").and_then(Value::as_bool) == Some(true);
                 self.asking = false;
@@ -1337,7 +1353,7 @@ pub struct Command {
 
 /// The commands this client serves that claude's list may not have, said as the phone does
 /// them.
-const CLIENT_ABOUT: [(&str, &str); 11] = [
+const CLIENT_ABOUT: [(&str, &str); 13] = [
     ("model", "Set the AI model for Claude Code"),
     ("effort", "Set the effort level"),
     ("rename", "Rename the conversation"),
@@ -1355,6 +1371,14 @@ const CLIENT_ABOUT: [(&str, &str); 11] = [
     ("expand", "Show every tool call with its result (ctrl+o)"),
     ("quit", "End the session"),
     ("btw", "Ask a side question without interrupting"),
+    (
+        "remote-control",
+        "Control this session from your phone or claude.ai/code",
+    ),
+    (
+        "rc",
+        "Control this session from your phone or claude.ai/code",
+    ),
 ];
 
 /// What the suggestion list offers for the prompt now: while its first word is a `/` and the
@@ -1442,7 +1466,7 @@ fn suggest_lines(list: &[Command], sel: usize, w: usize) -> Vec<Line> {
 
 /// The slash commands this client serves itself (`client::submit`); claude's own come in its
 /// meta.
-pub const CLIENT_COMMANDS: [&str; 11] = [
+pub const CLIENT_COMMANDS: [&str; 13] = [
     "model",
     "effort",
     "auto",
@@ -1454,6 +1478,8 @@ pub const CLIENT_COMMANDS: [&str; 11] = [
     "expand",
     "btw",
     "copy",
+    "rc",
+    "remote-control",
 ];
 
 /// Where `chars` names a slash command: `/` at the start or after whitespace, then a name
@@ -2794,6 +2820,28 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_on_its_way_from_before_a_reconnect_is_drawn_until_echoed() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"st","s":"working"}"#,
+                r#"{"t":"wait","p":[{"u":"u1","x":"then this","q":true}]}"#,
+                r#"{"t":"wait","p":[{"u":"u1","x":"then this","q":true}]}"#,
+            ],
+        );
+        assert_eq!(c.pending.len(), 1, "once, however often it is said");
+        let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
+        let at = got.iter().position(|l| l.ends_with("then this")).unwrap();
+        assert_eq!(got[at + 1], "  ctrl+x ctrl+s to send now");
+        feed(
+            &mut c,
+            &[r#"{"t":"add","id":1,"k":"user","x":"then this"}"#],
+        );
+        assert!(c.pending.is_empty());
+    }
+
+    #[test]
     fn the_cached_layout_follows_every_change_it_depends_on() {
         let mut c = convo();
         feed(
@@ -3162,7 +3210,10 @@ mod tests {
             "as Claude Code's `/mod`"
         );
         ui.input = "/co".into();
-        assert_eq!(names(&ui), ["copy", "color", "config", "disconnect"]);
+        assert_eq!(
+            names(&ui),
+            ["copy", "color", "config", "disconnect", "remote-control"]
+        );
         ui.input = "/exp".into();
         assert_eq!(names(&ui), ["expand"], "the phone's own");
         // A space ends it, Esc puts it away, a dialog has its own keys.

@@ -459,6 +459,24 @@ impl App {
                     }
                 }
             }
+            // `/rc` done: said in the transcript, as Claude Code says it, its link copied to open
+            // in the Claude app.
+            "rc" => {
+                if let Screen::Conv { c, ui, .. } = &mut self.screen {
+                    let on = v.get("on").and_then(Value::as_bool) == Some(true);
+                    let url = v.get("x").and_then(Value::as_str).unwrap_or("");
+                    if on {
+                        c.local(Entry::Note(format!("Remote Control active · {url}")));
+                        if !url.is_empty() {
+                            ui.status = Some(copied(url));
+                            self.clip = Some(url.to_string());
+                        }
+                    } else {
+                        c.local(Entry::Note("Remote Control disconnected.".into()));
+                        ui.status = None;
+                    }
+                }
+            }
             "pong" | "full" => {}
             _ => {
                 // The conversation's ops.
@@ -1103,6 +1121,12 @@ fn submit(
         "/expand" => {
             c.expanded = !c.expanded;
             Submit::Nothing
+        }
+        // Claude Code's `/remote-control`: the session reachable from the Claude app, where a
+        // screenshot can be attached; again, it is turned off.
+        "/rc" | "/remote-control" => {
+            ui.status = Some("Remote Control…".into());
+            Submit::Send(vec![m("rc", vec![])])
         }
         "/btw" if rest.is_empty() => {
             ui.status = Some("/btw takes a question".into());

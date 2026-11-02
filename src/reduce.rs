@@ -159,6 +159,8 @@ pub struct Reducer {
     /// Prompts views sent with a uuid, read back from the holder's log, and where each has got
     /// to by claude's `command_lifecycle`: until it ends, one way or another.
     said: HashMap<String, (String, String)>,
+    /// Their uuids in the order they were sent.
+    said_order: Vec<String>,
     /// Tool calls of the turn under way with no result yet: what Ctrl+X Ctrl+S puts in the
     /// background, as Claude Code's does, rather than stopping the turn (`relay.rs`).
     running: std::collections::HashSet<u64>,
@@ -333,6 +335,20 @@ impl Reducer {
     /// The number the next item would take.
     pub fn next_number(&self) -> u64 {
         self.next_id + 1
+    }
+
+    /// Prompts a view sent that claude has not echoed yet, oldest first: their uuid, text, and
+    /// whether claude has them queued behind a turn. A view that connects after sending one
+    /// draws it as on its way, as the view that sent it did.
+    pub fn waiting_prompts(&self) -> Vec<(String, String, bool)> {
+        self.said_order
+            .iter()
+            .filter_map(|u| {
+                let (text, st) = self.said.get(u)?;
+                matches!(st.as_str(), "sent" | "queued")
+                    .then(|| (u.clone(), text.clone(), st == "queued"))
+            })
+            .collect()
     }
 
     /// Every tool call's whole result, by item, taken out of the reducer.
@@ -521,6 +537,17 @@ impl Reducer {
             // A command's echo comes after its reply, which is drawn under it; any other
             // prompt is drawn after what was waiting.
             Msg::Prompt(text) => {
+                // Echoed: no longer on its way, whatever claude's lifecycle lines say after.
+                let echoed = self.said_order.iter().find(|u| {
+                    self.said.get(*u).is_some_and(|(t, st)| {
+                        matches!(st.as_str(), "sent" | "queued") && t.trim() == text.trim()
+                    })
+                });
+                if let Some(u) = echoed.cloned() {
+                    if let Some(said) = self.said.get_mut(&u) {
+                        said.1 = "echoed".into();
+                    }
+                }
                 let command = text.starts_with('/');
                 if !command {
                     self.flush_local(&mut out);
@@ -803,6 +830,8 @@ impl Reducer {
                     self.set_meta(&mut out, meta);
                 }
                 sdk::Input::Say { uuid, text } => {
+                    self.said_order.retain(|u| self.said.contains_key(u));
+                    self.said_order.push(uuid.clone());
                     self.said.insert(uuid, (text, "sent".into()));
                 }
                 sdk::Input::Other => {}
@@ -1631,6 +1660,42 @@ mod tests {
                 r#"{"s":"working","t":"st"}"#,
             ]
         );
+    }
+
+    #[test]
+    fn a_prompt_sent_and_not_yet_echoed_is_known_as_on_its_way() {
+        let mut r = Reducer::new();
+        let say = |u: &str, x: &str| {
+            format!(
+                r#"{{"type":"_in","line":{}}}"#,
+                crate::json::to_line(&sdk::prompt(x, u))
+            )
+        };
+        let a = "aaaaaaaa-1111-4111-8111-111111111111";
+        let b = "bbbbbbbb-1111-4111-8111-111111111111";
+        feed_all(
+            &mut r,
+            &[
+                &say(a, "first"),
+                &format!(r#"{{"type":"command_lifecycle","command_uuid":"{a}","state":"queued"}}"#),
+                &format!(
+                    r#"{{"type":"command_lifecycle","command_uuid":"{a}","state":"started"}}"#
+                ),
+                r#"{"type":"user","message":{"role":"user","content":"first"},"isReplay":true}"#,
+                &say(b, "behind it"),
+                &format!(r#"{{"type":"command_lifecycle","command_uuid":"{b}","state":"queued"}}"#),
+            ],
+        );
+        assert_eq!(
+            r.waiting_prompts(),
+            [(b.to_string(), "behind it".to_string(), true)]
+        );
+        // Echoed, it is on its way no more, even before claude says it started.
+        feed_all(
+            &mut r,
+            &[r#"{"type":"user","message":{"role":"user","content":"behind it"},"isReplay":true}"#],
+        );
+        assert!(r.waiting_prompts().is_empty());
     }
 
     #[test]
