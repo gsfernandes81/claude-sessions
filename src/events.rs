@@ -107,7 +107,7 @@ impl Event {
 /// | `before_agent_start` with `prompt` | `UserPromptSubmit` |
 /// | `agent_settled` | `Stop` — pi's documented final-idle point; `agent_end` is not |
 /// | `ui_prompt_start` | `Notification` permission_prompt: a blocking prompt waits |
-/// | `ui_prompt_end` | `PromptAnswered` (pi only): the prompt was answered |
+/// | `ui_prompt_end` | `PromptAnswered`: the prompt was answered (also the holder's) |
 /// | `session_shutdown` quit | `SessionEnd` other |
 /// | `session_shutdown` new / resume / fork / reload | `SessionEnd` clear: a start follows |
 /// | `session_info_changed` | `TitleChanged` (pi only), with `session_title`, absent = cleared |
@@ -328,8 +328,9 @@ pub fn apply(
             }
             _ => Outcome::Ignored("notification type does not mean a person is needed"),
         },
-        // pi only: the blocking prompt was answered, and the turn goes on. A Stop clears it
-        // too, as it does for claude; this clears it sooner.
+        // Never from claude's hooks: pi's, or the holder's when a remote view answers claude's
+        // last open prompt (`holder::prompt_answered`). The blocking prompt was answered and
+        // the turn goes on; a Stop clears it too, and this clears it sooner.
         "PromptAnswered" => {
             if rec.written.claim(Field::NeedsYou, tick) {
                 rec.needs_you = false;
@@ -711,6 +712,40 @@ mod tests {
         // An ask fired after the Stop (a background agent's) is newer and stands.
         let mut rec = slot();
         land(&mut rec, &[(stop, 4_000), (ask, 5_000)]);
+        assert!(rec.needs_you);
+    }
+
+    #[test]
+    fn a_remote_view_answering_clears_the_mark_and_a_later_ask_still_stands() {
+        // As the holder writes it: no session id, no pid.
+        let answered = ev(r#"{"hook_event_name":"PromptAnswered"}"#);
+        let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt"}"#;
+        let mut rec = slot();
+        land(&mut rec, &[(PROMPT, 2_000), (ask, 3_000)]);
+        assert!(rec.needs_you, "calibration: asked mid-turn");
+        apply(
+            &mut rec,
+            &answered,
+            Moment::ms(4_000),
+            Binding::Own,
+            None,
+            None,
+        );
+        assert!(!rec.needs_you && rec.busy, "answered, and the turn goes on");
+        // The next question's hook, fired after the answer, is newer and stands.
+        land(&mut rec, &[(ask, 5_000)]);
+        assert!(rec.needs_you);
+        // An answer stamped before an ask that lands late changes nothing.
+        let mut rec = slot();
+        land(&mut rec, &[(ask, 6_000)]);
+        apply(
+            &mut rec,
+            &answered,
+            Moment::ms(5_000),
+            Binding::Own,
+            None,
+            None,
+        );
         assert!(rec.needs_you);
     }
 

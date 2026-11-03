@@ -314,7 +314,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      answer to one request, so the first answer wins at the one place every answer passes.
      The reducer reads those lines back (`sdk::Input`): an answer resolves its prompt for
      every view, and a relay that reconnects and reads the log again finds it answered
-     rather than waiting; a change of model, mode or effort shows at once. Effort is carried
+     rather than waiting. When that answer settles the last prompt claude has open (or
+     claude withdraws it), the holder clears the slot's amber `!` in the registry
+     (`PromptAnswered`, design § *The event table*): answering fires no hook in claude, and
+     the home tree kept the `!` until the turn ended; a change of model, mode or effort shows at once. Effort is carried
      in the meta op as `e`, since claude's own lines never say it.
    - **Then the relay**, `src/relay.rs`: `claude-sessions relay` on the hub, for one client
      on stdin and stdout. It holds an agent per container as the hub's menu does and passes

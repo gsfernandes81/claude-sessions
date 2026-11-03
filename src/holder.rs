@@ -171,6 +171,9 @@ struct Log {
     /// The request ids a view has answered: a second answer to one is dropped, so the first
     /// answer wins whichever view sent it (`docs/remote-view.md` § *Decisions*).
     answered: HashSet<String>,
+    /// The prompts and questions claude is waiting on, by request id: the amber `!` is
+    /// cleared once a view has answered the last of them (`asked`, `settled`).
+    open: HashSet<String>,
 }
 
 impl Log {
@@ -185,6 +188,29 @@ impl Log {
         self.end += len;
         Ok(())
     }
+
+    /// Note what claude wrote: a prompt or question opens, a withdrawal or the end of the
+    /// turn settles. True when that leaves nothing open that was open before.
+    fn asked(&mut self, msg: &Msg) -> bool {
+        match msg {
+            Msg::Permission { request_id, .. } | Msg::Question { request_id, .. } => {
+                self.open.insert(request_id.clone());
+                false
+            }
+            Msg::Cancelled { request_id } => self.settled(request_id),
+            // The turn's end is claude's `Stop`, which clears it already.
+            Msg::Result { .. } => {
+                self.open.clear();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// A request answered or withdrawn: true when it was open and was the last one.
+    fn settled(&mut self, request_id: &str) -> bool {
+        self.open.remove(request_id) && self.open.is_empty()
+    }
 }
 
 struct Shared {
@@ -196,6 +222,7 @@ struct Shared {
     log_path: PathBuf,
     run: String,
     claude: Mutex<ChildStdin>,
+    slot: String,
 }
 
 /// Run claude headless under this holder until it exits, serving taps meanwhile. Returns
@@ -224,6 +251,7 @@ pub fn serve(
         end: 0,
         closed: false,
         answered: HashSet::new(),
+        open: HashSet::new(),
     };
     // A resume: the conversation so far is its transcript up to here, since claude sends none
     // of it again; claude appends to the same file from now on.
@@ -249,6 +277,7 @@ pub fn serve(
         log_path: paths.log.clone(),
         run,
         claude: Mutex::new(stdin),
+        slot: slot.to_string(),
     });
 
     // Typed into the session: read, and dropped.
@@ -277,13 +306,20 @@ pub fn serve(
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        shared
-            .log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append(&line)?;
+        let msg = std::str::from_utf8(&line)
+            .ok()
+            .and_then(|l| json::parse(l.trim()).ok())
+            .map(|v| sdk::classify(&v));
+        let settled = {
+            let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+            log.append(&line)?;
+            msg.as_ref().is_some_and(|m| log.asked(m))
+        };
         shared.grew.notify_all();
-        if let Some(doing) = next_said(&said, &line) {
+        if settled {
+            prompt_answered(&shared.slot);
+        }
+        if let Some(doing) = next_said(&said, msg.as_ref()) {
             if doing != said {
                 say(&format!("{slot}: open in the remote view; {doing}"));
                 said = doing.to_string();
@@ -302,13 +338,13 @@ pub fn serve(
 /// What the zmx session's line says after `line`, if that changes. Anything claude writes
 /// means it has started: a resumed claude says nothing more until it is prompted, and
 /// "starting" stood on the screen until then.
-fn next_said(said: &str, line: &[u8]) -> Option<&'static str> {
-    doing(line).or((said == "starting").then_some("idle"))
+fn next_said(said: &str, msg: Option<&Msg>) -> Option<&'static str> {
+    msg.and_then(doing)
+        .or((said == "starting").then_some("idle"))
 }
 
-fn doing(line: &[u8]) -> Option<&'static str> {
-    let v = json::parse(std::str::from_utf8(line).ok()?.trim()).ok()?;
-    match sdk::classify(&v) {
+fn doing(msg: &Msg) -> Option<&'static str> {
+    match msg {
         Msg::Prompt(_) | Msg::Status(Some(_)) => Some("working"),
         Msg::Permission { .. } | Msg::Question { .. } => Some("waiting for you"),
         Msg::Result { .. } => Some("idle"),
@@ -464,6 +500,7 @@ fn answer_older(v: &Value, shared: &Shared, out: &Mutex<UnixStream>) -> io::Resu
 /// dropped, from claude and the log alike.
 fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
     let mut claude = shared.claude.lock().unwrap_or_else(|e| e.into_inner());
+    let mut settled = false;
     if v.get("type").and_then(Value::as_str) == Some("control_response") {
         let id = v
             .get("response")
@@ -474,6 +511,7 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
             if !log.answered.insert(id.to_string()) {
                 return Ok(());
             }
+            settled = log.settled(id);
         }
     }
     // Logged first, so whatever claude does with it comes after it in the log.
@@ -486,7 +524,40 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
         .unwrap_or_else(|e| e.into_inner())
         .append(json::to_line(&logged).as_bytes())?;
     shared.grew.notify_all();
-    claude.write_all(format!("{}\n", json::to_line(v)).as_bytes())
+    claude.write_all(format!("{}\n", json::to_line(v)).as_bytes())?;
+    drop(claude);
+    if settled {
+        prompt_answered(&shared.slot);
+    }
+    Ok(())
+}
+
+/// The last prompt or question claude was waiting on is answered: clear the slot's amber `!`
+/// now rather than at the turn's end. Answering fires no hook in claude, so until this the `!`
+/// stood through the rest of the turn, which the owner read as the question still asked. Read
+/// as pi's `PromptAnswered` (`events.rs`), stamped now, so a prompt claude asks later wins.
+/// On its own thread, skipped when the lock is not had or the slot has no record: what claude
+/// is told never waits on the registry.
+fn prompt_answered(slot: &str) {
+    let fired = clock::Moment::now();
+    let slot = slot.to_string();
+    std::thread::spawn(move || {
+        let Ok(_lock) = SlotLock::acquire(&registry::lock_path(&slot), INTERACTIVE_WAIT) else {
+            return;
+        };
+        let Ok(Some(mut rec)) = registry::load(&slot) else {
+            return;
+        };
+        let ev = crate::events::Event::parse(r#"{"hook_event_name":"PromptAnswered"}"#)
+            .expect("a fixed payload");
+        let own = crate::events::Binding::Own;
+        if crate::events::apply(&mut rec, &ev, fired, own, None, None)
+            == crate::events::Outcome::Changed
+        {
+            rec.updated_ms = clock::now();
+            let _ = registry::store(&rec);
+        }
+    });
 }
 
 /// `claude-sessions tap <slot> [from] [run]`: what the hub runs over `ssh -T` to reach a
@@ -763,6 +834,42 @@ mod tests {
     }
 
     #[test]
+    fn the_amber_mark_goes_when_the_last_open_prompt_is_answered_or_withdrawn() {
+        let mut log = Log {
+            file: File::create(scratch("open").join("l")).unwrap(),
+            offsets: Vec::new(),
+            end: 0,
+            closed: false,
+            answered: HashSet::new(),
+            open: HashSet::new(),
+        };
+        let msg = |l: &str| sdk::classify(&json::parse(l).unwrap());
+        let ask = |id: &str, tool: &str| {
+            msg(&format!(
+                r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"can_use_tool","tool_name":"{tool}","input":{{"questions":[]}}}}}}"#
+            ))
+        };
+        // Calibration: a request nobody asked for settles nothing.
+        assert!(!log.settled("r0"));
+        assert!(!log.asked(&ask("q1", "AskUserQuestion")));
+        assert!(!log.asked(&ask("p1", "Bash")));
+        assert!(!log.settled("q1"), "another is still open");
+        assert!(!log.settled("q1"), "answered twice counts once");
+        assert!(log.settled("p1"), "the last one answered");
+        // Withdrawn by claude is settled as well.
+        log.asked(&ask("p2", "Bash"));
+        assert!(log.asked(&msg(
+            r#"{"type":"control_cancel_request","request_id":"p2"}"#
+        )));
+        // The turn's end leaves the clearing to Stop, and nothing open behind it.
+        log.asked(&ask("p3", "Bash"));
+        assert!(!log.asked(&msg(
+            r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s"}"#
+        )));
+        assert!(!log.settled("p3"));
+    }
+
+    #[test]
     fn claude_is_run_as_one_driven_over_ssh_so_it_has_the_artifact_tools() {
         let dir = scratch("entry");
         let program = stand_in(&dir);
@@ -855,16 +962,27 @@ mod tests {
 
     #[test]
     fn a_resumed_claude_reads_idle_once_it_writes_anything() {
-        let answer = br#"{"type":"control_response","response":{"subtype":"success"}}"#;
-        assert_eq!(next_said("starting", answer), Some("idle"));
+        let read = |l: &str| sdk::classify(&json::parse(l).unwrap());
+        let answer = read(r#"{"type":"control_response","response":{"subtype":"success"}}"#);
+        assert_eq!(next_said("starting", Some(&answer)), Some("idle"));
         assert_eq!(
-            next_said("working", answer),
+            next_said("starting", None),
+            Some("idle"),
+            "even a line not JSON"
+        );
+        assert_eq!(
+            next_said("working", Some(&answer)),
             None,
             "only the first line ends starting"
         );
-        let prompt = br#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#;
-        assert_eq!(next_said("starting", prompt), doing(prompt), "calibration");
-        assert_eq!(doing(prompt), Some("working"));
+        let prompt =
+            read(r#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#);
+        assert_eq!(
+            next_said("starting", Some(&prompt)),
+            doing(&prompt),
+            "calibration"
+        );
+        assert_eq!(doing(&prompt), Some("working"));
     }
 
     #[test]

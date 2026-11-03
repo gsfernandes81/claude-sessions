@@ -241,6 +241,7 @@ terminal.
 | `UserPromptSubmit` | activity, busy, clear `needs_you`; the first one of a conversation sets `first_prompt` — one line, at most 120 characters, the title of last resort |
 | `Stop` | activity, idle since it fired, clear `needs_you`: answering a permission prompt or a dialog submits no prompt, so the turn it was asked in ends here, and claude back at its prompt is asking nothing |
 | `Notification`, type `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input` | `needs_you` |
+| `PromptAnswered` — never from claude's hooks: pi's `ui_prompt_end`, or written by the holder when a remote view answers the last prompt or question claude has open (or claude withdraws it) | clear `needs_you`, stamped when answered, so a prompt asked later still stands. Answering fires no hook in claude, and without it the `!` stood through the rest of the turn |
 | `Notification`, type `idle_prompt` | **nothing.** It fires about a minute after every `Stop` nobody answers; treating it as `needs_you` would mark every unanswered session as waiting |
 | `SessionEnd`, reason `clear` **or `resume`** | nothing — a `SessionStart` follows in the same process. The hook takes no lock for it, so it cannot race that `SessionStart`; a lock failure in `hook.log` names its event and reason |
 | `SessionEnd`, any other reason | `closed`, unless the slot is marked `offloading`, in which case `offloaded`; not busy, `needs_you` cleared |
@@ -979,7 +980,7 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
   `SessionStart` startup / resume / fork / clear / compact; `before_agent_start` with its
   prompt as `UserPromptSubmit`; `agent_settled` — pi's documented final-idle point, where
   `agent_end` is not — as `Stop`; `ui_prompt_start`, a blocking prompt such as infra's gate
-  asks through, as the amber `!`; `ui_prompt_end` clears it (`PromptAnswered`, pi only);
+  asks through, as the amber `!`; `ui_prompt_end` clears it (`PromptAnswered`, which the remote view's holder writes too);
   `session_shutdown` quit as an end, any other reason as nothing, since a start follows in
   the same process; `session_info_changed` as the title (`TitleChanged`, pi only — pi's
   `/name` fires an event where claude's `/rename` fires none). An Esc settles the run like
