@@ -24,6 +24,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_claude-sessions");
 
 struct Slot {
     root: PathBuf,
+    /// The slot's name: `offload-t1`, unless a test needs one no other fixture shares.
+    name: String,
     server: Child,
     claude: u32,
     claude_start: u64,
@@ -97,6 +99,11 @@ enum Load {
 /// measured that session's processes as its own, and a fixture whose claude was dead read
 /// active on them.
 fn slot(tag: &str, load: Load, attached: bool, transcript: bool) -> Slot {
+    named("offload-t1", tag, load, attached, transcript)
+}
+
+/// [`slot`] under another name.
+fn named(name: &str, tag: &str, load: Load, attached: bool, transcript: bool) -> Slot {
     let root = std::env::temp_dir().join(format!("cs-offload-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     for d in ["bin", "registry", "zmx"] {
@@ -160,6 +167,7 @@ done
     // From here a panic drops the slot, which kills everything it started.
     let mut s = Slot {
         root,
+        name: name.to_string(),
         server,
         claude: 0,
         claude_start: 0,
@@ -205,7 +213,7 @@ done
 
     let attached = u8::from(attached);
     std::fs::write(
-        root.join("zmx/offload-t1"),
+        root.join("zmx").join(name),
         format!("{claude} {attached}\n"),
     )
     .unwrap();
@@ -217,11 +225,11 @@ done
         std::fs::write(&transcript_path, PROMPTED).unwrap();
     }
     let record = format!(
-        r#"{{"slot":"offload-t1","state":"live","pid":{claude},"proc_start":{claude_start},
+        r#"{{"slot":"{name}","state":"live","pid":{claude},"proc_start":{claude_start},
             "session_id":"conv-1","cwd":"/workspace","transcript_path":"{}"}}"#,
         transcript_path.display()
     );
-    std::fs::write(root.join("registry/offload-t1.json"), record).unwrap();
+    std::fs::write(root.join(format!("registry/{name}.json")), record).unwrap();
     measured_before(&s, -180_000);
     s
 }
@@ -353,7 +361,8 @@ fn measured_before(s: &Slot, at_offset_ms: i64) {
     std::fs::write(
         s.root.join("registry/activity.state"),
         format!(
-            r#"{{"offload-t1":{{"at":{},"last_active":{},"procs":[[{},{},0,0]],"minima":[[{},87.5]]}}}}"#,
+            r#"{{"{}":{{"at":{},"last_active":{},"procs":[[{},{},0,0]],"minima":[[{},87.5]]}}}}"#,
+            s.name,
             now + at_offset_ms,
             now - 11 * 60_000,
             s.claude,
@@ -576,9 +585,17 @@ fn a_keepalive_holds_a_quiet_slot_until_it_ends() {
 /// A session somebody attached by hand has no `CLAUDE_SESSIONS_SLOT`: a keep-alive asked from
 /// inside it finds the slot as the hook does, by `ZMX_SESSION` under a zmx daemon.
 /// Calibration: the same variable with no zmx above it is no slot.
+///
+/// **Its own slot name, not `offload-t1`.** Its processes carry `ZMX_SESSION`, and a pass in
+/// another test, its fixture named the same, counted one as its own slot's: the pass reads a
+/// process's name and its environment at different moments, so one caught as it execs bears
+/// the test's thread name, which nothing excludes, and already this variable. It left before
+/// it was read, and that pass read its quiet slot as active ("a process left"): two runs in
+/// 240 of this test beside the keep-alive one, under load; none in 240 without it.
 #[test]
 fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
-    let s = idle_slot("keepalive-by-hand", false);
+    let name = format!("offload-hand-{}", std::process::id());
+    let s = named(&name, "keepalive-by-hand", Load::Sleep, false, true);
     let ask = |session: Option<&str>, via_zmx: bool| {
         let line = format!("{BIN} keepalive 25m; :");
         let mut cmd = if via_zmx {
@@ -604,14 +621,17 @@ fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
     // The variable alone is not a session. Not checkable from inside a real one, whose daemon
     // is above this test too.
     if std::env::var_os("ZMX_SESSION").is_none() {
-        let out = ask(Some("offload-t1"), false);
+        let out = ask(Some(&name), false);
         assert!(out.contains("not inside a claude-sessions slot"), "{out}");
     }
-    let out = ask(Some("offload-t1"), true);
-    assert!(out.contains("offload-t1: kept alive for 25m"), "{out}");
+    let out = ask(Some(&name), true);
+    assert!(
+        out.contains(&format!("{name}: kept alive for 25m")),
+        "{out}"
+    );
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(
-        ok && out.contains("offload-t1: kept — kept alive for 25m more"),
+        ok && out.contains(&format!("{name}: kept — kept alive for 25m more")),
         "{out}"
     );
 }
