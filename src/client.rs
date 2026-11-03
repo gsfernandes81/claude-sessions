@@ -363,8 +363,10 @@ impl App {
                 if let Screen::Conv { c, .. } = &mut self.screen {
                     // What was sent and not yet echoed is still on its way.
                     let pending = std::mem::take(&mut c.pending);
+                    let shown = std::mem::take(&mut c.shown);
                     **c = Convo::new(&c.host, &c.slot, &c.run);
                     c.pending = pending;
+                    c.shown = shown;
                 }
             }
             "err" | "end" => {
@@ -913,7 +915,11 @@ impl App {
                 }
                 Key::Enter if backslash_newline(ui) => {}
                 Key::Enter => {
-                    let text = expand_pastes(&std::mem::take(&mut ui.input), &ui.pastes);
+                    let typed = std::mem::take(&mut ui.input);
+                    let text = expand_pastes(&typed, &ui.pastes);
+                    if !ui.pastes.is_empty() {
+                        c.collapsed(&text, &typed);
+                    }
                     ui.pastes.clear();
                     ui.cursor = 0;
                     ui.scroll = 0;

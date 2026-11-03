@@ -430,7 +430,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      - A bracketed paste (`?2004`, the phone's terminal only) past 800 characters or two line
        breaks — fewer on a screen under 13 rows — stands in the prompt as
        `[Pasted text #N +L lines]`, L its line breaks; Backspace after one takes it whole, and
-       sending puts each back. A shorter one goes in as itself, tabs as four spaces.
+       sending puts each back. A shorter one goes in as itself, tabs as four spaces. The
+       transcript draws a prompt sent with a stand-in as it stood in the prompt — waiting, and
+       once claude has it — while claude gets the paste whole (owner, 2026-11-03). That is the
+       sending view's memory only: another device, or the view restarted, draws it whole.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
      Ctrl-U; Ctrl or Alt with Left or Right a word at a time, back to a word's start and on to
      its end, as Claude Code's prompt goes; the prompt soft-wraps at words, the space a row breaks on hanging at its end so

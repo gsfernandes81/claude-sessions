@@ -290,6 +290,11 @@ pub struct Convo {
     /// Prompts sent and not yet echoed by claude, and when each was sent: drawn at once under
     /// the transcript, the spinner where `❯` goes, until claude's own line for it arrives.
     pub pending: Vec<Pending>,
+    /// Prompts this view sent with a paste's stand-in in them: the text claude got, trimmed,
+    /// to the prompt as it stood in the input box, which the transcript draws instead, as
+    /// Claude Code's does. Only this client's memory: another device, or this one restarted,
+    /// draws the paste whole.
+    pub shown: HashMap<String, String>,
     /// Entries a rewind took out of the transcript: a prompt an interrupt caught unanswered,
     /// and its note. By position, moved on when older entries are put in front.
     pub hidden: std::collections::HashSet<usize>,
@@ -364,6 +369,21 @@ impl Convo {
             uuid: uuid.clone(),
         });
         uuid
+    }
+
+    /// A prompt sent as `full` that stood in the input box as `typed`, its pastes collapsed:
+    /// drawn as `typed`, waiting and once claude has it.
+    pub fn collapsed(&mut self, full: &str, typed: &str) {
+        if full.trim() != typed.trim() {
+            self.changes += 1;
+            self.shown
+                .insert(full.trim().to_string(), typed.trim().to_string());
+        }
+    }
+
+    /// How a prompt is drawn: as it stood in the input box, if this view sent it so.
+    pub fn display<'a>(&'a self, text: &'a str) -> &'a str {
+        self.shown.get(text.trim()).map_or(text, String::as_str)
     }
 
     /// Up in an empty prompt with prompts waiting behind the turn: they leave the queue, as
@@ -1204,7 +1224,7 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             Entry::Prompt(text) => {
                 out.push(Vec::new());
                 last_prompt = Some(out.len());
-                out.extend(prompt_lines(text, "❯ ", w));
+                out.extend(prompt_lines(c.display(text), "❯ ", w));
             }
             Entry::Text(text) => {
                 out.push(Vec::new());
@@ -2168,7 +2188,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
         let glyph = crate::ui::SPINNER[frame as usize % crate::ui::SPINNER.len()];
         body.extra.push(Vec::new());
         body.extra
-            .extend(prompt_lines(&p.text, &format!("{glyph} "), w));
+            .extend(prompt_lines(c.display(&p.text), &format!("{glyph} "), w));
         // One waiting behind a turn can go now, as Claude Code says under it.
         if p.queued {
             body.extra
@@ -2709,6 +2729,37 @@ mod tests {
         );
         let got = text(&draw(&c, &Ui::new(), 40, 24, Instant::now()));
         assert!(!got.iter().any(|l| l.contains("answered")), "{got:?}");
+    }
+
+    #[test]
+    fn a_pasted_prompt_is_drawn_with_its_stand_in_waiting_and_once_echoed() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let t0 = Instant::now();
+        let full = "look: a\nb\nc\nd";
+        c.sent(full, t0);
+        c.collapsed(full, "look: [Pasted text #1 +3 lines]");
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        assert!(
+            got.iter().any(|l| l == "⠋ look: [Pasted text #1 +3 lines]"),
+            "{got:?}"
+        );
+        assert!(!got.iter().any(|l| l == "  b"), "{got:?}");
+        feed(
+            &mut c,
+            &[r#"{"t":"add","id":1,"k":"user","x":"look: a\nb\nc\nd\n"}"#],
+        );
+        assert!(c.pending.is_empty());
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        assert!(
+            got.iter().any(|l| l == "❯ look: [Pasted text #1 +3 lines]"),
+            "{got:?}"
+        );
+        assert!(!got.iter().any(|l| l == "  b"), "{got:?}");
+        // A prompt this view did not collapse is drawn whole.
+        feed(&mut c, &[r#"{"t":"add","id":2,"k":"user","x":"x\ny"}"#]);
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        assert!(got.iter().any(|l| l == "  y"), "{got:?}");
     }
 
     #[test]
