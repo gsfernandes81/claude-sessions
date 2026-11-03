@@ -53,14 +53,6 @@ pub enum Action {
     /// `c` on an offloaded row: archive it — mark the slot closed, so its conversation is
     /// listed under Archived — at once.
     Archive(usize),
-    /// Mockup 4's `y`: offload `victim`, then open `then` (or start a new slot in the
-    /// victim's container when `None`).
-    OffloadThenOpen {
-        victim: usize,
-        then: Option<usize>,
-        /// The harness of the new slot, when `then` is `None`.
-        harness: Harness,
-    },
 }
 
 /// A row named the way a question remembers it: its container and its key, never its index,
@@ -70,11 +62,9 @@ type Id = (String, RowKey);
 /// A dialog, plus what answering it needs that the drawing does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
+    /// `then` is the row that was asked to open, which the dialog keeps in view.
     NoRoom {
         then: Option<Id>,
-        victim: Option<Id>,
-        /// What `y` starts when `then` is nothing: a new slot of this harness.
-        harness: Harness,
     },
     ResumeFailed {
         key: Id,
@@ -290,10 +280,7 @@ impl Menu {
         // A dialog about a row that has gone is a question about nothing.
         let gone = match &self.ask {
             Some((Ask::ResumeFailed { key }, _)) => self.index_of(key).is_none(),
-            Some((Ask::NoRoom { victim, then, .. }, _)) => [victim, then]
-                .into_iter()
-                .flatten()
-                .any(|k| self.index_of(k).is_none()),
+            Some((Ask::NoRoom { then }, _)) => then.iter().any(|k| self.index_of(k).is_none()),
             None => false,
         };
         if gone {
@@ -508,7 +495,7 @@ impl Menu {
             Some((ask, dialog)) => {
                 let key = match ask {
                     Ask::ResumeFailed { key } => Some(key),
-                    Ask::NoRoom { victim, then, .. } => victim.as_ref().or(then.as_ref()),
+                    Ask::NoRoom { then } => then.as_ref(),
                 };
                 let about = key.and_then(|k| self.index_of(k));
                 (Some(dialog.clone()), about)
@@ -559,31 +546,10 @@ impl Menu {
     }
 
     /// Ask the owner something a launch came back with (mockups 4 and 5). `then` is the row
-    /// that was asked to open, by index into the rows as they were when it was asked for;
-    /// `host` is the container that answered, which the offered slot is in.
-    pub fn ask_no_room(
-        &mut self,
-        dialog: Dialog,
-        then: Option<usize>,
-        harness: Harness,
-        host: &str,
-    ) {
-        let victim = match &dialog {
-            Dialog::NoRoom {
-                offer: Some((key, _, _)),
-                ..
-            } => Some((host.to_string(), key.clone())),
-            _ => None,
-        };
+    /// that was asked to open, by index into the rows as they were when it was asked for.
+    pub fn ask_no_room(&mut self, dialog: Dialog, then: Option<usize>) {
         let then = then.and_then(|i| self.rows.get(i)).map(id);
-        self.ask = Some((
-            Ask::NoRoom {
-                then,
-                victim,
-                harness,
-            },
-            dialog,
-        ));
+        self.ask = Some((Ask::NoRoom { then }, dialog));
     }
 
     pub fn ask_resume_failed(&mut self, dialog: Dialog, index: usize) {
@@ -734,21 +700,6 @@ impl Menu {
         let at = |m: &Menu, k: &Id| m.index_of(k).unwrap_or(m.cursor);
         match (ask, key) {
             (_, Key::Resize) => Action::Redraw,
-            (
-                Ask::NoRoom {
-                    then,
-                    victim: Some(victim),
-                    harness,
-                },
-                Key::Char('y'),
-            ) => {
-                self.ask = None;
-                Action::OffloadThenOpen {
-                    victim: at(self, &victim),
-                    then: then.map(|k| at(self, &k)),
-                    harness,
-                }
-            }
             (Ask::NoRoom { .. }, Key::Char('n') | Key::Esc) => dismiss(self),
             (Ask::ResumeFailed { key }, Key::Char('r')) => {
                 self.ask = None;
@@ -912,14 +863,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         // What Claude Code's own session selector shows (`transcript.rs`), not the live
         // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1). Read
         // from the transcript as well as the record: a `/rename` fires no hook.
-        title: r.display_title_with(
-            &r.conversation_path()
-                .map(|p| match r.harness {
-                    Harness::Claude => crate::transcript::titles_cached(&p),
-                    Harness::Pi => crate::pisession::titles_cached(&p),
-                })
-                .unwrap_or_default(),
-        ),
+        title: r.row_title(),
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
@@ -1552,42 +1496,25 @@ mod tests {
     }
 
     #[test]
-    fn no_room_y_offloads_the_offer_then_opens() {
+    fn no_room_offers_nothing_and_esc_or_n_goes_back() {
+        // Owner, 2026-11-03: nothing is offered to offload; `c` is the way.
         let mut m = menu(vec![row("a"), row("b"), row("c")]);
         let dialog = Dialog::NoRoom {
             used: 1,
             limit: 2,
             want: 1,
-            offer: Some((RowKey::Slot("b".into()), "2d".into(), "b".into())),
         };
-        m.ask_no_room(dialog.clone(), Some(2), Harness::Claude, "");
+        m.ask_no_room(dialog.clone(), Some(2));
         assert_eq!(
             m.view().about,
-            Some(1),
-            "the dialog shows the session it offers"
-        );
-        assert_eq!(
-            m.key(Key::Char('y')),
-            Action::OffloadThenOpen {
-                victim: 1,
-                then: Some(2),
-                harness: Harness::Claude,
-            }
-        );
-        // With nothing to offer, y does nothing and n cancels.
-        m.ask_no_room(
-            Dialog::NoRoom {
-                used: 1,
-                limit: 2,
-                want: 1,
-                offer: None,
-            },
-            None,
-            Harness::Claude,
-            "",
+            Some(2),
+            "the dialog keeps the asked-for row in view"
         );
         assert_eq!(m.key(Key::Char('y')), Action::None);
         assert_eq!(m.key(Key::Char('n')), Action::Redraw);
+        assert_eq!(m.view().dialog, None);
+        m.ask_no_room(dialog, None);
+        assert_eq!(m.key(Key::Esc), Action::Redraw);
         assert_eq!(m.view().dialog, None);
     }
 

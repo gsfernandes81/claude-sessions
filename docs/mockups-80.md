@@ -52,21 +52,24 @@ conversation. The number is kept so the rest keep theirs; the 40-column file say
 ```
 infra-dev · 6 open · 892M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
-── Loaded · 5 ──────────────────────────────────────────────────────────────────
-  retire the old tunnel                                                      14m
+── Offloaded · 1 ───────────────────────────────────────────────────────────────
+  mount guards on one                                                         2d
                     ╭──────────────────────────────────────╮
                     │ No room for another claude           │
                     │                                      │
                     │ 892M of 1.0G used. A new one wants   │
                     │ about 250M.                          │
                     │                                      │
-                    │ Offload this session, idle 14m?      │
-                    │   retire the old tunnel              │
-                    │   resumable from disk                │
+                    │ c on a loaded session offloads it to │
+                    │ make room.                           │
                     │                                      │
-                    │ y offload, then open    n cancel     │
+                    │ Esc back                             │
                     ╰──────────────────────────────────────╯
 ```
+
+Redrawn 2026-11-03 on the owner's word ("don't offer to offload … point at c instead"):
+it offered the idlest session the offloader would stop, with `y offload, then open`. Now it
+offers nothing, at the door or in the remote view, and `c` on a loaded session is the way.
 
 ### Mockup 5 — A resume that fails
 ```

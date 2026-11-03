@@ -23,9 +23,7 @@
 //! `CLAUDE_SESSIONS_ZMX` names the zmx to run (default `zmx`) and
 //! `CLAUDE_SESSIONS_CLAUDE` the claude (default `claude`). An empty value is the default.
 
-use crate::activity;
 use crate::clock::{self, Millis, Moment};
-use crate::fmt;
 use crate::harness::Harness;
 use crate::live;
 use crate::lockfile::{INTERACTIVE_WAIT, SlotLock};
@@ -219,37 +217,12 @@ pub(crate) fn fresh_session_id() -> String {
 /// is where Claude Code looks for its transcript. It is in the signature so the menu calls
 /// every entry point the same way.
 pub fn open(rows: &[Row], index: usize, _workspace: &str, term: &mut dyn Terminal) -> Outcome {
-    open_with(rows, index, term, &Deps::from_env(), true)
+    open_with(rows, index, term, &Deps::from_env())
 }
 
 /// `n`: a new slot running claude in the workspace; `p`, one running pi.
-pub fn new_session(
-    rows: &[Row],
-    harness: Harness,
-    workspace: &str,
-    term: &mut dyn Terminal,
-) -> Outcome {
-    new_session_with(rows, harness, workspace, term, &Deps::from_env(), true)
-}
-
-/// Mockup 4's `y`: offload `victim`, then open `then`, or start a new slot when it is `None`.
-pub fn offload_then_open(
-    rows: &[Row],
-    victim: usize,
-    then: Option<usize>,
-    harness: Harness,
-    workspace: &str,
-    term: &mut dyn Terminal,
-) -> Outcome {
-    offload_then_open_with(
-        rows,
-        victim,
-        then,
-        harness,
-        workspace,
-        term,
-        &Deps::from_env(),
-    )
+pub fn new_session(harness: Harness, workspace: &str, term: &mut dyn Terminal) -> Outcome {
+    new_session_with(harness, workspace, term, &Deps::from_env())
 }
 
 /// `s`: a login shell in the workspace.
@@ -423,7 +396,6 @@ pub(crate) fn open_with(
     index: usize,
     term: &mut dyn Terminal,
     deps: &Deps,
-    check_room: bool,
 ) -> Outcome {
     let Some(row) = rows.get(index) else {
         return no_row(index);
@@ -432,15 +404,7 @@ pub(crate) fn open_with(
     let slot = match &row.key {
         RowKey::Socket(name) => return attach_socket(name, &n, term, deps),
         RowKey::Conversation { id, cwd, harness } => {
-            return resume_conversation(
-                rows,
-                (id, cwd, &row.title),
-                *harness,
-                &n,
-                term,
-                deps,
-                check_room,
-            );
+            return resume_conversation(rows, (id, cwd, &row.title), *harness, &n, term, deps);
         }
         // A heading, not a session; the menu folds it rather than asking for it to be opened.
         RowKey::ArchiveFold | RowKey::Container => return no_row(index),
@@ -461,7 +425,7 @@ pub(crate) fn open_with(
         Kind::Running => attach_slot(rows, slot, term, deps),
         // A closed slot is listed (owner, 2026-10-03) so that its conversation can be reached
         // again; opening it resumes it exactly as an offloaded one is resumed.
-        Kind::Resumable | Kind::Closed => resume(rows, slot, &n, term, deps, check_room),
+        Kind::Resumable | Kind::Closed => resume(rows, slot, &n, term, deps),
         Kind::Starting => Outcome::Refused(starting(&n)),
     }
 }
@@ -513,12 +477,22 @@ fn no_row(_index: usize) -> Outcome {
 /// enough to leave the message room on a phone. Nothing on the screen is numbered (owner,
 /// 2026-10-03).
 fn label(row: &Row) -> String {
+    quoted(&row.title)
+}
+
+/// A title as messages name it: quoted, and cut short enough to leave the message room.
+fn quoted(title: &str) -> String {
     const MOST: usize = 24;
-    let mut t: String = row.title.chars().take(MOST).collect();
-    if row.title.chars().count() > MOST {
+    let mut t: String = title.chars().take(MOST).collect();
+    if title.chars().count() > MOST {
         t.push_str("...");
     }
     format!("\"{t}\"")
+}
+
+/// A record's label: the title its row shows, quoted.
+fn rec_label(rec: &SlotRecord) -> String {
+    quoted(&rec.row_title())
 }
 
 /// A row's label, or the slot's name when it is not on the list — a new slot, or the one a
@@ -532,6 +506,15 @@ fn label_of(rows: &[Row], slot: &str) -> String {
 
 fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -> Outcome {
     let n = label_of(rows, slot);
+    // The remote view's holder drives it: its zmx session shows only a status line and drops
+    // what is typed, so attaching would be a dead end. Refused, as the phone refuses a
+    // terminal's slot (mockup R10); the owner, 2026-11-03: refuse takeovers.
+    if held(slot) {
+        return Outcome::Refused(format!(
+            "{n} runs in the remote view: open it from claude-remote, or end it there to open \
+             it here"
+        ));
+    }
     let mut cmd = attach_command(slot, deps);
     // zmx's exit status says nothing here — 0 for a detach and for a session that ended while
     // attached alike — so what happened is read afterwards, from the record.
@@ -542,6 +525,13 @@ fn attach_slot(rows: &[Row], slot: &str, term: &mut dyn Terminal, deps: &Deps) -
         After::Running => detached(),
         After::Ended | After::DiedUnbound => ended(&n),
     }
+}
+
+/// Whether the remote view's holder drives `slot`: its record says so, or its holder's
+/// socket answers (a record rewritten by an older release's hooks loses the field).
+fn held(slot: &str) -> bool {
+    let recorded = matches!(registry::load(slot), Ok(Some(r)) if r.driver == Driver::Holder);
+    recorded || crate::holder::serving(slot)
 }
 
 /// A session with no record: all there is to go on afterwards is whether zmx still lists it,
@@ -601,18 +591,9 @@ enum Plan {
     Refuse(String),
 }
 
-fn resume(
-    rows: &[Row],
-    slot: &str,
-    n: &str,
-    term: &mut dyn Terminal,
-    deps: &Deps,
-    check_room: bool,
-) -> Outcome {
-    if check_room {
-        if let Some(no_room) = room_check(rows, deps) {
-            return no_room;
-        }
+fn resume(rows: &[Row], slot: &str, n: &str, term: &mut dyn Terminal, deps: &Deps) -> Outcome {
+    if let Some(no_room) = room_check(deps) {
+        return no_room;
     }
     let title = rows
         .iter()
@@ -835,7 +816,6 @@ fn resume_conversation(
     n: &str,
     term: &mut dyn Terminal,
     deps: &Deps,
-    check_room: bool,
 ) -> Outcome {
     let now = clock::now();
     let holders: Vec<SlotRecord> = match registry::all() {
@@ -852,12 +832,10 @@ fn resume_conversation(
         return Outcome::Refused(starting(n));
     }
     if let Some(r) = holders.first() {
-        return resume(rows, &r.slot, n, term, deps, check_room);
+        return resume(rows, &r.slot, n, term, deps);
     }
-    if check_room {
-        if let Some(no_room) = room_check(rows, deps) {
-            return no_room;
-        }
+    if let Some(no_room) = room_check(deps) {
+        return no_room;
     }
     if !Path::new(cwd).is_dir() {
         return Outcome::Refused(format!(
@@ -899,17 +877,13 @@ fn resume_conversation(
 // ── new ─────────────────────────────────────────────────────────────────────
 
 pub(crate) fn new_session_with(
-    rows: &[Row],
     harness: Harness,
     workspace: &str,
     term: &mut dyn Terminal,
     deps: &Deps,
-    check_room: bool,
 ) -> Outcome {
-    if check_room {
-        if let Some(no_room) = room_check(rows, deps) {
-            return no_room;
-        }
+    if let Some(no_room) = room_check(deps) {
+        return no_room;
     }
     if !Path::new(workspace).is_dir() {
         return Outcome::Refused(format!("{workspace} is not a directory"));
@@ -1044,67 +1018,9 @@ fn allocate_for(
     ))
 }
 
-// ── offload, then open ──────────────────────────────────────────────────────
-
-pub(crate) fn offload_then_open_with(
-    rows: &[Row],
-    victim: usize,
-    then: Option<usize>,
-    harness: Harness,
-    workspace: &str,
-    term: &mut dyn Terminal,
-    deps: &Deps,
-) -> Outcome {
-    let Some(row) = rows.get(victim) else {
-        return no_row(victim);
-    };
-    let n = label(row);
-    let RowKey::Slot(slot) = &row.key else {
-        return Outcome::Refused(format!("{n} was not started here and cannot be offloaded"));
-    };
-    {
-        let _lock = match lock_slot(slot, &n) {
-            Ok(l) => l,
-            Err(why) => return Outcome::Refused(why),
-        };
-        let mut rec = match registry::load(slot) {
-            Ok(Some(rec)) => rec,
-            Ok(None) => return Outcome::Refused(format!("{n} is gone")),
-            Err(e) => return Outcome::Refused(format!("{n}: {e}")),
-        };
-        // The offer was made from a reading taken before the dialog went up, and the owner
-        // may have taken a while to answer. The offloader's own rule, asked again under the
-        // lock, is the only thing that may stop a slot.
-        let table = procinfo::table();
-        let now = clock::now();
-        let seen = offload::look(&rec, &activity::load(), now);
-        let verdict = match offload::judge(&rec, now, &seen) {
-            Ok(verdict) => verdict,
-            Err(hold) => {
-                return Outcome::Refused(format!("{n} can no longer be offloaded: {hold}"));
-            }
-        };
-        // Offered only with a conversation on disk (`offer`); if that went in the meantime, a
-        // stop is a close, as the offloader's would be.
-        match offload::stop_quiet(&mut rec, verdict, table.as_deref()) {
-            Ok(Ok(_)) => {}
-            Ok(Err(why)) => return Outcome::Refused(why),
-            Err(e) => return Outcome::Refused(format!("{n}: {e}")),
-        }
-    }
-    // No second room check. The owner has just accepted the trade, and what a stopped claude
-    // read stays charged as active page cache for a while, which even the working set counts
-    // (`mem.rs`), so asking again could answer no for the very room just made — and offer to
-    // stop another slot.
-    match then {
-        Some(index) => open_with(rows, index, term, deps, false),
-        None => new_session_with(rows, harness, workspace, term, deps, false),
-    }
-}
-
-/// Mockup 4, when there is no room: the memory figures and the idlest slot the offloader
-/// would stop, if there is one on the list.
-fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
+/// Mockup 4, when there is no room: the memory figures, and `c` as the way to make some. Nothing
+/// is offered for offloading (owner, 2026-11-03): which session goes is the owner's pick.
+fn room_check(deps: &Deps) -> Option<Outcome> {
     let m = (deps.memory)();
     // Unknown headroom answers yes (`mem.rs`): an unreadable cgroup file must not be worse
     // than a full container.
@@ -1115,36 +1031,7 @@ fn room_check(rows: &[Row], deps: &Deps) -> Option<Outcome> {
         used: m.used().unwrap_or(0),
         limit: m.limit.unwrap_or(0),
         want: mem::SESSION_COST,
-        offer: offer(rows),
     }))
-}
-
-/// The slot the offloader would offload that has been idle longest, as its key, idle age and
-/// title as drawn. A suggestion only: accepting it decides again under the lock.
-/// One the offloader would close instead — never prompted, nothing on disk — is not offered:
-/// the dialog promises the offered session is resumable from disk.
-fn offer(rows: &[Row]) -> Option<(RowKey, String, String)> {
-    let now = clock::now();
-    let measured = activity::load();
-    registry::all()
-        .ok()?
-        .iter()
-        .filter(|r| r.state.is_running())
-        .filter_map(|r| {
-            let verdict = offload::judge(r, now, &offload::look(r, &measured, now)).ok()?;
-            let offload::Verdict::Offload { idle } = verdict else {
-                return None;
-            };
-            let index = rows
-                .iter()
-                .position(|row| matches!(&row.key, RowKey::Slot(s) if *s == r.slot))?;
-            Some((idle, index))
-        })
-        .max_by_key(|(idle, _)| *idle)
-        .map(|(idle, index)| {
-            let r = &rows[index];
-            (r.key.clone(), fmt::age(idle), r.title.clone())
-        })
 }
 
 // ── shell ───────────────────────────────────────────────────────────────────
@@ -1437,19 +1324,20 @@ pub(crate) fn remote_open(slot: &str, deps: &Deps) -> Result<String, String> {
         Ok(None) => return Err(format!("{slot} is gone")),
         Err(e) => return Err(format!("{slot}: {e}")),
     };
+    let n = rec_label(&rec);
     match classify(&rec, clock::now()) {
         Kind::Running => return driven_by_holder(&rec),
-        Kind::Starting => return Err(starting(slot)),
+        Kind::Starting => return Err(starting(&n)),
         Kind::Resumable | Kind::Closed => {}
     }
     if rec.harness != Harness::Claude {
         return Err(format!(
-            "{slot} runs {}, which opens only in a terminal",
+            "{n} runs {}, which opens only in a terminal",
             rec.harness.as_str()
         ));
     }
     remote_room(deps)?;
-    match plan_resume(slot, slot, Driver::Holder) {
+    match plan_resume(slot, &n, Driver::Holder) {
         Plan::Start {
             session,
             cwd,
@@ -1475,8 +1363,9 @@ pub(crate) fn remote_resume(
     deps: &Deps,
 ) -> Result<String, String> {
     let now = clock::now();
+    let n = quoted(title);
     let holders: Vec<SlotRecord> = registry::all()
-        .map_err(|e| format!("{id}: {e}"))?
+        .map_err(|e| format!("{n}: {e}"))?
         .into_iter()
         .filter(|r| r.session_id.as_deref() == Some(id))
         .collect();
@@ -1484,7 +1373,7 @@ pub(crate) fn remote_resume(
         return driven_by_holder(r);
     }
     if holders.iter().any(|r| classify(r, now) == Kind::Starting) {
-        return Err(starting(title));
+        return Err(starting(&n));
     }
     if let Some(r) = holders.first() {
         return remote_open(&r.slot, deps);
@@ -1492,7 +1381,7 @@ pub(crate) fn remote_resume(
     remote_room(deps)?;
     if !Path::new(cwd).is_dir() {
         return Err(format!(
-            "{title} ran in {cwd}, which is gone — claude finds a conversation by the directory \
+            "{n} ran in {cwd}, which is gone — claude finds a conversation by the directory \
              it ran in"
         ));
     }
@@ -1504,7 +1393,7 @@ pub(crate) fn remote_resume(
     )? {
         Ok(slot) => slot,
         Err(Elsewhere::Slot(other)) => return running_slot(&other),
-        Err(Elsewhere::Unattachable(why)) => return Err(format!("{title} is not resumed: {why}")),
+        Err(Elsewhere::Unattachable(why)) => return Err(format!("{n} is not resumed: {why}")),
     };
     let args = start_args(Harness::Claude, Some(id));
     remote_start(&slot, cwd, &args, State::Closed, deps)?;
@@ -1526,7 +1415,7 @@ fn driven_by_holder(rec: &SlotRecord) -> Result<String, String> {
         Driver::Terminal if crate::holder::serving(&rec.slot) => Ok(rec.slot.clone()),
         Driver::Terminal => Err(format!(
             "{} is running in a terminal: attach to it from ssh, or end it there to open it here",
-            rec.slot
+            rec_label(rec)
         )),
     }
 }
@@ -1589,7 +1478,7 @@ pub(crate) fn remote_btw(
         return Err("nothing to ask about yet".into());
     };
     // A second claude for as long as it answers: the same room a new session needs.
-    match room_check(&[], deps) {
+    match room_check(deps) {
         None => {}
         Some(_) => return Err("no room for a side question here".into()),
     }
@@ -1644,11 +1533,16 @@ pub(crate) fn remote_btw(
     }
 }
 
-/// The menu's no-room check, said as a refusal: the remote view has no offer dialog.
+/// The remote view's no-room refusal: the door's mockup 4 in a line, pointing at the `c` the
+/// phone's home has too.
+const NO_ROOM_REMOTE: &str =
+    "No room for another claude here: c on a loaded session offloads it to make room";
+
+/// The menu's no-room check, said as a refusal: the remote view has no dialog for it.
 fn remote_room(deps: &Deps) -> Result<(), String> {
-    match room_check(&[], deps) {
+    match room_check(deps) {
         None => Ok(()),
-        Some(_) => Err("no room for another session here: offload one from ssh first".to_string()),
+        Some(_) => Err(NO_ROOM_REMOTE.to_string()),
     }
 }
 
@@ -1773,6 +1667,7 @@ mod tests {
     //! `CLAUDE_SESSIONS_ZMX`, pointed at the same stand-in.
 
     use super::*;
+    use crate::activity;
     use crate::ui::Row;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Child, Stdio};
@@ -2243,7 +2138,7 @@ exit 1"#,
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
         let before = clock::now();
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
 
         assert_eq!(
             out,
@@ -2267,7 +2162,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(&format!("kill {pid}; sleep 0.2")), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(out, Outcome::Back(Some("\"a\" ended".into())));
         term.assert_handed_over(1);
     }
@@ -2280,7 +2175,7 @@ exit 1"#,
         let mut rows = vec![row("x", "claude")];
         rows[0].key = RowKey::Socket("claude".into());
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2298,7 +2193,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
 
         assert_eq!(
             out,
@@ -2356,7 +2251,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         match &out {
             Outcome::Refused(why) => assert!(why.contains(&format!("pid {pid}")), "{why}"),
             other => panic!("expected a refusal, got {other:?}"),
@@ -2368,7 +2263,7 @@ exit 1"#,
         // Calibration: the same slot, with that session gone, resumes.
         std::fs::remove_file(&file).unwrap();
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2391,7 +2286,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2421,7 +2316,7 @@ exit 1"#,
         .unwrap();
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
-        let open = || open_with(&rows, 0, &mut Term::new(&f), &deps, true);
+        let open = || open_with(&rows, 0, &mut Term::new(&f), &deps);
         // No zmx session to attach to: its process is outside any slot we can reach.
         match open() {
             Outcome::Refused(why) => assert!(why.contains("outside any slot"), "{why}"),
@@ -2447,7 +2342,7 @@ exit 1"#,
         registry::store(&other).unwrap();
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
-        match open_with(&rows, 0, &mut Term::new(&f), &deps, true) {
+        match open_with(&rows, 0, &mut Term::new(&f), &deps) {
             Outcome::Refused(why) => {
                 assert!(why.contains("claude-2, which has no zmx session"), "{why}")
             }
@@ -2465,7 +2360,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         assert_eq!(
-            open_with(&rows, 0, &mut Term::new(&f), &deps, true),
+            open_with(&rows, 0, &mut Term::new(&f), &deps),
             Outcome::Refused(
                 "\"a\" is being started somewhere else — try again in a moment".into()
             )
@@ -2574,7 +2469,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "fix the dns")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2614,7 +2509,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "t")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains(&format!("pid {pid}"))),
             "{out:?}"
@@ -2626,7 +2521,7 @@ exit 1"#,
         );
         // Calibration: with that session gone, it resumes.
         std::fs::remove_file(&file).unwrap();
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2641,7 +2536,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [stored("conv-9", &f.work(), "t")];
         let mut term = Term::new(&f);
-        open_with(&rows, 0, &mut term, &deps, true);
+        open_with(&rows, 0, &mut term, &deps);
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         assert!(started.contains(" claude-4 --resume conv-9"), "{started}");
         assert!(registry::load("claude-1").unwrap().is_none(), "no new slot");
@@ -2653,7 +2548,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows = [stored("0f9c4a1e-7d", &f.work(), "fix the dns")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::ResumeFailed(Dialog::ResumeFailed {
@@ -2676,7 +2571,7 @@ exit 1"#,
         f.session("claude-1", true);
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
-        let out = open_with(&[row("claude-1", "a")], 0, &mut term, &deps, true);
+        let out = open_with(&[row("claude-1", "a")], 0, &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains("zmx kill")),
             "{out:?}"
@@ -2699,7 +2594,7 @@ exit 1"#,
         deps.oom_kills = rising;
         let rows: Vec<Row> = (1..=5).map(|n| row(&format!("claude-{n}"), "t")).collect();
         let mut term = Term::new(&f);
-        match open_with(&rows, 4, &mut term, &deps, true) {
+        match open_with(&rows, 4, &mut term, &deps) {
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 killed_for_memory, ..
             }) => assert!(killed_for_memory),
@@ -2708,7 +2603,7 @@ exit 1"#,
         // A count that cannot be read is not a kill.
         deps.oom_kills = || None;
         let mut term = Term::new(&f);
-        match open_with(&rows, 4, &mut term, &deps, true) {
+        match open_with(&rows, 4, &mut term, &deps) {
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 killed_for_memory, ..
             }) => assert!(!killed_for_memory),
@@ -2729,27 +2624,20 @@ exit 1"#,
         let f = Fixture::new("slow-resume");
         registry::store(&offloaded("claude-5", "0f9c4a1e-7d", &f.work())).unwrap();
         let rows = [row("claude-5", "t")];
-        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f), true);
+        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f));
         assert_eq!(out, Outcome::Back(Some("\"t\" ended".into())));
         assert_eq!(load("claude-5").state, State::Offloaded);
         drop(f);
 
         let f = Fixture::new("slow-stored");
         let rows = [stored("conv-9", &f.work(), "fix the dns")];
-        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f), true);
+        let out = open_with(&rows, 0, &mut Term::new(&f), &slow(&f));
         assert_eq!(out, Outcome::Back(Some("\"fix the dns\" ended".into())));
         assert_eq!(load("claude-1").state, State::Closed);
         drop(f);
 
         let f = Fixture::new("slow-new");
-        let out = new_session_with(
-            &[],
-            Harness::Claude,
-            &f.work(),
-            &mut Term::new(&f),
-            &slow(&f),
-            true,
-        );
+        let out = new_session_with(Harness::Claude, &f.work(), &mut Term::new(&f), &slow(&f));
         assert_eq!(out, Outcome::Back(Some("claude-1 ended".into())));
         assert_eq!(load("claude-1").state, State::Closed);
     }
@@ -2761,7 +2649,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows: Vec<Row> = (1..=5).map(|n| row(&format!("claude-{n}"), "t")).collect();
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 4, &mut term, &deps, true);
+        let out = open_with(&rows, 4, &mut term, &deps);
 
         assert_eq!(
             out,
@@ -2802,7 +2690,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -2824,7 +2712,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_fails());
         let rows = [row("claude-1", "a"), row("claude-2", "b")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 1, &mut term, &deps, true);
+        let out = open_with(&rows, 1, &mut term, &deps);
         assert!(matches!(out, Outcome::ResumeFailed(_)), "got {out:?}");
         assert_eq!(load("claude-2").state, State::Closed);
     }
@@ -2840,7 +2728,7 @@ exit 1"#,
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains("no conversation on disk")),
             "{out:?}"
@@ -2849,12 +2737,13 @@ exit 1"#,
         assert_eq!(load("claude-1").state, State::Offloaded, "left as it was");
         // Calibration: with the transcript back, the same slot resumes.
         std::fs::write(rec.transcript_path.as_ref().unwrap(), PROMPTED).unwrap();
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert!(!matches!(out, Outcome::Refused(_)), "{out:?}");
     }
 
     #[test]
-    fn a_resume_with_no_room_offers_the_idlest_offloadable_slot() {
+    fn a_resume_with_no_room_says_so_and_offers_nothing() {
+        // Owner, 2026-11-03: no offer to offload; `c` is the way, on the door and the phone.
         let mut f = Fixture::new("no-room");
         registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
         idle(&mut f, "claude-2");
@@ -2862,96 +2751,28 @@ exit 1"#,
         deps.memory = full;
         let rows = [row("claude-1", "a"), row("claude-2", "mount guards on one")];
         let mut term = Term::new(&f);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::NoRoom(Dialog::NoRoom {
                 used: (1 << 30) - (100 << 20),
                 limit: 1 << 30,
                 want: mem::SESSION_COST,
-                offer: Some((
-                    RowKey::Slot("claude-2".into()),
-                    "11m".into(),
-                    "mount guards on one".into()
-                )),
-            })
+            }),
+            "even with an idle slot the offloader would stop"
         );
         assert!(f.calls().is_empty() && term.events.is_empty());
         assert_eq!(load("claude-1").state, State::Offloaded);
-
-        // With nothing offloadable the dialog can only say so.
-        f.session("claude-2", true);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
-        assert!(
-            matches!(out, Outcome::NoRoom(Dialog::NoRoom { offer: None, .. })),
-            "an attached slot is not offered: {out:?}"
-        );
+        assert_eq!(remote_room(&deps), Err(NO_ROOM_REMOTE.to_string()));
 
         // Calibration: room, or no way of knowing, both let it through.
         for memory in [room as fn() -> mem::Memory, unknown] {
             deps.memory = memory;
             registry::store(&offloaded("claude-1", "conv-1", &f.work())).unwrap();
             let _ = std::fs::remove_file(f.path("zmx/claude-1"));
-            let out = open_with(&rows, 0, &mut term, &deps, true);
+            let out = open_with(&rows, 0, &mut term, &deps);
             assert!(matches!(out, Outcome::Back(_)), "{out:?}");
         }
-    }
-
-    #[test]
-    fn offload_then_open_stops_the_victim_and_starts_the_new_one() {
-        let mut f = Fixture::new("make-room");
-        let (pid, start) = idle(&mut f, "claude-1");
-        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
-        deps.memory = full;
-        let rows = [row("claude-1", "mount guards on one")];
-        let mut term = Term::new(&f);
-
-        // Refused while it no longer qualifies: attached since the offer was made.
-        f.session("claude-1", true);
-        let out =
-            offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
-        assert!(
-            matches!(&out, Outcome::Refused(why) if why.contains("attached")),
-            "{out:?}"
-        );
-        assert!(procinfo::is_alive(pid, start), "calibration: still running");
-
-        f.session("claude-1", false);
-        let out =
-            offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
-        assert_eq!(
-            out,
-            Outcome::Back(Some("detached · it is still running".into())),
-            "no second room check after making room"
-        );
-        assert!(!procinfo::is_alive(pid, start), "the victim was stopped");
-        assert_eq!(load("claude-1").state, State::Offloaded);
-        assert_eq!(load("claude-2").state, State::Live);
-        term.assert_handed_over(1);
-    }
-
-    #[test]
-    fn a_never_prompted_slot_is_not_offered_and_one_whose_transcript_went_is_closed() {
-        // Issue #5: the dialog promises the offered session is resumable from disk.
-        let mut f = Fixture::new("make-room-unprompted");
-        let (pid, start) = idle(&mut f, "claude-1");
-        let rows = [row("claude-1", "a")];
-        assert!(
-            offer(&rows).is_some(),
-            "calibration: with a transcript it is offered"
-        );
-        let transcript = load("claude-1").transcript_path.unwrap();
-        std::fs::remove_file(&transcript).unwrap();
-        assert_eq!(offer(&rows), None, "with none it is not");
-
-        // Accepted all the same — the transcript went after the offer was drawn — the stop is
-        // a close, as the offloader's would be.
-        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
-        deps.memory = full;
-        let mut term = Term::new(&f);
-        offload_then_open_with(&rows, 0, None, Harness::Claude, &f.work(), &mut term, &deps);
-        assert!(!procinfo::is_alive(pid, start), "the victim was stopped");
-        assert_eq!(load("claude-1").state, State::Closed);
     }
 
     // ── new ─────────────────────────────────────────────────────────────────
@@ -3028,7 +2849,7 @@ exit 1"#,
         let f = Fixture::new("new");
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
-        let out = new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
+        let out = new_session_with(Harness::Claude, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -3054,7 +2875,7 @@ exit 1"#,
         let f = Fixture::new("new-fails");
         let deps = f.deps(f.zmx(":"), f.claude_fails());
         let mut term = Term::new(&f);
-        let out = new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
+        let out = new_session_with(Harness::Claude, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Refused(
@@ -3073,7 +2894,7 @@ exit 1"#,
     fn running(f: &Fixture, prompted: bool) -> (u32, u64) {
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(f);
-        new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
+        new_session_with(Harness::Claude, &f.work(), &mut term, &deps);
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         let pid: u32 = started.split_whitespace().next().unwrap().parse().unwrap();
         let start = procinfo::start_time(pid).unwrap();
@@ -3187,12 +3008,12 @@ exit 1"#,
         let rows = [row("claude-1", "a")];
         let mut term = Term::new(&f);
         assert_eq!(
-            open_with(&rows, 0, &mut term, &deps, true),
+            open_with(&rows, 0, &mut term, &deps),
             Outcome::Refused("\"a\" is gone".into())
         );
         assert!(f.calls().is_empty(), "nothing attached");
         f.session("claude-1", false);
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert!(!matches!(out, Outcome::Refused(_)), "{out:?}");
         assert_eq!(f.calls().len(), 1, "{:?}", f.calls());
         assert!(
@@ -3259,7 +3080,7 @@ exit 1"#,
         let f = Fixture::new("close");
         let deps = f.deps(f.zmx(":"), f.claude_ok());
         let mut term = Term::new(&f);
-        new_session_with(&[], Harness::Claude, &f.work(), &mut term, &deps, true);
+        new_session_with(Harness::Claude, &f.work(), &mut term, &deps);
         // Play the hook's part: SessionStart binds the slot's own claude.
         let started = wait_for("the stand-in claude", || f.claude_log().pop());
         let pid: u32 = started.split_whitespace().next().unwrap().parse().unwrap();
@@ -3423,7 +3244,7 @@ exit 1"#,
         let mut deps = f.deps(f.zmx(":"), "/bin/false".into());
         deps.pi = f.claude_ok();
         let mut term = Term::new(&f);
-        let out = new_session_with(&[], Harness::Pi, &f.work(), &mut term, &deps, true);
+        let out = new_session_with(Harness::Pi, &f.work(), &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -3475,7 +3296,7 @@ exit 1"#,
         }];
         let mut term = Term::new(&f);
         // No conversation on disk under pi's layout: refused rather than started.
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert!(
             matches!(&out, Outcome::Refused(why) if why.contains("no conversation on disk")),
             "{out:?}"
@@ -3494,7 +3315,7 @@ exit 1"#,
         )
         .unwrap();
         registry::store(&rec).unwrap();
-        let out = open_with(&rows, 0, &mut term, &deps, true);
+        let out = open_with(&rows, 0, &mut term, &deps);
         assert_eq!(
             out,
             Outcome::Back(Some("detached · it is still running".into()))
@@ -3661,12 +3482,17 @@ exit 1"#,
         rec.pid = Some(pid);
         rec.proc_start = Some(start);
         rec.session_id = Some("conv-3".into());
+        rec.title = Some("fix the door".into());
         registry::store(&rec).unwrap();
         f.session("claude-3", true);
         let mut deps = f.deps(f.zmx(":"), f.claude_ok());
         deps.holder = holder_ok(&f);
         let why = remote_open("claude-3", &deps).unwrap_err();
         assert!(why.contains("running in a terminal"), "{why}");
+        assert!(
+            why.starts_with("\"fix the door\""),
+            "named by its title: {why}"
+        );
         assert!(f.calls().is_empty(), "nothing started");
         // Nor by its conversation from the store.
         let why = remote_resume("conv-3", &f.work(), "t", &deps).unwrap_err();
@@ -3681,6 +3507,39 @@ exit 1"#,
             Ok("claude-3".into())
         );
         assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn the_door_does_not_attach_a_slot_the_remote_view_drives() {
+        // Its zmx session shows a status line and drops what is typed: a dead end, refused as
+        // the phone refuses a terminal's slot (owner, 2026-11-03: refuse takeovers).
+        let mut f = Fixture::new("door-held");
+        let (pid, start) = f.process();
+        let mut rec = SlotRecord::new("claude-3", Moment::now());
+        rec.pid = Some(pid);
+        rec.proc_start = Some(start);
+        rec.session_id = Some("conv-3".into());
+        registry::store(&rec).unwrap();
+        f.session("claude-3", false);
+        let deps = f.deps(f.zmx(":"), f.claude_ok());
+        let rows = [row("claude-3", "fix the door")];
+        let mut term = Term::new(&f);
+        // Calibration: a terminal's slot is attached.
+        assert_eq!(
+            open_with(&rows, 0, &mut term, &deps),
+            Outcome::Back(Some("detached · it is still running".into()))
+        );
+        term.assert_handed_over(1);
+
+        rec.driver = Driver::Holder;
+        registry::store(&rec).unwrap();
+        let out = open_with(&rows, 0, &mut term, &deps);
+        assert!(
+            matches!(&out, Outcome::Refused(why)
+                if why.starts_with("\"fix the door\" runs in the remote view")),
+            "{out:?}"
+        );
+        term.assert_handed_over(1);
     }
 
     #[test]

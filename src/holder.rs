@@ -283,7 +283,7 @@ pub fn serve(
             .unwrap_or_else(|e| e.into_inner())
             .append(&line)?;
         shared.grew.notify_all();
-        if let Some(doing) = doing(&line) {
+        if let Some(doing) = next_said(&said, &line) {
             if doing != said {
                 say(&format!("{slot}: open in the remote view; {doing}"));
                 said = doing.to_string();
@@ -299,6 +299,13 @@ pub fn serve(
 }
 
 /// What a line says claude is doing, for the session's screen, when it says anything.
+/// What the zmx session's line says after `line`, if that changes. Anything claude writes
+/// means it has started: a resumed claude says nothing more until it is prompted, and
+/// "starting" stood on the screen until then.
+fn next_said(said: &str, line: &[u8]) -> Option<&'static str> {
+    doing(line).or((said == "starting").then_some("idle"))
+}
+
 fn doing(line: &[u8]) -> Option<&'static str> {
     let v = json::parse(std::str::from_utf8(line).ok()?.trim()).ok()?;
     match sdk::classify(&v) {
@@ -844,6 +851,20 @@ mod tests {
         let (got, _, _) = older(&path, len, 5).unwrap();
         assert_eq!(got.len(), 8);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumed_claude_reads_idle_once_it_writes_anything() {
+        let answer = br#"{"type":"control_response","response":{"subtype":"success"}}"#;
+        assert_eq!(next_said("starting", answer), Some("idle"));
+        assert_eq!(
+            next_said("working", answer),
+            None,
+            "only the first line ends starting"
+        );
+        let prompt = br#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#;
+        assert_eq!(next_said("starting", prompt), doing(prompt), "calibration");
+        assert_eq!(doing(prompt), Some("working"));
     }
 
     #[test]

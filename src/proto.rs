@@ -265,29 +265,11 @@ pub fn outcome_from(v: &Value) -> Option<Outcome> {
 
 fn dialog_to(d: &Dialog) -> Value {
     match d {
-        Dialog::NoRoom {
-            used,
-            limit,
-            want,
-            offer,
-        } => {
-            let mut v = obj(vec![
-                ("used", Value::num(*used as f64)),
-                ("limit", Value::num(*limit as f64)),
-                ("want", Value::num(*want as f64)),
-            ]);
-            if let Some((key, age, title)) = offer {
-                v.set(
-                    "offer",
-                    obj(vec![
-                        ("key", key_to(key)),
-                        ("age", Value::string(age)),
-                        ("title", Value::string(title)),
-                    ]),
-                );
-            }
-            v
-        }
+        Dialog::NoRoom { used, limit, want } => obj(vec![
+            ("used", Value::num(*used as f64)),
+            ("limit", Value::num(*limit as f64)),
+            ("want", Value::num(*want as f64)),
+        ]),
         Dialog::ResumeFailed {
             title,
             session,
@@ -308,18 +290,12 @@ fn dialog_to(d: &Dialog) -> Value {
 
 fn dialog_from(v: &Value) -> Option<Dialog> {
     if let Some(used) = v.get("used").and_then(Value::as_u64) {
-        let offer = v.get("offer").and_then(|o| {
-            Some((
-                key_from(o.get("key")?)?,
-                s(o, "age").unwrap_or_default(),
-                s(o, "title").unwrap_or_default(),
-            ))
-        });
+        // An older agent may name an `offer`; nothing is offered any more, so it is
+        // not read.
         return Some(Dialog::NoRoom {
             used,
             limit: v.get("limit").and_then(Value::as_u64).unwrap_or(0),
             want: v.get("want").and_then(Value::as_u64).unwrap_or(0),
-            offer,
         });
     }
     Some(Dialog::ResumeFailed {
@@ -571,13 +547,6 @@ mod tests {
                 used: 892 << 20,
                 limit: 1 << 30,
                 want: 250 << 20,
-                offer: Some((RowKey::Slot("claude-2".into()), "14m".into(), "t".into())),
-            }),
-            Outcome::NoRoom(Dialog::NoRoom {
-                used: 0,
-                limit: 1,
-                want: 2,
-                offer: None,
             }),
             Outcome::ResumeFailed(Dialog::ResumeFailed {
                 title: "mount guards on one".into(),
@@ -592,6 +561,21 @@ mod tests {
             assert_eq!(outcome_from(&wire(&outcome_to(&o))), Some(o));
         }
         assert_eq!(outcome_from(&Value::obj()), None, "nothing to read");
+    }
+
+    #[test]
+    fn an_older_agents_offer_is_read_past() {
+        // Until 2026-11-03 a no-room answer could name a session to offload; nothing is offered
+        // now, and the dialog still comes up.
+        let old = r#"{"no_room":{"used":5,"limit":6,"want":2,"offer":{"key":{"slot":"claude-2"},"age":"14m","title":"t"}}}"#;
+        assert_eq!(
+            outcome_from(&crate::json::parse(old).unwrap()),
+            Some(Outcome::NoRoom(Dialog::NoRoom {
+                used: 5,
+                limit: 6,
+                want: 2
+            }))
+        );
     }
 
     #[test]

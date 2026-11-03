@@ -178,15 +178,9 @@ pub struct HostLoad {
 /// offloaded one, neither of which loses the conversation. Mockup 3, the question it asked
 /// until then, is retired.
 pub enum Dialog {
-    /// Mockup 4. `offer` is the slot that could make room — its key, in the same container as
-    /// the session being opened, its idle age and its title — or `None` when nothing is
-    /// offloadable, and then the dialog can only say so.
-    NoRoom {
-        used: u64,
-        limit: u64,
-        want: u64,
-        offer: Option<(RowKey, String, String)>,
-    },
+    /// Mockup 4: the memory figures, and `c` as the way to make room. It offers nothing to
+    /// offload (owner, 2026-11-03).
+    NoRoom { used: u64, limit: u64, want: u64 },
     /// Mockup 5. `session` is the conversation id as shown (its first 8 characters),
     /// `killed_for_memory` whether the container's OOM-kill count rose while it started,
     /// `output` the last lines claude wrote to stderr, and `closed` whether the row went back

@@ -121,10 +121,9 @@ must stay loaded holds itself with `claude-sessions keepalive` (until 0.5.0 a pe
 `CLAUDE_SESSIONS_OFFLOAD=0` also existed; it went with the hub, as a second switch for one job).
 
 **Room is still a container's own**: each container keeps its own memory ceiling inside the
-pool (infra's `cgroup_parent`), and the no-room offer is from the same container as the session
+pool (infra's `cgroup_parent`), and the no-room dialog reads the container of the session
 being opened. The home's header shows the pool where infra mounts it read-only
-(`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory); offering a slot in another container to make
-room in the pool is not built.
+(`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory).
 
 ## Slots, conversations, and what is stored
 
@@ -381,8 +380,7 @@ reports without signalling. Where the rules above left a choice, this is the cho
   so a slower timer reads more active: at 3 minutes the CPU budget (3000 ms) is 16.7 ms/s,
   about twice an idle slot's 7–13 ms/s on zero (claude-sessions#14), and much past 4 minutes
   an idle claude reads active on CPU alone. A window of 10 minutes or more counts as active
-  whatever it measured, and the menu's make-room offer decides only on a reading at most 5
-  minutes old.
+  whatever it measured.
 - **Resumable or kept.** A slot with no recorded `session_id` or `cwd` is kept: stopping it
   would be a close with extra steps. Registered and unregistered slots get the same rules.
 - **Offload or close is decided after stop or keep.** `decide` answers whether a slot may be
@@ -392,10 +390,10 @@ reports without signalling. Where the rules above left a choice, this is the cho
 - **A close writes nothing before the signal.** The `SessionEnd` it provokes already reads as
   a close, and a stop that fails leaves the slot `live` for the next pass, where an offload
   leaves it `offloading`.
-- **The menu's make-room path asks the same.** Mockup 4 offers only a slot `judge` would
-  offload, from the measurements the last pass stored, under the same freshness and process
-  checks; accepted, the stop is `judge`'s again
-  under the lock, so a keep-alive or a transcript that went in between is respected.
+- **Nothing is offered to make room** (owner, 2026-11-03: "don't offer to offload … point at
+  c instead"). Until then mockup 4 offered the idlest slot `judge` would offload, with `y`
+  to stop it and open; now the door and the remote view both say no room and point at `c`,
+  so which session goes is always the owner's pick.
 - **Not being able to look keeps it.** A zmx that does not answer for the slot (attached
   cannot be ruled out), a slot not yet measured, a record with no pid — each is a reason to
   keep.
@@ -697,7 +695,10 @@ quits. With one container there is no home and `Esc` quits from its screen.
   — with an exchange in it. A slot offloaded before its first prompt, or `/clear`ed and left,
   has nothing to resume (issue #5), and the resume path refuses such a slot too, for one whose
   transcript went after the list was read.
-- **Opening a row:** live → `zmx attach <slot> false`; offloaded → start a new slot running
+- **Opening a row:** live → `zmx attach <slot> false`, except a slot the remote view's holder
+  drives, which is refused with words, as the remote view refuses a terminal's slot (owner,
+  2026-11-03: refuse takeovers) — its zmx session shows a status line and drops what is typed,
+  so an attach was a dead end; offloaded → start a new slot running
   `claude --resume <session_id>` in its `cwd`. The `false` is a guard: `zmx attach` *creates*
   a session that is not there, so one that ended between the list and the keypress would come
   back as a stray shell; given a command, zmx ignores it for a session that exists and runs
@@ -744,10 +745,6 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   RAM with nothing running — and the menu would have offered to offload a session for room the
   kernel would simply have taken back. The header, mockup 4's figures, `doctor` and the
   offloader's `memory:` line all use it, and the last two say the cache apart.
-- **Room is checked once.** After offloading to make room, the open goes ahead without asking
-  the cgroup again: what the stopped claude read stays charged as active page cache for a
-  while, which the working set still counts, and a second check could refuse the room just
-  made.
 - **`c` is one step down the list, and asks nothing** (owner, 2026-10-27; until then it asked
   "Close this session?", mockup 3, now retired). On a loaded slot it **offloads** it: the
   offloader's own stop (`offload::stop_quiet`) — the record marked `offloading` before the
@@ -768,8 +765,8 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
 - **A status line that does not fit wraps** rather than being cut: it is usually the reason
   something was refused.
 - **Wording the mockups did not draw**, written in their voice and the owner's to change:
-  no room with nothing offloadable says "Nothing is idle enough to offload. c on a loaded
-  session offloads it to make room." with only `Esc back`; a failed resume of an archived row
+  the remote view's no-room refusal is mockup 4 in a line, "No room for another claude here:
+  c on a loaded session offloads it to make room"; a failed resume of an archived row
   says "Left archived." where mockup 5 says "Left offloaded."; `c` says what it did on the
   status line — `offloaded · resumable from disk`, `archived · resumable from disk`.
 - **Nothing on the screen is numbered, so messages name a session by its title**, quoted and
@@ -777,8 +774,8 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   `detached · it is still running` names none, because the cursor is still on it.
 - **Nothing is ever resumed automatically.** Memory is spent on what the owner opens, in the
   order they open it. `Enter` on an offloaded row resumes immediately with no confirmation
-  (owner, 2026-10-01); near the memory ceiling it can instead answer with the no-room offer
-  for a *different* slot, which is accepted rather than designed around.
+  (owner, 2026-10-01); near the memory ceiling it instead answers that there is no room, and
+  `c` on a loaded session makes some.
 - **Keys:** `Enter` open (on the Archived heading, open or shut it; a click does the same) ·
   `n` new, in the workspace · `c` offload, or archive what is offloaded (the hint line says
   `c close`, the same seven columns as ever) · `s` a shell · `Esc` quit (back to the home, at the
@@ -1013,7 +1010,7 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
   smoke run TERMs a pi and lists what survives; if something does, that is the rule.
 - **Old hubs and old agents.** A 0.9.0 hub draws a pi row as a plain row and its `n` still
   makes claude slots. A new hub asks a container's agent for a pi slot as its own op,
-  `new_pi` (and `offload_then_open_pi` after a no-room offload), which an agent older than
+  `new_pi`, which an agent older than
   this answers it does not know, so a pi asked for never comes back as a claude. The
   resume-failed dialog says the harness's own line: `pi --session-id <id> ended`.
 - **Mail**: `<repo>/pi-<n>` is an address like any other, accepted when the container's

@@ -1046,12 +1046,7 @@ fn dialog_screen(view: &View, dialog: &Dialog, w: usize, h: usize) -> Vec<Line> 
 fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
     let mut out = Vec::new();
     match dialog {
-        Dialog::NoRoom {
-            used,
-            limit,
-            want,
-            offer,
-        } => {
+        Dialog::NoRoom { used, limit, want } => {
             paragraph(&mut out, "No room for another claude", 0, tw, BOLD);
             out.push(blank());
             let why = format!(
@@ -1062,26 +1057,12 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             );
             paragraph(&mut out, &why, 0, tw, FG);
             out.push(blank());
-            match offer {
-                Some((_, age, title)) => {
-                    let ask = format!("Offload this session, idle {age}?");
-                    paragraph(&mut out, &ask, 0, tw, FG);
-                    paragraph(&mut out, title, 2, tw, FG);
-                    paragraph(&mut out, "resumable from disk", 2, tw, FG);
-                    out.push(blank());
-                    let buttons = [("y", "offload, then open"), ("n", "cancel")];
-                    out.extend(hint_lines(&buttons, "    ", tw));
-                }
-                // Nothing to offer, so nothing to accept: the dialog can only say so and go
-                // back. `c` offloads whichever session the owner picks, so that is the advice.
-                None => {
-                    let none = "Nothing is idle enough to offload. c on a loaded session \
-                                offloads it to make room.";
-                    paragraph(&mut out, none, 0, tw, FG);
-                    out.push(blank());
-                    out.extend(hint_lines(&[("Esc", "back")], GAP, tw));
-                }
-            }
+            // No session is offered (owner, 2026-11-03): `c` offloads whichever one the owner
+            // picks, so that is the advice, as the remote view gives it.
+            let how = "c on a loaded session offloads it to make room.";
+            paragraph(&mut out, how, 0, tw, FG);
+            out.push(blank());
+            out.extend(hint_lines(&[("Esc", "back")], GAP, tw));
         }
         Dialog::ResumeFailed {
             title,
@@ -1309,16 +1290,12 @@ mod tests {
     }
     fn mockup_4(w: u16) -> View {
         View {
-            about: Some(RETIRE),
+            cursor: MOUNT,
+            about: Some(MOUNT),
             dialog: Some(Dialog::NoRoom {
                 used: 892 * MIB,
                 limit: 1024 * MIB,
                 want: 250 * MIB,
-                offer: Some((
-                    RowKey::Slot("retire the old tunnel".into()),
-                    "14m".to_string(),
-                    "retire the old tunnel".to_string(),
-                )),
             }),
             ..view(w, listed(), 892)
         }
@@ -2338,7 +2315,7 @@ mod tests {
             ..mockup_6(40)
         };
         let wrong_about = View {
-            about: Some(MOUNT),
+            about: Some(RETIRE),
             ..mockup_4(40)
         };
         let wrong_dialog = View {
@@ -2786,35 +2763,6 @@ mod tests {
     }
 
     #[test]
-    fn no_room_with_nothing_to_offload_can_only_go_back() {
-        let v = View {
-            dialog: Some(Dialog::NoRoom {
-                used: 1000 * MIB,
-                limit: 1024 * MIB,
-                want: 250 * MIB,
-                offer: None,
-            }),
-            ..mockup_4(40)
-        };
-        let f = render(&v).unwrap();
-        assert_eq!(
-            box_text(&f),
-            [
-                " No room for another claude",
-                "",
-                " 1000M of 1.0G used. A new one wants",
-                " about 250M.",
-                "",
-                " Nothing is idle enough to offload. c",
-                " on a loaded session offloads it to",
-                " make room.",
-                "",
-                " Esc back",
-            ]
-        );
-    }
-
-    #[test]
     fn a_resume_that_says_nothing_says_so_and_an_archived_one_is_left_archived() {
         let v = View {
             dialog: Some(Dialog::ResumeFailed {
@@ -2940,7 +2888,6 @@ mod tests {
                     used: 0,
                     limit: 0,
                     want: 0,
-                    offer: None,
                 }),
                 ..mockup_2(w)
             }),

@@ -20,7 +20,9 @@ The owner's decisions, in the session of 2026-11-01:
   JSON control protocol to the containers.**
 - **Copying is a `/copy` command**, as Claude Code has.
 - **Not attachable while it runs.** A conversation open in the remote view is not also attached
-  through zmx; the owner ends it and resumes it in a normal slot when needed.
+  through zmx; the owner ends it and resumes it in a normal slot when needed. The door refuses
+  the attach with words (owner, 2026-11-03: refuse takeovers), as the view refuses a
+  terminal's slot (R10).
 - **Look and feel as close to Claude Code's as possible**, against a pinned Claude Code version.
 - **The pin is fleet-wide**, for every session, not only the remote view's (below).
 - **The order of authority** for a design question: Claude Code's existing design first, then a
@@ -211,7 +213,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 - **The holder runs under zmx.** zmx already provides the listing, the offloader's teardown,
   `ZMX_SESSION` and the attach guard. The holder:
   - writes one plain line at start and on each state change, never on a timer, so attaching to
-    it from the old menu shows what it is;
+    it by hand with `zmx attach` shows what it is (the menu attached it too until 2026-11-03,
+    and refuses now); after a resume, the line says idle as soon as claude writes anything;
   - discards its stdin, because the mail nudge types into detached sessions;
   - writes claude's stderr to `<registry>/<slot>.stderr`, as the launcher does, so a failed
     start is still reported.

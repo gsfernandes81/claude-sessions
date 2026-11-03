@@ -480,7 +480,7 @@ fn act(
             return Ok(Done::Changed);
         }
     };
-    finish(term, menu, screen, Work::spawn(job), &plan, &host)
+    finish(term, menu, screen, Work::spawn(job), &plan)
 }
 
 /// What an action asks of a container: which one, what is sent, the spinner shown meanwhile,
@@ -494,10 +494,8 @@ struct Plan {
     /// 2026-10-04).
     row: Option<usize>,
     what: &'static str,
-    /// The row to open once there is room, for the no-room and resume-failed dialogs.
+    /// The row asked to open, for the no-room and resume-failed dialogs.
     then: Option<usize>,
-    /// The harness a new slot runs, for the no-room dialog's `y`.
-    harness: Harness,
 }
 
 /// [`Plan`] for `action` over the menu's `rows`; `None` for an action that asks nothing.
@@ -514,10 +512,6 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
             }
         }
         v
-    };
-    let harness = match action {
-        Action::New(_, h) | Action::OffloadThenOpen { harness: h, .. } => *h,
-        _ => Harness::Claude,
     };
     let (host, op, row, what, then) = match action {
         Action::None | Action::Redraw | Action::Quit => return None,
@@ -569,24 +563,6 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
             "archiving session",
             None,
         ),
-        // As `new`: a pi slot after the offload is its own op, refused by an older agent.
-        Action::OffloadThenOpen {
-            victim,
-            then,
-            harness,
-        } => (
-            host_of(*victim),
-            op(
-                match harness {
-                    Harness::Claude => "offload_then_open",
-                    Harness::Pi => "offload_then_open_pi",
-                },
-                vec![("victim", key_of(*victim)), ("then", then.and_then(key_of))],
-            ),
-            Some(*victim),
-            "offloading session for room",
-            *then,
-        ),
     };
     Some(Plan {
         host,
@@ -594,7 +570,6 @@ fn plan(action: &Action, rows: &[Row]) -> Option<Plan> {
         row,
         what,
         then,
-        harness,
     })
 }
 
@@ -624,7 +599,6 @@ fn finish(
     screen: &mut Screen,
     work: Work,
     plan: &Plan,
-    host: &str,
 ) -> Result<Done, Stop> {
     let Some(outcome) = wait_on(term, menu, screen, work, plan.row, plan.what)? else {
         return Ok(Done::Quit);
@@ -632,7 +606,7 @@ fn finish(
     match outcome {
         Outcome::Back(status) => menu.set_status(status),
         Outcome::Refused(why) => menu.set_status(Some(why)),
-        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, plan.then, plan.harness, host),
+        Outcome::NoRoom(dialog) => menu.ask_no_room(dialog, plan.then),
         Outcome::ResumeFailed(dialog) => menu.ask_resume_failed(dialog, plan.then.unwrap_or(0)),
     }
     Ok(Done::Changed)
@@ -1085,29 +1059,9 @@ mod tests {
     }
 
     #[test]
-    fn offloading_for_room_spins_on_the_victim_and_opens_the_other_after() {
+    fn each_action_sends_its_op_and_says_what_it_does() {
         let rows = rows_to_act_on();
-        let action = Action::OffloadThenOpen {
-            victim: 2,
-            then: Some(1),
-            harness: Harness::Claude,
-        };
-        let p = plan(&action, &rows).unwrap();
-        assert_eq!(
-            (p.row, p.what, p.then),
-            (Some(2), "offloading session for room", Some(1))
-        );
-        let key = |i: usize| crate::json::to_line(&proto::key_to(&rows[i].key));
-        assert_eq!(
-            crate::json::to_line(&p.op),
-            format!(
-                r#"{{"op":"offload_then_open","then":{},"victim":{}}}"#,
-                key(1),
-                key(2)
-            )
-        );
-        // The rest: what each sends and says, and that nothing is asked of a key that asks
-        // nothing.
+        // What each sends and says, and that nothing is asked of a key that asks nothing.
         let say = |a: Action| {
             let p = plan(&a, &rows).unwrap();
             (crate::json::to_line(&p.op), p.what, p.row, p.then)
@@ -1158,14 +1112,7 @@ mod tests {
             term.suspend().unwrap();
             Outcome::Back(Some("the session ended".into()))
         });
-        let done = finish(
-            &mut t,
-            &mut m,
-            &mut None,
-            Work::spawn(job),
-            &open_plan(),
-            "local",
-        );
+        let done = finish(&mut t, &mut m, &mut None, Work::spawn(job), &open_plan());
         assert_eq!(done.unwrap(), Done::Changed);
         assert_eq!(t.handed, ["suspend", "resume"]);
         assert_eq!(m.view().status.as_deref(), Some("the session ended"));
@@ -1187,7 +1134,6 @@ mod tests {
             &mut None,
             Work::spawn(slow(300)),
             &open_plan(),
-            "local",
         );
         assert_eq!(done.unwrap(), Done::Quit);
 
@@ -1199,7 +1145,6 @@ mod tests {
             &mut None,
             Work::spawn(slow(300)),
             &open_plan(),
-            "local",
         );
         assert_eq!(done.unwrap(), Done::Changed);
         assert_eq!(m.view().width, 40);

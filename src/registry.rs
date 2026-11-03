@@ -322,6 +322,20 @@ impl SlotRecord {
             .unwrap_or_else(|| "(no title yet)".into())
     }
 
+    /// The title its row shows, with titles read from its transcript (a `/rename` fires no
+    /// hook), as the menu draws it and messages name it.
+    pub fn row_title(&self) -> String {
+        self.display_title_with(
+            &self
+                .conversation_path()
+                .map(|p| match self.harness {
+                    Harness::Claude => crate::transcript::titles_cached(&p),
+                    Harness::Pi => crate::pisession::titles_cached(&p),
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     /// How much longer a keep-alive holds this slot, if one does: only while it runs.
     pub fn kept_for(&self, now: Millis) -> Option<Millis> {
         self.keep_until_ms

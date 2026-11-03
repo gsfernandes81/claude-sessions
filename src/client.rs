@@ -745,7 +745,7 @@ impl App {
             }
             // A shell, a pi session and the no-room question need the door's terminal: the
             // phone's home does not offer them (mockup R9), and their keys do nothing.
-            Action::New(_, Harness::Pi) | Action::Shell(_) | Action::OffloadThenOpen { .. } => {}
+            Action::New(_, Harness::Pi) | Action::Shell(_) => {}
             Action::None | Action::Redraw => {}
         }
     }

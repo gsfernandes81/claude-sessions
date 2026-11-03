@@ -51,20 +51,20 @@
 === mockup 4 at 40x24
 [2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
 [2K[2m────────────────────────────────────────[0m
-[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────[0m
-[2K[1mretire the old tunnel[0m              [2m  14m[0m
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────[0m
+[2K[7mmount guards on one                [0m[2;7m   2d[0m
 [2K[2m╭──────────────────────────────────────╮[0m
 [2K[2m│[0m [1mNo room for another claude[0m           [2m│[0m
 [2K[2m│[0m                                      [2m│[0m
 [2K[2m│[0m 892M of 1.0G used. A new one wants   [2m│[0m
 [2K[2m│[0m about 250M.                          [2m│[0m
 [2K[2m│[0m                                      [2m│[0m
-[2K[2m│[0m Offload this session, idle 14m?      [2m│[0m
-[2K[2m│[0m   retire the old tunnel              [2m│[0m
-[2K[2m│[0m   resumable from disk                [2m│[0m
+[2K[2m│[0m c on a loaded session offloads it to [2m│[0m
+[2K[2m│[0m make room.                           [2m│[0m
 [2K[2m│[0m                                      [2m│[0m
-[2K[2m│[0m [38;5;75my[0m offload, then open    [38;5;75mn[0m cancel     [2m│[0m
+[2K[2m│[0m [38;5;75mEsc[0m back                             [2m│[0m
 [2K[2m╰──────────────────────────────────────╯[0m
+[2K
 [2K
 [2K
 [2K
@@ -376,20 +376,20 @@
 === mockup 4 at 80x24
 [2Kinfra-dev[2m · 6 open · 892M of 1.0G[0m
 [2K[2m────────────────────────────────────────────────────────────────────────────────[0m
-[2K[2m── [0m[1mLoaded · 5[0m[2m ──────────────────────────────────────────────────────────────────[0m
-[2K  [1mretire the old tunnel[0m                                                    [2m  14m[0m
+[2K[2m── [0m[1mOffloaded · 1[0m[2m ───────────────────────────────────────────────────────────────[0m
+[2K[7m  mount guards on one                                                      [0m[2;7m   2d[0m
 [2K                    [2m╭──────────────────────────────────────╮[0m
 [2K                    [2m│[0m [1mNo room for another claude[0m           [2m│[0m
 [2K                    [2m│[0m                                      [2m│[0m
 [2K                    [2m│[0m 892M of 1.0G used. A new one wants   [2m│[0m
 [2K                    [2m│[0m about 250M.                          [2m│[0m
 [2K                    [2m│[0m                                      [2m│[0m
-[2K                    [2m│[0m Offload this session, idle 14m?      [2m│[0m
-[2K                    [2m│[0m   retire the old tunnel              [2m│[0m
-[2K                    [2m│[0m   resumable from disk                [2m│[0m
+[2K                    [2m│[0m c on a loaded session offloads it to [2m│[0m
+[2K                    [2m│[0m make room.                           [2m│[0m
 [2K                    [2m│[0m                                      [2m│[0m
-[2K                    [2m│[0m [38;5;75my[0m offload, then open    [38;5;75mn[0m cancel     [2m│[0m
+[2K                    [2m│[0m [38;5;75mEsc[0m back                             [2m│[0m
 [2K                    [2m╰──────────────────────────────────────╯[0m
+[2K
 [2K
 [2K
 [2K
