@@ -97,8 +97,14 @@ pub enum Msg {
         is_error: bool,
         session_id: String,
     },
-    /// Known and of no use to the view: hook progress, thinking-token estimates, rate-limit
-    /// readings, keep-alives and the stream events other than text.
+    /// `rate_limit_event` with its `unifiedWindows`: how much of the account's 5-hour and
+    /// weekly limits is used, each window only when claude read it.
+    Limits {
+        five_hour: Option<Window>,
+        seven_day: Option<Window>,
+    },
+    /// Known and of no use to the view: hook progress, thinking-token estimates, a rate-limit
+    /// reading with no window in it, keep-alives and the stream events other than text.
     Noise,
     /// A line a view sent claude, as the holder logs it (`{"type":"_in","line":…}`): read
     /// back so every view sees what any of them answered or changed.
@@ -125,6 +131,14 @@ pub enum Msg {
     TasksNow(Vec<TaskNow>),
     /// A line of a type this version does not know, kept by its name so a log can say so.
     Unknown(String),
+}
+
+/// A usage-limit window: the percentage used, rounded as Claude Code rounds it, and when it
+/// resets, in epoch seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub pct: u8,
+    pub resets_at: u64,
 }
 
 /// One entry of `background_tasks_changed`.
@@ -463,8 +477,36 @@ pub fn classify(v: &Value) -> Msg {
                 .unwrap_or(sub != "success"),
             session_id: s(v, "session_id"),
         },
-        "rate_limit_event" | "keep_alive" | "tool_progress" | "prompt_suggestion" => Msg::Noise,
+        "rate_limit_event" => limits(v),
+        "keep_alive" | "tool_progress" | "prompt_suggestion" => Msg::Noise,
         other => Msg::Unknown(other.to_string()),
+    }
+}
+
+/// A `rate_limit_event`'s windows. `utilization` is a fraction, shown by Claude Code as
+/// `Math.round(utilization*100)`; a window it cannot read is left out, not guessed.
+fn limits(v: &Value) -> Msg {
+    let windows = v
+        .get("rate_limit_info")
+        .and_then(|i| i.get("unifiedWindows"));
+    let window = |key: &str| {
+        let w = windows?.get(key)?;
+        let used = w.get("utilization")?.as_f64()?;
+        let resets_at = w.get("resetsAt")?.as_u64_lenient()?;
+        if !used.is_finite() {
+            return None;
+        }
+        Some(Window {
+            pct: (used * 100.0).round().clamp(0.0, 100.0) as u8,
+            resets_at,
+        })
+    };
+    match (window("five_hour"), window("seven_day")) {
+        (None, None) => Msg::Noise,
+        (five_hour, seven_day) => Msg::Limits {
+            five_hour,
+            seven_day,
+        },
     }
 }
 
@@ -1203,6 +1245,35 @@ mod tests {
         ] {
             assert_eq!(read(line), Msg::Noise, "{line}");
         }
+    }
+
+    #[test]
+    fn a_rate_limit_event_says_the_windows_it_has() {
+        // As claude 2.1.311 wrote it on 2026-11-04, with only the weekly window.
+        assert_eq!(
+            read(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1794006000,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false,"unifiedWindows":{"seven_day":{"utilization":0.72,"resetsAt":1794006000,"status":"allowed"}}}}"#
+            ),
+            Msg::Limits {
+                five_hour: None,
+                seven_day: Some(Window {
+                    pct: 72,
+                    resets_at: 1794006000
+                }),
+            }
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.125,"resetsAt":1793990000},"seven_day":{"utilization":"x","resetsAt":1}}}}"#
+            ),
+            Msg::Limits {
+                five_hour: Some(Window {
+                    pct: 13,
+                    resets_at: 1793990000
+                }),
+                seven_day: None,
+            }
+        );
     }
 
     #[test]

@@ -355,7 +355,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -482,6 +482,15 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      runs, one gone from it has ended. A monitor is a `local_bash` task whose call was
      `Monitor`, which only the call says. A task's start is its `run_id`'s first part,
      base-36 epoch milliseconds (measured against its `end_time`), so no clock is needed.
+     - **Usage** at the mode line's right, two columns short of the edge, grey:
+       `5h 12% · 7d 72%`, the account's 5-hour and weekly limits as headless claude's
+       `rate_limit_event` reads them (`unifiedWindows`, each `utilization` a fraction that
+       Claude Code rounds to a percentage, and its `resetsAt`). A window claude does not
+       read again keeps its last reading, and is no longer drawn from its reset, so a stale
+       figure is never shown as now's; until claude has read one, nothing is drawn. Asked
+       for by the owner on 2026-11-04; mockup R2 shows it. It fits beside `esc to interrupt` at 40 columns; beside a mode line,
+       `(/auto to cycle)` goes first, as it does for the pill, and when it still will not
+       fit — the strip's hints — it is left out.
      - **The pill**: running shells and monitors on the mode line after ` · `, in Claude
        Code's cyan `00cccc` — `2 shells, 1 monitor` — and `/tasks to see subagents` while
        an agent or workflow runs, since the pill counts only shells; the line is cut hard two

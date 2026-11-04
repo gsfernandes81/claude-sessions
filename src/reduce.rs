@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::json::Value;
-use crate::sdk::{self, Block, Msg, Question};
+use crate::sdk::{self, Block, Msg, Question, Window};
 
 /// How many lines of a tool's result the view is sent before it asks for the rest: Claude
 /// Code's collapsed result shows a few lines and a count of the others.
@@ -129,6 +129,9 @@ pub struct Meta {
     pub version: String,
     /// The slash commands claude has, for the view to colour as Claude Code colours them.
     pub commands: Vec<String>,
+    /// The account's 5-hour and weekly usage, as claude last read each.
+    pub five_hour: Option<Window>,
+    pub seven_day: Option<Window>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -817,6 +820,7 @@ impl Reducer {
             msg,
             Msg::Prompt(_)
                 | Msg::Noise
+                | Msg::Limits { .. }
                 | Msg::Unknown(_)
                 | Msg::Lifecycle { .. }
                 | Msg::Response { .. }
@@ -858,6 +862,18 @@ impl Reducer {
             Msg::TitleChanged(title) => {
                 let meta = Meta {
                     title,
+                    ..self.meta.clone()
+                };
+                self.set_meta(&mut out, meta);
+            }
+            // A window claude did not read this time keeps its last reading.
+            Msg::Limits {
+                five_hour,
+                seven_day,
+            } => {
+                let meta = Meta {
+                    five_hour: five_hour.or(self.meta.five_hour),
+                    seven_day: seven_day.or(self.meta.seven_day),
                     ..self.meta.clone()
                 };
                 self.set_meta(&mut out, meta);
@@ -1557,6 +1573,17 @@ impl Op {
                         Value::Arr(m.commands.iter().map(Value::string).collect()),
                     );
                 }
+                for (k, w) in [("u5", m.five_hour), ("u7", m.seven_day)] {
+                    if let Some(w) = w {
+                        v.set(
+                            k,
+                            obj(vec![
+                                ("p", Value::num(w.pct)),
+                                ("r", Value::num(w.resets_at as f64)),
+                            ]),
+                        );
+                    }
+                }
                 v
             }
         }
@@ -1742,6 +1769,44 @@ mod tests {
         r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"text","text":"Done"}]}}"#,
         r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}"#,
     ];
+
+    #[test]
+    fn usage_limits_ride_the_meta_op_and_a_window_not_read_again_keeps_its_reading() {
+        let mut r = Reducer::new();
+        let both = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"five_hour":{"utilization":0.12,"resetsAt":1793990000},"seven_day":{"utilization":0.72,"resetsAt":1794006000}}}}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&both.ops),
+            [
+                r#"{"cwd":"","e":"","m":"","pm":"","sid":"","t":"meta","ti":"","u5":{"p":12,"r":1793990000},"u7":{"p":72,"r":1794006000},"ver":""}"#
+            ]
+        );
+        let weekly = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"seven_day":{"utilization":0.73,"resetsAt":1794006000}}}}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&weekly.ops),
+            [
+                r#"{"cwd":"","e":"","m":"","pm":"","sid":"","t":"meta","ti":"","u5":{"p":12,"r":1793990000},"u7":{"p":73,"r":1794006000},"ver":""}"#
+            ]
+        );
+        // The same reading again, or one with no window, sends nothing.
+        let again = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"rate_limit_event","rate_limit_info":{"unifiedWindows":{"seven_day":{"utilization":0.731,"resetsAt":1794006000}}}}"#,
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+            ],
+        );
+        assert!(again.ops.is_empty());
+    }
 
     #[test]
     fn a_turn_reduces_to_what_claude_code_draws() {

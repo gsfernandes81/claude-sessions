@@ -301,6 +301,9 @@ pub struct Meta {
     pub version: String,
     /// claude's slash commands, without their `/`: coloured in the prompt (`slash_runs`).
     pub commands: Vec<String>,
+    /// The account's 5-hour and weekly usage, drawn at the footer's right (`usage`).
+    pub five_hour: Option<crate::sdk::Window>,
+    pub seven_day: Option<crate::sdk::Window>,
 }
 
 #[derive(Debug, Default)]
@@ -722,6 +725,8 @@ impl Convo {
                         .iter()
                         .filter_map(|c| c.as_str().map(String::from))
                         .collect(),
+                    five_hour: window(v.get("u5")),
+                    seven_day: window(v.get("u7")),
                 };
             }
             // Prompts on their way that this view did not see sent, or no longer remembers:
@@ -1775,6 +1780,28 @@ fn clip(l: Line, w: usize) -> Line {
     out
 }
 
+/// A usage-limit window from the meta op, `{p, r}`; anything else is no reading.
+fn window(v: Option<&Value>) -> Option<crate::sdk::Window> {
+    let v = v?;
+    Some(crate::sdk::Window {
+        pct: u8::try_from(v.get("p")?.as_u64()?).ok()?.min(100),
+        resets_at: v.get("r")?.as_u64()?,
+    })
+}
+
+/// The footer's usage, `5h 12% · 7d 72%`: each window claude has read and that has not
+/// reset since, so an old reading is not drawn as now's.
+fn usage(m: &Meta, now_ms: u64) -> Option<String> {
+    let parts: Vec<String> = [("5h", m.five_hour), ("7d", m.seven_day)]
+        .into_iter()
+        .filter_map(|(k, w)| {
+            w.filter(|w| w.resets_at.saturating_mul(1000) > now_ms)
+                .map(|w| format!("{k} {}%", w.pct))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 /// The input box and footer: R1's last five rows. A prompt taller than half the screen shows
 /// that many rows, scrolled to keep the cursor in them, `↑`/`↓` leading a row with more past it.
 fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usize)) {
@@ -1920,6 +1947,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     // The mode line, then claude's background shells after ` · ` in cyan, as Claude Code
     // puts them, and `/tasks to see subagents` while one runs, since the pill counts shells.
     // Claude Code drops its `(shift+tab to cycle)` while a pill shows.
+    let usage = usage(&c.meta, now_ms);
     let mut foot: Line = Vec::new();
     if let Focus::Strip(i) = ui.focus {
         // The strip has the focus: the mode line says its keys, as Claude Code's does.
@@ -1933,7 +1961,11 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     } else if busy {
         foot.push(("  esc to interrupt".into(), fg(GREY)));
     } else if let Some((m, colour)) = mode_line(&c.meta.mode) {
-        let m = if pill.is_some() || subagents {
+        // The hint goes too when the usage would not fit beside it.
+        let crowded = usage.as_ref().is_some_and(|u| {
+            pill.is_none() && !subagents && 2 + width(&m) + 2 + width(u) > w.saturating_sub(2)
+        });
+        let m = if pill.is_some() || subagents || crowded {
             m.replace(" (/auto to cycle)", "")
         } else {
             m
@@ -1972,7 +2004,17 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     if strip_focus.is_some() {
         foot.truncate(1);
     }
-    out.push(clip(foot, w.saturating_sub(2)));
+    let mut foot = clip(foot, w.saturating_sub(2));
+    // The usage at the right, two columns short of the edge as the rest is, when it fits.
+    if let Some(u) = usage {
+        let used = width(&plain(&foot));
+        let room = w.saturating_sub(2).saturating_sub(used);
+        if room >= width(&u) + 2 {
+            foot.push((" ".repeat(room - width(&u)), PLAIN));
+            foot.push((u, fg(GREY)));
+        }
+    }
+    out.push(foot);
     // The agent strip under it while agents run.
     out.extend(crate::tasks::strip(
         &c.tasks,
@@ -2896,6 +2938,22 @@ mod tests {
         )
     }
 
+    /// The limits' resets in `meta_used`, in epoch seconds, and a wall clock before both.
+    const FIVE_HOUR_RESETS: u64 = 1_793_990_000;
+    const WEEK_RESETS: u64 = 1_794_006_000;
+    const BEFORE_RESET_MS: u64 = 1_793_980_000_000;
+
+    /// `meta` with the usage limits the relay sends: so much of 5 hours and of the week.
+    fn meta_used(title: &str, mode: &str, five_hour: u8, week: u8) -> String {
+        meta(title, mode).replacen(
+            r#""t":"meta","#,
+            &format!(
+                r#""t":"meta","u5":{{"p":{five_hour},"r":{FIVE_HOUR_RESETS}}},"u7":{{"p":{week},"r":{WEEK_RESETS}}},"#
+            ),
+            1,
+        )
+    }
+
     fn convo() -> Convo {
         let mut c = Convo::new("claude-sessions", "claude-3", "run");
         c.apply(&parse(r#"{"t":"n","n":0}"#).unwrap(), Instant::now());
@@ -2908,7 +2966,7 @@ mod tests {
         feed(
             &mut c,
             &[
-                &meta("fix the door", "auto"),
+                &meta_used("fix the door", "auto", 12, 72),
                 r#"{"t":"add","id":1,"k":"user","x":"Run the tests and tell me if any fail."}"#,
                 r#"{"t":"add","id":2,"k":"tool","n":"Bash","a":"cargo test"}"#,
                 r#"{"t":"res","id":2,"ok":true,"p":["ok"],"l":1}"#,
@@ -2926,6 +2984,7 @@ mod tests {
         );
         let mut ui = Ui::new();
         ui.load = Some(figures(1.2, 2.0, 70));
+        ui.wall = Some(BEFORE_RESET_MS);
         let now = c.working_since.unwrap() + Duration::from_secs(12);
         let got = text(&draw(&c, &ui, 40, 24, now));
         let want = mockup("R2");
@@ -2938,6 +2997,39 @@ mod tests {
             assert_eq!(g, w, "row {i}");
         }
         assert_eq!(got.len(), 24);
+    }
+
+    #[test]
+    fn the_usage_sits_at_the_footers_right_and_a_window_that_has_reset_is_not_drawn() {
+        let mut c = convo();
+        feed(&mut c, &[&meta_used("fix the door", "auto", 12, 72)]);
+        let mut ui = Ui::new();
+        ui.wall = Some(BEFORE_RESET_MS);
+        let last = |c: &Convo, ui: &Ui, w: usize| {
+            text(&draw(c, ui, w, 24, Instant::now()))
+                .last()
+                .unwrap()
+                .clone()
+        };
+        // At 40 the mode line's hint gives way to it; at 80 both fit.
+        assert_eq!(last(&c, &ui, 40), "  ⏵⏵ auto mode on      5h 12% · 7d 72%");
+        assert_eq!(
+            last(&c, &ui, 80),
+            format!(
+                "  ⏵⏵ auto mode on (/auto to cycle){}5h 12% · 7d 72%",
+                " ".repeat(29)
+            )
+        );
+        // From the 5-hour reset, only the week is drawn; from both, nothing is.
+        ui.wall = Some(FIVE_HOUR_RESETS * 1000);
+        assert_eq!(
+            last(&c, &ui, 40),
+            format!("  ⏵⏵ auto mode on{}7d 72%", " ".repeat(15))
+        );
+        feed(&mut c, &[&meta_used("fix the door", "default", 12, 72)]);
+        assert_eq!(last(&c, &ui, 40), format!("{}7d 72%", " ".repeat(32)));
+        ui.wall = Some(WEEK_RESETS * 1000);
+        assert_eq!(last(&c, &ui, 40), "");
     }
 
     #[test]

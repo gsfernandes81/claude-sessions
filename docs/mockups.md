@@ -618,7 +618,7 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ❯
 ────────────────────────────────────────
   RAM: 1.2G / 2.0G, Load: 0.7
-  esc to interrupt
+  esc to interrupt     5h 12% · 7d 72%
 ```
 
 ### Mockup R3 — A permission prompt
