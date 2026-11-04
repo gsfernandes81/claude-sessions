@@ -129,6 +129,8 @@ struct Conv {
     /// is on, as claude last said (`bridge_state`, or the answer to one).
     rc_req: Option<(String, bool)>,
     rc_on: bool,
+    /// `get_task_output` requests sent for the client's tasks view: request id to task id.
+    output_reqs: HashMap<String, String>,
     /// What the client sent before the conversation was open (`action`), in its order.
     held: Vec<(String, Value)>,
     pending: Vec<Op>,
@@ -144,6 +146,8 @@ struct Conv {
     /// The newest state and meta ops, for a client sent only the end of the conversation.
     state_op: Option<Op>,
     meta_op: Option<Op>,
+    /// The background task list as last sent, for a client that connects.
+    tasks_op: Option<Op>,
     /// Whether the end of the log as it stood has been sent.
     started: bool,
     /// The history the holder serves backwards, before the log.
@@ -195,7 +199,7 @@ fn op_id(op: &Op) -> Option<u64> {
         | Op::Result { id, .. }
         | Op::Resolved { id, .. }
         | Op::Progress { id, .. } => Some(*id),
-        Op::State(_) | Op::Meta(_) | Op::Back { .. } => None,
+        Op::State(_) | Op::Meta(_) | Op::Back { .. } | Op::Tasks(_) => None,
     }
 }
 
@@ -586,6 +590,7 @@ impl Relay {
             reducer: Reducer::new(),
             models_req: None,
             rc_req: None,
+            output_reqs: HashMap::new(),
             rc_on: false,
             held: Vec::new(),
             pending: Vec::new(),
@@ -602,6 +607,7 @@ impl Relay {
             from: 0,
             state_op: None,
             meta_op: None,
+            tasks_op: None,
             started: false,
             history: History {
                 next: HISTORY_IDS,
@@ -689,9 +695,36 @@ impl Relay {
                 out.push(Effect::ToConv { epoch, line });
             }
         }
+        // A task's output, for the tasks view: what it said so far, or why there is none.
+        let mut for_output = false;
+        if let Msg::Response {
+            request_id,
+            ok,
+            body,
+        } = sdk::classify(&v)
+        {
+            if let Some(task) = c.output_reqs.remove(&request_id) {
+                let mut m = msg("tout", vec![("i", Value::string(task))]);
+                if ok {
+                    let all = s(&body, "output").unwrap_or_default();
+                    m.set("x", Value::string(output_tail(&all)));
+                    if let Some(n) = body.get("total_bytes").and_then(Value::as_u64) {
+                        m.set("n", Value::num(n as f64));
+                    }
+                    if body.get("truncated").and_then(Value::as_bool) == Some(true) {
+                        m.set("tr", Value::Bool(true));
+                    }
+                } else {
+                    let why = body.as_str().unwrap_or("claude has no output for it");
+                    m.set("e", Value::string(why));
+                }
+                out.push(Effect::Send(m));
+                for_output = true;
+            }
+        }
         // claude refusing something this relay asked of it — a rename, a model — is said to the
         // client, which would otherwise see nothing happen.
-        if live {
+        if live && !for_output {
             if let Msg::Response {
                 request_id,
                 ok: false,
@@ -751,6 +784,7 @@ impl Relay {
                 match &op {
                     Op::State(_) => c.state_op = Some(op.clone()),
                     Op::Meta(_) => c.meta_op = Some(op.clone()),
+                    Op::Tasks(_) => c.tasks_op = Some(op.clone()),
                     _ => {}
                 }
                 if c.started && at.is_none_or(|i| i >= c.from) {
@@ -880,6 +914,17 @@ impl Relay {
                 let title = c.reducer.meta().title.clone();
                 to(sdk::remote_control(&id, on, &title));
             }
+            // The tasks view: a shell's or monitor's output so far, and `x` to stop one.
+            "tout" => {
+                let task = s(v, "i").unwrap_or_default();
+                // Only so many outstanding: a client that asks and asks must not grow this.
+                if c.output_reqs.len() >= 16 {
+                    c.output_reqs.clear();
+                }
+                c.output_reqs.insert(id.clone(), task.clone());
+                to(sdk::get_task_output(&id, &task));
+            }
+            "tstop" => to(sdk::stop_task(&id, &s(v, "i").unwrap_or_default())),
             "esc" => to(sdk::interrupt(&id)),
             "exit" => to(sdk::end_session(&id)),
             "models" => {
@@ -914,6 +959,7 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
     let mut ops: Vec<Op> = c.meta_op.iter().cloned().collect();
     ops.extend(c.shown.ops(c.from..c.shown.items.len()));
     ops.extend(c.state_op.iter().cloned());
+    ops.extend(c.tasks_op.iter().cloned());
     c.pending = ops;
     flush(c, out);
     // `flush` says nothing for nothing; the client still needs to hear the log is in.
@@ -941,6 +987,26 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
         .collect();
     if !waiting.is_empty() {
         out.push(Effect::Send(msg("wait", vec![("p", Value::Arr(waiting))])));
+    }
+}
+
+/// How much of a task's output reaches the client: the view shows its last nine lines, and
+/// claude answers with all of it, which for a long-running shell is megabytes.
+const OUTPUT_TAIL: usize = 4096;
+
+/// The end of a task's output, from a line's start, at most `OUTPUT_TAIL` bytes.
+fn output_tail(all: &str) -> String {
+    if all.len() <= OUTPUT_TAIL {
+        return all.to_string();
+    }
+    let mut from = all.len() - OUTPUT_TAIL;
+    while !all.is_char_boundary(from) {
+        from += 1;
+    }
+    let tail = &all[from..];
+    match tail.find('\n') {
+        Some(nl) if nl + 1 < tail.len() => tail[nl + 1..].to_string(),
+        _ => tail.to_string(),
     }
 }
 
@@ -2063,6 +2129,88 @@ mod tests {
         assert!(to_claude(&fx)[0].contains(r#""effortLevel":null"#));
         let fx = client(&mut r, r#"{"t":"teleport"}"#);
         assert!(sent(&fx)[0].contains("not something the relay knows"));
+    }
+
+    #[test]
+    fn the_tasks_view_asks_claude_for_output_and_stops_a_task() {
+        let mut r = relay();
+        client(&mut r, r#"{"t":"hi","v":1}"#);
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":10}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let conv = |r: &mut Relay, l: &str| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: l.into(),
+                },
+                Instant::now(),
+            )
+        };
+        conv(&mut r, r#"{"slot":"claude-3"}"#);
+        conv(&mut r, r#"{"next":2,"run":"run-1"}"#);
+        // The list as it stood reaches a client that connects, with the log's end.
+        let now = r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b1","task_type":"local_bash","description":"Ticks"}]}"#;
+        let fx = line(&mut r, epoch, 1, now);
+        assert!(
+            sent(&fx)
+                .iter()
+                .any(|l| l.contains(r#""t":"tasks""#) && l.contains(r#""i":"b1""#)),
+            "{:?}",
+            sent(&fx)
+        );
+        let fx = client(&mut r, r#"{"t":"tout","i":"b1"}"#);
+        let asked = parse(&to_claude(&fx)[0]).unwrap();
+        let req = asked.get("request").unwrap();
+        assert_eq!(
+            json::to_line(req),
+            r#"{"subtype":"get_task_output","task_id":"b1"}"#
+        );
+        let rid = asked
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let answer = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{rid}","response":{{"output":"tick 1\ntick 2\n","total_bytes":14,"truncated":false}}}}}}"#
+        );
+        let fx = line(&mut r, epoch, 2, &answer);
+        assert_eq!(
+            sent(&fx),
+            [r#"{"i":"b1","n":14,"t":"tout","x":"tick 1\ntick 2\n"}"#]
+        );
+        // One claude has no output for is said in the view, not as a refusal.
+        let fx = client(&mut r, r#"{"t":"tout","i":"a1"}"#);
+        let rid = parse(&to_claude(&fx)[0])
+            .unwrap()
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let refused = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{rid}","error":"no shell or Monitor task with that task_id"}}}}"#
+        );
+        let fx = line(&mut r, epoch, 3, &refused);
+        assert_eq!(
+            sent(&fx),
+            [r#"{"e":"no shell or Monitor task with that task_id","i":"a1","t":"tout"}"#]
+        );
+        // Only the end of a long output crosses the link.
+        let long: String = (0..2000).map(|n| format!("line {n}\n")).collect();
+        let tail = output_tail(&long);
+        assert!(
+            tail.len() <= OUTPUT_TAIL && tail.starts_with("line "),
+            "{}",
+            &tail[..20]
+        );
+        assert!(tail.ends_with("line 1999\n"));
+        assert_eq!(output_tail("short\n"), "short\n");
+        let fx = client(&mut r, r#"{"t":"tstop","i":"b1"}"#);
+        assert!(to_claude(&fx)[0].contains(r#""request":{"subtype":"stop_task","task_id":"b1"}"#));
     }
 
     fn to_line_of(v: &Value) -> String {

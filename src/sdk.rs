@@ -112,19 +112,45 @@ pub enum Msg {
         questions: Vec<Question>,
         answers: Vec<(String, String)>,
     },
-    /// `system/task_started`, `task_progress` and `task_notification` for a subagent or a
-    /// workflow, said under the tool call that started it (`tool_use_id`).
-    Task { tool_use_id: String, event: Task },
+    /// `system/task_started`, `task_progress`, `task_updated` and `task_notification`: a
+    /// background shell, monitor, subagent or workflow, by claude's `task_id`, and the tool
+    /// call that started it (`tool_use_id`, empty on `task_updated`).
+    Task {
+        task_id: String,
+        tool_use_id: String,
+        event: Task,
+    },
+    /// `system/background_tasks_changed`: the tasks running in the background now, in
+    /// claude's order. Sent whenever one starts or ends, so it is the list as claude has it.
+    TasksNow(Vec<TaskNow>),
     /// A line of a type this version does not know, kept by its name so a log can say so.
     Unknown(String),
 }
 
+/// One entry of `background_tasks_changed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskNow {
+    pub task_id: String,
+    pub task_type: String,
+    pub description: String,
+    pub started_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Task {
-    /// `task_type` is `local_agent`, `local_workflow`, `local_bash`, …
+    /// `task_type` is `local_agent`, `local_workflow`, `local_bash` (a shell or a monitor),
+    /// `remote_agent`, …; `started_ms` when it started, read from its `run_id` (`run_started`).
     Started {
         task_type: String,
         description: String,
+        started_ms: Option<u64>,
+        /// A subagent's prompt, empty for anything else.
+        prompt: String,
+    },
+    /// `task_updated`: its status changed, and when it ended if it has.
+    Updated {
+        status: String,
+        ended_ms: Option<u64>,
     },
     /// The running totals, and a workflow's phases and agents as last reported (empty when a
     /// progress line did not carry them).
@@ -172,16 +198,44 @@ fn usage(v: &Value) -> Usage {
     }
 }
 
+/// When a task started: its `run_id` is that time in base-36 milliseconds, a dash, then a
+/// random part (`0mw1kjn2l-1614a111`, 2.1.311, measured against its `end_time` on
+/// 2026-11-04). `None` for anything else, so a view falls back on when it first heard of it.
+pub fn run_started(run_id: &str) -> Option<u64> {
+    let (head, _) = run_id.split_once('-')?;
+    let ms = u64::from_str_radix(head, 36).ok()?;
+    // Within reason: after 2020 and before 2100.
+    (1_577_836_800_000..4_102_444_800_000)
+        .contains(&ms)
+        .then_some(ms)
+}
+
 fn task(v: &Value, sub: &str) -> Msg {
+    let task_id = s(v, "task_id");
     let tool_use_id = s(v, "tool_use_id");
-    if tool_use_id.is_empty() {
+    if tool_use_id.is_empty() && task_id.is_empty() {
         return Msg::Noise;
     }
     let event = match sub {
         "task_started" => Task::Started {
             task_type: s(v, "task_type"),
             description: s(v, "description"),
+            started_ms: run_started(&s(v, "run_id")),
+            prompt: s(v, "prompt"),
         },
+        "task_updated" => {
+            let patch = v.get("patch");
+            Task::Updated {
+                status: patch
+                    .and_then(|p| p.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                ended_ms: patch
+                    .and_then(|p| p.get("end_time"))
+                    .and_then(Value::as_u64),
+            }
+        }
         "task_progress" => {
             let mut phases = Vec::new();
             let mut agents = Vec::new();
@@ -215,7 +269,11 @@ fn task(v: &Value, sub: &str) -> Msg {
                 .map(String::from),
         },
     };
-    Msg::Task { tool_use_id, event }
+    Msg::Task {
+        task_id,
+        tool_use_id,
+        event,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -283,13 +341,22 @@ pub fn classify(v: &Value) -> Msg {
                     post_tokens: n("post_tokens"),
                 }
             }
-            "task_started" | "task_progress" | "task_notification" => task(v, sub),
-            "hook_started"
-            | "hook_response"
-            | "hook_progress"
-            | "thinking_tokens"
-            | "task_updated"
-            | "background_tasks_changed" => Msg::Noise,
+            "task_started" | "task_progress" | "task_updated" | "task_notification" => task(v, sub),
+            "background_tasks_changed" => Msg::TasksNow(
+                v.get("tasks")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|t| TaskNow {
+                        task_id: s(t, "task_id"),
+                        task_type: s(t, "task_type"),
+                        description: s(t, "description"),
+                        started_ms: run_started(&s(t, "run_id")),
+                    })
+                    .filter(|t| !t.task_id.is_empty())
+                    .collect(),
+            ),
+            "hook_started" | "hook_response" | "hook_progress" | "thinking_tokens" => Msg::Noise,
             other => Msg::Unknown(format!("system/{other}")),
         },
         "stream_event" => {
@@ -814,6 +881,24 @@ pub fn cancel_async_message(request_id: &str, uuid: &str) -> Value {
 /// goes on without them, so a prompt waiting behind it is taken in at once.
 pub fn background_tasks(request_id: &str) -> Value {
     control(request_id, subtype("background_tasks", vec![]))
+}
+
+/// A background shell's or monitor's output so far: answered `{output, total_bytes,
+/// truncated}`, or an error for any other kind of task.
+pub fn get_task_output(request_id: &str, task_id: &str) -> Value {
+    control(
+        request_id,
+        subtype("get_task_output", vec![("task_id", Value::string(task_id))]),
+    )
+}
+
+/// Stop a background task, as `x` in Claude Code's tasks dialog does: claude answers, then
+/// says it ended (`task_updated` `killed`, `task_notification` `stopped`).
+pub fn stop_task(request_id: &str, task_id: &str) -> Value {
+    control(
+        request_id,
+        subtype("stop_task", vec![("task_id", Value::string(task_id))]),
+    )
 }
 
 /// Ctrl+X Ctrl+S, Claude Code's send-now: the prompts waiting behind the running turn reach

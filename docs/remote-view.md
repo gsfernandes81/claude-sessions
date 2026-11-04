@@ -346,6 +346,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
      | `esc` · `exit` · `models` · `full {id}` | interrupt, end the session, the model list, a tool result whole |
      | `btw {x}` | a side question, answered by its own claude beside the conversation (`claude-sessions remote btw SLOT [MODEL]`, the question on its stdin) and never added to it |
+     | `tout {i}` · `tstop {i}` | the tasks view: a background shell's or monitor's output so far (claude's `get_task_output`), or stop task `i` (its `stop_task`) |
 
      | From the relay | Means |
      |---|---|
@@ -356,6 +357,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
+     | `tasks {l}` | claude's background tasks, the whole list whenever it changes and once to a client that connects: each `{i, k, d, c, p, t0, t1, st, it}` — claude's task id, kind (`shell`, `monitor`, `agent`, `workflow`, `remote`), description, command or agent type, an agent's prompt (its first 600 characters), start and end in epoch ms, status, and the transcript item an agent is drawn as; the latest ten ended ones kept; an older client skips it |
+     | `tout {i, x, n, tr}` or `tout {i, e}` | a task's output, its last 4 KB from a line's start, its whole size and whether claude cut it; or why there is none |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.
@@ -467,6 +470,43 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      itself in a `<command-name>` wrapper, after its reply: the view draws it as typed, its
      reply under it. A background task's `<task-notification>`, which claude hands the model
      as a prompt, is drawn as its summary, grey under `⎿`, not as its markup.
+   - **The tasks view**, as Claude Code 2.1.311 draws it — driven in a pty and read off its
+     screen at 40 and 80 columns on 2026-11-04, since the owner asked for its subagent and
+     workflow views, shells and monitors included. The reducer keeps claude's background
+     tasks from its `task_started`, `task_updated`, `task_notification` and
+     `background_tasks_changed` lines, the last being the list as claude has it: a task in it
+     runs, one gone from it has ended. A monitor is a `local_bash` task whose call was
+     `Monitor`, which only the call says. A task's start is its `run_id`'s first part,
+     base-36 epoch milliseconds (measured against its `end_time`), so no clock is needed.
+     - **The pill**: running shells and monitors on the mode line after ` · `, in Claude
+       Code's cyan `00cccc` — `2 shells, 1 monitor` — and `/tasks to see subagents` while
+       an agent or workflow runs, since the pill counts only shells; the line is cut hard two
+       columns short of the edge, as Claude Code's is at 40. A turn's end line says
+       `· 2 shells, 1 monitor still running`, drawn from the list as it stands, as Claude
+       Code rewrites every such line as tasks end.
+     - **In**: `/tasks` (or `/bashes`) opens the list under a lavender `▔`, three columns in;
+       Down on an empty prompt focuses the pill (drawn inverse) and Enter opens it under a
+       cyan `─`, two in — straight into the details when only one task runs.
+     - **The list**: `Background`, `3 active shells · 1 active agent` (a monitor counts as a
+       shell), and sections only when there is more than one kind: `Shells`, `Local agents`,
+       `Dynamic workflows`, then `Completed` for agents that finished (a shell or workflow
+       that ends leaves the list, as there). Each row `❯ ● title   status`, a shell's title
+       its command, others' their description; the hint drops `x to stop` on a finished row.
+     - **Details**: a shell's or monitor's `Status:`, `Runtime:` (kept as it was when they
+       opened, as Claude Code's is), `Command:` or `Script:`, then its last lines in a
+       rounded box with `Showing N lines`, asked of claude when they open and every two
+       seconds while they stay open; the relay sends only the output's last 4 KB. Claude
+       Code shows nine lines and runs off a 24-row screen; this box shrinks so the hint
+       stays on it. An agent's `type › description`, how long it has run, its progress
+       (the lines the transcript draws under it) and the start of its prompt. `x` stops a
+       task and goes back to the list; `←` goes back; Esc, Enter or Space close.
+     - **Not built**, Claude Code's but bigger than this pass: the agent strip under the
+       footer (`● main`, `◯ general-purpose …`) and moving into it with Down; `f` to
+       foreground an agent, and Enter on a finished one opening its transcript; the
+       workflow's two-pane phases and agents browser with its pause, restart and save keys
+       (a workflow's details here are its name, runtime and progress lines); the agent row's
+       model and token counts; the `N background task updates waiting while this panel is
+       open` line and the `Shell details dismissed` toast.
    - **Ctrl+O and `/expand`** switch the transcript between runs of tool calls summed up, as
      the mockups draw them, and every call on its own with the first lines of its result
      and how many more, as Claude Code's Ctrl+O transcript does; a failed call says `Error`.

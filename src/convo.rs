@@ -46,14 +46,14 @@ pub const PLAIN: St = St {
     strike: false,
 };
 
-fn fg(c: u32) -> St {
+pub(crate) fn fg(c: u32) -> St {
     St {
         fg: Some(c),
         ..PLAIN
     }
 }
 
-fn bold(c: u32) -> St {
+pub(crate) fn bold(c: u32) -> St {
     St {
         fg: Some(c),
         bold: true,
@@ -64,7 +64,7 @@ fn bold(c: u32) -> St {
 /// One row of the screen: runs of text, each in one style.
 pub type Line = Vec<(String, St)>;
 
-fn line(text: impl Into<String>, st: St) -> Line {
+pub(crate) fn line(text: impl Into<String>, st: St) -> Line {
     vec![(text.into(), st)]
 }
 
@@ -254,6 +254,31 @@ pub enum Entry {
     Worked(String),
 }
 
+/// One of claude's background tasks, as the relay's `tasks` op lists it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Task {
+    pub id: String,
+    /// `shell`, `monitor`, `agent`, `workflow`, `remote`, or a kind a later claude has.
+    pub kind: String,
+    pub description: String,
+    /// A shell's or monitor's command, a subagent's type.
+    pub detail: String,
+    /// A subagent's prompt, the start of it.
+    pub prompt: String,
+    pub started_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    /// `running`, `completed`, `failed`, `killed` or `stopped`.
+    pub status: String,
+    /// The transcript item a subagent or workflow is drawn as.
+    pub item: Option<u64>,
+}
+
+impl Task {
+    pub fn running(&self) -> bool {
+        self.status == "running"
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Meta {
     pub session_id: String,
@@ -275,6 +300,8 @@ pub struct Convo {
     /// Every op of the log's lines up to this has arrived (`n`).
     pub n: u64,
     pub entries: Vec<Entry>,
+    /// claude's background tasks, as the relay last listed them.
+    pub tasks: Vec<Task>,
     /// Where each numbered item is in `entries`.
     index: HashMap<u64, usize>,
     pub state: String,
@@ -420,6 +447,11 @@ impl Convo {
         self.entries.push(e);
     }
 
+    /// The entry drawn for item `id`.
+    pub fn entry(&self, id: u64) -> Option<&Entry> {
+        self.index.get(&id).and_then(|&i| self.entries.get(i))
+    }
+
     fn at(&mut self, id: u64) -> Option<&mut Entry> {
         let i = *self.index.get(&id)?;
         self.entries.get_mut(i)
@@ -516,6 +548,27 @@ impl Convo {
                 if let Some(Entry::Text(t)) = self.at(id) {
                     *t = s(v, "x");
                 }
+            }
+            "tasks" => {
+                let num = |t: &Value, k: &str| t.get(k).and_then(Value::as_u64);
+                self.tasks = v
+                    .get("l")
+                    .and_then(Value::as_arr)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|t| Task {
+                        id: s(t, "i"),
+                        kind: s(t, "k"),
+                        description: s(t, "d"),
+                        detail: s(t, "c"),
+                        prompt: s(t, "p"),
+                        started_ms: num(t, "t0"),
+                        ended_ms: num(t, "t1"),
+                        status: s(t, "st"),
+                        item: num(t, "it"),
+                    })
+                    .filter(|t| !t.id.is_empty())
+                    .collect();
             }
             "prog" => {
                 if let Some(Entry::Agent { lines, state, .. }) = self.at(id) {
@@ -985,6 +1038,8 @@ pub enum Dialog {
         sel: usize,
         choices: Vec<(String, String)>,
     },
+    /// `/tasks`, or Down then Enter on the pill: claude's background tasks (`tasks.rs`).
+    Tasks(crate::tasks::View),
     /// `/btw`: the side question, its answer once it has come (or why there is none), and
     /// how far the answer is scrolled.
     Btw {
@@ -1069,6 +1124,9 @@ pub struct Ui {
     /// prompt next changes.
     pub suggest: usize,
     pub suggest_off: bool,
+    /// Down on an empty prompt focused the tasks pill, as Claude Code's does: Enter opens
+    /// the tasks view from it.
+    pub pill: bool,
 }
 
 impl Ui {
@@ -1086,6 +1144,7 @@ impl Ui {
             catalog: Vec::new(),
             suggest: 0,
             suggest_off: false,
+            pill: false,
         }
     }
 }
@@ -1275,7 +1334,13 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             }
             Entry::Worked(text) => {
                 out.push(Vec::new());
-                out.extend(wrapped(text, "✻ ", "  ", w, fg(GREY)));
+                // `· 2 shells, 1 monitor still running` while they run, as Claude Code
+                // rewrites every turn's end line as tasks end.
+                let text = match crate::tasks::still_running(&c.tasks) {
+                    Some(r) => format!("{text} · {r}"),
+                    None => text.clone(),
+                };
+                out.extend(wrapped(&text, "✻ ", "  ", w, fg(GREY)));
             }
             Entry::Ask {
                 questions,
@@ -1317,7 +1382,7 @@ fn home_short(cwd: &str) -> String {
     }
 }
 
-fn rule(w: usize, glyph: &str, st: St) -> Line {
+pub(crate) fn rule(w: usize, glyph: &str, st: St) -> Line {
     line(glyph.repeat(w), st)
 }
 
@@ -1373,7 +1438,7 @@ pub struct Command {
 
 /// The commands this client serves that claude's list may not have, said as the phone does
 /// them.
-const CLIENT_ABOUT: [(&str, &str); 13] = [
+const CLIENT_ABOUT: [(&str, &str); 14] = [
     ("model", "Set the AI model for Claude Code"),
     ("effort", "Set the effort level"),
     ("rename", "Rename the conversation"),
@@ -1391,6 +1456,10 @@ const CLIENT_ABOUT: [(&str, &str); 13] = [
     ("expand", "Show every tool call with its result (ctrl+o)"),
     ("quit", "End the session"),
     ("btw", "Ask a side question without interrupting"),
+    (
+        "tasks",
+        "View and manage everything running in the background",
+    ),
     (
         "remote-control",
         "Control this session from your phone or claude.ai/code",
@@ -1486,7 +1555,7 @@ fn suggest_lines(list: &[Command], sel: usize, w: usize) -> Vec<Line> {
 
 /// The slash commands this client serves itself (`client::submit`); claude's own come in its
 /// meta.
-pub const CLIENT_COMMANDS: [&str; 13] = [
+pub const CLIENT_COMMANDS: [&str; 14] = [
     "model",
     "effort",
     "auto",
@@ -1500,6 +1569,7 @@ pub const CLIENT_COMMANDS: [&str; 13] = [
     "copy",
     "rc",
     "remote-control",
+    "tasks",
 ];
 
 /// Where `chars` names a slash command: `/` at the start or after whitespace, then a name
@@ -1627,6 +1697,26 @@ fn reconnecting_line(
     said(vec![("  ".into(), PLAIN)])
 }
 
+/// A line cut to `w` cells with no ellipsis.
+fn clip(l: Line, w: usize) -> Line {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for (t, st) in l {
+        let mut keep = String::new();
+        for ch in t.chars() {
+            if used + cw(ch) > w {
+                break;
+            }
+            used += cw(ch);
+            keep.push(ch);
+        }
+        if !keep.is_empty() {
+            out.push((keep, st));
+        }
+    }
+    out
+}
+
 /// The input box and footer: R1's last five rows. A prompt taller than half the screen shows
 /// that many rows, scrolled to keep the cursor in them, `↑`/`↓` leading a row with more past it.
 fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usize)) {
@@ -1728,16 +1818,48 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
         ));
     }
     let busy = matches!(c.state.as_str(), "working" | "compacting");
+    let pill = crate::tasks::pill(&c.tasks);
+    let subagents = crate::tasks::subagents_running(&c.tasks);
+    // The mode line, then claude's background shells after ` · ` in cyan, as Claude Code
+    // puts them, and `/tasks to see subagents` while one runs, since the pill counts shells.
+    // Claude Code drops its `(shift+tab to cycle)` while a pill shows.
+    let mut foot: Line = Vec::new();
     if busy {
-        out.push(line("  esc to interrupt", fg(GREY)));
+        foot.push(("  esc to interrupt".into(), fg(GREY)));
     } else if let Some((m, colour)) = mode_line(&c.meta.mode) {
-        out.push(line(
-            format!("  {}", cut(&m, w.saturating_sub(2))),
-            fg(colour),
-        ));
-    } else {
-        out.push(Vec::new());
+        let m = if pill.is_some() || subagents {
+            m.replace(" (/auto to cycle)", "")
+        } else {
+            m
+        };
+        foot.push((format!("  {m}"), fg(colour)));
     }
+    let mut extra: Vec<(String, St)> = Vec::new();
+    if let Some(p) = pill {
+        let st = if ui.pill {
+            St {
+                fg: Some(0x00_0000),
+                bg: Some(crate::tasks::CYAN),
+                ..PLAIN
+            }
+        } else {
+            fg(crate::tasks::CYAN)
+        };
+        extra.push((p, st));
+    }
+    if subagents {
+        extra.push(("/tasks to see subagents".into(), fg(GREY)));
+    }
+    for (i, run) in extra.into_iter().enumerate() {
+        if i > 0 || !foot.is_empty() {
+            foot.push((" · ".into(), fg(GREY)));
+        } else {
+            foot.push(("  ".into(), PLAIN));
+        }
+        foot.push(run);
+    }
+    // Cut hard, two columns short of the edge, as Claude Code's is at 40 columns.
+    out.push(clip(foot, w.saturating_sub(2)));
     (out, cursor)
 }
 
@@ -2203,6 +2325,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
         (Some(Dialog::Model { sel, list }), _) => model_dialog(c, *sel, list, w),
         (Some(Dialog::Effort { sel }), _) => effort_dialog(*sel, w),
         (Some(Dialog::Copy { sel, choices }), _) => copy_dialog(*sel, choices, w),
+        (Some(Dialog::Tasks(v)), _) => crate::tasks::draw(c, v, w, h),
         (
             Some(Dialog::Btw {
                 question,
@@ -2439,6 +2562,48 @@ mod tests {
                 "  ⎿  Error",
                 "     no such file",
             ]
+        );
+    }
+
+    #[test]
+    fn background_shells_show_on_the_mode_line_and_the_turns_end_line() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "auto"),
+                r#"{"t":"tasks","l":[{"i":"a","k":"shell","d":"x","st":"running"},{"i":"b","k":"shell","d":"y","st":"running"},{"i":"m","k":"monitor","d":"z","st":"running"}]}"#,
+            ],
+        );
+        c.local(Entry::Worked("Worked for 1s · done 3:43 AM".into()));
+        let mut ui = Ui::new();
+        let f = draw(&c, &ui, 80, 24, Instant::now());
+        let t = text(&f);
+        assert_eq!(t[23], "  ⏵⏵ auto mode on · 2 shells, 1 monitor");
+        let last = &f.lines[23];
+        assert_eq!(last.last().unwrap().1.fg, Some(crate::tasks::CYAN));
+        assert!(
+            t.iter()
+                .any(|l| l == "✻ Worked for 1s · done 3:43 AM · 2 shells, 1 monitor still running"),
+            "{t:?}"
+        );
+        // At 40 it is cut hard at the edge, as Claude Code's is.
+        let t = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert_eq!(t[23], "  ⏵⏵ auto mode on · 2 shells, 1 monito");
+        // Focused by Down, the pill is drawn inverse: its colour behind it.
+        ui.pill = true;
+        let f = draw(&c, &ui, 80, 24, Instant::now());
+        assert_eq!(f.lines[23].last().unwrap().1.bg, Some(crate::tasks::CYAN));
+        // A subagent running adds the way to see it; the turn's line says only the shells.
+        feed(
+            &mut c,
+            &[r#"{"t":"tasks","l":[{"i":"g","k":"agent","d":"survey","st":"running"}]}"#],
+        );
+        let t = text(&draw(&c, &Ui::new(), 80, 24, Instant::now()));
+        assert_eq!(t[23], "  ⏵⏵ auto mode on · /tasks to see subagents");
+        assert!(
+            t.iter().any(|l| l == "✻ Worked for 1s · done 3:43 AM"),
+            "{t:?}"
         );
     }
 

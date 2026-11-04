@@ -20,6 +20,7 @@ use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::menu::{Action, Menu, Place, Reach};
 use crate::proto;
+use crate::tasks;
 use crate::term::{self, Input, RawTerminal};
 use crate::ui::{Busy, Header, Key, Row, RowKey};
 use std::collections::HashMap;
@@ -38,6 +39,8 @@ const AHEAD: usize = 5;
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
+/// How often an open shell's details ask for its output again.
+const OUTPUT_EVERY: Duration = Duration::from_secs(2);
 /// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
 const DETACH: char = '\x1c';
 /// Ctrl+X, then Ctrl+S: Claude Code's send-now chord. Raw mode turns off XON/XOFF, so Ctrl+S
@@ -131,6 +134,10 @@ struct App {
     models: Option<Vec<(String, String)>>,
     history: Vec<String>,
     history_at: Option<usize>,
+    /// The task whose output the tasks view last asked for, and when to ask again: while a
+    /// shell's or monitor's details are open, its output keeps coming, as Claude Code's box
+    /// keeps scrolling.
+    output_for: Option<(String, Instant)>,
     /// What was being typed when Up went back into what was sent: Down past the newest gives
     /// it back, as Claude Code does, so no keypress loses it.
     draft: Option<String>,
@@ -479,6 +486,24 @@ impl App {
                     }
                 }
             }
+            // A task's output, for its details in the tasks view.
+            "tout" => {
+                if let Screen::Conv { ui, .. } = &mut self.screen {
+                    if let Some(Dialog::Tasks(view)) = &mut ui.dialog {
+                        let id = v.get("i").and_then(Value::as_str);
+                        if view.open.as_deref() == id {
+                            view.output = Some(match v.get("x").and_then(Value::as_str) {
+                                Some(x) => Ok(x.to_string()),
+                                None => Err(v
+                                    .get("e")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("no output")
+                                    .to_string()),
+                            });
+                        }
+                    }
+                }
+            }
             "pong" | "full" => {}
             _ => {
                 // The conversation's ops.
@@ -497,6 +522,7 @@ impl App {
                         Applied::Nothing => {}
                     }
                     follow_prompts(c, ui);
+                    follow_tasks(c, ui);
                     if let Some(before) = held {
                         ui.scroll = hold_scroll(ui.scroll, before, convo::max_scroll(c, ui, w, h));
                     }
@@ -580,6 +606,38 @@ impl App {
         }
         ui.status = Some(selection_copied(&text));
         self.clip = Some(text);
+    }
+
+    /// The open shell's or monitor's output, asked for when its details open and every
+    /// `OUTPUT_EVERY` while they stay open.
+    fn want_output(&mut self, now: Instant) {
+        let Some(id) = self.output_wanted() else {
+            self.output_for = None;
+            return;
+        };
+        let due = match &self.output_for {
+            Some((was, at)) if *was == id => now >= *at,
+            _ => true,
+        };
+        if due && self.up() {
+            self.output_for = Some((id.clone(), now + OUTPUT_EVERY));
+            self.send(App::msg("tout", vec![("i", Value::string(id))]));
+        }
+    }
+
+    /// The task whose output the open tasks view shows, if any.
+    fn output_wanted(&self) -> Option<String> {
+        let Screen::Conv { c, ui, .. } = &self.screen else {
+            return None;
+        };
+        let Some(Dialog::Tasks(v)) = &ui.dialog else {
+            return None;
+        };
+        let id = v.open.as_ref()?;
+        c.tasks
+            .iter()
+            .find(|t| &t.id == id && matches!(t.kind.as_str(), "shell" | "monitor"))
+            .map(|t| t.id.clone())
     }
 
     /// Fewer than `AHEAD` screens above the view, with more before them: the next stretch is
@@ -838,6 +896,31 @@ impl App {
                 _ => {}
             }
         }
+        // The pill Down focused, as Claude Code's: Enter opens the tasks view from it — straight
+        // into the details when only one task runs — and any other key puts the focus away.
+        if std::mem::take(&mut ui.pill) && ui.dialog.is_none() && !suggested {
+            match k {
+                Key::Enter => {
+                    let mut v = tasks::View {
+                        inline: true,
+                        ..tasks::View::default()
+                    };
+                    let rows = tasks::listed(&c.tasks);
+                    if let [(_, t)] = rows.as_slice() {
+                        v.direct = true;
+                        open_task(&mut v, t);
+                    }
+                    ui.dialog = Some(Dialog::Tasks(v));
+                    return;
+                }
+                Key::Down => {
+                    ui.pill = true;
+                    return;
+                }
+                Key::Up | Key::Esc => return,
+                _ => {}
+            }
+        }
         match ui.dialog.take() {
             // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
             // detach key does in ssh dev: the session runs on, and the home comes back.
@@ -951,6 +1034,15 @@ impl App {
                 }
                 // Up and Down move between the prompt's rows first; off its top or bottom row
                 // they step through what was sent, as Claude Code's do.
+                // Down in an empty prompt, not stepping through what was sent: the tasks
+                // pill takes the focus, as in Claude Code.
+                Key::Down
+                    if ui.input.is_empty()
+                        && self.history_at.is_none()
+                        && tasks::pill(&c.tasks).is_some() =>
+                {
+                    ui.pill = true;
+                }
                 Key::Up | Key::Down => {
                     let room = term::size().map_or(38, |(w, _)| (w as usize).saturating_sub(2));
                     if !row_step(ui, k == Key::Up, room) {
@@ -1033,6 +1125,86 @@ fn hold_scroll(scroll: usize, before: usize, after: usize) -> usize {
     }
     let moved = scroll as i64 + after as i64 - before as i64;
     moved.clamp(1, after as i64) as usize
+}
+
+/// The task list changed under the tasks view: a task whose details are open and that has
+/// left the list goes back to the list, as Claude Code's does when a shell finishes, or
+/// closes the view when it was opened straight into it; the pill loses its focus once there
+/// is no pill.
+fn follow_tasks(c: &Convo, ui: &mut Ui) {
+    if tasks::pill(&c.tasks).is_none() {
+        ui.pill = false;
+    }
+    let Some(Dialog::Tasks(v)) = &mut ui.dialog else {
+        return;
+    };
+    let rows = tasks::listed(&c.tasks);
+    if let Some(id) = &v.open {
+        if !rows.iter().any(|(_, t)| &t.id == id) {
+            if v.direct {
+                ui.dialog = None;
+                return;
+            }
+            v.open = None;
+            v.output = None;
+        }
+    }
+    v.sel = v.sel.min(rows.len().saturating_sub(1));
+}
+
+/// A task's details opened: how long it has run, kept as Claude Code keeps it.
+fn open_task(v: &mut tasks::View, t: &convo::Task) {
+    v.open = Some(t.id.clone());
+    v.output = None;
+    v.runtime = tasks::runtime(t, crate::clock::now());
+}
+
+/// A key in the tasks view; what it leaves open.
+fn tasks_key(c: &Convo, mut v: tasks::View, k: Key, out: &mut Vec<Value>) -> Option<Dialog> {
+    let rows = tasks::listed(&c.tasks);
+    let stop = |t: &convo::Task, out: &mut Vec<Value>| {
+        if t.running() {
+            out.push(App::msg("tstop", vec![("i", Value::string(&t.id))]));
+        }
+    };
+    let open = v
+        .open
+        .as_ref()
+        .and_then(|id| c.tasks.iter().find(|t| &t.id == id))
+        .cloned();
+    match (open, k) {
+        // Details: back to the list, closed, or the task stopped and back to the list.
+        (Some(_), Key::Left) if !v.direct => {
+            v.open = None;
+            v.output = None;
+        }
+        (Some(_), Key::Left | Key::Esc | Key::Enter | Key::Char(' ')) => return None,
+        (Some(t), Key::Char('x')) => {
+            stop(&t, out);
+            if v.direct {
+                return None;
+            }
+            v.open = None;
+            v.output = None;
+        }
+        (Some(_), _) => {}
+        // The list.
+        (None, Key::Up) => v.sel = v.sel.saturating_sub(1),
+        (None, Key::Down) => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
+        (None, Key::Enter) => {
+            if let Some((_, t)) = rows.get(v.sel) {
+                open_task(&mut v, t);
+            }
+        }
+        (None, Key::Char('x')) => {
+            if let Some((_, t)) = rows.get(v.sel) {
+                stop(t, out);
+            }
+        }
+        (None, Key::Esc | Key::Left) => return None,
+        (None, _) => {}
+    }
+    Some(Dialog::Tasks(v))
 }
 
 fn follow_prompts(c: &Convo, ui: &mut Ui) {
@@ -1126,6 +1298,11 @@ fn submit(
         "/home" | "/disconnect" => Submit::Home,
         "/expand" => {
             c.expanded = !c.expanded;
+            Submit::Nothing
+        }
+        // Claude Code's tasks view: what runs in the background, its output, and `x` to stop.
+        "/tasks" | "/bashes" => {
+            ui.dialog = Some(Dialog::Tasks(tasks::View::default()));
             Submit::Nothing
         }
         // Claude Code's `/remote-control`: the session reachable from the Claude app, where a
@@ -1740,6 +1917,7 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             }
             _ => Some(Dialog::Effort { sel }),
         },
+        Dialog::Tasks(v) => tasks_key(c, v, k, out),
         // Taken by `conv_key` before it gets here, since what they do is the client's.
         d @ (Dialog::Copy { .. } | Dialog::Btw { .. }) => Some(d),
     }
@@ -2010,6 +2188,9 @@ impl App {
         if let Some(a) = self.awaiting {
             soon(a + self.ack_wait());
         }
+        if self.output_wanted().is_some() {
+            soon(self.output_for.as_ref().map_or(now, |(_, at)| *at));
+        }
         at.map(|a| a.saturating_duration_since(now))
     }
 }
@@ -2053,6 +2234,7 @@ impl App {
             models: None,
             history: Vec::new(),
             history_at: None,
+            output_for: None,
             draft: None,
             drawn: Vec::new(),
             clip: None,
@@ -2092,6 +2274,7 @@ pub fn run(name: &str) -> Result<(), String> {
             app.rebuild_menu(w, h);
         }
         app.want_older();
+        app.want_output(now);
         if app.paint(&mut term, now).is_err() {
             break;
         }
@@ -2717,6 +2900,107 @@ mod tests {
             app.key(Key::Char(ch), Instant::now());
         }
         app.key(Key::Enter, Instant::now());
+    }
+
+    const TASKS: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","c":"for i in 1 2; do echo $i; done","st":"running","t0":1000},{"i":"m1","k":"monitor","d":"Watch it","c":"tail -f x","st":"running"}]}"#;
+
+    #[test]
+    fn down_on_an_empty_prompt_focuses_the_pill_and_enter_opens_the_tasks_view() {
+        let mut app = app_in(&[TASKS]);
+        app.key(Key::Down, Instant::now());
+        let Screen::Conv { ui, .. } = &app.screen else {
+            panic!()
+        };
+        assert!(ui.pill, "Down focused the pill");
+        app.key(Key::Enter, Instant::now());
+        let Some(Dialog::Tasks(v)) = dialog(&app) else {
+            panic!("{:?}", dialog(&app))
+        };
+        assert!(v.inline && v.open.is_none(), "two tasks: the list, inline");
+        // With one task left, Enter goes straight to its details, and ← closes them.
+        let one =
+            r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running","t0":1000}]}"#;
+        let mut app = app_in(&[one]);
+        app.key(Key::Down, Instant::now());
+        app.key(Key::Enter, Instant::now());
+        let Some(Dialog::Tasks(v)) = dialog(&app) else {
+            panic!()
+        };
+        assert_eq!(v.open.as_deref(), Some("b1"));
+        assert!(v.direct);
+        app.key(Key::Left, Instant::now());
+        assert!(dialog(&app).is_none());
+        // A typed key after Down is itself, and the focus goes.
+        let mut app = app_in(&[one]);
+        app.key(Key::Down, Instant::now());
+        app.key(Key::Char('h'), Instant::now());
+        let Screen::Conv { ui, .. } = &app.screen else {
+            panic!()
+        };
+        assert!(!ui.pill);
+        assert_eq!(ui.input, "h");
+    }
+
+    #[test]
+    fn the_tasks_view_opens_details_stops_and_follows_the_list() {
+        let mut app = app_in(&[TASKS]);
+        type_in(&mut app, "/tasks");
+        assert!(matches!(dialog(&app), Some(Dialog::Tasks(v)) if !v.inline));
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!()
+        };
+        let v = tasks::View::default();
+        let mut out = Vec::new();
+        // x on a row stops it, and the list stays open.
+        let d = tasks_key(c, v.clone(), Key::Char('x'), &mut out);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"b1","t":"tstop"}"#]
+        );
+        assert!(matches!(d, Some(Dialog::Tasks(_))));
+        // Down and Enter open the monitor's details; ← goes back to the list.
+        let mut out = Vec::new();
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Down, &mut out) else {
+            panic!()
+        };
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Enter, &mut out) else {
+            panic!()
+        };
+        assert_eq!(v.open.as_deref(), Some("m1"));
+        let Some(Dialog::Tasks(back)) = tasks_key(c, v.clone(), Key::Left, &mut out) else {
+            panic!()
+        };
+        assert_eq!(back.open, None);
+        assert_eq!(back.sel, 1, "the cursor stays on its row");
+        // x in the details stops it and goes back; Esc closes.
+        let Some(Dialog::Tasks(after)) = tasks_key(c, v.clone(), Key::Char('x'), &mut out) else {
+            panic!()
+        };
+        assert_eq!(after.open, None);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"m1","t":"tstop"}"#]
+        );
+        assert!(tasks_key(c, v.clone(), Key::Esc, &mut Vec::new()).is_none());
+        // Its output arrives for it, and its leaving the list takes the view back to the list.
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Tasks(v));
+        }
+        app.heard(
+            parse(r#"{"t":"tout","i":"m1","x":"a\nb\n","n":4}"#).unwrap(),
+            Instant::now(),
+        );
+        assert!(
+            matches!(dialog(&app), Some(Dialog::Tasks(v)) if v.output == Some(Ok("a\nb\n".into())))
+        );
+        assert_eq!(app.output_wanted().as_deref(), Some("m1"));
+        app.heard(
+            parse(r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"}]}"#)
+                .unwrap(),
+            Instant::now(),
+        );
+        assert!(matches!(dialog(&app), Some(Dialog::Tasks(v)) if v.open.is_none()));
+        assert_eq!(app.output_wanted(), None);
     }
 
     fn dialog(app: &App) -> Option<&Dialog> {

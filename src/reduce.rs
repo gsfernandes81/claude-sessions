@@ -63,6 +63,9 @@ pub enum Op {
     State(String),
     /// The conversation's model, permission mode, title and id, sent when one changes.
     Meta(Meta),
+    /// Claude's background tasks — shells, monitors, subagents, workflows — as they stand:
+    /// the whole list, sent when any of it changes, for Claude Code's tasks view.
+    Tasks(Vec<BgTask>),
     /// An interrupt caught a prompt a view sent (`command_lifecycle` `cancelled`): its text,
     /// and whether another prompt was waiting behind it. The view decides, as Claude Code
     /// does, whether that hands the prompt back to its input (`convo.rs`).
@@ -72,6 +75,36 @@ pub enum Op {
         queued: bool,
     },
 }
+
+/// One of claude's background tasks, as the tasks view is told of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BgTask {
+    /// claude's `task_id`, which `get_task_output` and `stop_task` take.
+    pub id: String,
+    /// `shell`, `monitor`, `agent`, `workflow`, `remote`, or claude's own `task_type`.
+    pub kind: String,
+    pub description: String,
+    /// A shell's or monitor's command; a subagent's type (`Explore`).
+    pub detail: String,
+    /// A subagent's prompt, its first `PROMPT_MAX` characters: the details view shows a
+    /// few lines of it.
+    pub prompt: String,
+    /// When it started and ended, epoch milliseconds, where claude said.
+    pub started_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    /// `running`, `completed`, `failed`, `killed` or `stopped`.
+    pub status: String,
+    /// The transcript item a subagent or workflow is drawn as, whose progress lines say
+    /// what it is doing.
+    pub item: Option<u64>,
+}
+
+/// How many ended tasks the list keeps, the latest: Claude Code's dialog shows ended ones
+/// until they are cleared; a long session must not grow the list without end.
+pub const ENDED_KEPT: usize = 10;
+
+/// How much of a subagent's prompt the list carries.
+pub const PROMPT_MAX: usize = 600;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Meta {
@@ -164,6 +197,31 @@ pub struct Reducer {
     /// Tool calls of the turn under way with no result yet: what Ctrl+X Ctrl+S puts in the
     /// background, as Claude Code's does, rather than stopping the turn (`relay.rs`).
     running: std::collections::HashSet<u64>,
+    /// Background tasks, in the order they started, and the list as last sent.
+    bg: Vec<Bg>,
+    bg_sent: Vec<BgTask>,
+    /// What started each background shell, monitor or agent: tool name and command or
+    /// type, by tool-use id, until its task is heard of or its result comes.
+    calls: HashMap<String, (String, String)>,
+}
+
+/// A background task, and the tool call that started it.
+#[derive(Debug, Clone)]
+struct Bg {
+    task: BgTask,
+    tool_use_id: String,
+}
+
+/// claude's `task_type` as the view names it; a monitor is a `local_bash` whose call was
+/// `Monitor`, which only the call says.
+fn task_kind(task_type: &str) -> &str {
+    match task_type {
+        "local_bash" => "shell",
+        "local_agent" => "agent",
+        "local_workflow" => "workflow",
+        "remote_agent" => "remote",
+        other => other,
+    }
 }
 
 /// What the view is told of one subagent or workflow.
@@ -393,6 +451,130 @@ impl Reducer {
         }
     }
 
+    /// The background task list, sent when it differs from what was sent last.
+    fn show_bg(&mut self, out: &mut Out) {
+        let now: Vec<BgTask> = self.bg.iter().map(|b| b.task.clone()).collect();
+        if now != self.bg_sent {
+            self.bg_sent = now.clone();
+            out.ops.push(Op::Tasks(now));
+        }
+    }
+
+    /// A task's start, change or end, by claude's task id.
+    fn bg_event(&mut self, task_id: &str, tool_use_id: &str, event: &sdk::Task) {
+        if task_id.is_empty() {
+            return;
+        }
+        match event {
+            sdk::Task::Started {
+                task_type,
+                description,
+                started_ms,
+                prompt,
+            } => {
+                let call = self.calls.remove(tool_use_id);
+                let item = self.tasks.get(tool_use_id).map(|t| t.item);
+                let b = self.bg_entry(task_id, task_type, description, *started_ms);
+                if !tool_use_id.is_empty() {
+                    b.tool_use_id = tool_use_id.to_string();
+                }
+                if let Some((name, detail)) = call {
+                    if name == "Monitor" {
+                        b.task.kind = "monitor".into();
+                    }
+                    b.task.detail = detail;
+                }
+                b.task.item = item.or(b.task.item);
+                if !prompt.is_empty() {
+                    b.task.prompt = prompt.chars().take(PROMPT_MAX).collect();
+                }
+            }
+            sdk::Task::Updated { status, ended_ms } => {
+                if let Some(b) = self.bg.iter_mut().find(|b| b.task.id == task_id) {
+                    if !status.is_empty() {
+                        b.task.status = status.clone();
+                    }
+                    b.task.ended_ms = ended_ms.or(b.task.ended_ms);
+                }
+            }
+            // The notification's word wins: `stopped` where the update said `killed`.
+            sdk::Task::Done { status, .. } => {
+                if let Some(b) = self.bg.iter_mut().find(|b| b.task.id == task_id) {
+                    b.task.status = if status.is_empty() {
+                        "completed".into()
+                    } else {
+                        status.clone()
+                    };
+                }
+            }
+            sdk::Task::Progress { .. } => {}
+        }
+        self.trim_bg();
+    }
+
+    /// The entry for `task_id`, made if there is none yet.
+    fn bg_entry(
+        &mut self,
+        task_id: &str,
+        task_type: &str,
+        description: &str,
+        started_ms: Option<u64>,
+    ) -> &mut Bg {
+        let at = match self.bg.iter().position(|b| b.task.id == task_id) {
+            Some(at) => at,
+            None => {
+                self.bg.push(Bg {
+                    task: BgTask {
+                        id: task_id.to_string(),
+                        kind: task_kind(task_type).to_string(),
+                        status: "running".into(),
+                        ..BgTask::default()
+                    },
+                    tool_use_id: String::new(),
+                });
+                self.bg.len() - 1
+            }
+        };
+        let b = &mut self.bg[at];
+        if !description.is_empty() {
+            b.task.description = cut(description);
+        }
+        b.task.started_ms = b.task.started_ms.or(started_ms);
+        b
+    }
+
+    /// claude's list of what runs in the background now: anything in it is running, and
+    /// anything not in it that was has ended, whatever line saying so went missing.
+    fn tasks_now(&mut self, now: Vec<sdk::TaskNow>) {
+        for t in &now {
+            let b = self.bg_entry(&t.task_id, &t.task_type, &t.description, t.started_ms);
+            b.task.status = "running".into();
+        }
+        for b in self.bg.iter_mut() {
+            if b.task.status == "running" && !now.iter().any(|t| t.task_id == b.task.id) {
+                b.task.status = "completed".into();
+            }
+        }
+        self.trim_bg();
+    }
+
+    /// Only the latest `ENDED_KEPT` ended tasks stay.
+    fn trim_bg(&mut self) {
+        let ended = self
+            .bg
+            .iter()
+            .filter(|b| b.task.status != "running")
+            .count();
+        let mut drop = ended.saturating_sub(ENDED_KEPT);
+        self.bg.retain(|b| {
+            let gone = drop > 0 && b.task.status != "running";
+            if gone {
+                drop -= 1;
+            }
+            !gone
+        });
+    }
+
     /// The conversation's id, model, mode, title and effort, as last heard.
     pub fn meta(&self) -> &Meta {
         &self.meta
@@ -581,6 +763,12 @@ impl Reducer {
                     match b {
                         Block::Text(text) => self.finish_text(&mut out, &message_id, text),
                         Block::ToolUse { id, name, input } if is_task_tool(&name) => {
+                            let kind = input
+                                .get("subagent_type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            self.calls.insert(id.clone(), (name.clone(), kind));
                             let arg = if name == "Workflow" {
                                 workflow_title(&input)
                             } else {
@@ -602,6 +790,11 @@ impl Reducer {
                             self.show_task(&id, &mut out);
                         }
                         Block::ToolUse { id, name, input } => {
+                            if matches!(name.as_str(), "Bash" | "Monitor") {
+                                let cmd = input.get("command").and_then(Value::as_str);
+                                let cmd = cut(cmd.unwrap_or("").lines().next().unwrap_or(""));
+                                self.calls.insert(id.clone(), (name.clone(), cmd));
+                            }
                             let arg = tool_arg(&name, &input);
                             let item = self.add(&mut out, Item::Tool { name, arg });
                             self.tools.insert(id, item);
@@ -613,6 +806,10 @@ impl Reducer {
             }
             Msg::ToolResults(results) => {
                 for r in results {
+                    // A call whose task was not heard of by its result never had one.
+                    if !self.bg.iter().any(|b| b.tool_use_id == r.tool_use_id) {
+                        self.calls.remove(&r.tool_use_id);
+                    }
                     let Some(&id) = self.tools.get(&r.tool_use_id) else {
                         continue;
                     };
@@ -722,13 +919,23 @@ impl Reducer {
                     answers,
                 });
             }
-            Msg::Task { tool_use_id, event } => {
+            Msg::TasksNow(now) => {
+                self.tasks_now(now);
+                self.show_bg(&mut out);
+            }
+            Msg::Task {
+                task_id,
+                tool_use_id,
+                event,
+            } => {
+                self.bg_event(&task_id, &tool_use_id, &event);
+                self.show_bg(&mut out);
                 let Some(t) = self.tasks.get_mut(&tool_use_id) else {
                     // A background shell command's task, or one before this log began.
                     return out;
                 };
                 match event {
-                    sdk::Task::Started { .. } => {}
+                    sdk::Task::Started { .. } | sdk::Task::Updated { .. } => {}
                     sdk::Task::Progress {
                         usage,
                         phases,
@@ -959,7 +1166,7 @@ pub fn always_label(suggestions: &[Value]) -> Option<String> {
 }
 
 /// Merge a batch of ops for one write: consecutive appends to one item become one, and only
-/// the last progress op of each agent is kept.
+/// the last progress op of each agent, and the last task list, is kept.
 pub fn coalesce(ops: Vec<Op>) -> Vec<Op> {
     let mut merged: Vec<Op> = Vec::with_capacity(ops.len());
     for op in ops {
@@ -967,6 +1174,10 @@ pub fn coalesce(ops: Vec<Op>) -> Vec<Op> {
         // already out of date.
         if let Op::Progress { id, .. } = &op {
             merged.retain(|m| !matches!(m, Op::Progress { id: was, .. } if was == id));
+        }
+        // So does a task list.
+        if let Op::Tasks(_) = &op {
+            merged.retain(|m| !matches!(m, Op::Tasks(_)));
         }
         if let (
             Some(Op::Append {
@@ -1136,6 +1347,10 @@ impl Op {
                 ),
                 ("st", Value::string(state.clone())),
             ]),
+            Op::Tasks(list) => obj(vec![
+                ("t", Value::string("tasks")),
+                ("l", Value::Arr(list.iter().map(BgTask::to_value).collect())),
+            ]),
             Op::State(s) => obj(vec![
                 ("t", Value::string("st")),
                 ("s", Value::string(s.clone())),
@@ -1167,6 +1382,32 @@ impl Op {
                 v
             }
         }
+    }
+}
+
+impl BgTask {
+    fn to_value(&self) -> Value {
+        let mut v = obj(vec![
+            ("i", Value::string(self.id.clone())),
+            ("k", Value::string(self.kind.clone())),
+            ("d", Value::string(self.description.clone())),
+            ("st", Value::string(self.status.clone())),
+        ]);
+        if !self.detail.is_empty() {
+            v.set("c", Value::string(self.detail.clone()));
+        }
+        let set = |v: &mut Value, k: &str, n: Option<u64>| {
+            if let Some(n) = n {
+                v.set(k, Value::num(n as f64));
+            }
+        };
+        if !self.prompt.is_empty() {
+            v.set("p", Value::string(self.prompt.clone()));
+        }
+        set(&mut v, "t0", self.started_ms);
+        set(&mut v, "t1", self.ended_ms);
+        set(&mut v, "it", self.item);
+        v
     }
 }
 
@@ -2065,5 +2306,107 @@ mod tests {
         assert_eq!(r.waiting_suggestions("p1"), [touch]);
         r.answered("p1", "allowed", vec![]);
         assert!(r.waiting_suggestions("p1").is_empty());
+    }
+
+    // Background tasks as 2.1.311 wrote them on 2026-11-04, cut to the fields read: two
+    // shells, a monitor and a subagent started at once, the subagent finishing, the monitor
+    // stopped from the host (`stop_task`).
+    const BACKGROUND: &[&str] = &[
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_s","name":"Bash","input":{"command":"for i in $(seq 60); do echo tick $i; sleep 2; done","description":"Print ticks","run_in_background":true}}]}}"#,
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bub8w8bhh","run_id":"0mw1kjm9v-295e62a9","task_type":"local_bash","description":"Print ticks"}]}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"bub8w8bhh","run_id":"0mw1kjm9v-295e62a9","tool_use_id":"tu_s","description":"Print ticks","is_backgrounded":true,"task_type":"local_bash"}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_s","content":"Command running in background with ID: bub8w8bhh."}]}}"#,
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"List big files","prompt":"…","subagent_type":"Explore","run_in_background":true}}]}}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"a46e","run_id":"0mw1kjn2l-1614a111","tool_use_id":"tu_a","description":"List big files","subagent_type":"Explore","is_backgrounded":true,"task_type":"local_agent","prompt":"Find the five largest files."}"#,
+        r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_m","name":"Monitor","input":{"command":"for i in $(seq 30); do echo mon $i; sleep 3; done","description":"Watch mon","timeout_ms":300000}}]}}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"byee","run_id":"0mw1kjpk7-e36b8f12","tool_use_id":"tu_m","description":"Watch mon","is_backgrounded":true,"task_type":"local_bash"}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"a46e","run_id":"0mw1kjn2l-1614a111","patch":{"status":"completed","end_time":1793763624232}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"a46e","tool_use_id":"tu_a","status":"completed","summary":"done","usage":{"total_tokens":1,"tool_uses":1,"duration_ms":4500}}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"byee","patch":{"status":"killed","end_time":1793763656919}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"byee","tool_use_id":"tu_m","status":"stopped","summary":"Watch mon"}"#,
+    ];
+
+    fn last_tasks(ops: &[Op]) -> Option<String> {
+        ops.iter()
+            .rev()
+            .find(|o| matches!(o, Op::Tasks(_)))
+            .map(|o| to_line(&o.to_value()))
+    }
+
+    #[test]
+    fn background_shells_monitors_and_agents_are_listed_as_claude_has_them() {
+        let mut r = Reducer::new();
+        let o = feed_all(&mut r, BACKGROUND);
+        assert_eq!(
+            last_tasks(&o.ops).unwrap(),
+            concat!(
+                r#"{"l":["#,
+                r#"{"c":"for i in $(seq 60); do echo tick $i; sleep 2; done","d":"Print ticks","i":"bub8w8bhh","k":"shell","st":"running","t0":1793763618691},"#,
+                r#"{"c":"Explore","d":"List big files","i":"a46e","it":2,"k":"agent","p":"Find the five largest files.","st":"completed","t0":1793763619725,"t1":1793763624232},"#,
+                r#"{"c":"for i in $(seq 30); do echo mon $i; sleep 3; done","d":"Watch mon","i":"byee","k":"monitor","st":"stopped","t0":1793763622951,"t1":1793763656919}"#,
+                r#"],"t":"tasks"}"#
+            )
+        );
+        // The start's time is the run id's, which the end's measures against: 4.5 s.
+        assert_eq!(sdk::run_started("0mw1kjn2l-1614a111"), Some(1793763619725));
+        assert_eq!(sdk::run_started("toolu_x"), None);
+        assert_eq!(sdk::run_started("zzzzzzzzzzzz-1"), None, "out of reason");
+        // A line that changes nothing in the list sends no list.
+        let again = feed_all(&mut r, &[BACKGROUND[11]]);
+        assert_eq!(last_tasks(&again.ops), None);
+    }
+
+    #[test]
+    fn a_task_claude_no_longer_lists_has_ended_and_only_the_latest_ended_are_kept() {
+        let mut r = Reducer::new();
+        let now = |ids: &[&str]| {
+            let tasks: Vec<String> = ids
+                .iter()
+                .map(|i| {
+                    format!(r#"{{"task_id":"{i}","task_type":"local_bash","description":"d{i}"}}"#)
+                })
+                .collect();
+            format!(
+                r#"{{"type":"system","subtype":"background_tasks_changed","tasks":[{}]}}"#,
+                tasks.join(",")
+            )
+        };
+        let o = feed_all(&mut r, &[&now(&["a", "b"])]);
+        assert_eq!(
+            last_tasks(&o.ops).unwrap(),
+            r#"{"l":[{"d":"da","i":"a","k":"shell","st":"running"},{"d":"db","i":"b","k":"shell","st":"running"}],"t":"tasks"}"#
+        );
+        // `a` is gone from claude's list with no line saying how it ended.
+        let o = feed_all(&mut r, &[&now(&["b"])]);
+        assert!(
+            last_tasks(&o.ops)
+                .unwrap()
+                .contains(r#""i":"a","k":"shell","st":"completed""#)
+        );
+        // Many more come and go: the running one stays, and only ENDED_KEPT ended ones.
+        for n in 0..(ENDED_KEPT + 5) {
+            let id = format!("x{n}");
+            feed_all(&mut r, &[&now(&["b", &id]), &now(&["b"])]);
+        }
+        let ended: Vec<&str> =
+            r.bg.iter()
+                .filter(|b| b.task.status != "running")
+                .map(|b| b.task.id.as_str())
+                .collect();
+        assert_eq!(ended.len(), ENDED_KEPT);
+        assert_eq!(ended.last(), Some(&format!("x{}", ENDED_KEPT + 4).as_str()));
+        assert!(
+            r.bg.iter()
+                .any(|b| b.task.id == "b" && b.task.status == "running")
+        );
+        // A foreground call's command is not kept once its result comes without a task.
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"fg","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"fg","content":"x"}]}}"#,
+            ],
+        );
+        assert!(!r.calls.contains_key("fg"));
     }
 }

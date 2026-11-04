@@ -78,6 +78,7 @@ mod signal;
 mod sockdiag;
 mod statusline;
 mod store;
+mod tasks;
 mod term;
 mod transcript;
 mod ui;
