@@ -165,6 +165,9 @@ pub enum Item {
     /// A background task's notice, which claude hands the model as a prompt: drawn as a note,
     /// and counted by Claude Code's tasks view while it is open.
     Notice(String),
+    /// A message another agent sent: a subagent's hand-back, another session's, a
+    /// teammate's. Drawn as Claude Code draws one, not as a prompt.
+    Message(sdk::Message),
     /// The conversation was compacted, from and to so many tokens.
     Compacted { pre: Option<u64>, post: Option<u64> },
 }
@@ -1020,6 +1023,11 @@ impl Reducer {
                 self.add(&mut out, Item::Notice(text));
                 self.set_state(&mut out, "working");
             }
+            // Claude takes it as a prompt, and answers it.
+            Msg::Message(m) => {
+                self.add(&mut out, Item::Message(m));
+                self.set_state(&mut out, "working");
+            }
             Msg::LocalOutput(text) => {
                 let text = strip_ansi(&text);
                 if !text.trim().is_empty() {
@@ -1643,6 +1651,18 @@ impl Item {
                 ("x", Value::string(x.clone())),
                 ("tn", Value::Bool(true)),
             ]),
+            // An older client skips it.
+            Item::Message(m) => {
+                let mut v = obj(vec![
+                    k("msg"),
+                    ("n", Value::string(m.from.clone())),
+                    ("x", Value::string(m.body.clone())),
+                ]);
+                if m.inline {
+                    v.set("i", Value::Bool(true));
+                }
+                v
+            }
             Item::Tool { name, arg } => obj(vec![
                 k("tool"),
                 ("n", Value::string(name.clone())),
@@ -2145,6 +2165,26 @@ mod tests {
             sdk::command_typed("<command-name>/btw</command-name><command-args>a b</command-args>")
                 .as_deref(),
             Some("/btw a b")
+        );
+    }
+
+    #[test]
+    fn an_agents_message_is_an_item_of_its_own_and_starts_a_turn() {
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"<agent-message from=\"a1\">\nreport\n</agent-message>"},"isReplay":true,"origin":{"kind":"peer","name":"Explore","handbackReportText":"All done."}}"#,
+                r#"{"type":"user","message":{"role":"user","content":"<cross-session-message from=\"infra/claude-22\">\nPinned.\n</cross-session-message>"},"isReplay":true}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&o.ops),
+            [
+                r#"{"id":1,"k":"msg","n":"Explore","t":"add","x":"All done."}"#,
+                r#"{"s":"working","t":"st"}"#,
+                r#"{"i":true,"id":2,"k":"msg","n":"infra/claude-22","t":"add","x":"Pinned."}"#,
+            ]
         );
     }
 

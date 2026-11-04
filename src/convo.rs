@@ -251,6 +251,13 @@ pub enum Entry {
         answers: Vec<(String, String)>,
     },
     Note(String),
+    /// A message another agent sent: who from, what it said, and whether Claude Code puts its
+    /// words on the collapsed line (a peer session's).
+    Message {
+        from: String,
+        body: String,
+        inline: bool,
+    },
     Compacted,
     /// `✻ Worked for 41s · done 1:12 AM`: the client's own, at the end of a turn it saw.
     Worked(String),
@@ -533,6 +540,11 @@ impl Convo {
                         Entry::Note(s(v, "x"))
                     }
                     "compact" => Entry::Compacted,
+                    "msg" => Entry::Message {
+                        from: s(v, "n"),
+                        body: s(v, "x"),
+                        inline: v.get("i").and_then(Value::as_bool) == Some(true),
+                    },
                     "tool" => Entry::Tool {
                         name: s(v, "n"),
                         arg: s(v, "a"),
@@ -973,6 +985,29 @@ fn agent_block(name: &str, arg: &str, lines: &[String], state: &str, w: usize) -
     out
 }
 
+/// A message another agent sent, as Claude Code draws one (2.1.311): collapsed, one grey
+/// line, `› Message from @Explore (ctrl+o to expand)`, a peer session's words on it after a
+/// colon; expanded, `› Message from Explore` and what it said under it.
+fn message_block(from: &str, body: &str, inline: bool, expanded: bool, w: usize) -> Vec<Line> {
+    if expanded {
+        let mut out = wrapped_by(&format!("› Message from {from}"), "", "", w, fg(GREY));
+        out.extend(wrapped_by(body, "  ", "  ", w, PLAIN));
+        return out;
+    }
+    let said = if inline {
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        format!(": {flat}")
+    } else {
+        String::new()
+    };
+    let head = format!("› Message from @{from}");
+    let hint = " (ctrl+o to expand)";
+    // The words are cut to keep the line to one row, as Claude Code keeps it to a line.
+    let said = cut(&said, w.saturating_sub(width(&head) + width(hint)));
+    let said = if said == "…" { String::new() } else { said };
+    wrapped_by(&format!("{head}{said}{hint}"), "", "", w, fg(GREY))
+}
+
 fn tool_line(name: &str, arg: &str) -> String {
     match name {
         "Bash" => format!("$ {arg}"),
@@ -1385,6 +1420,10 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             } => {
                 out.push(Vec::new());
                 out.extend(agent_block(name, arg, lines, state, w));
+            }
+            Entry::Message { from, body, inline } => {
+                out.push(Vec::new());
+                out.extend(message_block(from, body, *inline, c.expanded, w));
             }
             Entry::Compacted => {
                 out.push(Vec::new());
@@ -2652,6 +2691,76 @@ mod tests {
         for o in ops {
             c.apply(&parse(o).unwrap(), now);
         }
+    }
+
+    #[test]
+    fn an_agents_message_is_one_grey_line_until_ctrl_o_shows_what_it_said() {
+        // As Claude Code 2.1.311 draws a subagent's hand-back, captured at 80 columns on
+        // 2026-11-04: `› Message from @general-purpose (ctrl+o to expand)`, grey.
+        let mut c = Convo::new("h", "claude-3", "r");
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"msg","n":"general-purpose","x":"All 25 files read.\n\n1. adduser: GPL-2+"}"#,
+                r#"{"t":"add","id":2,"k":"msg","n":"infra","x":"Pinned\n0.16.0.","i":true}"#,
+            ],
+        );
+        let body = |c: &Convo, w: usize| -> Vec<(String, St)> {
+            let (lines, _) = transcript(c, w);
+            lines[4..]
+                .iter()
+                .map(|l| {
+                    (
+                        plain(l).trim_end().to_string(),
+                        l.first().map_or(PLAIN, |r| r.1),
+                    )
+                })
+                .collect()
+        };
+        let grey = fg(GREY);
+        assert_eq!(
+            body(&c, 80),
+            [
+                (String::new(), PLAIN),
+                (
+                    "› Message from @general-purpose (ctrl+o to expand)".into(),
+                    grey
+                ),
+                (String::new(), PLAIN),
+                (
+                    "› Message from @infra: Pinned 0.16.0. (ctrl+o to expand)".into(),
+                    grey
+                ),
+            ]
+        );
+        // At 40 the line wraps as Claude Code's does; a peer's words are cut to keep its line
+        // to one row, and left out where nothing of them fits.
+        let narrow: Vec<String> = body(&c, 40).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            narrow,
+            [
+                "",
+                "› Message from @general-purpose (ctrl+o",
+                "to expand)",
+                "",
+                "› Message from @infra (ctrl+o to expand)",
+            ]
+        );
+        c.expanded = true;
+        assert_eq!(
+            body(&c, 80),
+            [
+                (String::new(), PLAIN),
+                ("› Message from general-purpose".into(), grey),
+                ("  All 25 files read.".into(), PLAIN),
+                (String::new(), PLAIN),
+                ("  1. adduser: GPL-2+".into(), PLAIN),
+                (String::new(), PLAIN),
+                ("› Message from infra".into(), grey),
+                ("  Pinned".into(), PLAIN),
+                ("  0.16.0.".into(), PLAIN),
+            ]
+        );
     }
 
     #[test]

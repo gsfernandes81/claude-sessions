@@ -355,7 +355,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -568,6 +568,24 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      when it failed or was stopped, which the line under it says in words. A subagent's
      handback and structured output are counted, not listed, and its report is what `full`
      answers.
+   - **A message from another agent** — a subagent's hand-back (`<agent-message>`), another
+     session's (`<cross-session-message>`), a teammate's (`<teammate-message>`), which claude
+     hands the model as a prompt — is drawn as Claude Code 2.1.311 draws one, never as the
+     prompt's markup (owner, 2026-11-04): collapsed, one grey line, `› Message from
+     @general-purpose (ctrl+o to expand)`, a peer session's words after a colon where they
+     fit; with Ctrl+O, `› Message from general-purpose` and what it said under it, a
+     hand-back's report without the frame Claude Code puts round it. The sender is the
+     line's `origin.name`, else the tag's `from-name`, else Claude Code's own `agent`,
+     `peer` or `teammate`. One delivered mid-turn is in a transcript as a `queued_command`
+     attachment, read on a resume, as a task's notice there is.
+   - **Nothing of Claude Code's own wrapping is drawn as typed.** A replayed line that opens
+     with one of the tags Claude Code never shows as typed (its list in 2.1.311:
+     `system-reminder`, `tick`, `channel`, `local-command-caveat` and the rest, `WRAPPERS`
+     in `sdk.rs`) is not a prompt; `<local-command-stderr>` is a note like stdout. A tool
+     result is drawn as Claude Code shows it rather than as the model reads it: an error
+     without `<tool_use_error>`, reminders and `<sandbox_violations>` left out, and a
+     `<persisted-output>` stand-in as the shell's own output where claude gives it, else
+     the preview it kept.
    - **A holder's live socket counts as `driver: holder`** (`holder::serving`) where the
      record's field is missing: the released hooks on this dev container rewrote it, and the
      fleet runs mixed releases for a while after a pin bump.

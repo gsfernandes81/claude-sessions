@@ -297,6 +297,8 @@ fn item_rows(ops: &[Op], w: usize) -> usize {
             Item::Agent { .. } => 3,
             Item::Permission { .. } | Item::Ask { .. } => 4,
             Item::Compacted { .. } => 2,
+            // Collapsed, as it is drawn until Ctrl+O.
+            Item::Message(_) => 2,
         },
         _ => 1,
     };

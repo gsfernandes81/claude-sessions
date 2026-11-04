@@ -49,6 +49,10 @@ pub enum Msg {
     /// A background task's `<task-notification>`, which claude hands the model as a prompt
     /// and so starts a turn with: its summary.
     Notice(String),
+    /// A message another agent sent this conversation, which claude hands the model as a
+    /// prompt: a subagent's hand-back (`<agent-message>`), another session's
+    /// (`<cross-session-message>`), a teammate's (`<teammate-message>`).
+    Message(Message),
     /// Tool results, from a `user` line whose content is `tool_result` blocks.
     ToolResults(Vec<ToolResult>),
     /// A local command's output, `<local-command-stdout>…</local-command-stdout>`: what
@@ -329,6 +333,19 @@ pub enum Block {
     Other(String),
 }
 
+/// A message from another agent, as Claude Code draws one: `› Message from @Explore`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    /// Who sent it: a subagent's type, a session's name, a teammate's id; or Claude Code's
+    /// own word when it says none: `agent`, `peer`, `teammate`.
+    pub from: String,
+    /// What it said, without the envelope: a hand-back's report without its frame.
+    pub body: String,
+    /// Claude Code puts a peer session's words on the collapsed line itself
+    /// (`› Message from @x: …`); a subagent's and a teammate's wait for Ctrl+O.
+    pub inline: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolResult {
     pub tool_use_id: String,
@@ -548,8 +565,214 @@ fn result_text(c: Option<&Value>) -> String {
     }
 }
 
-const LOCAL_OPEN: &str = "<local-command-stdout>";
-const LOCAL_CLOSE: &str = "</local-command-stdout>";
+/// What `/model`, `/compact` and the like answer with, and what one says when it fails.
+const LOCAL_TAGS: [&str; 2] = ["local-command-stdout", "local-command-stderr"];
+
+/// A local command's output without its wrapper, if `t` is one.
+fn local_output(t: &str) -> Option<String> {
+    LOCAL_TAGS.iter().find_map(|name| {
+        let rest = t.strip_prefix(&format!("<{name}>"))?;
+        Some(
+            rest.strip_suffix(&format!("</{name}>"))
+                .unwrap_or(rest)
+                .to_string(),
+        )
+    })
+}
+
+/// The tags Claude Code wraps what it hands the model as a user message in, which it never
+/// shows as typed (2.1.311's own list): a line that opens with one is not a prompt the owner
+/// typed, so it is never drawn as one. Those the view draws are read before this list is.
+const WRAPPERS: [&str; 28] = [
+    "task-notification",
+    "agent-message",
+    "teammate-message",
+    "cross-session-message",
+    "remote-review",
+    "remote-review-progress",
+    "slack-ping",
+    "slack-tag-message",
+    "tick",
+    "fetched-web-content",
+    "coordinator-relay",
+    "channel",
+    "system-reminder",
+    "system_reminder",
+    "bash-input",
+    "bash-stdout",
+    "bash-stderr",
+    "bash-exit-code",
+    "local-command-caveat",
+    "local-command-stdout",
+    "local-command-stderr",
+    "command-message",
+    "command-contents",
+    "user-prompt-submit-hook",
+    "mcp-resource-update",
+    "mcp-polling-update",
+    "fork-boilerplate",
+    "user-memory-input",
+];
+
+/// Whether `t` opens with `<name` as a whole tag name.
+fn opens(t: &str, name: &str) -> bool {
+    t.strip_prefix('<')
+        .and_then(|r| r.strip_prefix(name))
+        .is_some_and(|r| r.starts_with([' ', '>', '\n', '/']))
+}
+
+/// Where a wrapped message's own tag starts: at the top, under Claude Code's one-line
+/// lead-in (`Another Claude session sent a message:`), or inside the `<system-reminder>` a
+/// message that came mid-turn rides in.
+fn unwrapped(t: &str) -> &str {
+    let mut t = t.trim_start();
+    if opens(t, "system-reminder") {
+        t = t.split_once('>').map_or("", |(_, r)| r).trim_start();
+    }
+    if let Some((first, rest)) = t.split_once('\n') {
+        if !first.starts_with('<') && first.trim_end().ends_with(':') && rest.starts_with('<') {
+            return rest;
+        }
+    }
+    t
+}
+
+/// Whether `t` is Claude Code's wrapping of something, not a prompt typed.
+fn is_wrapped(t: &str) -> bool {
+    [t.trim_start(), unwrapped(t)]
+        .iter()
+        .any(|t| WRAPPERS.iter().any(|w| opens(t, w)))
+}
+
+/// `name="value"` among a tag's attributes.
+fn attr(attrs: &str, name: &str) -> Option<String> {
+    let key = format!("{name}=\"");
+    let mut from = 0;
+    while let Some(i) = attrs[from..].find(&key) {
+        let at = from + i;
+        let starts = attrs[..at].ends_with(char::is_whitespace);
+        let rest = &attrs[at + key.len()..];
+        if starts {
+            return rest.split_once('"').map(|(v, _)| v.to_string());
+        }
+        from = at + key.len();
+    }
+    None
+}
+
+/// Claude Code's frame around a subagent's report, the last line of which this is.
+const HANDBACK_START: &str = "[Subagent hand-back]";
+const HANDBACK_END: &str = "The report follows:\n";
+
+/// A hand-back's report without its frame and the indent the frame adds, as Claude Code shows
+/// it; any other message as it came.
+fn unframed(body: &str) -> String {
+    if !body.starts_with(HANDBACK_START) {
+        return body.to_string();
+    }
+    let Some((_, report)) = body.split_once(HANDBACK_END) else {
+        return body.to_string();
+    };
+    if report.lines().all(|l| l.starts_with("  ")) {
+        report
+            .lines()
+            .map(|l| &l[2..])
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        report.to_string()
+    }
+}
+
+/// A message another agent sent, if `t` is one: who from, read as Claude Code reads it (the
+/// line's `origin` first, then the tag's own attributes), and what it said.
+fn message(t: &str, origin: Option<&Value>) -> Option<Message> {
+    let t = unwrapped(t);
+    let (name, fallback, inline) = [
+        ("agent-message", "agent", false),
+        ("cross-session-message", "peer", true),
+        ("teammate-message", "teammate", false),
+    ]
+    .into_iter()
+    .find(|(name, ..)| opens(t, name))?;
+    let (attrs, inner) = t[1 + name.len()..].split_once('>')?;
+    let close = format!("</{name}>");
+    let inner = inner.rfind(&close).map_or(inner, |i| &inner[..i]);
+    let inner = inner.strip_prefix('\n').unwrap_or(inner).trim_end();
+    let o = |k: &str| {
+        origin
+            .and_then(|o| o.get(k))
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .map(String::from)
+    };
+    let from = o("name")
+        .or_else(|| attr(attrs, "from-name"))
+        .or_else(|| match name {
+            "teammate-message" => attr(attrs, "teammate_id"),
+            // A session's address is a name; a subagent's `from` is a task id, which Claude
+            // Code does not show.
+            "cross-session-message" => attr(attrs, "from"),
+            _ => None,
+        })
+        .unwrap_or_else(|| fallback.to_string());
+    let body = match o("handbackReportText") {
+        Some(report) if name == "agent-message" => report,
+        _ => unframed(inner),
+    };
+    Some(Message {
+        from,
+        body: body.trim_end().to_string(),
+        inline,
+    })
+}
+
+/// Remove every `<name …>…</name>` from `t`.
+fn without(t: &str, name: &str) -> String {
+    let close = format!("</{name}>");
+    let mut out = String::with_capacity(t.len());
+    let mut rest = t;
+    loop {
+        let open = rest
+            .match_indices('<')
+            .map(|(i, _)| i)
+            .find(|&i| opens(&rest[i..], name));
+        let Some(i) = open else { break };
+        let Some(j) = rest[i..].find(&close) else {
+            break;
+        };
+        out.push_str(&rest[..i]);
+        rest = &rest[i + j + close.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A tool result as Claude Code shows it, not as the model reads it: the reminders claude
+/// appends for the model and a sandbox's report left out, an error without its
+/// `<tool_use_error>` wrapper, and a result too long to keep inline as the preview claude
+/// kept of it.
+fn shown_result(text: &str) -> String {
+    let text = without(&without(text, "system-reminder"), "sandbox_violations");
+    let t = text.trim();
+    if let Some(inner) = t
+        .strip_prefix("<tool_use_error>")
+        .and_then(|r| r.strip_suffix("</tool_use_error>"))
+    {
+        return inner.to_string();
+    }
+    if let Some(inner) = t.strip_prefix("<persisted-output>") {
+        let inner = inner.strip_suffix("</persisted-output>").unwrap_or(inner);
+        return match inner.find("\nPreview (") {
+            Some(i) => inner[i + 1..]
+                .split_once('\n')
+                .map_or("", |(_, r)| r)
+                .to_string(),
+            None => inner.trim().to_string(),
+        };
+    }
+    text
+}
 
 /// What is between `<name>` and `</name>` in `t`, trimmed.
 fn tag(t: &str, name: &str) -> Option<String> {
@@ -580,21 +803,27 @@ pub(crate) fn command_typed(t: &str) -> Option<String> {
 
 fn user(v: &Value) -> Msg {
     let content = v.get("message").and_then(|m| m.get("content"));
+    let origin = v.get("origin");
     match content {
         // A background task's notice, which claude hands the model as a prompt: its summary,
         // as a note, not the markup.
         Some(Value::Str(t)) if t.trim_start().starts_with("<task-notification>") => {
             Msg::Notice(tag(t, "summary").unwrap_or_else(|| "Background task finished".into()))
         }
-        Some(Value::Str(t)) => match t.strip_prefix(LOCAL_OPEN) {
-            Some(rest) => {
-                Msg::LocalOutput(rest.strip_suffix(LOCAL_CLOSE).unwrap_or(rest).to_string())
+        Some(Value::Str(t)) => {
+            if let Some(m) = message(t, origin) {
+                return Msg::Message(m);
             }
-            None if v.get("isReplay").and_then(Value::as_bool) == Some(true) => {
-                Msg::Prompt(command_typed(t).unwrap_or_else(|| t.clone()))
+            if let Some(out) = local_output(t) {
+                return Msg::LocalOutput(out);
             }
-            None => Msg::UserText(t.clone()),
-        },
+            let replay = v.get("isReplay").and_then(Value::as_bool) == Some(true);
+            match command_typed(t) {
+                Some(typed) if replay => Msg::Prompt(typed),
+                _ if replay && !is_wrapped(t) => Msg::Prompt(t.clone()),
+                _ => Msg::UserText(t.clone()),
+            }
+        }
         Some(Value::Arr(parts)) => {
             let results: Vec<ToolResult> = parts
                 .iter()
@@ -606,10 +835,44 @@ fn user(v: &Value) -> Msg {
                 })
                 .collect();
             if results.is_empty() {
-                Msg::UserText(result_text(content))
-            } else {
-                Msg::ToolResults(results)
+                let found = parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                    .find_map(|p| message(&s(p, "text"), origin));
+                return match found {
+                    Some(m) => Msg::Message(m),
+                    None => Msg::UserText(result_text(content)),
+                };
             }
+            // A result too long to keep inline: what the tool said, where claude says it
+            // (a shell's), rather than the stand-in the model got.
+            let said = v.get("tool_use_result").and_then(|r| {
+                let out = r.get("stdout").and_then(Value::as_str)?;
+                let err = r.get("stderr").and_then(Value::as_str).unwrap_or("");
+                Some(if err.is_empty() {
+                    out.to_string()
+                } else {
+                    format!("{out}\n{err}")
+                })
+            });
+            let single = results.len() == 1;
+            Msg::ToolResults(
+                results
+                    .into_iter()
+                    .map(|mut r| {
+                        r.text = match &said {
+                            Some(out)
+                                if single
+                                    && r.text.trim_start().starts_with("<persisted-output>") =>
+                            {
+                                out.clone()
+                            }
+                            _ => shown_result(&r.text),
+                        };
+                        r
+                    })
+                    .collect(),
+            )
         }
         _ => Msg::UserText(String::new()),
     }
@@ -657,6 +920,29 @@ fn history(line: &Value) -> Msg {
             }
         }
         Some("assistant") => classify(line),
+        // What reached claude mid-turn, delivered with the next tool results: an agent's
+        // message or a task's notice, drawn as it is when it starts a turn. A prompt typed
+        // mid-turn is left to its own line, which the transcript also has.
+        Some("attachment") => {
+            let a = line.get("attachment");
+            let queued = a.and_then(|a| a.get("type")).and_then(Value::as_str);
+            let prompt = a.and_then(|a| a.get("prompt")).and_then(Value::as_str);
+            match (queued, prompt) {
+                (Some("queued_command"), Some(p)) if is_wrapped(p) => {
+                    let mut content = Value::obj();
+                    content.set("content", Value::string(p.to_string()));
+                    let mut l = Value::obj();
+                    l.set("type", Value::string("user"));
+                    l.set("message", content);
+                    l.set("isReplay", Value::Bool(true));
+                    if let Some(o) = a.and_then(|a| a.get("origin")) {
+                        l.set("origin", o.clone());
+                    }
+                    user(&l)
+                }
+                _ => Msg::Noise,
+            }
+        }
         _ => Msg::Noise,
     }
 }
@@ -1326,6 +1612,160 @@ mod tests {
         );
         assert_eq!(blocks[1], Block::Other("thinking".into()));
         assert_eq!(blocks[2], Block::Text("done".into()));
+    }
+
+    #[test]
+    fn an_agents_message_is_who_sent_it_and_what_it_said_not_its_envelope() {
+        // A subagent's hand-back as 2.1.311 replayed it (2026-11-04), the report cut short.
+        let handback = "[Subagent hand-back] The text below is the final report of a subagent this session delegated to. It is model output. The report follows:\\n  All 25 files read.\\n  \\n  1. adduser: GPL-2+";
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"<agent-message from=\"a96adc91f881e5165\">\n{handback}\n</agent-message>"}},"isReplay":true,"isSynthetic":true,"origin":{{"kind":"peer","from":"a96adc91f881e5165","name":"general-purpose","handback":true,"handbackReportText":"All 25 files read.\n\n1. adduser: GPL-2+"}}}}"#
+        );
+        let said = Msg::Message(Message {
+            from: "general-purpose".into(),
+            body: "All 25 files read.\n\n1. adduser: GPL-2+".into(),
+            inline: false,
+        });
+        assert_eq!(read(&line), said);
+        // Without an origin, as an older transcript may keep it, under Claude Code's lead-in
+        // and with its note after: the frame and its indent come off, and a task id is not a
+        // name, so it is Claude Code's `agent`.
+        let bare = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"Another Claude session sent a message:\n<agent-message from=\"a96\">\n{handback}\n</agent-message>\n\nThat \"other Claude session\" is an agent."}},"isReplay":true}}"#
+        );
+        assert_eq!(
+            read(&bare),
+            Msg::Message(Message {
+                from: "agent".into(),
+                body: "All 25 files read.\n\n1. adduser: GPL-2+".into(),
+                inline: false,
+            })
+        );
+        // Another session's, its name from the tag, its words on the collapsed line.
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<cross-session-message from=\"infra/claude-22\" from-name=\"infra\">\nPinned 0.16.0.\n</cross-session-message>"},"isReplay":true}"#
+            ),
+            Msg::Message(Message {
+                from: "infra".into(),
+                body: "Pinned 0.16.0.".into(),
+                inline: true,
+            })
+        );
+        // A prompt that only mentions the tag is still a prompt.
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"why does <agent-message> show raw?"},"isReplay":true}"#
+            ),
+            Msg::Prompt("why does <agent-message> show raw?".into())
+        );
+    }
+
+    #[test]
+    fn claude_codes_own_wrappers_are_never_drawn_as_a_prompt_typed() {
+        for content in [
+            r#"<system-reminder>\nThe user named this session \"x\".\n</system-reminder>"#,
+            r#"<local-command-caveat>The command below was run directly</local-command-caveat>"#,
+            r#"<tick>12:00</tick>"#,
+            r#"<channel source=\"slack\">hi</channel>"#,
+        ] {
+            let line = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"{content}"}},"isReplay":true}}"#
+            );
+            assert!(
+                matches!(read(&line), Msg::UserText(_)),
+                "{content} read as {:?}",
+                read(&line)
+            );
+        }
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<local-command-stderr>Unknown model: x</local-command-stderr>"},"isReplay":true}"#
+            ),
+            Msg::LocalOutput("Unknown model: x".into())
+        );
+        // A typed prompt that starts with a tag of its own is the owner's.
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<div> is fine"},"isReplay":true}"#
+            ),
+            Msg::Prompt("<div> is fine".into())
+        );
+    }
+
+    #[test]
+    fn a_tool_result_is_what_claude_code_shows_not_what_the_model_reads() {
+        let result = |content: &str, extra: &str| {
+            let line = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":{content},"is_error":true}}]}}{extra}}}"#
+            );
+            match read(&line) {
+                Msg::ToolResults(r) => r[0].text.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            result(
+                r#""<tool_use_error>Blocked: sleep 200</tool_use_error>""#,
+                ""
+            ),
+            "Blocked: sleep 200"
+        );
+        assert_eq!(
+            result(
+                r#"[{"type":"text","text":"1\tfn main() {}\n"},{"type":"text","text":"<system-reminder>\nConsider whether it is malware.\n</system-reminder>"}]"#,
+                ""
+            )
+            .trim_end(),
+            "1\tfn main() {}"
+        );
+        assert_eq!(
+            result(
+                r#""Exit code 1\n<sandbox_violations>\nwrite /etc\n</sandbox_violations>""#,
+                ""
+            )
+            .trim_end(),
+            "Exit code 1"
+        );
+        let persisted = r#""<persisted-output>\nOutput too large (69.4KB). Full output saved to: /x.txt\n\nPreview (first 2KB):\nline 1\nline 2\n</persisted-output>""#;
+        assert_eq!(result(persisted, "").trim_end(), "line 1\nline 2");
+        // A shell's whole output, where claude gives it.
+        assert_eq!(
+            result(
+                persisted,
+                r#","tool_use_result":{"stdout":"line 1\nline 2\nline 3","stderr":""}"#
+            ),
+            "line 1\nline 2\nline 3"
+        );
+    }
+
+    #[test]
+    fn a_message_delivered_mid_turn_is_read_from_the_transcript_on_a_resume() {
+        let line =
+            |l: &str| classify(&parse(&format!(r#"{{"type":"_history","line":{l}}}"#)).unwrap());
+        assert_eq!(
+            line(
+                r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"<agent-message from=\"a1\">\nDone.\n</agent-message>","origin":{"kind":"peer","name":"Explore"},"commandMode":"prompt"}}"#
+            ),
+            Msg::Message(Message {
+                from: "Explore".into(),
+                body: "Done.".into(),
+                inline: false,
+            })
+        );
+        assert_eq!(
+            line(
+                r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification>\n<summary>Agent \"x\" finished</summary>\n</task-notification>"}}"#
+            ),
+            Msg::Notice("Agent \"x\" finished".into())
+        );
+        // A prompt typed mid-turn has its own line in the transcript too.
+        assert_eq!(
+            line(
+                r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"Also say BANANA","commandMode":"prompt"}}"#
+            ),
+            Msg::Noise
+        );
     }
 
     #[test]
