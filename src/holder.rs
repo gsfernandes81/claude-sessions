@@ -25,6 +25,10 @@
 //! byte B, back to the prompt that starts a turn. The header says `"older":true` when there
 //! is history to ask for (`docs/remote-view.md` § *Lazy history*).
 //!
+//! A tap's `{"type":"_save_workflow","name","scope","script"}` is the holder's too: the script
+//! written where Claude Code's workflow browser saves one, answered `H<TAB>{"type":"_saved",
+//! "path"|"error"}` (`save_workflow`).
+//!
 //! **What the zmx session shows**: one plain line at start and at each change of what claude
 //! is doing, never on a timer, so attaching from the old menu explains the slot rather than
 //! showing a blank screen. Whatever is typed into the session is read and dropped: the mail
@@ -410,6 +414,17 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
                     }
                     continue;
                 }
+                // And a workflow's script saved, as Claude Code's `s save` saves it.
+                if v.get("type").and_then(Value::as_str) == Some("_save_workflow") {
+                    let home = std::env::var_os("HOME").map(PathBuf::from);
+                    let here = std::env::current_dir().ok();
+                    let reply = save_workflow(&v, here.as_deref(), home.as_deref());
+                    let line = format!("H\t{}\n", json::to_line(&reply));
+                    if lock(&out).write_all(line.as_bytes()).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 if from_view(&v, &shared).is_err() {
                     break;
                 }
@@ -453,6 +468,61 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A workflow's name as a file name, as Claude Code makes one: lower case, letters, digits,
+/// `-` and `_`, anything else a `-`; `workflow` when nothing is left.
+fn workflow_file_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars().flat_map(char::to_lowercase) {
+        let keep = c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        let c = if keep { c } else { '-' };
+        if !(c == '-' && out.ends_with('-')) {
+            out.push(c);
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "workflow".into()
+    } else {
+        out
+    }
+}
+
+/// A view's `{"type":"_save_workflow","name","scope","script"}`: the script written to
+/// `.claude/workflows/<name>.js` under claude's directory (`project`), or under the home
+/// (`user`), where Claude Code's `s save` puts it, never over a file already there. Answered
+/// `{"type":"_saved","path"}` or `{"type":"_saved","error"}`.
+fn save_workflow(v: &Value, here: Option<&Path>, home: Option<&Path>) -> Value {
+    let mut reply = Value::obj();
+    reply.set("type", Value::string("_saved"));
+    let get = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
+    let base = if get("scope") == "user" { home } else { here };
+    let script = get("script");
+    let result = (|| -> Result<PathBuf, String> {
+        let base = base.ok_or("no directory to save it in")?;
+        if script.trim().is_empty() {
+            return Err("the workflow has no script".into());
+        }
+        let dir = base.join(".claude").join("workflows");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.js", workflow_file_name(get("name"))));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => format!("{} already exists", path.display()),
+                _ => e.to_string(),
+            })?;
+        f.write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(path)
+    })();
+    match result {
+        Ok(p) => reply.set("path", Value::string(p.display().to_string())),
+        Err(e) => reply.set("error", Value::string(e)),
+    }
+    reply
 }
 
 /// How many transcript lines a tap may ask for at once.
@@ -698,6 +768,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn a_workflow_is_saved_where_claude_code_saves_it_and_never_over_another() {
+        let d = scratch("save-wf");
+        let (proj, home) = (d.join("proj"), d.join("home"));
+        let req = |name: &str, scope: &str| {
+            json::parse(&format!(
+                r#"{{"type":"_save_workflow","name":"{name}","scope":"{scope}","script":"export const meta = {{}}\n"}}"#
+            ))
+            .unwrap()
+        };
+        let r = save_workflow(&req("Two Readers!", "project"), Some(&proj), Some(&home));
+        let want = proj.join(".claude/workflows/two-readers.js");
+        assert_eq!(
+            r.get("path").and_then(Value::as_str),
+            Some(want.display().to_string().as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&want).unwrap(),
+            "export const meta = {}\n"
+        );
+        let again = save_workflow(&req("two-readers", "project"), Some(&proj), Some(&home));
+        assert!(
+            again
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.ends_with("already exists")),
+            "{}",
+            json::to_line(&again)
+        );
+        let user = save_workflow(&req("../x", "user"), Some(&proj), Some(&home));
+        assert!(
+            home.join(".claude/workflows/x.js").exists(),
+            "{}",
+            json::to_line(&user)
+        );
+        assert_eq!(workflow_file_name("  "), "workflow");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     fn connect(sock: &Path, from: u64, run: &str) -> (BufReader<UnixStream>, UnixStream) {

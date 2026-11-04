@@ -25,6 +25,8 @@ pub const YELLOW: u32 = 0xff_c107;
 pub const RED: u32 = 0xff_6b80;
 pub const PURPLE: u32 = 0xaf_87ff;
 pub const TEAL: u32 = 0x48_968c;
+/// The rules around the prompt while an agent is in view, Claude Code's `0891b2`.
+pub const AGENT_TEAL: u32 = 0x08_91b2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct St {
@@ -271,6 +273,15 @@ pub struct Task {
     pub status: String,
     /// The transcript item a subagent or workflow is drawn as.
     pub item: Option<u64>,
+    /// A subagent's model id, tokens and tool calls, and its latest call; a workflow's agents
+    /// done and in all; whether a workflow has a script `s save` can keep.
+    pub model: String,
+    pub tokens: u64,
+    pub tools: u64,
+    pub activity: String,
+    pub agents_done: u64,
+    pub agents: u64,
+    pub saveable: bool,
 }
 
 impl Task {
@@ -302,6 +313,12 @@ pub struct Convo {
     pub entries: Vec<Entry>,
     /// claude's background tasks, as the relay last listed them.
     pub tasks: Vec<Task>,
+    /// How many background tasks' notices have arrived: the tasks view says how many came
+    /// while it was open, as Claude Code's does.
+    pub notices: u64,
+    /// The agent in view instead of the conversation, Claude Code's foregrounded agent: its
+    /// task id, and its own conversation as the relay sends it (`fgo`).
+    pub viewing: Option<(String, Box<Convo>)>,
     /// Where each numbered item is in `entries`.
     index: HashMap<u64, usize>,
     pub state: String,
@@ -506,7 +523,12 @@ impl Convo {
                         Entry::Prompt(x)
                     }
                     "text" => Entry::Text(s(v, "x")),
-                    "note" => Entry::Note(s(v, "x")),
+                    "note" => {
+                        if v.get("tn").and_then(Value::as_bool) == Some(true) {
+                            self.notices += 1;
+                        }
+                        Entry::Note(s(v, "x"))
+                    }
                     "compact" => Entry::Compacted,
                     "tool" => Entry::Tool {
                         name: s(v, "n"),
@@ -566,6 +588,13 @@ impl Convo {
                         ended_ms: num(t, "t1"),
                         status: s(t, "st"),
                         item: num(t, "it"),
+                        model: s(t, "m"),
+                        tokens: num(t, "tk").unwrap_or(0),
+                        tools: num(t, "tc").unwrap_or(0),
+                        activity: s(t, "ac"),
+                        agents_done: num(t, "ad").unwrap_or(0),
+                        agents: num(t, "an").unwrap_or(0),
+                        saveable: t.get("sv").and_then(Value::as_bool) == Some(true),
                     })
                     .filter(|t| !t.id.is_empty())
                     .collect();
@@ -1098,6 +1127,24 @@ pub enum Link {
     },
 }
 
+/// What Down from an empty prompt has focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Focus {
+    #[default]
+    Prompt,
+    /// The tasks pill on the mode line.
+    Pill,
+    /// A row of the agent strip: 0 `main`, then its agents.
+    Strip(usize),
+}
+
+impl Ui {
+    /// The wall clock, epoch milliseconds.
+    pub fn now_ms(&self) -> u64 {
+        self.wall.unwrap_or_else(crate::clock::now)
+    }
+}
+
 /// Everything the conversation screen draws that is the client's, not claude's.
 #[derive(Debug, Clone)]
 pub struct Ui {
@@ -1124,9 +1171,13 @@ pub struct Ui {
     /// prompt next changes.
     pub suggest: usize,
     pub suggest_off: bool,
-    /// Down on an empty prompt focused the tasks pill, as Claude Code's does: Enter opens
-    /// the tasks view from it.
-    pub pill: bool,
+    /// What Down from an empty prompt has focused, as in Claude Code: the tasks pill, or a
+    /// row of the agent strip under the footer.
+    pub focus: Focus,
+    /// A word on the right above the prompt until the next key: `Shell details dismissed`.
+    pub toast: Option<String>,
+    /// The wall clock, epoch milliseconds, for a test to fix; the real one otherwise.
+    pub wall: Option<u64>,
 }
 
 impl Ui {
@@ -1144,7 +1195,9 @@ impl Ui {
             catalog: Vec::new(),
             suggest: 0,
             suggest_off: false,
-            pill: false,
+            focus: Focus::Prompt,
+            toast: None,
+            wall: None,
         }
     }
 }
@@ -1721,8 +1774,33 @@ fn clip(l: Line, w: usize) -> Line {
 /// that many rows, scrolled to keep the cursor in them, `↑`/`↓` leading a row with more past it.
 fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usize)) {
     let mut out = Vec::new();
+    let now_ms = ui.now_ms();
+    let viewing = c.viewing.as_ref().map(|(id, _)| id.as_str());
+    let agent = viewing.and_then(|id| c.tasks.iter().find(|t| t.id == id));
+    // `Shell details dismissed`, on the right over the prompt, until the next key.
+    if let Some(t) = &ui.toast {
+        let t = cut(t, w.saturating_sub(2));
+        let pad = w.saturating_sub(width(&t) + 2);
+        out.push(vec![(" ".repeat(pad), PLAIN), (t, fg(GREY))]);
+    }
     let title = c.meta.title.trim();
-    if title.is_empty() || width(title) + 4 > w {
+    if let Some(a) = agent {
+        // An agent in view: Claude Code's teal rules, its description on the top one.
+        let label = cut(&a.description, w.saturating_sub(6));
+        let left = w.saturating_sub(width(&label) + 3);
+        out.push(vec![
+            ("─".repeat(left), fg(AGENT_TEAL)),
+            (
+                format!(" {label} "),
+                St {
+                    fg: Some(0x00_0000),
+                    bg: Some(AGENT_TEAL),
+                    ..PLAIN
+                },
+            ),
+            ("─".into(), fg(AGENT_TEAL)),
+        ]);
+    } else if title.is_empty() || width(title) + 4 > w {
         out.push(rule(w, "─", fg(RULE)));
     } else {
         let left = w - width(title) - 3;
@@ -1782,14 +1860,30 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             l.push((format!(" {}", cut(hint, room)), fg(GREY)));
         }
     }
-    if chars.is_empty() && c.pending.iter().any(|p| p.queued) {
+    if let (true, Some(a)) = (chars.is_empty(), agent) {
+        let kind = if a.detail.is_empty() {
+            "agent"
+        } else {
+            &a.detail
+        };
+        if let Some(l) = out.last_mut() {
+            l.push((
+                cut(&format!("Message @{kind}…"), w.saturating_sub(3)),
+                fg(GREY),
+            ));
+        }
+    } else if chars.is_empty() && c.pending.iter().any(|p| p.queued) {
         // What Claude Code says in an empty prompt with prompts waiting behind the turn.
         if let Some(l) = out.last_mut() {
             l.push(("Press up to edit queued messages".into(), fg(GREY)));
         }
     }
     let cursor = (first + cur.0 - top, 2 + cur.1);
-    out.push(rule(w, "─", fg(RULE)));
+    out.push(rule(
+        w,
+        "─",
+        fg(if agent.is_some() { AGENT_TEAL } else { RULE }),
+    ));
     let place = format!("{}/{}", c.host, c.slot);
     let first_foot = match (&ui.link, &ui.status, &ui.load) {
         (Link::Down { since, not_sent }, _, _) => {
@@ -1824,7 +1918,16 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     // puts them, and `/tasks to see subagents` while one runs, since the pill counts shells.
     // Claude Code drops its `(shift+tab to cycle)` while a pill shows.
     let mut foot: Line = Vec::new();
-    if busy {
+    if let Focus::Strip(i) = ui.focus {
+        // The strip has the focus: the mode line says its keys, as Claude Code's does.
+        foot.push((
+            format!(
+                "  {}",
+                crate::tasks::strip_hint(&c.tasks, viewing, i, now_ms)
+            ),
+            fg(GREY),
+        ));
+    } else if busy {
         foot.push(("  esc to interrupt".into(), fg(GREY)));
     } else if let Some((m, colour)) = mode_line(&c.meta.mode) {
         let m = if pill.is_some() || subagents {
@@ -1836,7 +1939,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     }
     let mut extra: Vec<(String, St)> = Vec::new();
     if let Some(p) = pill {
-        let st = if ui.pill {
+        let st = if ui.focus == Focus::Pill {
             St {
                 fg: Some(0x00_0000),
                 bg: Some(crate::tasks::CYAN),
@@ -1859,7 +1962,22 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
         foot.push(run);
     }
     // Cut hard, two columns short of the edge, as Claude Code's is at 40 columns.
+    let strip_focus = match ui.focus {
+        Focus::Strip(i) => Some(i),
+        _ => None,
+    };
+    if strip_focus.is_some() {
+        foot.truncate(1);
+    }
     out.push(clip(foot, w.saturating_sub(2)));
+    // The agent strip under it while agents run.
+    out.extend(crate::tasks::strip(
+        &c.tasks,
+        viewing,
+        strip_focus,
+        w.saturating_sub(2),
+        now_ms,
+    ));
     (out, cursor)
 }
 
@@ -2301,11 +2419,14 @@ struct Parts {
 }
 
 fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
+    // The agent in view, Claude Code's foregrounded one, in place of the conversation; the
+    // footer, dialogs and prompts waiting on the owner stay the conversation's.
+    let shown: &Convo = c.viewing.as_ref().map_or(c, |(_, a)| a.as_ref());
     let mut body = Body {
-        laid: laid_out(c, w),
+        laid: laid_out(shown, w),
         extra: Vec::new(),
     };
-    for p in &c.pending {
+    for p in &shown.pending {
         let frame = now.saturating_duration_since(p.since).as_millis() / 120;
         let glyph = crate::ui::SPINNER[frame as usize % crate::ui::SPINNER.len()];
         body.extra.push(Vec::new());
@@ -2325,7 +2446,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
         (Some(Dialog::Model { sel, list }), _) => model_dialog(c, *sel, list, w),
         (Some(Dialog::Effort { sel }), _) => effort_dialog(*sel, w),
         (Some(Dialog::Copy { sel, choices }), _) => copy_dialog(*sel, choices, w),
-        (Some(Dialog::Tasks(v)), _) => crate::tasks::draw(c, v, w, h),
+        (Some(Dialog::Tasks(v)), _) => crate::tasks::draw(c, v, w, h, ui.now_ms()),
         (
             Some(Dialog::Btw {
                 question,
@@ -2356,8 +2477,9 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
             b
         }
     };
-    let spinner: Vec<Line> = match (c.state.as_str(), &cursor) {
+    let spinner: Vec<Line> = match (shown.state.as_str(), &cursor) {
         ("working" | "compacting", Some(_)) => {
+            let c = shown;
             let since = c.working_since.unwrap_or(now);
             let el = now.saturating_duration_since(since);
             let frame = SPIN[(el.as_millis() / 120) as usize % SPIN.len()];
@@ -2591,7 +2713,7 @@ mod tests {
         let t = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(t[23], "  ⏵⏵ auto mode on · 2 shells, 1 monito");
         // Focused by Down, the pill is drawn inverse: its colour behind it.
-        ui.pill = true;
+        ui.focus = Focus::Pill;
         let f = draw(&c, &ui, 80, 24, Instant::now());
         assert_eq!(f.lines[23].last().unwrap().1.bg, Some(crate::tasks::CYAN));
         // A subagent running adds the way to see it; the turn's line says only the shells.
@@ -2600,11 +2722,40 @@ mod tests {
             &[r#"{"t":"tasks","l":[{"i":"g","k":"agent","d":"survey","st":"running"}]}"#],
         );
         let t = text(&draw(&c, &Ui::new(), 80, 24, Instant::now()));
-        assert_eq!(t[23], "  ⏵⏵ auto mode on · /tasks to see subagents");
+        // And the agent strip under it: `main`, then the agent.
+        assert_eq!(t[20], "  ⏵⏵ auto mode on · /tasks to see subagents");
+        assert_eq!(t[21], "");
+        assert_eq!(t[22], "  ● main");
+        assert_eq!(t[23], "  ◯ agent  survey");
         assert!(
             t.iter().any(|l| l == "✻ Worked for 1s · done 3:43 AM"),
             "{t:?}"
         );
+    }
+
+    #[test]
+    fn an_agent_in_view_takes_the_screen_with_claude_codes_teal_rules() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "auto"),
+                r#"{"t":"add","id":1,"k":"text","x":"the conversation"}"#,
+                r#"{"t":"tasks","l":[{"i":"a","k":"agent","d":"slow reader","c":"general-purpose","st":"running"}]}"#,
+            ],
+        );
+        let mut a = Convo::new("h", "s", "r");
+        feed(&mut a, &[r#"{"t":"add","id":1,"k":"user","x":"Read it."}"#]);
+        c.viewing = Some(("a".into(), Box::new(a)));
+        let f = draw(&c, &Ui::new(), 40, 24, Instant::now());
+        let t = text(&f);
+        assert!(t.iter().any(|l| l.contains("Read it.")), "{t:?}");
+        assert!(!t.iter().any(|l| l.contains("the conversation")), "{t:?}");
+        assert_eq!(t[16], "────────────────────────── slow reader ─");
+        assert_eq!(f.lines[16][1].1.bg, Some(AGENT_TEAL));
+        assert_eq!(t[17], "❯ Message @general-purpose…");
+        assert_eq!(f.lines[18][0].1.fg, Some(AGENT_TEAL));
+        assert_eq!(t[22..], ["  ◯ main", "  ● general-purpose  slow reader"]);
     }
 
     #[test]

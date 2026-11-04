@@ -15,7 +15,7 @@
 //! Drawing writes only the rows that changed. Nothing is written while nothing happens, save
 //! the spinner while claude works and the seconds while the link is down.
 
-use crate::convo::{self, Applied, Convo, Dialog, Entry, Link, Ui};
+use crate::convo::{self, Applied, Convo, Dialog, Entry, Focus, Link, Ui};
 use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::menu::{Action, Menu, Place, Reach};
@@ -39,6 +39,9 @@ const AHEAD: usize = 5;
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
+/// What the agent view says to a message typed to the agent.
+const AGENT_MESSAGE_REFUSED: &str = "headless claude can't message agents";
+
 /// How often an open shell's details ask for its output again.
 const OUTPUT_EVERY: Duration = Duration::from_secs(2);
 /// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
@@ -272,7 +275,15 @@ impl App {
                                 ("r", Value::num(size().1 as f64)),
                             ],
                         );
+                        // The agent in view, which the new link's relay does not know of.
+                        let fg = c
+                            .viewing
+                            .as_ref()
+                            .map(|(id, _)| App::msg("fg", vec![("i", Value::string(id))]));
                         self.send(re);
+                        if let Some(fg) = fg {
+                            self.send(fg);
+                        }
                     }
                 }
             }
@@ -504,6 +515,67 @@ impl App {
                     }
                 }
             }
+            // The agent in view: its conversation, whole (`reset`) or as it goes.
+            "fgo" => {
+                if let Screen::Conv { c, .. } = &mut self.screen {
+                    let id = v.get("i").and_then(Value::as_str).unwrap_or("");
+                    let started = c
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .and_then(|t| t.started_ms);
+                    let (host, slot, run, meta) = (
+                        c.host.clone(),
+                        c.slot.clone(),
+                        c.run.clone(),
+                        c.meta.clone(),
+                    );
+                    if let Some((_, a)) = c.viewing.as_mut().filter(|(i, _)| i == id) {
+                        if v.get("reset").and_then(Value::as_bool) == Some(true) {
+                            **a = Convo::new(&host, &slot, &run);
+                            a.meta = meta;
+                        }
+                        for op in v.get("o").and_then(Value::as_arr).unwrap_or(&[]) {
+                            a.apply(op, now);
+                        }
+                        // Its spinner counts from when it started, not from when it came
+                        // into view.
+                        if a.state == "working" {
+                            if let Some(t0) = started {
+                                let ran = crate::clock::now().saturating_sub(t0);
+                                a.working_since = now.checked_sub(Duration::from_millis(ran));
+                            }
+                        }
+                    }
+                }
+            }
+            // The workflow browser's phases and agents.
+            "wf" => {
+                if let Screen::Conv { ui, .. } = &mut self.screen {
+                    if let Some(Dialog::Tasks(view)) = &mut ui.dialog {
+                        if view.open.as_deref() == v.get("i").and_then(Value::as_str) {
+                            view.wf = Some(tasks::parse_wf(&v));
+                        }
+                    }
+                }
+            }
+            // `s save` answered.
+            "wsaved" => {
+                if let Screen::Conv { ui, .. } = &mut self.screen {
+                    if let Some(Dialog::Tasks(view)) = &mut ui.dialog {
+                        if let Some(f) = view.save.as_mut() {
+                            f.said = Some(match v.get("x").and_then(Value::as_str) {
+                                Some(p) => Ok(p.to_string()),
+                                None => Err(v
+                                    .get("e")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("not saved")
+                                    .to_string()),
+                            });
+                        }
+                    }
+                }
+            }
             "pong" | "full" => {}
             _ => {
                 // The conversation's ops.
@@ -621,7 +693,22 @@ impl App {
         };
         if due && self.up() {
             self.output_for = Some((id.clone(), now + OUTPUT_EVERY));
-            self.send(App::msg("tout", vec![("i", Value::string(id))]));
+            // `wf:<task>[:<agent>]` for a workflow's browser, a task id for a shell's output.
+            let m = match id.strip_prefix("wf:") {
+                Some(rest) => {
+                    let (task, agent) = match rest.split_once(':') {
+                        Some((t, a)) => (t, a.parse::<u64>().ok()),
+                        None => (rest, None),
+                    };
+                    let mut fields = vec![("i", Value::string(task))];
+                    if let Some(a) = agent {
+                        fields.push(("a", Value::num(a as f64)));
+                    }
+                    App::msg("wf", fields)
+                }
+                None => App::msg("tout", vec![("i", Value::string(id))]),
+            };
+            self.send(m);
         }
     }
 
@@ -634,10 +721,23 @@ impl App {
             return None;
         };
         let id = v.open.as_ref()?;
-        c.tasks
-            .iter()
-            .find(|t| &t.id == id && matches!(t.kind.as_str(), "shell" | "monitor"))
-            .map(|t| t.id.clone())
+        let t = c.tasks.iter().find(|t| &t.id == id)?;
+        match t.kind.as_str() {
+            "shell" | "monitor" => Some(t.id.clone()),
+            // A workflow's browser, with the previews of the agent whose pane is open: a new
+            // key, so it is asked for at once.
+            "workflow" => {
+                let wf = v.wf.clone().unwrap_or_default();
+                let agent = (v.pane == tasks::Pane::Agent)
+                    .then(|| tasks::wf_agents(&wf, v).get(v.agent).map(|(i, _)| *i))
+                    .flatten();
+                Some(match agent {
+                    Some(a) => format!("wf:{}:{a}", t.id),
+                    None => format!("wf:{}", t.id),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Fewer than `AHEAD` screens above the view, with more before them: the next stretch is
@@ -840,6 +940,7 @@ impl App {
             return;
         };
         ui.status = None;
+        ui.toast = None;
         let mut out: Vec<Value> = Vec::new();
         let mut leave = false;
         // Ctrl+X Ctrl+S, Claude Code's send-now: what waits behind the turn goes now. Ctrl+X
@@ -896,13 +997,25 @@ impl App {
                 _ => {}
             }
         }
-        // The pill Down focused, as Claude Code's: Enter opens the tasks view from it — straight
-        // into the details when only one task runs — and any other key puts the focus away.
-        if std::mem::take(&mut ui.pill) && ui.dialog.is_none() && !suggested {
-            match k {
-                Key::Enter => {
+        // What Down focused, as in Claude Code: on the pill, Enter opens the tasks view —
+        // straight into the details when only one task runs; on the agent strip, Enter views
+        // that agent, or the conversation again on `main`, and `x` stops one. Any other key
+        // puts the focus away and is itself.
+        let now_ms = ui.now_ms();
+        let viewing = c.viewing.as_ref().map(|(id, _)| id.clone());
+        let strip: Vec<convo::Task> = tasks::strip_tasks(&c.tasks, now_ms, viewing.as_deref())
+            .into_iter()
+            .cloned()
+            .collect();
+        let has_pill = tasks::pill(&c.tasks).is_some();
+        let mut early = false;
+        let focus = std::mem::take(&mut ui.focus);
+        if focus != Focus::Prompt && ui.dialog.is_none() && !suggested {
+            match (focus, k) {
+                (Focus::Pill, Key::Enter) => {
                     let mut v = tasks::View {
                         inline: true,
+                        notices_at: c.notices,
                         ..tasks::View::default()
                     };
                     let rows = tasks::listed(&c.tasks);
@@ -911,163 +1024,246 @@ impl App {
                         open_task(&mut v, t);
                     }
                     ui.dialog = Some(Dialog::Tasks(v));
-                    return;
+                    early = true;
                 }
-                Key::Down => {
-                    ui.pill = true;
-                    return;
+                (Focus::Pill, Key::Down) => {
+                    ui.focus = if strip.is_empty() {
+                        Focus::Pill
+                    } else {
+                        Focus::Strip(0)
+                    };
+                    early = true;
                 }
-                Key::Up | Key::Esc => return,
+                (Focus::Strip(i), Key::Down) => {
+                    ui.focus = Focus::Strip((i + 1).min(strip.len()));
+                    early = true;
+                }
+                (Focus::Strip(0), Key::Up) => {
+                    ui.focus = if has_pill { Focus::Pill } else { Focus::Prompt };
+                    early = true;
+                }
+                (Focus::Strip(i), Key::Up) => {
+                    ui.focus = Focus::Strip(i - 1);
+                    early = true;
+                }
+                (Focus::Strip(0), Key::Enter) => {
+                    if viewing.is_some() {
+                        leave_agent(c, ui);
+                        out.push(App::msg("fg", vec![]));
+                    }
+                    early = true;
+                }
+                (Focus::Strip(i), Key::Enter) => {
+                    if let Some(t) = strip.get(i - 1) {
+                        if t.kind == "agent" {
+                            view_agent(c, ui, t);
+                            out.push(App::msg("fg", vec![("i", Value::string(&t.id))]));
+                        } else {
+                            // A workflow's is its browser.
+                            let mut v = tasks::View {
+                                notices_at: c.notices,
+                                ..tasks::View::default()
+                            };
+                            open_task(&mut v, t);
+                            ui.dialog = Some(Dialog::Tasks(v));
+                        }
+                    }
+                    early = true;
+                }
+                (Focus::Strip(i), Key::Char('x')) if i > 0 => {
+                    if let Some(t) = strip.get(i - 1).filter(|t| t.running()) {
+                        out.push(App::msg("tstop", vec![("i", Value::string(&t.id))]));
+                    }
+                    ui.focus = Focus::Strip(i);
+                    early = true;
+                }
+                (_, Key::Up | Key::Esc) => early = true,
                 _ => {}
             }
         }
-        match ui.dialog.take() {
-            // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
-            // detach key does in ssh dev: the session runs on, and the home comes back.
-            _ if k == Key::Char(DETACH) => leave = true,
-            _ if chorded || suggested => {}
-            Some(Dialog::Btw {
-                question,
-                answer,
-                top,
-            }) => match k {
-                Key::Esc | Key::Enter | Key::Char(' ') => {}
-                Key::Up | Key::WheelUp | Key::PageUp => {
-                    let step = if k == Key::PageUp { 10 } else { 1 };
-                    ui.dialog = Some(Dialog::Btw {
-                        question,
-                        answer,
-                        top: top.saturating_sub(step),
-                    });
-                }
-                Key::Down | Key::WheelDown | Key::PageDown => {
-                    let step = if k == Key::PageDown { 10 } else { 1 };
-                    ui.dialog = Some(Dialog::Btw {
-                        question,
-                        answer,
-                        top: top + step,
-                    });
-                }
-                _ => {
-                    ui.dialog = Some(Dialog::Btw {
-                        question,
-                        answer,
-                        top,
-                    })
-                }
-            },
-            Some(Dialog::Copy { sel, choices }) => match k {
-                Key::Up => {
-                    ui.dialog = Some(Dialog::Copy {
-                        sel: sel.saturating_sub(1),
-                        choices,
-                    })
-                }
-                Key::Down => {
-                    let sel = (sel + 1).min(choices.len().saturating_sub(1));
-                    ui.dialog = Some(Dialog::Copy { sel, choices });
-                }
-                Key::Enter => {
-                    if let Some((_, t)) = choices.into_iter().nth(sel) {
-                        ui.status = Some(copied(&t));
-                        self.clip = Some(t);
+        if early {
+        } else {
+            match ui.dialog.take() {
+                // Ctrl+\\ detaches from anywhere in a conversation, a dialog open or not, as zmx's
+                // detach key does in ssh dev: the session runs on, and the home comes back.
+                _ if k == Key::Char(DETACH) => leave = true,
+                _ if chorded || suggested => {}
+                Some(Dialog::Btw {
+                    question,
+                    answer,
+                    top,
+                }) => match k {
+                    Key::Esc | Key::Enter | Key::Char(' ') => {}
+                    Key::Up | Key::WheelUp | Key::PageUp => {
+                        let step = if k == Key::PageUp { 10 } else { 1 };
+                        ui.dialog = Some(Dialog::Btw {
+                            question,
+                            answer,
+                            top: top.saturating_sub(step),
+                        });
+                    }
+                    Key::Down | Key::WheelDown | Key::PageDown => {
+                        let step = if k == Key::PageDown { 10 } else { 1 };
+                        ui.dialog = Some(Dialog::Btw {
+                            question,
+                            answer,
+                            top: top + step,
+                        });
+                    }
+                    _ => {
+                        ui.dialog = Some(Dialog::Btw {
+                            question,
+                            answer,
+                            top,
+                        })
+                    }
+                },
+                Some(Dialog::Copy { sel, choices }) => match k {
+                    Key::Up => {
+                        ui.dialog = Some(Dialog::Copy {
+                            sel: sel.saturating_sub(1),
+                            choices,
+                        })
+                    }
+                    Key::Down => {
+                        let sel = (sel + 1).min(choices.len().saturating_sub(1));
+                        ui.dialog = Some(Dialog::Copy { sel, choices });
+                    }
+                    Key::Enter => {
+                        if let Some((_, t)) = choices.into_iter().nth(sel) {
+                            ui.status = Some(copied(&t));
+                            self.clip = Some(t);
+                        }
+                    }
+                    Key::Esc => {}
+                    _ => ui.dialog = Some(Dialog::Copy { sel, choices }),
+                },
+                Some(Dialog::Tasks(v)) => {
+                    let mut fg = None;
+                    ui.dialog = tasks_key(c, v, k, &mut out, &mut ui.toast, &mut fg);
+                    if let Some(t) = fg {
+                        view_agent(c, ui, &t);
+                        out.push(App::msg("fg", vec![("i", Value::string(&t.id))]));
                     }
                 }
-                Key::Esc => {}
-                _ => ui.dialog = Some(Dialog::Copy { sel, choices }),
-            },
-            Some(d) => {
-                ui.dialog = dialog_key(c, d, k, &mut out);
-            }
-            None => match k {
-                Key::Char('\x03') | Key::Char('\x04') if ui.input.is_empty() => leave = true,
-                Key::Char('\x03') => {
-                    ui.input.clear();
-                    ui.cursor = 0;
+                Some(d) => {
+                    ui.dialog = dialog_key(c, d, k, &mut out);
                 }
-                // Ctrl+O, Claude Code's: every tool call drawn with its result, or summed again.
-                Key::Char('\x0f') => c.expanded = !c.expanded,
-                Key::Esc => {
-                    if ui.scroll > 0 {
+                None => match k {
+                    Key::Char('\x03') | Key::Char('\x04') if ui.input.is_empty() => leave = true,
+                    Key::Char('\x03') => {
+                        ui.input.clear();
+                        ui.cursor = 0;
+                    }
+                    // Ctrl+O, Claude Code's: every tool call drawn with its result, or summed again.
+                    Key::Char('\x0f') => c.expanded = !c.expanded,
+                    // An agent in view: Esc interrupts it, as Claude Code's does, or leaves the
+                    // view of one that has ended.
+                    Key::Esc if ui.scroll == 0 && viewing.is_some() => {
+                        let id = viewing.clone().unwrap_or_default();
+                        let running = c.tasks.iter().any(|t| t.id == id && t.running());
+                        if running {
+                            out.push(App::msg("tesc", vec![("i", Value::string(&id))]));
+                        } else {
+                            leave_agent(c, ui);
+                            out.push(App::msg("fg", vec![]));
+                        }
+                    }
+                    // Claude Code messages the agent; headless claude refuses to
+                    // (`send_task_message`, 2.1.311), so the prompt stays and says so.
+                    Key::Enter
+                        if viewing.is_some()
+                            && !ui.input.trim().is_empty()
+                            && !ui.input.starts_with('/') =>
+                    {
+                        ui.status = Some(AGENT_MESSAGE_REFUSED.into());
+                    }
+                    Key::Esc => {
+                        if ui.scroll > 0 {
+                            ui.scroll = 0;
+                        } else if c.state != "idle" || !c.pending.is_empty() {
+                            // A turn, or a prompt not yet taken in: claude says what came of it,
+                            // and a prompt it caught unanswered comes back to the input (`back`).
+                            out.push(App::msg("esc", vec![]));
+                        }
+                    }
+                    Key::Enter if backslash_newline(ui) => {}
+                    Key::Enter => {
+                        let typed = std::mem::take(&mut ui.input);
+                        let text = expand_pastes(&typed, &ui.pastes);
+                        if !ui.pastes.is_empty() {
+                            c.collapsed(&text, &typed);
+                        }
+                        ui.pastes.clear();
+                        ui.cursor = 0;
                         ui.scroll = 0;
-                    } else if c.state != "idle" || !c.pending.is_empty() {
-                        // A turn, or a prompt not yet taken in: claude says what came of it,
-                        // and a prompt it caught unanswered comes back to the input (`back`).
-                        out.push(App::msg("esc", vec![]));
+                        if !text.trim().is_empty() {
+                            self.history.push(text.clone());
+                        }
+                        self.history_at = None;
+                        self.draft = None;
+                        match submit(c, ui, text.trim(), &self.models) {
+                            Submit::Send(v) => out.extend(v),
+                            Submit::Copy(t) => self.clip = Some(t),
+                            Submit::Home => leave = true,
+                            Submit::Nothing => {}
+                        }
                     }
-                }
-                Key::Enter if backslash_newline(ui) => {}
-                Key::Enter => {
-                    let typed = std::mem::take(&mut ui.input);
-                    let text = expand_pastes(&typed, &ui.pastes);
-                    if !ui.pastes.is_empty() {
-                        c.collapsed(&text, &typed);
+                    // Claude Code's "Press up to edit queued messages": out of the queue, into the
+                    // prompt, a line each, above anything typed meanwhile (2.1.311, driven in a pty
+                    // on 2026-11-02).
+                    Key::Up if c.pending.iter().any(|p| p.queued) => {
+                        let (texts, uuids) = c.unqueue();
+                        give_back(ui, &texts.join("\n"));
+                        out.push(App::msg(
+                            "unqueue",
+                            vec![(
+                                "u",
+                                Value::Arr(uuids.into_iter().map(Value::string).collect()),
+                            )],
+                        ));
                     }
-                    ui.pastes.clear();
-                    ui.cursor = 0;
-                    ui.scroll = 0;
-                    if !text.trim().is_empty() {
-                        self.history.push(text.clone());
+                    // Up and Down move between the prompt's rows first; off its top or bottom row
+                    // they step through what was sent, as Claude Code's do.
+                    // Down in an empty prompt, not stepping through what was sent: the tasks
+                    // pill takes the focus, as in Claude Code.
+                    Key::Down
+                        if ui.input.is_empty()
+                            && self.history_at.is_none()
+                            && (has_pill || !strip.is_empty()) =>
+                    {
+                        ui.focus = if has_pill {
+                            Focus::Pill
+                        } else {
+                            Focus::Strip(0)
+                        };
                     }
-                    self.history_at = None;
-                    self.draft = None;
-                    match submit(c, ui, text.trim(), &self.models) {
-                        Submit::Send(v) => out.extend(v),
-                        Submit::Copy(t) => self.clip = Some(t),
-                        Submit::Home => leave = true,
-                        Submit::Nothing => {}
+                    Key::Up | Key::Down => {
+                        let room = term::size().map_or(38, |(w, _)| (w as usize).saturating_sub(2));
+                        if !row_step(ui, k == Key::Up, room) {
+                            history_step(
+                                ui,
+                                k == Key::Up,
+                                &self.history,
+                                &mut self.history_at,
+                                &mut self.draft,
+                            );
+                        }
                     }
-                }
-                // Claude Code's "Press up to edit queued messages": out of the queue, into the
-                // prompt, a line each, above anything typed meanwhile (2.1.311, driven in a pty
-                // on 2026-11-02).
-                Key::Up if c.pending.iter().any(|p| p.queued) => {
-                    let (texts, uuids) = c.unqueue();
-                    give_back(ui, &texts.join("\n"));
-                    out.push(App::msg(
-                        "unqueue",
-                        vec![(
-                            "u",
-                            Value::Arr(uuids.into_iter().map(Value::string).collect()),
-                        )],
-                    ));
-                }
-                // Up and Down move between the prompt's rows first; off its top or bottom row
-                // they step through what was sent, as Claude Code's do.
-                // Down in an empty prompt, not stepping through what was sent: the tasks
-                // pill takes the focus, as in Claude Code.
-                Key::Down
-                    if ui.input.is_empty()
-                        && self.history_at.is_none()
-                        && tasks::pill(&c.tasks).is_some() =>
-                {
-                    ui.pill = true;
-                }
-                Key::Up | Key::Down => {
-                    let room = term::size().map_or(38, |(w, _)| (w as usize).saturating_sub(2));
-                    if !row_step(ui, k == Key::Up, room) {
-                        history_step(
-                            ui,
-                            k == Key::Up,
-                            &self.history,
-                            &mut self.history_at,
-                            &mut self.draft,
-                        );
+                    Key::PageUp | Key::WheelUp => {
+                        let step = if k == Key::PageUp { 10 } else { self.wheel };
+                        let (w, h) = term::size().unwrap_or((40, 24));
+                        let most = convo::max_scroll(c, ui, w as usize, h as usize);
+                        ui.scroll = (ui.scroll + step).min(most);
                     }
-                }
-                Key::PageUp | Key::WheelUp => {
-                    let step = if k == Key::PageUp { 10 } else { self.wheel };
-                    let (w, h) = term::size().unwrap_or((40, 24));
-                    let most = convo::max_scroll(c, ui, w as usize, h as usize);
-                    ui.scroll = (ui.scroll + step).min(most);
-                }
-                Key::PageDown | Key::WheelDown => {
-                    let step = if k == Key::PageDown { 10 } else { self.wheel };
-                    ui.scroll = ui.scroll.saturating_sub(step);
-                }
-                Key::End if ui.scroll > 0 => ui.scroll = 0,
-                k => edit(ui, k),
-            },
+                    Key::PageDown | Key::WheelDown => {
+                        let step = if k == Key::PageDown { 10 } else { self.wheel };
+                        ui.scroll = ui.scroll.saturating_sub(step);
+                    }
+                    Key::End if ui.scroll > 0 => ui.scroll = 0,
+                    k => edit(ui, k),
+                },
+            }
         }
         // A changed prompt: the list starts again from its top, and shows again after Esc.
         if let Screen::Conv { ui, .. } = &mut self.screen {
@@ -1132,9 +1328,15 @@ fn hold_scroll(scroll: usize, before: usize, after: usize) -> usize {
 /// closes the view when it was opened straight into it; the pill loses its focus once there
 /// is no pill.
 fn follow_tasks(c: &Convo, ui: &mut Ui) {
-    if tasks::pill(&c.tasks).is_none() {
-        ui.pill = false;
-    }
+    let now_ms = ui.now_ms();
+    let viewing = c.viewing.as_ref().map(|(id, _)| id.as_str());
+    let n = tasks::strip_tasks(&c.tasks, now_ms, viewing).len();
+    ui.focus = match ui.focus {
+        Focus::Pill if tasks::pill(&c.tasks).is_none() => Focus::Prompt,
+        Focus::Strip(_) if n == 0 => Focus::Prompt,
+        Focus::Strip(i) => Focus::Strip(i.min(n)),
+        f => f,
+    };
     let Some(Dialog::Tasks(v)) = &mut ui.dialog else {
         return;
     };
@@ -1159,8 +1361,34 @@ fn open_task(v: &mut tasks::View, t: &convo::Task) {
     v.runtime = tasks::runtime(t, crate::clock::now());
 }
 
-/// A key in the tasks view; what it leaves open.
-fn tasks_key(c: &Convo, mut v: tasks::View, k: Key, out: &mut Vec<Value>) -> Option<Dialog> {
+/// An agent in view in place of the conversation, Claude Code's foregrounded agent: its
+/// own conversation comes from the relay (`fgo`).
+fn view_agent(c: &mut Convo, ui: &mut Ui, t: &convo::Task) {
+    let mut a = Convo::new(&c.host, &c.slot, &c.run);
+    a.meta = c.meta.clone();
+    c.viewing = Some((t.id.clone(), Box::new(a)));
+    ui.scroll = 0;
+    ui.focus = Focus::Prompt;
+    ui.dialog = None;
+}
+
+/// The conversation back in view.
+fn leave_agent(c: &mut Convo, ui: &mut Ui) {
+    c.viewing = None;
+    ui.scroll = 0;
+    ui.focus = Focus::Prompt;
+}
+
+/// A key in the tasks view; what it leaves open. `toast` takes Claude Code's word on closing
+/// a task's details, and `fg` the agent to bring into view.
+fn tasks_key(
+    c: &Convo,
+    mut v: tasks::View,
+    k: Key,
+    out: &mut Vec<Value>,
+    toast: &mut Option<String>,
+    fg: &mut Option<convo::Task>,
+) -> Option<Dialog> {
     let rows = tasks::listed(&c.tasks);
     let stop = |t: &convo::Task, out: &mut Vec<Value>| {
         if t.running() {
@@ -1172,20 +1400,39 @@ fn tasks_key(c: &Convo, mut v: tasks::View, k: Key, out: &mut Vec<Value>) -> Opt
         .as_ref()
         .and_then(|id| c.tasks.iter().find(|t| &t.id == id))
         .cloned();
+    let back = |v: &mut tasks::View| {
+        v.open = None;
+        v.output = None;
+        v.wf = None;
+        v.pane = tasks::Pane::Phases;
+        v.phase = 0;
+        v.agent = 0;
+        v.filter.clear();
+        v.save = None;
+    };
     match (open, k) {
-        // Details: back to the list, closed, or the task stopped and back to the list.
-        (Some(_), Key::Left) if !v.direct => {
-            v.open = None;
-            v.output = None;
+        // The workflow browser.
+        (Some(t), k) if t.kind == "workflow" => {
+            return workflow_key(&t, v, k, out);
         }
-        (Some(_), Key::Left | Key::Esc | Key::Enter | Key::Char(' ')) => return None,
+        // Details: back to the list, closed, the task stopped, or the agent in view.
+        (Some(_), Key::Left) if !v.direct => back(&mut v),
+        (Some(t), Key::Left | Key::Esc | Key::Enter | Key::Char(' ')) => {
+            if k == Key::Esc && !v.direct {
+                *toast = Some(format!("{} details dismissed", kind_word(&t)));
+            }
+            return None;
+        }
         (Some(t), Key::Char('x')) => {
             stop(&t, out);
             if v.direct {
                 return None;
             }
-            v.open = None;
-            v.output = None;
+            back(&mut v);
+        }
+        (Some(t), Key::Char('f')) if t.kind == "agent" && t.running() => {
+            *fg = Some(t);
+            return None;
         }
         (Some(_), _) => {}
         // The list.
@@ -1193,7 +1440,18 @@ fn tasks_key(c: &Convo, mut v: tasks::View, k: Key, out: &mut Vec<Value>) -> Opt
         (None, Key::Down) => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
         (None, Key::Enter) => {
             if let Some((_, t)) = rows.get(v.sel) {
+                // A finished agent opens its conversation, as Claude Code's does.
+                if t.kind == "agent" && !t.running() {
+                    *fg = Some((*t).clone());
+                    return None;
+                }
                 open_task(&mut v, t);
+            }
+        }
+        (None, Key::Char('f')) => {
+            if let Some((_, t)) = rows.get(v.sel).filter(|(_, t)| t.kind == "agent") {
+                *fg = Some((*t).clone());
+                return None;
             }
         }
         (None, Key::Char('x')) => {
@@ -1203,6 +1461,113 @@ fn tasks_key(c: &Convo, mut v: tasks::View, k: Key, out: &mut Vec<Value>) -> Opt
         }
         (None, Key::Esc | Key::Left) => return None,
         (None, _) => {}
+    }
+    Some(Dialog::Tasks(v))
+}
+
+/// What Claude Code calls a task's details: `Shell details`, `Monitor details`.
+fn kind_word(t: &convo::Task) -> &'static str {
+    match t.kind.as_str() {
+        "shell" => "Shell",
+        "monitor" => "Monitor",
+        "workflow" => "Workflow",
+        _ => "Agent",
+    }
+}
+
+/// A key in the workflow browser: phases, then agents (→ or Enter), then one agent's pane;
+/// Esc or ← back a level at a time; `x` stops the workflow, `f` filters the agents, `s`
+/// saves its script.
+fn workflow_key(
+    t: &convo::Task,
+    mut v: tasks::View,
+    k: Key,
+    out: &mut Vec<Value>,
+) -> Option<Dialog> {
+    use tasks::Pane;
+    // `s save`'s form has the keys while it is open.
+    if let Some(mut f) = v.save.take() {
+        match k {
+            Key::Esc => {}
+            Key::Char('\t') => {
+                f.user = !f.user;
+                f.said = None;
+                v.save = Some(f);
+            }
+            Key::Enter if matches!(f.said, Some(Ok(_))) => {}
+            Key::Enter => {
+                let name = if f.name.trim().is_empty() {
+                    t.detail.clone()
+                } else {
+                    f.name.clone()
+                };
+                out.push(App::msg(
+                    "wsave",
+                    vec![
+                        ("i", Value::string(&t.id)),
+                        ("n", Value::string(name)),
+                        ("sc", Value::string(if f.user { "user" } else { "project" })),
+                    ],
+                ));
+                f.said = None;
+                v.save = Some(f);
+            }
+            Key::Char('\x7f') | Key::Char('\x08') => {
+                f.name.pop();
+                f.said = None;
+                v.save = Some(f);
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                f.name.push(ch);
+                f.said = None;
+                v.save = Some(f);
+            }
+            _ => v.save = Some(f),
+        }
+        return Some(Dialog::Tasks(v));
+    }
+    let wf = v.wf.clone().unwrap_or_default();
+    let phases = wf.phases.len().max(1);
+    let agents = tasks::wf_agents(&wf, &v).len();
+    match (v.pane, k) {
+        (_, Key::Char('s')) if t.saveable => {
+            v.save = Some(tasks::Save {
+                name: t.detail.clone(),
+                ..tasks::Save::default()
+            });
+        }
+        (Pane::Phases, Key::Up) => v.phase = v.phase.saturating_sub(1),
+        (Pane::Phases, Key::Down) => v.phase = (v.phase + 1).min(phases - 1),
+        (Pane::Phases, Key::Right | Key::Enter) => {
+            v.pane = Pane::Agents;
+            v.agent = 0;
+        }
+        (Pane::Phases, Key::Char('x')) if t.running() => {
+            out.push(App::msg("tstop", vec![("i", Value::string(&t.id))]));
+        }
+        // Back to the list, as Claude Code's browser goes; closed if the list was not seen.
+        (Pane::Phases, Key::Esc | Key::Left) => {
+            if v.direct {
+                return None;
+            }
+            v.open = None;
+            v.wf = None;
+            v.phase = 0;
+        }
+        (Pane::Agents, Key::Up) => v.agent = v.agent.saturating_sub(1),
+        (Pane::Agents, Key::Down) => v.agent = (v.agent + 1).min(agents.saturating_sub(1)),
+        (Pane::Agents, Key::Enter) if agents > 0 => v.pane = Pane::Agent,
+        (Pane::Agents, Key::Char('f')) => {
+            let at = tasks::FILTERS
+                .iter()
+                .position(|f| *f == v.filter)
+                .unwrap_or(0);
+            v.filter = tasks::FILTERS[(at + 1) % tasks::FILTERS.len()].to_string();
+            v.agent = 0;
+        }
+        (Pane::Agents, Key::Esc | Key::Left) => v.pane = Pane::Phases,
+        (Pane::Agent, Key::Esc | Key::Left | Key::Enter) => v.pane = Pane::Agents,
+        _ => {}
     }
     Some(Dialog::Tasks(v))
 }
@@ -1302,7 +1667,10 @@ fn submit(
         }
         // Claude Code's tasks view: what runs in the background, its output, and `x` to stop.
         "/tasks" | "/bashes" => {
-            ui.dialog = Some(Dialog::Tasks(tasks::View::default()));
+            ui.dialog = Some(Dialog::Tasks(tasks::View {
+                notices_at: c.notices,
+                ..tasks::View::default()
+            }));
             Submit::Nothing
         }
         // Claude Code's `/remote-control`: the session reachable from the Claude app, where a
@@ -1917,7 +2285,8 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             }
             _ => Some(Dialog::Effort { sel }),
         },
-        Dialog::Tasks(v) => tasks_key(c, v, k, out),
+        // Taken by `conv_key`, which can open an agent's view from it.
+        d @ Dialog::Tasks(_) => Some(d),
         // Taken by `conv_key` before it gets here, since what they do is the client's.
         d @ (Dialog::Copy { .. } | Dialog::Btw { .. }) => Some(d),
     }
@@ -2911,7 +3280,7 @@ mod tests {
         let Screen::Conv { ui, .. } = &app.screen else {
             panic!()
         };
-        assert!(ui.pill, "Down focused the pill");
+        assert_eq!(ui.focus, Focus::Pill, "Down focused the pill");
         app.key(Key::Enter, Instant::now());
         let Some(Dialog::Tasks(v)) = dialog(&app) else {
             panic!("{:?}", dialog(&app))
@@ -2937,7 +3306,7 @@ mod tests {
         let Screen::Conv { ui, .. } = &app.screen else {
             panic!()
         };
-        assert!(!ui.pill);
+        assert_eq!(ui.focus, Focus::Prompt);
         assert_eq!(ui.input, "h");
     }
 
@@ -2952,7 +3321,7 @@ mod tests {
         let v = tasks::View::default();
         let mut out = Vec::new();
         // x on a row stops it, and the list stays open.
-        let d = tasks_key(c, v.clone(), Key::Char('x'), &mut out);
+        let d = tasks_key(c, v.clone(), Key::Char('x'), &mut out, &mut None, &mut None);
         assert_eq!(
             out.iter().map(json::to_line).collect::<Vec<_>>(),
             [r#"{"i":"b1","t":"tstop"}"#]
@@ -2960,20 +3329,26 @@ mod tests {
         assert!(matches!(d, Some(Dialog::Tasks(_))));
         // Down and Enter open the monitor's details; ← goes back to the list.
         let mut out = Vec::new();
-        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Down, &mut out) else {
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Down, &mut out, &mut None, &mut None)
+        else {
             panic!()
         };
-        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Enter, &mut out) else {
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Enter, &mut out, &mut None, &mut None)
+        else {
             panic!()
         };
         assert_eq!(v.open.as_deref(), Some("m1"));
-        let Some(Dialog::Tasks(back)) = tasks_key(c, v.clone(), Key::Left, &mut out) else {
+        let Some(Dialog::Tasks(back)) =
+            tasks_key(c, v.clone(), Key::Left, &mut out, &mut None, &mut None)
+        else {
             panic!()
         };
         assert_eq!(back.open, None);
         assert_eq!(back.sel, 1, "the cursor stays on its row");
         // x in the details stops it and goes back; Esc closes.
-        let Some(Dialog::Tasks(after)) = tasks_key(c, v.clone(), Key::Char('x'), &mut out) else {
+        let Some(Dialog::Tasks(after)) =
+            tasks_key(c, v.clone(), Key::Char('x'), &mut out, &mut None, &mut None)
+        else {
             panic!()
         };
         assert_eq!(after.open, None);
@@ -2981,7 +3356,17 @@ mod tests {
             out.iter().map(json::to_line).collect::<Vec<_>>(),
             [r#"{"i":"m1","t":"tstop"}"#]
         );
-        assert!(tasks_key(c, v.clone(), Key::Esc, &mut Vec::new()).is_none());
+        assert!(
+            tasks_key(
+                c,
+                v.clone(),
+                Key::Esc,
+                &mut Vec::new(),
+                &mut None,
+                &mut None
+            )
+            .is_none()
+        );
         // Its output arrives for it, and its leaving the list takes the view back to the list.
         if let Screen::Conv { ui, .. } = &mut app.screen {
             ui.dialog = Some(Dialog::Tasks(v));
@@ -3001,6 +3386,159 @@ mod tests {
         );
         assert!(matches!(dialog(&app), Some(Dialog::Tasks(v)) if v.open.is_none()));
         assert_eq!(app.output_wanted(), None);
+    }
+
+    const AGENTS: &str = r#"{"t":"tasks","l":[{"i":"ag1","k":"agent","d":"slow reader","c":"general-purpose","st":"running","t0":1000},{"i":"wf1","k":"workflow","d":"Two agents","c":"two-readers","st":"running","an":2,"sv":true,"t0":1000}]}"#;
+
+    fn ui_of(app: &App) -> &Ui {
+        let Screen::Conv { ui, .. } = &app.screen else {
+            panic!()
+        };
+        ui
+    }
+
+    fn viewing(app: &App) -> Option<String> {
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!()
+        };
+        c.viewing.as_ref().map(|(id, _)| id.clone())
+    }
+
+    #[test]
+    fn down_walks_the_agent_strip_and_enter_views_an_agent_then_main_again() {
+        let mut app = app_in(&[AGENTS]);
+        let key = |app: &mut App, k: Key| app.key(k, Instant::now());
+        // No shells, so no pill: Down goes straight to `main`.
+        key(&mut app, Key::Down);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(0));
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        assert_eq!(
+            ui_of(&app).focus,
+            Focus::Strip(2),
+            "it stops at the last row"
+        );
+        key(&mut app, Key::Up);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1));
+        key(&mut app, Key::Enter);
+        assert_eq!(viewing(&app).as_deref(), Some("ag1"));
+        assert_eq!(ui_of(&app).focus, Focus::Prompt);
+        // Its conversation arrives for it.
+        app.heard(
+            parse(r#"{"t":"fgo","i":"ag1","reset":true,"o":[{"t":"add","id":1,"k":"user","x":"Read it."},{"t":"st","s":"working"}]}"#).unwrap(),
+            Instant::now(),
+        );
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!()
+        };
+        let a = &c.viewing.as_ref().unwrap().1;
+        assert_eq!(a.entries, [Entry::Prompt("Read it.".into())]);
+        assert_eq!(a.state, "working");
+        // A message to it says why it cannot go; a slash command still works.
+        type_in(&mut app, "hello");
+        assert_eq!(ui_of(&app).status.as_deref(), Some(AGENT_MESSAGE_REFUSED));
+        assert_eq!(ui_of(&app).input, "hello", "kept");
+        // Down then Enter on `main`: the conversation again.
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.input.clear();
+            ui.cursor = 0;
+        }
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Enter);
+        assert_eq!(viewing(&app), None);
+        // Enter on the workflow's row opens its browser.
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Down);
+        key(&mut app, Key::Enter);
+        assert!(matches!(dialog(&app), Some(Dialog::Tasks(v)) if v.open.as_deref() == Some("wf1")));
+        assert_eq!(app.output_wanted().as_deref(), Some("wf:wf1"));
+    }
+
+    #[test]
+    fn the_tasks_view_foregrounds_agents_and_its_browser_saves_a_workflow() {
+        let app = app_in(&[AGENTS]);
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!()
+        };
+        let (mut toast, mut fg) = (None, None);
+        let mut out = Vec::new();
+        // `f` on the running agent's row brings it into view.
+        let d = tasks_key(
+            c,
+            tasks::View::default(),
+            Key::Char('f'),
+            &mut out,
+            &mut toast,
+            &mut fg,
+        );
+        assert!(d.is_none());
+        assert_eq!(fg.as_ref().map(|t| t.id.as_str()), Some("ag1"));
+        // Esc from a task's details says they were dismissed.
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[0]);
+        assert!(tasks_key(c, v, Key::Esc, &mut out, &mut toast, &mut None).is_none());
+        assert_eq!(toast.as_deref(), Some("Agent details dismissed"));
+        // The browser: → to the agents, f filters, ← back, s opens the save form.
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        let step = |v: tasks::View, k: Key, out: &mut Vec<Value>| match tasks_key(
+            c, v, k, out, &mut None, &mut None,
+        ) {
+            Some(Dialog::Tasks(v)) => v,
+            d => panic!("{d:?}"),
+        };
+        let v = step(v, Key::Right, &mut out);
+        assert_eq!(v.pane, tasks::Pane::Agents);
+        let v = step(v, Key::Char('f'), &mut out);
+        assert_eq!(v.filter, "running");
+        let v = step(v, Key::Left, &mut out);
+        assert_eq!(v.pane, tasks::Pane::Phases);
+        let v = step(v, Key::Char('s'), &mut out);
+        assert_eq!(
+            v.save.as_ref().map(|f| f.name.as_str()),
+            Some("two-readers")
+        );
+        let v = step(v, Key::Char('\t'), &mut out);
+        let mut out = Vec::new();
+        let v = step(v, Key::Enter, &mut out);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"wf1","n":"two-readers","sc":"user","t":"wsave"}"#]
+        );
+        // x in the phases stops the workflow; Esc leaves the form, then the browser.
+        let v = step(v, Key::Esc, &mut out);
+        assert!(v.save.is_none());
+        let mut out = Vec::new();
+        let v = step(v, Key::Char('x'), &mut out);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"wf1","t":"tstop"}"#]
+        );
+        let v = step(v, Key::Esc, &mut out);
+        assert_eq!(v.open, None, "back to the list");
+    }
+
+    #[test]
+    fn esc_in_an_agents_view_interrupts_it_and_leaves_one_that_ended() {
+        let mut app = app_in(&[AGENTS]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            let t = c.tasks[0].clone();
+            view_agent(c, ui, &t);
+        }
+        // Nothing to read what was sent here; the view stays, as Claude Code's does.
+        app.key(Key::Esc, Instant::now());
+        assert_eq!(viewing(&app).as_deref(), Some("ag1"));
+        app.heard(
+            parse(
+                r#"{"t":"tasks","l":[{"i":"ag1","k":"agent","d":"slow reader","st":"stopped"}]}"#,
+            )
+            .unwrap(),
+            Instant::now(),
+        );
+        app.key(Key::Esc, Instant::now());
+        assert_eq!(viewing(&app), None);
     }
 
     fn dialog(app: &App) -> Option<&Dialog> {

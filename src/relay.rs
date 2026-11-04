@@ -135,6 +135,14 @@ struct Conv {
     held: Vec<(String, Value)>,
     pending: Vec<Op>,
     pending_n: u64,
+    /// Each subagent's own conversation, by the tool-use id of its call, kept as `shown` is:
+    /// for Claude Code's view of one agent, which the client opens with `fg`.
+    agents: HashMap<String, Shown>,
+    /// And whether each is working, which is no item's.
+    agent_states: HashMap<String, Op>,
+    /// The agent the client views, by that id and its task id, and its ops not yet sent.
+    fg: Option<(String, String)>,
+    fg_pending: Vec<Op>,
     pending_since: Option<Instant>,
     /// The client's width and rows, when it loads lazily: it is sent the last few screens of
     /// the conversation, and older ones as it scrolls back (`docs/remote-view.md` § *Lazy
@@ -284,7 +292,7 @@ fn item_rows(ops: &[Op], w: usize) -> usize {
     };
     let mut rows = match ops.first() {
         Some(Op::Add { item, .. }) => match item {
-            Item::Prompt(t) | Item::Text(t) | Item::Note(t) => 1 + text_rows(t),
+            Item::Prompt(t) | Item::Text(t) | Item::Note(t) | Item::Notice(t) => 1 + text_rows(t),
             Item::Tool { .. } => 1,
             Item::Agent { .. } => 3,
             Item::Permission { .. } | Item::Ask { .. } => 4,
@@ -594,6 +602,10 @@ impl Relay {
             rc_on: false,
             held: Vec::new(),
             pending: Vec::new(),
+            agents: HashMap::new(),
+            agent_states: HashMap::new(),
+            fg: None,
+            fg_pending: Vec::new(),
             pending_n: 0,
             pending_since: None,
             size: match (
@@ -680,7 +692,19 @@ impl Relay {
         };
         if n == "H" {
             if let Ok(v) = json::parse(body.trim()) {
-                history_in(c, &v, out);
+                match v.get("type").and_then(Value::as_str) {
+                    // A workflow saved, or why not (`holder::save_workflow`).
+                    Some("_saved") => {
+                        let mut m = msg("wsaved", vec![]);
+                        for k in ["path", "error"] {
+                            if let Some(x) = s(&v, k) {
+                                m.set(if k == "path" { "x" } else { "e" }, Value::string(x));
+                            }
+                        }
+                        out.push(Effect::Send(m));
+                    }
+                    _ => history_in(c, &v, out),
+                }
             }
             return;
         }
@@ -689,7 +713,17 @@ impl Relay {
             return;
         };
         let live = n >= c.live_from;
-        let fed = c.reducer.feed(&v);
+        let mut fed = c.reducer.feed(&v);
+        for (tool, op) in std::mem::take(&mut fed.sub) {
+            c.agents.entry(tool.clone()).or_default().record(&op);
+            if let Op::State(_) = op {
+                c.agent_states.insert(tool.clone(), op.clone());
+            }
+            if c.started && c.fg.as_ref().is_some_and(|(t, _)| *t == tool) {
+                c.fg_pending.push(op);
+                c.pending_since.get_or_insert(now);
+            }
+        }
         if live {
             for line in fed.to_claude {
                 out.push(Effect::ToConv { epoch, line });
@@ -925,6 +959,68 @@ impl Relay {
                 to(sdk::get_task_output(&id, &task));
             }
             "tstop" => to(sdk::stop_task(&id, &s(v, "i").unwrap_or_default())),
+            // Esc in the view of one agent: that agent interrupted, as Claude Code's does.
+            "tesc" => to(sdk::interrupt_task(&id, &s(v, "i").unwrap_or_default())),
+            // Claude Code's view of one agent: its conversation so far, then as it goes; `fg`
+            // without `i` leaves it.
+            "fg" => {
+                c.fg_pending.clear();
+                let Some(task) = s(v, "i") else {
+                    c.fg = None;
+                    return;
+                };
+                let tool = c.reducer.tool_of_task(&task).map(str::to_string);
+                let ops = tool
+                    .as_ref()
+                    .and_then(|t| c.agents.get(t))
+                    .map(|shown| {
+                        let from = shown.items.len().saturating_sub(AGENT_ITEMS);
+                        reduce::coalesce(shown.ops(from..shown.items.len()))
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(tool.as_ref().and_then(|t| c.agent_states.get(t)).cloned())
+                    .collect::<Vec<Op>>();
+                c.fg = tool.map(|t| (t, task.clone()));
+                out.push(Effect::Send(msg(
+                    "fgo",
+                    vec![
+                        ("i", Value::string(task)),
+                        ("reset", Value::Bool(true)),
+                        ("o", Value::Arr(ops.iter().map(Op::to_value).collect())),
+                    ],
+                )));
+            }
+            // Claude Code's workflow browser: its phases and agents, one agent's previews.
+            "wf" => {
+                let task = s(v, "i").unwrap_or_default();
+                let agent = v.get("a").and_then(Value::as_u64).map(|a| a as usize);
+                match c.reducer.workflow_view(&task, agent) {
+                    Some(mut w) => {
+                        w.set("t", Value::string("wf"));
+                        w.set("i", Value::string(task));
+                        out.push(Effect::Send(w));
+                    }
+                    None => out.push(err("no such workflow")),
+                }
+            }
+            // `s save` in the browser: the holder writes the script where Claude Code would.
+            "wsave" => {
+                let task = s(v, "i").unwrap_or_default();
+                let Some(script) = c.reducer.workflow_script(&task) else {
+                    out.push(err("that workflow has no script to save"));
+                    return;
+                };
+                let mut line = Value::obj();
+                line.set("type", Value::string("_save_workflow"));
+                line.set("name", Value::string(s(v, "n").unwrap_or_default()));
+                line.set(
+                    "scope",
+                    Value::string(s(v, "sc").unwrap_or_else(|| "project".into())),
+                );
+                line.set("script", Value::string(script));
+                to(line);
+            }
             "esc" => to(sdk::interrupt(&id)),
             "exit" => to(sdk::end_session(&id)),
             "models" => {
@@ -989,6 +1085,9 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
         out.push(Effect::Send(msg("wait", vec![("p", Value::Arr(waiting))])));
     }
 }
+
+/// How many of an agent's items the view of it is sent when it opens: the last of them.
+const AGENT_ITEMS: usize = 200;
 
 /// How much of a task's output reaches the client: the view shows its last nine lines, and
 /// claude answers with all of it, which for a long-running shell is megabytes.
@@ -1085,6 +1184,19 @@ fn history_in(c: &mut Conv, v: &Value, out: &mut Vec<Effect>) {
 
 fn flush(c: &mut Conv, out: &mut Vec<Effect>) {
     c.pending_since = None;
+    if !c.fg_pending.is_empty() {
+        if let Some((_, task)) = &c.fg {
+            let ops = reduce::coalesce(std::mem::take(&mut c.fg_pending));
+            out.push(Effect::Send(msg(
+                "fgo",
+                vec![
+                    ("i", Value::string(task)),
+                    ("o", Value::Arr(ops.iter().map(Op::to_value).collect())),
+                ],
+            )));
+        }
+        c.fg_pending.clear();
+    }
     if c.pending.is_empty() {
         return;
     }
@@ -2211,6 +2323,91 @@ mod tests {
         assert_eq!(output_tail("short\n"), "short\n");
         let fx = client(&mut r, r#"{"t":"tstop","i":"b1"}"#);
         assert!(to_claude(&fx)[0].contains(r#""request":{"subtype":"stop_task","task_id":"b1"}"#));
+    }
+
+    #[test]
+    fn the_view_of_one_agent_gets_its_conversation_then_follows_it() {
+        let mut r = relay();
+        client(&mut r, r#"{"t":"hi","v":1}"#);
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":10}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let conv = |r: &mut Relay, l: &str| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: l.into(),
+                },
+                Instant::now(),
+            )
+        };
+        conv(&mut r, r#"{"slot":"claude-3"}"#);
+        conv(&mut r, r#"{"next":3,"run":"run-1"}"#);
+        line(
+            &mut r,
+            epoch,
+            1,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"reader","prompt":"Read it.","run_in_background":true}}]}}"#,
+        );
+        line(
+            &mut r,
+            epoch,
+            2,
+            r#"{"type":"system","subtype":"task_started","task_id":"ag1","tool_use_id":"tu_a","description":"reader","task_type":"local_agent"}"#,
+        );
+        let fx = client(&mut r, r#"{"t":"fg","i":"ag1"}"#);
+        assert_eq!(
+            sent(&fx),
+            [
+                r#"{"i":"ag1","o":[{"id":1,"k":"user","t":"add","x":"Read it."},{"s":"working","t":"st"}],"reset":true,"t":"fgo"}"#
+            ]
+        );
+        // What it does next comes with the next batch, and only while it is viewed.
+        line(
+            &mut r,
+            epoch,
+            3,
+            r#"{"type":"assistant","parent_tool_use_id":"tu_a","message":{"id":"s1","content":[{"type":"tool_use","id":"tu_r","name":"Read","input":{"file_path":"/x"}}]}}"#,
+        );
+        let fx = r.tick(Instant::now() + Duration::from_secs(1));
+        assert!(
+            sent(&fx)
+                .iter()
+                .any(|l| l.starts_with(r#"{"i":"ag1","o":[{"a":"/x","id":2,"k":"tool""#)),
+            "{:?}",
+            sent(&fx)
+        );
+        client(&mut r, r#"{"t":"fg"}"#);
+        line(
+            &mut r,
+            epoch,
+            4,
+            r#"{"type":"user","parent_tool_use_id":"tu_a","message":{"role":"user","content":[{"tool_use_id":"tu_r","type":"tool_result","content":"ok"}]}}"#,
+        );
+        let fx = r.tick(Instant::now() + Duration::from_secs(1));
+        assert!(
+            !sent(&fx).iter().any(|l| l.contains("fgo")),
+            "{:?}",
+            sent(&fx)
+        );
+        // Esc there interrupts that agent alone.
+        let fx = client(&mut r, r#"{"t":"tesc","i":"ag1"}"#);
+        assert!(to_claude(&fx)[0].contains(r#""request":{"subtype":"interrupt","task_id":"ag1"}"#));
+        // A save goes to the holder, which answers it under `H`.
+        let fx = client(&mut r, r#"{"t":"wsave","i":"ag1","n":"x"}"#);
+        assert!(sent(&fx)[0].contains("no script"), "{:?}", sent(&fx));
+        let fx = conv(
+            &mut r,
+            "H\t{\"type\":\"_saved\",\"path\":\"/p/.claude/workflows/x.js\"}\n",
+        );
+        assert_eq!(
+            sent(&fx),
+            [r#"{"t":"wsaved","x":"/p/.claude/workflows/x.js"}"#]
+        );
     }
 
     fn to_line_of(v: &Value) -> String {

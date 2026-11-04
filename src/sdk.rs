@@ -146,6 +146,8 @@ pub enum Task {
         started_ms: Option<u64>,
         /// A subagent's prompt, empty for anything else.
         prompt: String,
+        /// A workflow's name, from its script's `meta`.
+        workflow_name: String,
     },
     /// `task_updated`: its status changed, and when it ended if it has.
     Updated {
@@ -174,14 +176,26 @@ pub struct Usage {
     pub duration_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorkflowAgent {
     pub label: String,
     /// 1-based, into the phases.
     pub phase: u64,
-    /// `queued`, `running`, `done`, `failed`, …
+    /// `start`, `progress`, `done`, `failed`, `error`, `queued`, …
     pub state: String,
     pub last_tool: String,
+    /// What the last tool call was on: a path, a pattern (`lastToolSummary`).
+    pub last_summary: String,
+    pub model: String,
+    pub tokens: u64,
+    pub tool_calls: u64,
+    /// When it started, epoch milliseconds, and how long it took once done.
+    pub started_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// The start of its prompt and of its result, as claude previews them.
+    pub prompt: String,
+    pub result: String,
+    pub error: String,
 }
 
 fn usage(v: &Value) -> Usage {
@@ -222,6 +236,7 @@ fn task(v: &Value, sub: &str) -> Msg {
             description: s(v, "description"),
             started_ms: run_started(&s(v, "run_id")),
             prompt: s(v, "prompt"),
+            workflow_name: s(v, "workflow_name"),
         },
         "task_updated" => {
             let patch = v.get("patch");
@@ -243,12 +258,24 @@ fn task(v: &Value, sub: &str) -> Msg {
                 for it in items {
                     match it.get("type").and_then(Value::as_str) {
                         Some("workflow_phase") => phases.push(s(it, "title")),
-                        Some("workflow_agent") => agents.push(WorkflowAgent {
-                            label: s(it, "label"),
-                            phase: it.get("phaseIndex").and_then(Value::as_u64).unwrap_or(0),
-                            state: s(it, "state"),
-                            last_tool: s(it, "lastToolName"),
-                        }),
+                        Some("workflow_agent") => {
+                            let n = |k: &str| it.get(k).and_then(Value::as_u64);
+                            agents.push(WorkflowAgent {
+                                label: s(it, "label"),
+                                phase: n("phaseIndex").unwrap_or(0),
+                                state: s(it, "state"),
+                                last_tool: s(it, "lastToolName"),
+                                last_summary: s(it, "lastToolSummary"),
+                                model: s(it, "model"),
+                                tokens: n("tokens").unwrap_or(0),
+                                tool_calls: n("toolCalls").unwrap_or(0),
+                                started_ms: n("startedAt"),
+                                duration_ms: n("durationMs"),
+                                prompt: s(it, "promptPreview"),
+                                result: s(it, "resultPreview"),
+                                error: s(it, "error"),
+                            })
+                        }
                         _ => {}
                     }
                 }
@@ -889,6 +916,16 @@ pub fn get_task_output(request_id: &str, task_id: &str) -> Value {
     control(
         request_id,
         subtype("get_task_output", vec![("task_id", Value::string(task_id))]),
+    )
+}
+
+/// Interrupt one background agent, as Esc does in Claude Code's view of it: headless claude
+/// stops it (`task_updated` `killed`; measured 2026-11-04). Claude Code's terminal can then
+/// message it to go on; headless claude refuses `send_task_message` (2.1.311).
+pub fn interrupt_task(request_id: &str, task_id: &str) -> Value {
+    control(
+        request_id,
+        subtype("interrupt", vec![("task_id", Value::string(task_id))]),
     )
 }
 

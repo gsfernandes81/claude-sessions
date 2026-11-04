@@ -84,7 +84,7 @@ pub struct BgTask {
     /// `shell`, `monitor`, `agent`, `workflow`, `remote`, or claude's own `task_type`.
     pub kind: String,
     pub description: String,
-    /// A shell's or monitor's command; a subagent's type (`Explore`).
+    /// A shell's or monitor's command; a subagent's type (`Explore`); a workflow's name.
     pub detail: String,
     /// A subagent's prompt, its first `PROMPT_MAX` characters: the details view shows a
     /// few lines of it.
@@ -97,6 +97,16 @@ pub struct BgTask {
     /// The transcript item a subagent or workflow is drawn as, whose progress lines say
     /// what it is doing.
     pub item: Option<u64>,
+    /// A subagent's model, tokens and tool calls so far, and what it did last
+    /// (`Read(/a/b)`); a workflow's tokens, its agents done and in all.
+    pub model: String,
+    pub tokens: u64,
+    pub tools: u64,
+    pub activity: String,
+    pub agents_done: u64,
+    pub agents: u64,
+    /// A workflow ran from a script, which `s save` can keep.
+    pub saveable: bool,
 }
 
 /// How many ended tasks the list keeps, the latest: Claude Code's dialog shows ended ones
@@ -104,7 +114,7 @@ pub struct BgTask {
 pub const ENDED_KEPT: usize = 10;
 
 /// How much of a subagent's prompt the list carries.
-pub const PROMPT_MAX: usize = 600;
+pub const PROMPT_MAX: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Meta {
@@ -149,6 +159,9 @@ pub enum Item {
     },
     /// A line of its own: a local command's output, an interruption, an error.
     Note(String),
+    /// A background task's notice, which claude hands the model as a prompt: drawn as a note,
+    /// and counted by Claude Code's tasks view while it is open.
+    Notice(String),
     /// The conversation was compacted, from and to so many tokens.
     Compacted { pre: Option<u64>, post: Option<u64> },
 }
@@ -159,6 +172,9 @@ pub struct Out {
     pub ops: Vec<Op>,
     /// Lines claude is owed at once: the refusal of a request the view does not serve.
     pub to_claude: Vec<Value>,
+    /// A subagent's own conversation, reduced as the main one is: by the tool-use id of the
+    /// call that started it, for Claude Code's view of one agent (`relay.rs`).
+    pub sub: Vec<(String, Op)>,
 }
 
 /// The state that turns a stream of lines into items.
@@ -229,6 +245,12 @@ fn task_kind(task_type: &str) -> &str {
 struct TaskView {
     item: u64,
     workflow: bool,
+    /// The model a subagent's messages name.
+    model: String,
+    /// A workflow's script, for Claude Code's `s save`; none for a saved one run by name.
+    script: Option<String>,
+    /// A subagent's own conversation, as its own reducer has it.
+    convo: Box<Reducer>,
     /// A subagent's own tool calls, as `Name(arg)`.
     calls: Vec<String>,
     usage: sdk::Usage,
@@ -451,8 +473,127 @@ impl Reducer {
         }
     }
 
+    /// A subagent's line, without the id that marks it as one, to its own reducer: what
+    /// that makes of it goes out under the agent's call.
+    fn feed_sub(&mut self, parent: &str, v: &Value, out: &mut Out) {
+        let Some(t) = self.tasks.get_mut(parent) else {
+            return;
+        };
+        if let Some(m) = v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+        {
+            t.model = m.to_string();
+        }
+        let mut line = v.clone();
+        if let Value::Obj(m) = &mut line {
+            m.remove("parent_tool_use_id");
+        }
+        let o = t.convo.feed(&line);
+        // Its whole results are not kept: the agent's view shows their first lines.
+        t.convo.results.clear();
+        out.sub
+            .extend(o.ops.into_iter().map(|op| (parent.to_string(), op)));
+    }
+
+    /// The tool-use id of the call that started task `task_id`: what its own conversation's
+    /// ops are sent under.
+    pub fn tool_of_task(&self, task_id: &str) -> Option<&str> {
+        self.bg
+            .iter()
+            .find(|b| b.task.id == task_id && !b.tool_use_id.is_empty())
+            .map(|b| b.tool_use_id.as_str())
+    }
+
+    /// A workflow's script, by its task id, for `s save`.
+    pub fn workflow_script(&self, task_id: &str) -> Option<&str> {
+        let tool = self.tool_of_task(task_id)?;
+        self.tasks.get(tool)?.script.as_deref()
+    }
+
+    /// A workflow's phases and agents as Claude Code's browser shows them, by its task id:
+    /// `{ph:[titles], ag:[{l, ph, m, st, tk, tc, t0, ms, tl}]}`, and the prompt and result
+    /// previews (`pp`, `rp`) of agent `agent` only, since they are long and many.
+    pub fn workflow_view(&self, task_id: &str, agent: Option<usize>) -> Option<Value> {
+        let tool = self.tool_of_task(task_id)?;
+        let t = self.tasks.get(tool).filter(|t| t.workflow)?;
+        let mut v = Value::obj();
+        v.set(
+            "ph",
+            Value::Arr(t.phases.iter().map(Value::string).collect()),
+        );
+        let ags = t
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let mut o = obj(vec![
+                    ("l", Value::string(a.label.clone())),
+                    ("ph", Value::num(a.phase as f64)),
+                    ("st", Value::string(a.state.clone())),
+                ]);
+                let put = |o: &mut Value, k: &str, s: &str| {
+                    if !s.is_empty() {
+                        o.set(k, Value::string(s));
+                    }
+                };
+                put(&mut o, "m", &a.model);
+                let tool = if a.last_summary.is_empty() {
+                    a.last_tool.clone()
+                } else {
+                    format!("{}({})", a.last_tool, a.last_summary)
+                };
+                put(&mut o, "tl", &cut(&tool));
+                put(&mut o, "er", &cut(&a.error));
+                for (k, n) in [
+                    ("tk", Some(a.tokens)),
+                    ("tc", Some(a.tool_calls)),
+                    ("t0", a.started_ms),
+                    ("ms", a.duration_ms),
+                ] {
+                    if let Some(n) = n.filter(|n| *n > 0) {
+                        o.set(k, Value::num(n as f64));
+                    }
+                }
+                if agent == Some(i) {
+                    put(&mut o, "pp", &a.prompt);
+                    put(&mut o, "rp", &a.result);
+                }
+                o
+            })
+            .collect();
+        v.set("ag", Value::Arr(ags));
+        Some(v)
+    }
+
     /// The background task list, sent when it differs from what was sent last.
     fn show_bg(&mut self, out: &mut Out) {
+        // What the agents and workflows have done, from their calls' own records.
+        for b in self.bg.iter_mut() {
+            let Some(t) = self.tasks.get(&b.tool_use_id) else {
+                continue;
+            };
+            let k = &mut b.task;
+            k.model = t.model.clone();
+            k.tokens = t.usage.tokens;
+            k.tools = t.usage.tool_uses.max(t.calls.len() as u64);
+            k.activity = t.calls.last().cloned().unwrap_or_default();
+            k.saveable = t.workflow && t.script.is_some();
+            if t.workflow {
+                k.agents = t.agents.len() as u64;
+                k.agents_done = t.agents.iter().filter(|a| a.state == "done").count() as u64;
+                let sum: u64 = t.agents.iter().map(|a| a.tokens).sum();
+                k.tokens = k.tokens.max(sum);
+                if k.model.is_empty() {
+                    k.model = t
+                        .agents
+                        .first()
+                        .map(|a| a.model.clone())
+                        .unwrap_or_default();
+                }
+            }
+        }
         let now: Vec<BgTask> = self.bg.iter().map(|b| b.task.clone()).collect();
         if now != self.bg_sent {
             self.bg_sent = now.clone();
@@ -471,6 +612,7 @@ impl Reducer {
                 description,
                 started_ms,
                 prompt,
+                workflow_name,
             } => {
                 let call = self.calls.remove(tool_use_id);
                 let item = self.tasks.get(tool_use_id).map(|t| t.item);
@@ -487,6 +629,10 @@ impl Reducer {
                 b.task.item = item.or(b.task.item);
                 if !prompt.is_empty() {
                     b.task.prompt = prompt.chars().take(PROMPT_MAX).collect();
+                }
+                // A workflow's name is its detail, as a shell's command is.
+                if !workflow_name.is_empty() {
+                    b.task.detail = cut(workflow_name);
                 }
             }
             sdk::Task::Updated { status, ended_ms } => {
@@ -632,11 +778,15 @@ impl Reducer {
         // A subagent's own messages are drawn by Claude Code as progress under its agent call,
         // its tool calls as the last few of them, not as the conversation's.
         if let Some(parent) = sdk::parent_tool_use_id(v) {
-            match sdk::classify(v) {
+            let parent = parent.to_string();
+            let msg = sdk::classify(v);
+            if !matches!(msg, Msg::Permission { .. } | Msg::Question { .. }) {
+                self.feed_sub(&parent, v, &mut out);
+            }
+            match msg {
                 // A subagent's permission prompt still needs the owner.
                 Msg::Permission { .. } | Msg::Question { .. } => {}
                 Msg::Assistant { blocks, .. } => {
-                    let parent = parent.to_string();
                     if let Some(t) = self.tasks.get_mut(&parent) {
                         for b in blocks {
                             if let Block::ToolUse { name, input, .. } = b {
@@ -656,6 +806,7 @@ impl Reducer {
                         }
                     }
                     self.show_task(&parent, &mut out);
+                    self.show_bg(&mut out);
                     return out;
                 }
                 _ => return out,
@@ -779,11 +930,25 @@ impl Reducer {
                             self.tools.insert(id.clone(), item);
                             // A subagent is a foreground task too, which Ctrl+B backgrounds.
                             self.running.insert(item);
+                            let mut convo = Box::new(Reducer::new());
+                            // The agent's view starts with what it was asked.
+                            if let Some(p) = input.get("prompt").and_then(Value::as_str) {
+                                let mut first = Out::default();
+                                convo.add(&mut first, Item::Prompt(p.to_string()));
+                                convo.set_state(&mut first, "working");
+                                out.sub
+                                    .extend(first.ops.into_iter().map(|op| (id.clone(), op)));
+                            }
                             self.tasks.insert(
                                 id.clone(),
                                 TaskView {
                                     item,
                                     workflow: name == "Workflow",
+                                    script: input
+                                        .get("script")
+                                        .and_then(Value::as_str)
+                                        .map(String::from),
+                                    convo,
                                     ..TaskView::default()
                                 },
                             );
@@ -836,7 +1001,7 @@ impl Reducer {
                 }
             }
             Msg::Notice(text) => {
-                self.add(&mut out, Item::Note(text));
+                self.add(&mut out, Item::Notice(text));
                 self.set_state(&mut out, "working");
             }
             Msg::LocalOutput(text) => {
@@ -929,13 +1094,21 @@ impl Reducer {
                 event,
             } => {
                 self.bg_event(&task_id, &tool_use_id, &event);
-                self.show_bg(&mut out);
                 let Some(t) = self.tasks.get_mut(&tool_use_id) else {
                     // A background shell command's task, or one before this log began.
+                    self.show_bg(&mut out);
                     return out;
                 };
                 match event {
-                    sdk::Task::Started { .. } | sdk::Task::Updated { .. } => {}
+                    sdk::Task::Started { .. } => {}
+                    // Ended: its own view stops working.
+                    sdk::Task::Updated { status, .. } if status != "running" => {
+                        let mut o = Out::default();
+                        t.convo.set_state(&mut o, "idle");
+                        out.sub
+                            .extend(o.ops.into_iter().map(|op| (tool_use_id.clone(), op)));
+                    }
+                    sdk::Task::Updated { .. } => {}
                     sdk::Task::Progress {
                         usage,
                         phases,
@@ -965,9 +1138,14 @@ impl Reducer {
                         if let Some(r) = report {
                             self.results.insert(t.item, r);
                         }
+                        let mut o = Out::default();
+                        t.convo.set_state(&mut o, "idle");
+                        out.sub
+                            .extend(o.ops.into_iter().map(|op| (tool_use_id.clone(), op)));
                     }
                 }
                 self.show_task(&tool_use_id, &mut out);
+                self.show_bg(&mut out);
             }
             Msg::Cancelled { request_id } => {
                 if let Some(o) = self.answered(&request_id, "withdrawn", Vec::new()) {
@@ -1404,6 +1582,20 @@ impl BgTask {
         if !self.prompt.is_empty() {
             v.set("p", Value::string(self.prompt.clone()));
         }
+        if !self.model.is_empty() {
+            v.set("m", Value::string(self.model.clone()));
+        }
+        if !self.activity.is_empty() {
+            v.set("ac", Value::string(self.activity.clone()));
+        }
+        if self.saveable {
+            v.set("sv", Value::Bool(true));
+        }
+        let nonzero = |n: u64| (n > 0).then_some(n);
+        set(&mut v, "tk", nonzero(self.tokens));
+        set(&mut v, "tc", nonzero(self.tools));
+        set(&mut v, "ad", nonzero(self.agents_done));
+        set(&mut v, "an", nonzero(self.agents));
         set(&mut v, "t0", self.started_ms);
         set(&mut v, "t1", self.ended_ms);
         set(&mut v, "it", self.item);
@@ -1418,6 +1610,12 @@ impl Item {
             Item::Prompt(x) => obj(vec![k("user"), ("x", Value::string(x.clone()))]),
             Item::Text(x) => obj(vec![k("text"), ("x", Value::string(x.clone()))]),
             Item::Note(x) => obj(vec![k("note"), ("x", Value::string(x.clone()))]),
+            // A note to a client that does not know the flag.
+            Item::Notice(x) => obj(vec![
+                k("note"),
+                ("x", Value::string(x.clone())),
+                ("tn", Value::Bool(true)),
+            ]),
             Item::Tool { name, arg } => obj(vec![
                 k("tool"),
                 ("n", Value::string(name.clone())),
@@ -1514,6 +1712,7 @@ mod tests {
             let o = r.feed(&parse(l).expect("fixture parses"));
             all.ops.extend(o.ops);
             all.to_claude.extend(o.to_claude);
+            all.sub.extend(o.sub);
         }
         all
     }
@@ -1897,7 +2096,7 @@ mod tests {
         assert_eq!(
             wire(&o.ops),
             [
-                r#"{"id":1,"k":"note","t":"add","x":"Agent \"Review\" finished"}"#,
+                r#"{"id":1,"k":"note","t":"add","tn":true,"x":"Agent \"Review\" finished"}"#,
                 r#"{"s":"working","t":"st"}"#,
             ]
         );
@@ -2342,7 +2541,7 @@ mod tests {
             concat!(
                 r#"{"l":["#,
                 r#"{"c":"for i in $(seq 60); do echo tick $i; sleep 2; done","d":"Print ticks","i":"bub8w8bhh","k":"shell","st":"running","t0":1793763618691},"#,
-                r#"{"c":"Explore","d":"List big files","i":"a46e","it":2,"k":"agent","p":"Find the five largest files.","st":"completed","t0":1793763619725,"t1":1793763624232},"#,
+                r#"{"c":"Explore","d":"List big files","i":"a46e","it":2,"k":"agent","p":"Find the five largest files.","st":"completed","t0":1793763619725,"t1":1793763624232,"tc":1,"tk":1},"#,
                 r#"{"c":"for i in $(seq 30); do echo mon $i; sleep 3; done","d":"Watch mon","i":"byee","k":"monitor","st":"stopped","t0":1793763622951,"t1":1793763656919}"#,
                 r#"],"t":"tasks"}"#
             )
@@ -2408,5 +2607,81 @@ mod tests {
             ],
         );
         assert!(!r.calls.contains_key("fg"));
+    }
+
+    #[test]
+    fn a_subagents_own_conversation_is_reduced_under_its_call_with_its_model_and_counts() {
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"slow reader","prompt":"Read the files.","subagent_type":"general-purpose","run_in_background":true}}]}}"#,
+                r#"{"type":"system","subtype":"task_started","task_id":"ae72","run_id":"0mw1z3876-605c2715","tool_use_id":"tu_a","description":"slow reader","task_type":"local_agent","prompt":"Read the files."}"#,
+                r#"{"type":"assistant","parent_tool_use_id":"tu_a","message":{"id":"s1","model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"tu_r","name":"Read","input":{"file_path":"/usr/share/doc/apt/copyright"}}]}}"#,
+                r#"{"type":"user","parent_tool_use_id":"tu_a","message":{"role":"user","content":[{"tool_use_id":"tu_r","type":"tool_result","content":"Format: x\nLicense: GPL-2"}]}}"#,
+                r#"{"type":"system","subtype":"task_progress","task_id":"ae72","tool_use_id":"tu_a","usage":{"total_tokens":16612,"tool_uses":1,"duration_ms":2093}}"#,
+            ],
+        );
+        let sub: Vec<String> = o
+            .sub
+            .iter()
+            .map(|(k, op)| format!("{k} {}", to_line(&op.to_value())))
+            .collect();
+        assert_eq!(
+            sub,
+            [
+                r#"tu_a {"id":1,"k":"user","t":"add","x":"Read the files."}"#,
+                r#"tu_a {"s":"working","t":"st"}"#,
+                r#"tu_a {"a":"/usr/share/doc/apt/copyright","id":2,"k":"tool","n":"Read","t":"add"}"#,
+                r#"tu_a {"id":2,"l":2,"ok":true,"p":["Format: x","License: GPL-2"],"t":"res"}"#,
+            ]
+        );
+        assert_eq!(r.tool_of_task("ae72"), Some("tu_a"));
+        let list = last_tasks(&o.ops).unwrap();
+        assert!(
+            list.contains(r#""ac":"Read(/usr/share/doc/apt/copyright)""#)
+                && list.contains(r#""m":"claude-haiku-5-5""#)
+                && list.contains(r#""tc":1,"tk":16612"#),
+            "{list}"
+        );
+        // Its end stops its own view working.
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"system","subtype":"task_notification","task_id":"ae72","tool_use_id":"tu_a","status":"completed"}"#,
+            ],
+        );
+        assert!(o.sub.iter().any(|(_, op)| *op == Op::State("idle".into())));
+    }
+
+    #[test]
+    fn a_workflows_agents_are_kept_for_its_browser_with_one_agents_previews() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"tu_w","name":"Workflow","input":{"script":"export const meta = {name:'two-readers', description:'Two agents'}\n"}}]}}"#,
+                r#"{"type":"system","subtype":"task_started","task_id":"wm4","run_id":"0mw1z4zbr-626ec235","tool_use_id":"tu_w","description":"Two agents","task_type":"local_workflow"}"#,
+                r#"{"type":"system","subtype":"task_progress","task_id":"wm4","tool_use_id":"tu_w","usage":{"total_tokens":0,"tool_uses":0,"duration_ms":1},"workflow_progress":[{"type":"workflow_phase","index":1,"title":"Read"},{"type":"workflow_agent","index":1,"label":"reader-a","phaseIndex":1,"model":"claude-haiku-5-5","state":"progress","startedAt":1793788130153,"lastToolName":"Read","lastToolSummary":"/usr/share/doc/sed/copyright","promptPreview":"Read three files","tokens":30029,"toolCalls":3},{"type":"workflow_agent","index":2,"label":"reader-b","phaseIndex":1,"model":"claude-haiku-5-5","state":"done","startedAt":1793788130154,"tokens":26757,"toolCalls":3,"durationMs":6939,"resultPreview":"GPL-3+"}]}"#,
+            ],
+        );
+        let v = r.workflow_view("wm4", Some(1)).unwrap();
+        assert_eq!(
+            to_line(&v),
+            concat!(
+                r#"{"ag":[{"l":"reader-a","m":"claude-haiku-5-5","ph":1,"st":"progress","t0":1793788130153,"tc":3,"tk":30029,"tl":"Read(/usr/share/doc/sed/copyright)"},"#,
+                r#"{"l":"reader-b","m":"claude-haiku-5-5","ms":6939,"ph":1,"rp":"GPL-3+","st":"done","t0":1793788130154,"tc":3,"tk":26757}],"ph":["Read"]}"#
+            )
+        );
+        assert_eq!(
+            r.workflow_script("wm4"),
+            Some("export const meta = {name:'two-readers', description:'Two agents'}\n")
+        );
+        let list = to_line(&Op::Tasks(r.bg.iter().map(|b| b.task.clone()).collect()).to_value());
+        assert!(
+            list.contains(r#""ad":1,"an":2"#) && list.contains(r#""sv":true"#),
+            "{list}"
+        );
+        assert!(r.workflow_view("nope", None).is_none());
     }
 }

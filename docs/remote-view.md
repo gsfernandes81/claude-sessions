@@ -347,6 +347,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `esc` · `exit` · `models` · `full {id}` | interrupt, end the session, the model list, a tool result whole |
      | `btw {x}` | a side question, answered by its own claude beside the conversation (`claude-sessions remote btw SLOT [MODEL]`, the question on its stdin) and never added to it |
      | `tout {i}` · `tstop {i}` | the tasks view: a background shell's or monitor's output so far (claude's `get_task_output`), or stop task `i` (its `stop_task`) |
+     | `fg {i}` · `fg {}` · `tesc {i}` | view agent `i`'s own conversation, or stop viewing it; Esc there, claude's `interrupt` with that `task_id` |
+     | `wf {i, a}` · `wsave {i, n, sc}` | a workflow's phases and agents, with agent `a`'s previews; save its script as `n` in scope `project` or `user` |
 
      | From the relay | Means |
      |---|---|
@@ -359,6 +361,8 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
      | `tasks {l}` | claude's background tasks, the whole list whenever it changes and once to a client that connects: each `{i, k, d, c, p, t0, t1, st, it}` — claude's task id, kind (`shell`, `monitor`, `agent`, `workflow`, `remote`), description, command or agent type, an agent's prompt (its first 600 characters), start and end in epoch ms, status, and the transcript item an agent is drawn as; the latest ten ended ones kept; an older client skips it |
      | `tout {i, x, n, tr}` or `tout {i, e}` | a task's output, its last 4 KB from a line's start, its whole size and whether claude cut it; or why there is none |
+     | `fgo {i, o, reset}` | agent `i`'s conversation as ops of the reducer's own kinds: its last 200 items with `reset` when `fg` asks, then what changes, with each batch, while it is viewed |
+     | `wf {i, ph, ag}` · `wsaved {x}` or `wsaved {e}` | a workflow's phase titles and agents, each `{l, ph, st, m, tk, tc, t0, ms, tl, er}` and `pp`, `rp` for the one asked; a save's path, or why not |
 6. The view, to its screens: approved by the owner on 2026-11-01 as mockups R1–R10 in
    [`mockups.md`](mockups.md) § *The remote view* (R1 and R4b also in
    [`mockups-80.md`](mockups-80.md)). They are binding as the other mockups are.
@@ -500,13 +504,49 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        stays on it. An agent's `type › description`, how long it has run, its progress
        (the lines the transcript draws under it) and the start of its prompt. `x` stops a
        task and goes back to the list; `←` goes back; Esc, Enter or Space close.
-     - **Not built**, Claude Code's but bigger than this pass: the agent strip under the
-       footer (`● main`, `◯ general-purpose …`) and moving into it with Down; `f` to
-       foreground an agent, and Enter on a finished one opening its transcript; the
-       workflow's two-pane phases and agents browser with its pause, restart and save keys
-       (a workflow's details here are its name, runtime and progress lines); the agent row's
-       model and token counts; the `N background task updates waiting while this panel is
-       open` line and the `Shell details dismissed` toast.
+     - **The agent strip** under the mode line while agents or workflows run, and
+       for a minute after one ends: a blank row, `● main`, then `◯ general-purpose  <its
+       latest call>  <time> · ↓ <tokens> tokens`, a workflow with its 20-cell `▰▱` bar and
+       `done/all`; what does not fit goes, the tokens first. Down from an empty prompt goes
+       to the pill and on into the strip, the mode line saying the focused row's keys
+       (`↑/↓ to select`, `Enter to view · x to stop`); Enter on an agent views it, on a
+       workflow opens its browser, on `main` brings the conversation back.
+     - **An agent in view** — Enter in the strip, `f` on a running agent in the list or its
+       details, Enter on a finished one — takes the transcript's place with its own
+       conversation, which the reducer keeps from its lines (`parent_tool_use_id`) with a
+       reducer of its own, the relay keeps as it keeps the conversation's, and sends while it
+       is viewed (`fg`, `fgo`). The rules around the prompt turn Claude Code's teal
+       `0891b2`, the agent's description on the top one, the prompt says `Message
+       @general-purpose…`, and the strip says which is in view. Esc interrupts a running agent
+       (claude's `interrupt` with its `task_id`, which stops it) and leaves one that ended.
+       Claude Code's terminal can then message the agent; headless claude refuses
+       `send_task_message` (2.1.311, measured 2026-11-04), so a message typed there stays and
+       the footer says `headless claude can't message agents`.
+     - **The workflow browser**: its name, `description · done/all agents · time`, then a box
+       of phases beside the chosen phase's agents (`● label Haiku 5.5 · 112.3k tokens  42s`,
+       grey `●` running, green `✔` done, red `●` failed), stacked under 60 columns. → or
+       Enter goes into the agents, Enter on one opens its pane (state, time, tokens, tool
+       calls, model, prompt, last call, error, result), `f` filters by state, Esc or ← go
+       back a level at a time; `x` stops the workflow. Its phases and agents are asked for
+       every two seconds while it is open (`wf`), the previews only for the agent whose
+       pane is open, since there may be many. Claude Code's pause, restart and skip are not
+       offered: they act inside its own process, and headless claude has no request for them.
+     - **`s save`** opens a form: the name (the workflow's own), Tab between project and user
+       scope, Enter to save. The holder writes the script from the workflow's call to
+       `.claude/workflows/<name>.js` under claude's directory or the home, as Claude Code's
+       save does, the name made a file name as it makes one, and never over a file already
+       there (`holder::save_workflow`).
+     - **Models and counts**: a list row says `running · Haiku 5.5` at 60 columns and over;
+       an agent's details say `1m 39s · 237.5k tokens · 51 tools · Haiku 5.5`, live, broken
+       between whole segments on a phone.
+     - **While the view is open**, a line over it counts the task notices that came since,
+       `2 background task updates waiting while this panel is open` (Claude Code holds them
+       back; here they are in the transcript behind it); a notice reaches the client as a
+       note with `tn`. Esc from a task's details opened from the list leaves Claude Code's
+       grey `Shell details dismissed` on the right over the prompt until the next key (it
+       says `Monitor`, `Agent` or `Workflow` for those; Claude Code says `Shell` for all).
+     - Glyphs: `◯`, `▰`, `▱`, `›` and `↓` are drawn by Claude Code on these screens, which
+       the owner's word of 2026-10-27 covers.
    - **Ctrl+O and `/expand`** switch the transcript between runs of tool calls summed up, as
      the mockups draw them, and every call on its own with the first lines of its result
      and how many more, as Claude Code's Ctrl+O transcript does; a failed call says `Error`.
