@@ -516,12 +516,13 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        conversation, which the reducer keeps from its lines (`parent_tool_use_id`) with a
        reducer of its own, the relay keeps as it keeps the conversation's, and sends while it
        is viewed (`fg`, `fgo`). The rules around the prompt turn Claude Code's teal
-       `0891b2`, the agent's description on the top one, the prompt says `Message
-       @general-purpose…`, and the strip says which is in view. Esc interrupts a running agent
-       (claude's `interrupt` with its `task_id`, which stops it) and leaves one that ended.
-       Claude Code's terminal can then message the agent; headless claude refuses
-       `send_task_message` (2.1.311, measured 2026-11-04), so a message typed there stays and
-       the footer says `headless claude can't message agents`.
+       `0891b2`, the agent's description on the top one, and the strip says which is in
+       view. Esc interrupts a running agent (claude's `interrupt` with its `task_id`, which
+       stops it) and leaves one that ended. Claude Code's prompt there messages the agent
+       (`Message @general-purpose…`); headless claude refuses `send_task_message` (2.1.311,
+       measured 2026-11-04), so here the prompt takes nothing — no typing, no paste, no
+       cursor — and says `headless claude can't message agents` in grey (owner, 2026-11-04);
+       what was typed for the conversation waits for it.
      - **The workflow browser**: its name, `description · done/all agents · time`, then a box
        of phases beside the chosen phase's agents (`● label Haiku 5.5 · 112.3k tokens  42s`,
        grey `●` running, green `✔` done, red `●` failed), stacked under 60 columns. → or

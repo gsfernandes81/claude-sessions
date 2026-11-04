@@ -39,9 +39,6 @@ const AHEAD: usize = 5;
 const QUIET_PROBE: Duration = Duration::from_secs(120);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SPIN_EVERY: Duration = Duration::from_millis(120);
-/// What the agent view says to a message typed to the agent.
-const AGENT_MESSAGE_REFUSED: &str = "headless claude can't message agents";
-
 /// How often an open shell's details ask for its output again.
 const OUTPUT_EVERY: Duration = Duration::from_secs(2);
 /// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
@@ -824,12 +821,15 @@ impl App {
             }
             (Key::PasteEnd, _) => {
                 let text = self.pasting.take().unwrap_or_default();
+                let agent_in_view = c_viewing(&self.screen);
                 if let Screen::Conv { ui, .. } = &mut self.screen {
                     if ui.dialog.is_some() {
                         // A dialog's text field takes it typed, on one line.
                         for c in text.chars() {
                             self.conv_key(Key::Char(if c == '\n' { ' ' } else { c }));
                         }
+                    } else if agent_in_view {
+                        // A prompt that takes nothing takes no paste either.
                     } else {
                         let rows = term::size().map_or(24, |(_, h)| h as usize);
                         paste(ui, &text, rows);
@@ -1169,15 +1169,13 @@ impl App {
                             out.push(App::msg("fg", vec![]));
                         }
                     }
-                    // Claude Code messages the agent; headless claude refuses to
-                    // (`send_task_message`, 2.1.311), so the prompt stays and says so.
-                    Key::Enter
-                        if viewing.is_some()
-                            && !ui.input.trim().is_empty()
-                            && !ui.input.starts_with('/') =>
-                    {
-                        ui.status = Some(AGENT_MESSAGE_REFUSED.into());
-                    }
+                    // An agent in view: the prompt takes nothing, since headless claude cannot
+                    // message an agent (`convo::AGENT_READ_ONLY`). What was typed for the
+                    // conversation waits for it.
+                    Key::Enter | Key::Up | Key::Left | Key::Right | Key::Home | Key::Delete
+                        if viewing.is_some() => {}
+                    Key::End if viewing.is_some() && ui.scroll == 0 => {}
+                    Key::Char(_) if viewing.is_some() => {}
                     Key::Esc => {
                         if ui.scroll > 0 {
                             ui.scroll = 0;
@@ -1359,6 +1357,11 @@ fn open_task(v: &mut tasks::View, t: &convo::Task) {
     v.open = Some(t.id.clone());
     v.output = None;
     v.runtime = tasks::runtime(t, crate::clock::now());
+}
+
+/// Whether an agent is in view in place of the conversation.
+fn c_viewing(screen: &Screen) -> bool {
+    matches!(screen, Screen::Conv { c, .. } if c.viewing.is_some())
 }
 
 /// An agent in view in place of the conversation, Claude Code's foregrounded agent: its
@@ -3435,15 +3438,18 @@ mod tests {
         let a = &c.viewing.as_ref().unwrap().1;
         assert_eq!(a.entries, [Entry::Prompt("Read it.".into())]);
         assert_eq!(a.state, "working");
-        // A message to it says why it cannot go; a slash command still works.
+        // The prompt takes nothing while it is in view, a paste included.
         type_in(&mut app, "hello");
-        assert_eq!(ui_of(&app).status.as_deref(), Some(AGENT_MESSAGE_REFUSED));
-        assert_eq!(ui_of(&app).input, "hello", "kept");
+        key(&mut app, Key::PasteStart);
+        key(&mut app, Key::Char('x'));
+        key(&mut app, Key::PasteEnd);
+        assert_eq!(ui_of(&app).input, "");
+        assert_eq!(
+            viewing(&app).as_deref(),
+            Some("ag1"),
+            "Enter sent nothing and left nothing"
+        );
         // Down then Enter on `main`: the conversation again.
-        if let Screen::Conv { ui, .. } = &mut app.screen {
-            ui.input.clear();
-            ui.cursor = 0;
-        }
         key(&mut app, Key::Down);
         key(&mut app, Key::Enter);
         assert_eq!(viewing(&app), None);
@@ -3524,6 +3530,9 @@ mod tests {
     fn esc_in_an_agents_view_interrupts_it_and_leaves_one_that_ended() {
         let mut app = app_in(&[AGENTS]);
         if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            // A draft for the conversation, which waits while the agent is in view.
+            ui.input = "half a prompt".into();
+            ui.cursor = 4;
             let t = c.tasks[0].clone();
             view_agent(c, ui, &t);
         }
@@ -3539,6 +3548,7 @@ mod tests {
         );
         app.key(Key::Esc, Instant::now());
         assert_eq!(viewing(&app), None);
+        assert_eq!(ui_of(&app).input, "half a prompt");
     }
 
     fn dialog(app: &App) -> Option<&Dialog> {

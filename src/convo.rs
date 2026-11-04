@@ -1750,6 +1750,11 @@ fn reconnecting_line(
     said(vec![("  ".into(), PLAIN)])
 }
 
+/// What the prompt says, taking nothing, while an agent is in view: Claude Code's prompt there
+/// messages the agent (`Message @general-purpose…`), and headless claude refuses to
+/// (`send_task_message`, 2.1.311).
+pub const AGENT_READ_ONLY: &str = "headless claude can't message agents";
+
 /// A line cut to `w` cells with no ellipsis.
 fn clip(l: Line, w: usize) -> Line {
     let mut used = 0;
@@ -1810,10 +1815,16 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             ("─".into(), fg(RULE)),
         ]);
     }
-    // The prompt, soft-wrapped as Claude Code's is, with the cursor's place.
+    // The prompt, soft-wrapped as Claude Code's is, with the cursor's place. With an agent
+    // in view it takes nothing (`AGENT_READ_ONLY`), and what was typed for the conversation
+    // waits for it.
     let room = w.saturating_sub(2).max(1);
-    let chars: Vec<char> = ui.input.chars().collect();
-    let (rows, cur) = soft_wrap(&chars, ui.cursor, room);
+    let chars: Vec<char> = if agent.is_some() {
+        Vec::new()
+    } else {
+        ui.input.chars().collect()
+    };
+    let (rows, cur) = soft_wrap(&chars, ui.cursor.min(chars.len()), room);
     // A slash command claude or this client knows, anywhere in the prompt, in Claude Code's
     // lavender (its `permission` colour, read off its screen on 2026-11-02).
     let slash = slash_runs(&chars, &c.meta.commands);
@@ -1860,17 +1871,9 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             l.push((format!(" {}", cut(hint, room)), fg(GREY)));
         }
     }
-    if let (true, Some(a)) = (chars.is_empty(), agent) {
-        let kind = if a.detail.is_empty() {
-            "agent"
-        } else {
-            &a.detail
-        };
+    if agent.is_some() {
         if let Some(l) = out.last_mut() {
-            l.push((
-                cut(&format!("Message @{kind}…"), w.saturating_sub(3)),
-                fg(GREY),
-            ));
+            l.push((cut(AGENT_READ_ONLY, w.saturating_sub(3)), fg(GREY)));
         }
     } else if chars.is_empty() && c.pending.iter().any(|p| p.queued) {
         // What Claude Code says in an empty prompt with prompts waiting behind the turn.
@@ -2441,6 +2444,8 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     // The bottom: a dialog, or the input box.
     let waiting = c.waiting();
     let mut cursor = None;
+    // Whether the prompt is drawn, rather than a dialog: the spinner goes over it.
+    let mut prompt = false;
     let mut ask_top = false;
     let bottom: Vec<Line> = match (&ui.dialog, waiting) {
         (Some(Dialog::Model { sel, list }), _) => model_dialog(c, *sel, list, w),
@@ -2465,20 +2470,28 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
         (Some(Dialog::Perm { sel }), Some(e @ Entry::Perm { .. })) => perm_dialog(e, *sel, w),
         _ => {
             // The suggestion list over the prompt, as Claude Code puts it.
-            let list = suggestions(ui);
+            let list = if c.viewing.is_some() {
+                Vec::new()
+            } else {
+                suggestions(ui)
+            };
             let mut b = if list.is_empty() {
                 Vec::new()
             } else {
                 suggest_lines(&list, ui.suggest, w)
             };
             let (boxed, cur) = input_box(c, ui, w, h);
-            cursor = Some((cur.0 + b.len(), cur.1));
+            prompt = true;
+            // No cursor in a prompt that takes nothing.
+            if c.viewing.is_none() {
+                cursor = Some((cur.0 + b.len(), cur.1));
+            }
             b.extend(boxed);
             b
         }
     };
-    let spinner: Vec<Line> = match (shown.state.as_str(), &cursor) {
-        ("working" | "compacting", Some(_)) => {
+    let spinner: Vec<Line> = match (shown.state.as_str(), prompt) {
+        ("working" | "compacting", true) => {
             let c = shown;
             let since = c.working_since.unwrap_or(now);
             let el = now.saturating_duration_since(since);
@@ -2753,7 +2766,8 @@ mod tests {
         assert!(!t.iter().any(|l| l.contains("the conversation")), "{t:?}");
         assert_eq!(t[16], "────────────────────────── slow reader ─");
         assert_eq!(f.lines[16][1].1.bg, Some(AGENT_TEAL));
-        assert_eq!(t[17], "❯ Message @general-purpose…");
+        assert_eq!(t[17], "❯ headless claude can't message agents");
+        assert_eq!(f.cursor, None, "a prompt that takes nothing has no cursor");
         assert_eq!(f.lines[18][0].1.fg, Some(AGENT_TEAL));
         assert_eq!(t[22..], ["  ◯ main", "  ● general-purpose  slow reader"]);
     }
