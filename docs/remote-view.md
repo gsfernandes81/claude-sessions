@@ -231,7 +231,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 - **No application heartbeat; liveness is detected lazily.** Idle is zero bytes. The link is
   dead when:
   - the ssh child exits;
-  - something the view sent gets no acknowledgement within about 5 seconds;
+  - something the view sent gets no acknowledgement within about 5 seconds — save a new
+    link's hello, which gets 30: ssh's handshake through cloudflared from a phone often takes
+    longer than 5, and cutting it there cut every redial, so the view said Reconnecting for
+    ever (fixed after 0.17.0);
   - a keypress after 2 minutes of silence gets no answer to the probe it sends first.
 
   ssh's own `ServerAliveInterval` is the owner's ssh config. The link is not silent all the
@@ -374,7 +377,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      Enter on it puts R10's words where the hint line was.
    - **The link** is `ssh -T -C -o BatchMode=yes <name> claude-sessions relay`
      (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
-     backoff from 1 to 30 seconds; dead too when something sent has no answer in 5 seconds,
+     backoff from 1 to 30 seconds, doubling once per failed dial (an ssh the client cut is
+     not counted again when it ends); dead too when something sent has no answer in 5
+     seconds (30 for a new link's hello),
      and a key after 2 minutes of silence sends a `ping` first. So the relay answers every
      message at once, with `pong` when it has nothing else to say yet: a side question takes
      6 to 11 seconds, and through 0.13.6 a quiet conversation's link was dropped before its

@@ -34,6 +34,10 @@ const ACK_WAIT: Duration = Duration::from_secs(5);
 /// long conversation's history into it can take many seconds, and the 5 that any other answer
 /// gets cut the link mid-open, which left the conversation opening for ever.
 const OPEN_WAIT: Duration = Duration::from_secs(60);
+/// How long a new link may take to say hello: ssh's handshake, through cloudflared from a phone
+/// on mobile data, often takes more than the 5 seconds any other answer gets, and cutting it
+/// there cut every new link, so the view said Reconnecting for ever.
+const HELLO_WAIT: Duration = Duration::from_secs(30);
 /// How many screens above the view the client keeps loaded ahead of a scroll back.
 const AHEAD: usize = 5;
 const QUIET_PROBE: Duration = Duration::from_secs(120);
@@ -119,6 +123,8 @@ struct App {
     name: String,
     wire: Option<Wire>,
     epoch: u64,
+    /// The link has said nothing yet: it gets `HELLO_WAIT` to answer, not `ACK_WAIT`.
+    hello_due: bool,
     down_since: Option<Instant>,
     retry_at: Option<Instant>,
     backoff: Duration,
@@ -235,6 +241,7 @@ impl App {
     fn dial(&mut self, now: Instant, tx: &Sender<Heard>) {
         self.retry_at = None;
         self.epoch += 1;
+        self.hello_due = true;
         match connect(&self.name, self.epoch, tx) {
             Ok(w) => {
                 self.wire = Some(w);
@@ -293,6 +300,7 @@ impl App {
     fn heard(&mut self, v: Value, now: Instant) {
         self.last_heard = now;
         self.awaiting = None;
+        self.hello_due = false;
         if self.down_since.take().is_some() {
             self.backoff = Duration::from_secs(1);
             if let Screen::Conv { ui, .. } = &mut self.screen {
@@ -2528,12 +2536,30 @@ impl App {
     }
 
     /// How long something sent may go unanswered before the link is thought dead: longer while
-    /// a conversation opens.
+    /// a conversation opens, and while a new link has yet to say hello.
     fn ack_wait(&self) -> Duration {
         if matches!(self.screen, Screen::Conv { opening: true, .. }) {
             OPEN_WAIT
+        } else if self.hello_due {
+            HELLO_WAIT
         } else {
             ACK_WAIT
+        }
+    }
+
+    /// The link's ssh ended. One the client already cut, for want of an answer, was counted
+    /// down then: counting it again doubled the backoff twice per failed dial.
+    fn gone(&mut self, epoch: u64, why: String, now: Instant) {
+        if epoch != self.epoch || self.wire.is_none() {
+            return;
+        }
+        self.link_down(now);
+        // ssh's own last word, when it said one: why the link is down.
+        if !why.is_empty() {
+            match &mut self.screen {
+                Screen::Home => self.menu.set_status(Some(why)),
+                Screen::Conv { ui, .. } => ui.status = Some(why),
+            }
         }
     }
 
@@ -2591,6 +2617,7 @@ impl App {
             name: name.to_string(),
             wire: None,
             epoch: 0,
+            hello_due: false,
             down_since: None,
             retry_at: None,
             backoff: Duration::from_secs(1),
@@ -2672,16 +2699,7 @@ pub fn run(name: &str) -> Result<(), String> {
         while let Ok(h) = rx.try_recv() {
             match h {
                 Heard::Line(e, v) if e == app.epoch => app.heard(v, now),
-                Heard::Gone(e, why) if e == app.epoch => {
-                    app.link_down(now);
-                    // ssh's own last word, when it said one: why the link is down.
-                    if !why.is_empty() {
-                        match &mut app.screen {
-                            Screen::Home => app.menu.set_status(Some(why)),
-                            Screen::Conv { ui, .. } => ui.status = Some(why),
-                        }
-                    }
-                }
+                Heard::Gone(e, why) => app.gone(e, why, now),
                 _ => {}
             }
         }
@@ -3698,6 +3716,33 @@ mod tests {
             dialog(&app),
             Some(Dialog::Btw { answer: Some(Err(e)), .. }) if e.contains("ask again")
         ));
+    }
+
+    #[test]
+    fn a_new_link_gets_longer_than_five_seconds_to_say_hello() {
+        let mut app = App::new("dev", 80, 24, 3);
+        app.hello_due = true;
+        assert_eq!(app.ack_wait(), HELLO_WAIT);
+        app.heard(
+            parse(r#"{"t":"hi","v":1,"hosts":[]}"#).unwrap(),
+            Instant::now(),
+        );
+        assert_eq!(app.ack_wait(), ACK_WAIT);
+    }
+
+    #[test]
+    fn a_link_cut_for_want_of_an_answer_is_not_counted_down_again_when_its_ssh_ends() {
+        let mut app = App::new("dev", 80, 24, 3);
+        let now = Instant::now();
+        app.link_down(now);
+        let (retry, backoff) = (app.retry_at, app.backoff);
+        assert_eq!(backoff, Duration::from_secs(2));
+        app.gone(
+            app.epoch,
+            "Connection closed".into(),
+            now + Duration::from_millis(60),
+        );
+        assert_eq!((app.retry_at, app.backoff), (retry, backoff));
     }
 
     #[test]
