@@ -165,8 +165,9 @@ does not read healthy against a working case first, the test is wrong.
 
 ## Handoffs
 
-`docs/handoff/YYYY-MM-DD-<topic>.md`, written at the end of a session for the next one.
-**A handoff's opening instructions are the next session's first orders.** A note is deleted
-once its open items are all closed *and* nothing in it is the only record of a decision —
-move the durable reasoning into `docs/` first, then delete it. A handoff that outlives its
-items becomes a second, stale source of truth.
+`docs/handoff/YYYY-MM-DD-<topic>.md`, **written only when the owner asks for one** (owner,
+2026-11-06) — never as a matter of course at the end of a session. When one exists, **its
+opening instructions are the next session's first orders.** Prune it once it has been dealt
+with: when its open items are all closed, move anything in it that is the only record of a
+decision into `docs/`, then delete it in the same commit that closes the last item. A handoff
+that outlives its items becomes a second, stale source of truth.
