@@ -77,7 +77,11 @@ binaries on 2026-11-01:
 to infra by agent mail on 2026-11-01. **A bump is a checklist**, run before the pin moves:
 
 1. infra's `scrollvars` line
-2. this repo's tests
+2. this repo's tests, with `CLAUDE_CODE_VERSION` in `.github/workflows/ci.yml` moved to the
+   new version: `tests/claude_peer.rs` runs agent messaging against the real binary, one test
+   per behaviour the relay relies on, so a failure names what changed (design § *Agent
+   messaging*). Locally, `CLAUDE_SESSIONS_TEST_CLAUDE=<new claude> cargo test --test
+   claude_peer`.
 3. the protocol spike below, run against the new version, with the message shapes compared
 
 ## The protocol, measured (2.1.311, 2026-11-01)

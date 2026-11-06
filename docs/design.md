@@ -1116,7 +1116,24 @@ class, as is every slot by default, but a slot started in `bypassPermissions` is
 to the owner. Claude Code's GrowthBook flags can change its messaging without a version
 change: a risk the owner accepted.
 
-`tests/peer.rs` proves it end to end, with the real binary as the router and as two
+**Against the real Claude Code**, `tests/claude_peer.rs` holds each behaviour the relay
+relies on in a test of its own. A real `claude` runs headless with a scratch config, the
+real agent beside it, and a local stand-in for the Anthropic API that records what the
+model is sent and answers with scripted tool calls. So no request leaves the machine, no
+account is used, and each test reads as the promise it checks:
+- the record names an inbox in protocol 1, and `peer-check` agrees;
+- a stand-in is listed, and a dead one is not;
+- a send to a stand-in reaches the agent from the sender's slot, and nothing is carried from
+  a claude in no slot;
+- a delivered message reaches the model from the verified sender;
+- the reply comes back through the stand-in;
+- the shipped settings deliver across permission classes, and without them the message is
+  held, the hold receipt coming back through the stand-in.
+
+CI runs these at infra's pin (`CLAUDE_CODE_VERSION`), so a bump is mechanical when nothing
+changed, and names the broken behaviour when something did.
+
+`tests/peer.rs` proves the rest end to end, with the real binary as the router and as two
 containers' agents over a stand-in ssh:
 - stand-ins for the other container's slots, and none for a container's own;
 - a message delivered with its verified sender, and the sender's own claim of a name

@@ -31,6 +31,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The Claude Code infra pins, for tests/claude_peer.rs: agent messaging rides Claude Code's
+  # own cross-session protocol, which no version promises to keep, so every behaviour the
+  # relay relies on is tested against the real binary. Moved with infra's pin, as one step of
+  # the bump checklist (docs/remote-view.md).
+  CLAUDE_CODE_VERSION: "2.1.311"
 
 jobs:
   test:
@@ -64,6 +69,14 @@ jobs:
           echo "dfd75720b942466f28870731cc86dbc07afa72fb8f3bd5eeb4ff707e4eecebe8  zmx.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/zmx" && tar -xzf zmx.tgz -C "$RUNNER_TEMP/zmx"
           echo "CLAUDE_SESSIONS_TEST_ZMX=$RUNNER_TEMP/zmx/zmx" >> "$GITHUB_ENV"
+      # The real Claude Code, for tests/claude_peer.rs, at infra's pin. The tests drive it
+      # against a local stand-in for the API, so it needs no account; under CI they fail
+      # without it rather than pass for the wrong reason.
+      - name: Install the pinned Claude Code
+        run: |
+          npm install -g --prefix "$RUNNER_TEMP/claude" "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          "$RUNNER_TEMP/claude/bin/claude" --version
+          echo "CLAUDE_SESSIONS_TEST_CLAUDE=$RUNNER_TEMP/claude/bin/claude" >> "$GITHUB_ENV"
       - run: cargo test --target x86_64-unknown-linux-musl
       # The image's build runs this as a FATAL check on a bare static binary, so CI runs the
       # same thing rather than trusting that it would work.
@@ -97,6 +110,14 @@ jobs:
           echo "943eb44c812333fd450da12097521afd3339436e86f8c2ac618b905c4c9ece68  zmx.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/zmx" && tar -xzf zmx.tgz -C "$RUNNER_TEMP/zmx"
           echo "CLAUDE_SESSIONS_TEST_ZMX=$RUNNER_TEMP/zmx/zmx" >> "$GITHUB_ENV"
+      # The real Claude Code, for tests/claude_peer.rs, at infra's pin. The tests drive it
+      # against a local stand-in for the API, so it needs no account; under CI they fail
+      # without it rather than pass for the wrong reason.
+      - name: Install the pinned Claude Code
+        run: |
+          npm install -g --prefix "$RUNNER_TEMP/claude" "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          "$RUNNER_TEMP/claude/bin/claude" --version
+          echo "CLAUDE_SESSIONS_TEST_CLAUDE=$RUNNER_TEMP/claude/bin/claude" >> "$GITHUB_ENV"
       - run: cargo test
       - name: --version answers on the built binary
         run: ./target/aarch64-unknown-linux-musl/debug/claude-sessions --version
