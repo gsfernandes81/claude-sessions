@@ -1,11 +1,38 @@
 # Replacing agent mail with Claude Code's own messaging — investigation, 2026-11-06
 
-**First orders for the next session:** this is a proposal, not a decision. Nothing here is
-built. The owner asked for "a design that links all sessions across all containers and does
-away with our custom mail work"; what follows is what Claude Code 2.1.311 does, read from
-its bundle, and the design it points to. Two experiments (below) were blocked by the
-auto-mode classifier because they write into the shared `~/.claude/sessions/`; run them
-with the owner's go-ahead before writing code.
+**First orders for the next session:** build design A below (relay into Claude Code's own
+messaging) with **the hub as router**. Nothing is built yet. The owner asked for "a design
+that links all sessions across all containers and does away with our custom mail work".
+Both experiments have passed (see the end). The decisions are below.
+
+## Settled, 2026-11-06 (owner, and infra's agent infra/claude-14 by mail)
+
+- **The hub stays the router.** Agents send to the hub with today's container token, and the
+  hub stamps the sender. The signed hub-free variant at the end is **not** taken, so there is
+  no `keygen`, no init service, and no listener on each agent.
+- **Sender identity:** the receiving side sets `from-name` from what it verified (the hub's
+  stamp, then the local stand-in), never from the sender's claim. The docs will name that
+  field as the authoritative one.
+- **`crossSessionInbound: "accept"`** goes in **our** drop-in
+  (`managed-settings.d/claude-sessions.json`), which `hooks-config` prints, not in infra's
+  file. It arrives and leaves with our pin. Auto mode is in the "prompting" class, so
+  auto-to-auto was never held. This covers a slot the owner starts in `bypassPermissions`,
+  whose messages would otherwise be held and expire unseen while headless.
+- **Policy text:** Claude Code's own rules for peer messages replace infra's managed mail text,
+  which goes at cutover.
+- **Pi slots are out of scope.**
+- **No separate traffic log.** The owner reads messages in each session or the remote view.
+  Issue #17's view goes with mail.
+- **Cutover in one step:** once the relay is proven, mail goes in the same release, with no
+  side-by-side release. Then infra removes the `mail` volume and `HUB_MAIL_LISTEN`.
+- **Owed to infra:**
+  - a check for `make verify` and dev-smoke that the pinned claude speaks `peerProtocol 1`
+    and the relay is linked;
+  - a relay that switches itself off, and says so, on a protocol mismatch.
+- **Queues stay durable:** a queue on the hub's side stays on a persisted volume, as the
+  mail store is today, because every deploy recreates every container.
+- **`tengu_*` flag risk is accepted by the owner.** Anthropic can change behaviour through
+  these flags without a version change.
 
 ## What Claude Code does (2.1.311, read from the bundled JS)
 
@@ -110,16 +137,33 @@ It's cheap to try on one container, but it's a fleet setting, so the owner and i
   slot, as it already can today through the socket. The relay must not widen that beyond
   container-token holders.
 
-## Experiments to run first (blocked this session: they write `~/.claude/sessions/`)
+## Experiments: both passed, 2026-11-06 (owner's go-ahead)
 
-1. Write a record with a foreign `pidDomain` pointing at a Python listener on
-   `/tmp/cc-socks/<hex>.sock`; check `ListAgents` lists it, and `SendMessage` to it delivers
-   the frame shape above (log `SO_PEERCRED` too). Remove the record and socket afterwards.
-2. From that listener, deliver a message to a scratch slot (a headless `claude -p` under the
-   holder, cheap model), and have the slot reply. Confirm the reply reaches the stand-in,
-   and see what happens without `crossSessionInbound: "accept"`.
+1. **A foreign record is listed and delivered to.** We wrote a record with
+   `pidDomain: "claude-sessions:test:other-repo"`, `name: "other-repo/claude-3"` and a fake
+   pid, and a Python listener on `/tmp/cc-socks/c5e57.sock`. This session's `ListAgents` listed
+   it as `other-repo/claude-3 · interactive · idle`, with the slash kept. `SendMessage` to it
+   was delivered:
+   - the sender first opened the socket twice with nothing written, to check it was live;
+   - it sent no auth line, because there was no `.key` beside the record;
+   - then it sent one line:
+     `{"msgV":1,"msg_id":…,"type":"user","message":{"role":"user","content":"<cross-session-message
+     from=\"uds:/tmp/cc-socks/32330.sock\" from-name=\"Agent Intercom\"
+     from-mode=\"prompting\">\n…\n</cross-session-message>"},"priority":"next","from":"uds:…"}`.
+2. **A round trip through a headless claude.** We started a throwaway `claude -p
+   --input-format stream-json` (haiku, scratch cwd, managed settings as on the fleet, auto
+   mode). One Python process held a stand-in `/tmp/cc-socks/d00d1.sock` and wrote a frame
+   with `from` set to that stand-in into the claude's socket.
+   - The idle claude woke and ran the message as a turn.
+   - Its reply, `pong`, sent with `SendMessage` to the `from` address, arrived at the
+     stand-in from the claude's pid, carrying a `hop-chain`.
+   - There was no `peer_message_hold`, with `crossSessionInbound` unset and both sides in
+     the prompting class.
+   Afterwards the record, sockets and processes were removed.
 
-## Variant: no hub, signed messages between agents (owner's question, 2026-11-06)
+## Variant considered and not taken: no hub, signed messages between agents
+
+The owner chose the hub as router (2026-11-06). This is kept for the reasoning.
 
 The hub does four jobs for mail: carrying messages between containers, proving who sent them,
 keeping the roster, and queueing for a container that is down. All four can move into the
