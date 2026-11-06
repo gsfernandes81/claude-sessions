@@ -149,6 +149,8 @@ impl Hub {
                     .insert(name.clone(), hub::place_of(&name, &snap));
                 self.rows.insert(name, snap.rows);
             }
+            // The router's business, not the menu's.
+            Event::Relay(_) => {}
             Event::Down(name, why) => {
                 self.heard.insert(name.clone());
                 self.retry

@@ -31,8 +31,8 @@
 //!
 //! **What the zmx session shows**: one plain line at start and at each change of what claude
 //! is doing, never on a timer, so attaching from the old menu explains the slot rather than
-//! showing a blank screen. Whatever is typed into the session is read and dropped: the mail
-//! nudge types into idle detached sessions, and a remote slot always reads as detached.
+//! showing a blank screen. Whatever is typed into the session is read and dropped, since
+//! nothing typed there is meant for claude, which reads the tap instead.
 //!
 //! The holder takes no registry lock: the tap's writes to the slot's record do, with a timeout
 //! (`Viewing`): `keep_until` re-stamped while a view is connected, and `last_attach` when it

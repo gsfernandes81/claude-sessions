@@ -11,9 +11,10 @@
 //! - `managed-settings.d/claude-sessions.json` — the hooks and the status line naming
 //!   `DIR/bin/claude-sessions` (`hooks-config`), for a container to mount at
 //!   `/etc/claude-code/managed-settings.d/`;
-//! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, and the three mail skills
-//!   `mail-send`, `mail-read` and `mail-reply`, for a container's start to link into Claude
-//!   Code's config directory. A file here it did not write — a skill infra keeps beside these —
+//! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, for a container's start to
+//!   link into Claude Code's config directory. A skill an earlier release shipped and this one
+//!   does not (agent mail's three, `RETIRED_SKILLS`) is removed, so no session is told to run
+//!   a command that is gone. A file here it did not write — a skill infra keeps beside these —
 //!   is left alone;
 //! - `extensions/claude-sessions.js` — the pi extension (`pi-extension`), which feeds the
 //!   same hook from a pi slot (`docs/design.md` § *Harnesses*), with `DIR/bin/claude-sessions`
@@ -55,6 +56,13 @@ pub fn run(dir: &Path) -> io::Result<Vec<String>> {
         let skill = dir.join(format!("skills/{name}/SKILL.md"));
         put(dir, &skill, text.as_bytes(), 0o644)?;
         done.push(skill.display().to_string());
+    }
+    for name in crate::RETIRED_SKILLS {
+        let old = dir.join(format!("skills/{name}"));
+        if old.join("SKILL.md").exists() {
+            let _ = fs::remove_file(old.join("SKILL.md"));
+            let _ = fs::remove_dir(&old);
+        }
     }
     let ext = dir.join("extensions/claude-sessions.js");
     put(
@@ -206,19 +214,23 @@ mod tests {
             "extensions",
             "skills",
             "skills/keepalive",
-            "skills/mail-send",
-            "skills/mail-read",
-            "skills/mail-reply",
         ] {
             assert_eq!(mode(&dir.join(d)), 0o755, "{d}");
         }
         // Again, over itself, and nothing temporary is left behind — nor anything of somebody
-        // else's taken away.
+        // else's taken away; but a skill an earlier release wrote and this one retired goes.
+        let retired = dir.join("skills/mail-send/SKILL.md");
+        fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        fs::write(&retired, "agent mail").unwrap();
         let theirs = dir.join("skills/infra-only/SKILL.md");
         fs::create_dir_all(theirs.parent().unwrap()).unwrap();
         fs::write(&theirs, "infra's").unwrap();
         run(&dir).unwrap();
         assert_eq!(fs::read_to_string(&theirs).unwrap(), "infra's");
+        assert!(
+            !dir.join("skills/mail-send").exists(),
+            "the retired skill is gone"
+        );
         let stray: Vec<_> = fs::read_dir(dir.join("bin"))
             .unwrap()
             .filter_map(Result::ok)

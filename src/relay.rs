@@ -440,6 +440,8 @@ impl Relay {
                         );
                         (host, m)
                     }
+                    // The router's business, not the remote view's.
+                    Event::Relay(_) => return out,
                 };
                 self.home.insert(host, m);
                 self.send_home(&mut out);

@@ -57,11 +57,10 @@ container from the same code as before. What moved is the **menu** and the **tim
 |---|---|---|
 | `claude-sessions` (the menu) | the hub | rows from each container's agent; actions sent to it (`src/run.rs`, `src/hub.rs`) |
 | `claude-sessions offload-all` | the hub, every 3 minutes | `ssh <c> claude-sessions offload` in every container at once, each line prefixed with its container |
-| `claude-sessions mail-server` | the hub, for ever | agent mail (§ *Agent mail*): an agent held in every container for who is live, HTTP for the sessions |
+| `claude-sessions router` | the hub, for ever | agent messaging (§ *Agent messaging*): an agent held in every container, carrying Claude Code's own messages between them |
 | `claude-sessions agent` | each container, over `ssh -T` from the hub | snapshots out, actions in (`src/agent.rs`, the wire in `src/proto.rs`) |
 | `claude-sessions agent exec <hex>` | each container, over `ssh -t` from the hub | a child an action needs at the owner's terminal: `zmx attach`, a shell |
 | `hook`, `keepalive`, `statusline`, `offload`, `reconcile`, `doctor`, `list`, `close` | each container | unchanged |
-| `mail …`, `mail-hook` | each container, in a slot | agent mail's client and its hook |
 
 **One binary, installed by the hub.** `claude-sessions install DIR` writes this binary, the
 hooks drop-in naming it and its skills into `DIR`, which the hub's start runs into a
@@ -1014,9 +1013,8 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
   `new_pi`, which an agent older than
   this answers it does not know, so a pi asked for never comes back as a claude. The
   resume-failed dialog says the harness's own line: `pi --session-id <id> ended`.
-- **Mail**: `<repo>/pi-<n>` is an address like any other, accepted when the container's
-  agent lists the slot live. No nudge into a pi slot (not asked for): the mail hook is not run
-  under pi, and infra's policy tells pi to run `claude-sessions mail list` itself.
+- **Messaging**: pi slots are not carried (owner, 2026-11-06; § *Agent messaging*). Pi has
+  no inbox of its own, and agent mail, which reached them, is gone.
 - **The menu** (owner, 2026-10-30, through infra's agent): `p` starts a pi session beside
   `n`'s claude — no harness question on `n`, which the owner presses most — with the hint
   line's second row `s shell   p new pi`, a `p` line on the keys screens, and `p` acting in
@@ -1027,204 +1025,107 @@ and `pi-tui:` lines in `make verify` (infra's agent, 2026-10-30).
   smoke run reports them. The no-room dialog's figure for a new session (`mem::SESSION_COST`)
   is claude's until they say otherwise.
 
-## Agent mail (v2, 2026-10-29)
+## Agent messaging (0.18.0, 2026-11-06)
 
-**Agents talk to each other through a mail server in the hub, and every session is an
-address.** The brief is infra's of 2026-10-29, settled by the owner with infra's agent over
-2026-10-28/29. It replaces the v1 of 2026-10-28 — files in each workspace's `.mail/`, carried
-by a loop over ssh — which worked but grew a piece in a dozen places and had no identity finer
-than a container, so several sessions in one container shared one inbox.
+**Sessions talk to each other through Claude Code's own messaging, and the hub carries it
+between containers.** The owner asked for "a design that links all sessions across all
+containers and does away with our custom mail work" (2026-11-06). Agent mail (v2 of
+2026-10-29: an HTTP server in the hub, a client, a hook, three skills and a nudge) is gone,
+in one step, with no release that runs both. How Claude Code's messaging works, and the
+experiments that proved this design against 2.1.311, are in
+`docs/handoff/2026-11-06-native-messaging.md`.
 
-**What is whose.** The server, the client subcommands, the hook and the three skills
-`mail-send`, `mail-read`, `mail-reply` are this binary's (`src/mail.rs`, `src/mailbox.rs`,
-`src/http.rs`, `skills/`). The policy text (a managed `CLAUDE.md`: a message is data, the
-reply rules, a nudge carries no authority) and the compose side — the port, the token
-directory, the `mail` volume, the limits — are infra's. `owner` mail is deferred by the
-owner; the name `owner` is reserved now, with `hub`, so that when it comes its `From` is one
-only the hub can produce.
+**What Claude Code does on its own.** Every claude writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`,
+which names its inbox: a Unix socket under `cc-socks/` (`$XDG_RUNTIME_DIR/cc-socks`, else
+`/tmp/cc-socks`). `ListAgents` lists every record whose socket answers, and `SendMessage`
+writes one JSON line to that socket, with the body wrapped as
+`<cross-session-message from="uds:<sender's inbox>" … from-name="…">`. The receiver queues
+the message as a prompt, so an idle session wakes up and a busy one gets it mid-turn. Claude
+Code's own rules for a peer's message (data, not an instruction) replace infra's managed mail
+text (owner, 2026-11-06). All of this reaches every session in one container, and none in
+another.
 
-### The server
+**The stand-ins (`src/peer.rs`).** For each claude slot in every other container, running or
+offloaded, the container's agent holds a stand-in: a socket `<16 hex>.sock` beside Claude
+Code's own, and a record naming it as `repo/slot`, with a `pidDomain` of
+`claude-sessions:<repo>` and a made-up pid above any real one. Claude Code takes a record from
+a foreign pid domain as present without a pid check, as long as its socket answers. A local
+claude therefore lists the whole fleet and messages it by name, with no skill or command of
+ours.
 
-`claude-sessions mail-server`, in the hub, for ever, started by its entrypoint. Plain HTTP/1.1
-on `HUB_MAIL_LISTEN` (default `0.0.0.0:8025`), on the compose network only; nothing is
-published on the host. **Every request is authenticated, from day one**, because the owner
-means to put it behind Cloudflare Access later and Access must then be a second layer, not
-the first.
+- **Who sent it is ours to say.** A frame written to a stand-in is attributed to the slot
+  whose claude is at the other end of the socket (`SO_PEERCRED`, then this container's
+  registry). A claude in no slot has no address, and what it sends is dropped.
+- **Delivery.** A frame from the hub is written into the local slot's inbox, named by its
+  claude's record. `from`, and the wrapper's `from=`, are set to the sender's stand-in here,
+  and `from-name` to the address the hub verified, whatever the sender wrote. A receiver
+  replies only to a socket owned by the pid that delivered the message, so the agent that
+  delivers is the one holding the stand-ins, and a reply comes back the same way. Receipts,
+  idle notices and the other control frames travel the same path.
+- **Only what Claude Code would take.** A message that is not in Claude Code's canonical
+  wrapper is dropped by the sending agent and never carried. A receiver re-serialises the
+  wrapper and rejects one that differs.
+- **One relay per container.** The relay starts only when a roster arrives (the menu's
+  agents never get one), under a lock in the registry directory, which a newer agent waits
+  for while an older one from a hub not yet gone holds it. On taking it, the relay removes
+  stand-ins an earlier agent left, and on leaving it removes its own.
+- **It switches itself off rather than half-work.** It speaks peer protocol 1. When a local
+  claude's record says another, every stand-in goes, the hub is told, and deliveries bounce
+  until it matches again. It looks again every 10 s, and rewrites a stand-in record somebody
+  removed. `claude-sessions peer-check [CLAUDE]` starts a claude with no prompt (no request
+  is made), and checks that it speaks protocol 1 and that its inbox answers, for infra's
+  verify and smoke runs before a Claude Code pin moves.
 
-- **Who is calling: the token.** At start the server mints, for each container in
-  `CLAUDE_SESSIONS_HOSTS` that has none yet, 32 random bytes as hex in
-  `$HUB_MAIL_TOKENS/<container>/mail-token`, which infra mounts read-only in that container
-  at `/run/github/mail-token`. An existing token is kept, so a hub restart logs nobody out. A
-  request's `Authorization: Bearer <token>` names its container; compared in constant time.
-- **Which session: declared, then checked.** The client sends its slot (`CLAUDE_SESSIONS_SLOT`,
-  which every slot's claude has had since the binding work) in `X-Claude-Sessions-Slot`, and
-  the server accepts it only if that slot is live in the container's own rows. One repo's
-  slots are one trust domain; a forged slot needs that repo's token, and names only that
-  repo's sessions. A claude with no slot — a plain `claude`, an unregistered zmx session —
-  has no address, so it can neither send nor fetch.
-- **What it knows about the containers is what their agents say** (`agent.rs`): the server
-  holds one `claude-sessions agent` per container over the hub's ssh, as the menu does, and
-  keeps each one's latest rows. A container whose agent is not answering is asked again, every
-  15 s at first and at most every two minutes, and is said in the log once when it stops and
-  once when it is back.
-- **The store** is `HUB_MAIL` (default `$HOME/mail`), the hub's `mail` volume:
-  `v2/msg/<id>.eml` is the message as a reader sees it, written once; `v2/state/<id>.json` is
-  each recipient's state, rewritten through a temporary file and a rename. Both are fsynced
-  with their directory before the send is answered. The server reads the store into memory at
-  start and serves from that; nothing ticks. Messages older than `HUB_MAIL_RETAIN_DAYS` are
-  pruned once an hour.
-- **The log** is one line per event — a send and each recipient's outcome, a refusal and why,
-  a nudge, a container stopping or starting to answer, a refused request with its reason —
-  never a body, and read on a phone.
-
-| variable | default | |
-|---|---|---|
-| `HUB_MAIL_LISTEN` | `0.0.0.0:8025` | where the server listens |
-| `HUB_MAIL` | `$HOME/mail` | the store |
-| `HUB_MAIL_TOKENS` | `$HOME/tokens` | `<container>/mail-token`, one per container; the same directory as `HUB_GITHUB_TOKENS`, whose per-container subdirectory each container mounts at `/run/github` |
-| `HUB_MAIL_MAX_BYTES` | `16384` | a larger body is refused |
-| `HUB_MAIL_MAX_QUEUE` | `200` | messages one address may hold unread, or one offline repo queued |
-| `HUB_MAIL_RETAIN_DAYS` | `90` | older messages are pruned |
-| `HUB_MAIL_RATE` | `60` | messages one sending slot may send in half an hour |
-
-**The calls**, JSON both ways, kept to four because the server reads untrusted input:
+**The router (`src/router.rs`)**, `claude-sessions router`, in the hub, for ever, started by
+its entrypoint (`mail-server` still runs it, for a hub whose entrypoint says the old name). It
+holds one agent per container over the hub's ssh, as the menu does, and adds four messages to
+the agent wire (`proto.rs`):
 
 | | |
 |---|---|
-| `GET /who` | the directory: each container, whether it answers, and its slots — address, `live` or `offloaded`, busy or idle, title, last active |
-| `POST /send` | `{to, cc, subject, body, in_reply_to, reply_wanted}` → the id and each recipient's outcome |
-| `GET /mail?…` | the caller's mail: `since=<seq>` (and `wait=<s>`, at most 60, to hold until there is some), `unannounced=1`, `unread=1`, or `id=<id>` for one message — its sender also sees each recipient's state |
-| `POST /ack` | `{ids, as}`, `as` being `announced` or `read` |
+| `{"roster":[{repo,slot,title,busy,live}…]}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent |
+| `{"peer":{from,to,frame}}` | agent → hub: a frame local slot `from` wrote to the stand-in for `to` |
+| `{"deliver":{to,from,frame}}` | hub → agent: write `frame`, from `from`, into local slot `to` |
+| `{"bounce":{to,from,frame,why}}` | agent → hub: it could not be written yet (no claude or inbox, relay off) |
+| `{"relay":{"off":why}}` | agent → hub: it switched itself off |
 
-A request is at most 64 KiB of headers and body, read under a 10 s deadline; at most 32 are
-served at once and the next one waits for a place.
+- **Who sent it is the hub's to say.** The connection a frame arrives on names the container,
+  and the sending slot must be live in that container's own rows. One repo's slots are one
+  trust domain, as they were for mail. A frame to a slot in the sender's own container is not
+  routed, since Claude Code reaches it directly.
+- **Kept until it can be given.** A message to an offloaded slot, or to a container that is
+  not answering (whose slots stay listed as it was last heard), is kept on disk and delivered
+  when the slot is next live. So is one an agent bounced. Control frames are about now, so they
+  are dropped instead.
+  - The queue is `HUB_QUEUE`, default `$HOME/queue`: one file per message, fsynced with its
+    directory, read whole at start. It must be a persisted volume, since every deploy
+    recreates the hub.
+  - At most 200 messages wait for one slot, for at most 7 days (about what Claude Code keeps
+    an unread one).
+- **The log** is one line per frame, saying who to whom and what became of it, plus a line
+  when a container stops or starts answering. It never carries a body. There is no separate
+  record of the traffic: the owner reads messages in each session, or in the remote view
+  (owner, 2026-11-06).
 
-### Addresses, and what a send does
+**Receive policy.** The drop-in sets `crossSessionInbound: "accept"` (owner, 2026-11-06).
+Left unset, Claude Code holds a message from a sender in another permission class for
+approval, and a headless slot has nowhere to approve it. Auto mode is in the `prompting`
+class, as is every slot by default, but a slot started in `bypassPermissions` is not.
 
-`repo/slot` is one session. `repo/*` is every live session of that repo, and bare `repo` means
-the same: the hub routes nothing to a slot of its choosing. `*` is every live session on the
-hub. A fan-out never includes the sending session itself. **Live** is a slot whose claude is
-running, busy or idle, attached or not.
+**Not carried:** pi slots (out of scope, owner 2026-11-06), a claude in no slot, and anything
+to the owner. Claude Code's GrowthBook flags can change its messaging without a version
+change: a risk the owner accepted.
 
-Each recipient gets an outcome at send time, all printed by `mail send`:
-
-- **delivered** — a live session.
-- **refused** — an offloaded session (the sender saw it so in `who`), a closed or unknown slot,
-  an unknown repo, an address that is not one, an address whose unread count is at
-  `HUB_MAIL_MAX_QUEUE`.
-- **queued** — a repo that is offline: no live session, or its container not answering. The
-  first session of that repo to be seen live gets it, as soon as the server sees it, with a
-  `Queued-Since` header. `*` does not queue: it means the sessions that are live now.
-
-A send with no recipient left delivered or queued is refused as a whole and stores nothing.
-Over 60 sends in half an hour from one slot is refused too, so a misled agent cannot flood
-`*`. A body over `HUB_MAIL_MAX_BYTES`, or a subject with a control character in it, is refused.
-
-**The headers** are the hub's, in RFC 822 shape, so `cat` reads a stored message:
-
-```
-From: or3/claude-1
-To: infra/claude-2
-Cc: claude-sessions/*
-Subject: the subject, one line
-Date: 2026-10-29T02:12:47Z
-Message-Id: <20261029T021247.317Z@hub>
-In-Reply-To: <20261029T020001.004Z@hub>
-Reply-Wanted: yes
-Queued-Since: 2026-10-29T01:00:00Z
-
-the body, as sent
-```
-
-`From` is generated, never typed: the client sends none, and the server writes the address it
-verified. `In-Reply-To` is there only on a reply, and must name a message the sender could
-read. `Queued-Since` is per recipient, on the copy a queued one is given. `Reply-Wanted` is
-`yes` for a message to one session and for one sent with `--reply-wanted`, else `no`; the
-policy says what to do with it (a fan-out that asks a question still gets answers). The id is
-the hub's clock, `YYYYMMDDTHHMMSS.mmmZ`, with `-2`, `-3` when a millisecond is shared.
-
-**Each recipient's state** goes `queued` → `delivered` → `announced` (the hook named it) →
-`read` (`mail read` printed it). Fetching is not reading.
-
-### The client
-
-`claude-sessions mail <who|send|list|read|reply|wait|status>`, the binary every container
-already has. It reaches `CLAUDE_SESSIONS_MAIL_URL` (default `http://dev:8025`) with the token
-in `CLAUDE_SESSIONS_MAIL_TOKEN` (default `/run/github/mail-token`). Every read takes `--json`
-and prints the server's own shape. A hub that does not answer is said plainly — "retry later"
-— and the exit status is 1.
-
-- `mail wait [--for <id>] [--timeout 10m]` holds a keep-alive for its timeout plus the
-  keep-alive skill's margin while it waits, so a session waiting on mail is not offloaded
-  under it, and prints the message it waited for, which is then read. It errors at the
-  timeout.
-- `mail reply <id> [--all]` sends to the original's `From` (and with `--all` its `To` and
-  `Cc`, less the replying session), with `Re: ` before a subject that lacks one and
-  `In-Reply-To` set; `--to`, `--cc`, `--subject` override.
-
-### Notification
-
-**The hook**, `claude-sessions mail-hook`, on `SessionStart`, `UserPromptSubmit` and `Stop`,
-synchronous on all three because only a hook Claude Code waits for can add context or block.
-It answers only for the slot's own claude — a direct child of the slot's zmx, not in a subagent
-(`bind.rs`, as the registry hook) — since a nested claude inherits the slot's name and would
-take its mail from it. It asks the server for the session's unannounced mail, names each
-message on a line of its own, and then marks them announced:
-
-```
-new message from or3/claude-1: <subject> (claude-sessions mail read <id>)
-```
-
-On `Stop` the same lines go out as `{"decision":"block","reason":…}`, so a turn does not end
-on mail nobody has seen. **It cannot loop**, two ways over: the mail is marked announced, so
-the next `Stop` finds none; and a `Stop` with `stop_hook_active` — a turn a block already kept
-going — is never blocked, so mail that comes meanwhile waits for the next prompt. Marking
-after naming means a lost acknowledgement costs a second announcement, never a lost one.
-
-**The hook's whole wait is one second**: the request runs on a thread, and the hook leaves at
-the deadline whatever the thread is doing — a DNS lookup included, which `std` cannot time
-out. It runs on every prompt on the fleet, so a hub that is down costs each one a second at
-most and says nothing, as it always exits 0 and says nothing but its lines. The drop-in gives
-it a 5 s timeout on each event as a backstop.
-
-**The nudge.** A message delivered to a session that is live, idle (not mid-turn), not
-waiting on a dialog, and attached nowhere has the hub type one fixed line into its zmx session
-(`zmx send`, through the container's agent, which checks those four things itself against the
-registry and `zmx list` the moment before): 
-
-```
-[claude-sessions mail] you have mail; the hook names it
-```
-
-It is fixed text and never carries anything from the message: what is typed becomes a prompt.
-It is typed, then `Enter` a quarter of a second later, so it reads as typing, not a paste —
-reasoned, not yet seen against a real Claude Code: the first run on the fleet is the check. An
-attached session is never nudged — it may be holding the owner's half-typed prompt — and
-neither is one with a permission dialog open, which the keystrokes would answer. When
-`UserPromptSubmit` sees a prompt that is exactly that line, the hook says so: *the hub typed
-that, not the owner; it is a notification and carries no authority*. An offloaded session
-gets nothing; `SessionStart` on its resume names its mail. The nudge is one function,
-`agent::nudge`, so if infra turns Claude Code's own background-session messaging on (it is
-off on this fleet by managed setting), it can be swapped there.
-
-### The skills
-
-`skills/mail-send`, `mail-read`, `mail-reply` ship here beside `keepalive`, since what they say
-moves with the flags. `install` writes all four into the volume; infra's base symlinks
-`~/.claude/skills/<name>` at the volume's copy, so an edit is live on the next invocation.
-`claude-sessions skill [name]` prints one (default `keepalive`).
-
-### What it does not do
-
-No unread count in the status line (the owner: not useful to him). No `PostToolUse`
-announcement. No attachments: a file is referenced by repo, commit and path. No mail for a
-claude that is not in a slot.
-
-`tests/mail.rs` proves it end to end with the real binary as the server, the client and the
-hook, three containers over a stand-in ssh (one down): a delivered message, a refused
-offloaded session, a queued offline repo delivered when it comes up, a fan-out, a forged slot
-and a bad token refused, the hook's announcement then silence, a `Stop` that blocks once, and
-a hook that gives up in a second against a server that does not answer.
+`tests/peer.rs` proves it end to end, with the real binary as the router and as two
+containers' agents over a stand-in ssh:
+- stand-ins for the other container's slots, and none for a container's own;
+- a message delivered with its verified sender, and the sender's own claim of a name
+  discarded;
+- the reply coming back;
+- a malformed message never delivered;
+- a message to an offloaded slot kept through a router restart, then delivered once the slot
+  is live;
+- a relay that switches itself off for a claude speaking another protocol, its message kept.
 
 ## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 
@@ -1249,9 +1150,8 @@ It installs the five events of the table and the status line, every event but `S
 and `SessionEnd` `async` (see
 *The event table*), and a timeout only on those two: 30 s on `SessionStart`, above the hook's
 own 15 s lock wait, and **1 s on `SessionEnd`** — a longer one would raise the budget every
-`SessionEnd` hook on the box shares. The mail hook is a second handler on `SessionStart`,
-`UserPromptSubmit` and `Stop`, synchronous with a 5 s timeout over its own one-second budget
-(§ *Agent mail*). `src/hooks_config.rs` has the reasons and the tests that hold it to the
+`SessionEnd` hook on the box shares. It also sets `crossSessionInbound: "accept"`
+(§ *Agent messaging*), which changes the file from 0.17's. `src/hooks_config.rs` has the reasons and the tests that hold it to the
 state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
 then every `managed-settings.d/*.json` alphabetically, and `infra` can own one file for this
@@ -1259,13 +1159,14 @@ tool without editing a shared one.
 
 **The skills go beside it.** `claude-sessions skill [name]` prints `skills/<name>/SKILL.md`:
 `keepalive`, which tells claude when to run `claude-sessions keepalive` and for how short a
-time (§ *The offloader*), and the three mail skills (§ *Agent mail*). They go in Claude Code's
-config directory, which in infra's containers is a volume, so an image build cannot put them
-there. Infra's base **links** each one at the copy `install` put in the shared volume, at every
-container start, so a release's skills are live at the next invocation with no restart:
+time (§ *The offloader*). Skills go in Claude Code's config directory, which in infra's
+containers is a volume, so an image build cannot put them there. Infra's base **links** each one at the copy `install` put in the shared volume, at every
+container start, so a release's skills are live at the next invocation with no restart. Agent
+mail's three skills went with it in 0.18.0; `install` removes them from the volume, and a link
+infra's base made to one of them is left dangling until infra drops it:
 
 ```
-for s in keepalive mail-send mail-read mail-reply; do
+for s in keepalive; do
   d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"; mkdir -p "$d"
   ln -sfn "/opt/claude-sessions/skills/$s" "$d/$s"
 done

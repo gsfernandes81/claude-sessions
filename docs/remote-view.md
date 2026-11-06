@@ -206,7 +206,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
   It gets one record field, `driver: "holder"`; when the field is absent, the slot is driven by
   a terminal, as today.
   - Old hubs and agents read such a record as a plain claude row.
-  - Archived, mail addresses and the offloader are unchanged.
+  - Archived, messaging addresses and the offloader are unchanged.
   - Resuming it in a normal slot is the same record with the field cleared.
   - A mark on remote rows in the menu, like pi's dim `pi: `, changes the approved mockups.
     **Owner.**
@@ -215,7 +215,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
   - writes one plain line at start and on each state change, never on a timer, so attaching to
     it by hand with `zmx attach` shows what it is (the menu attached it too until 2026-11-03,
     and refuses now); after a resume, the line says idle as soon as claude writes anything;
-  - discards its stdin, because the mail nudge types into detached sessions;
+  - discards its stdin, since nothing typed into its zmx session is meant for claude;
   - writes claude's stderr to `<registry>/<slot>.stderr`, as the launcher does, so a failed
     start is still reported.
 

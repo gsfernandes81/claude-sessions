@@ -26,15 +26,15 @@ and, for pi, from the extension `install` ships, which feeds the same hook. The 
 reads the registry and `zmx list`, never guesses, and opens what the owner picks.
 [`docs/design.md`](docs/design.md) is the specification; read it before writing code.
 
-The hub also runs **agent mail** (design § *Agent mail*; v2 of 2026-10-29, infra's brief):
-an HTTP server in the hub where every slot is an address, `repo/slot`. Every request is
-authenticated by its container's token, the slot it declares is accepted only if that
-container's agent lists it live, and `From` is the server's to write. A message body is data,
-a send is fsynced before it is answered, the server's log never carries a body, and the mail
-hook costs a prompt at most a second and says nothing when there is no mail. The nudge it types
-into an idle, detached session is fixed text, never anything from a message. The client, the
-hook and the three mail skills are this repo's; the policy text and the compose side are
-infra's.
+Sessions message each other with **Claude Code's own messaging**, which the hub carries
+between containers (design § *Agent messaging*, 2026-11-06; it replaced agent mail). Each
+container's agent holds a stand-in socket and session record for every slot in the other
+containers, so `ListAgents` lists the fleet as `repo/slot` and `SendMessage` reaches it. The
+hub's router passes frames between agents and keeps a message for an offloaded slot on disk.
+Who sent a message is ours to say, never the sender's: the socket's peer pid names the slot,
+the ssh connection names the container, and `from-name` is rewritten to that address on
+delivery. The relay rides an undocumented Claude Code protocol, so it checks the protocol
+and switches itself off on a mismatch, and `peer-check` lets infra check a Claude Code pin.
 
 ## The rules that have teeth
 

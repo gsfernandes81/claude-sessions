@@ -1,6 +1,6 @@
 //! The two number formats every screen shares, so the list, the header, `doctor` and the
-//! dialogs can never disagree about what `14m` or `1.0G` means — and the two UTC date formats
-//! mail is stamped with.
+//! dialogs can never disagree about what `14m` or `1.0G` means — and the UTC date the hub's
+//! logs are stamped with.
 
 /// An age as the list shows it: `now` under a minute, then whole minutes, hours, days.
 /// Coarse on purpose — the menu redraws an age at most once a minute, and a finer unit would
@@ -56,29 +56,19 @@ pub fn utc(ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
-/// `ms` as a file name that sorts by time: `20261028T031500.123Z` — no colons, which a
-/// Windows checkout and a shell both mind, and milliseconds, since two messages in one
-/// second are ordinary.
-pub fn stamp(ms: u64) -> String {
-    let (y, m, d, h, mi, s, milli) = civil(ms);
-    format!("{y:04}{m:02}{d:02}T{h:02}{mi:02}{s:02}.{milli:03}Z")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dates_are_utc_and_the_stamp_sorts_by_time() {
+    fn dates_are_utc() {
         // 2026-10-28T03:15:00.123Z, checked against `date -u -d @1793157300`.
         let ms = 1_793_157_300_123;
         assert_eq!(utc(ms), "2026-10-28T03:15:00Z");
-        assert_eq!(stamp(ms), "20261028T031500.123Z");
         assert_eq!(utc(0), "1970-01-01T00:00:00Z");
         // A leap day, and the year turning.
         assert_eq!(utc(1_709_164_800_000), "2024-02-29T00:00:00Z");
         assert_eq!(utc(1_767_225_599_000), "2025-12-31T23:59:59Z");
-        assert!(stamp(ms) < stamp(ms + 1));
     }
 
     #[test]

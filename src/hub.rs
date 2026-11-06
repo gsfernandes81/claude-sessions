@@ -103,6 +103,9 @@ pub enum Event {
     Snapshot(String, Snapshot),
     /// The container stopped answering, or never did, and what was said about it.
     Down(String, String),
+    /// What its relay said (`peer.rs`): a frame a local claude sent another container's slot,
+    /// a delivery it bounced, or that it switched itself off. Only the router acts on these.
+    Relay(Value),
 }
 
 /// What a connection tells an action waiting on it.
@@ -141,12 +144,10 @@ impl Conn {
         pipe.flush()
     }
 
-    /// `op` sent to the container's agent with an id of its own, and its answer not waited
-    /// for: the mail server's nudge, which the agent judges and the log does not need back.
-    pub fn fire(&self, mut op: Value) -> io::Result<()> {
-        let id = self.next.fetch_add(1, Ordering::SeqCst);
-        op.set("id", Value::num(id as f64));
-        self.send(&op)
+    /// `v` sent to the container's agent as it is: the router's roster and deliveries, which
+    /// are not actions and get no answer.
+    pub fn tell(&self, v: &Value) -> io::Result<()> {
+        self.send(v)
     }
 
     fn fail_all(&self, why: &str) {
@@ -206,6 +207,13 @@ pub fn connect(host: &str, events: Sender<Event>, wake: fn()) -> Arc<Conn> {
                 if let Some(snap) = proto::snapshot_from(&msg, &name) {
                     let _ = events.send(Event::Snapshot(name.clone(), snap));
                     wake();
+                    continue;
+                }
+                if ["peer", "bounce", "relay"]
+                    .iter()
+                    .any(|k| msg.get(k).is_some())
+                {
+                    let _ = events.send(Event::Relay(msg));
                     continue;
                 }
                 let Some(id) = msg.get("id").and_then(Value::as_u64) else {

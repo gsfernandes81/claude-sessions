@@ -51,7 +51,6 @@ mod fmt;
 mod harness;
 mod holder;
 mod hooks_config;
-mod http;
 mod hub;
 mod install;
 mod json;
@@ -59,12 +58,11 @@ mod keepalive;
 mod launch;
 mod live;
 mod lockfile;
-mod mail;
-mod mailbox;
 mod markdown;
 mod mem;
 mod menu;
 mod offload;
+mod peer;
 mod pisession;
 mod procinfo;
 mod proto;
@@ -72,6 +70,7 @@ mod reduce;
 mod registry;
 mod relay;
 mod render;
+mod router;
 mod run;
 mod sdk;
 mod signal;
@@ -102,12 +101,11 @@ const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 /// still a placeholder (`install::pi_extension` fills it).
 pub const PI_EXTENSION: &str = include_str!("../extensions/claude-sessions.js");
 
-pub const SKILLS: [(&str, &str); 4] = [
-    ("keepalive", SKILL),
-    ("mail-send", include_str!("../skills/mail-send/SKILL.md")),
-    ("mail-read", include_str!("../skills/mail-read/SKILL.md")),
-    ("mail-reply", include_str!("../skills/mail-reply/SKILL.md")),
-];
+pub const SKILLS: [(&str, &str); 1] = [("keepalive", SKILL)];
+
+/// Skills earlier releases shipped, which `install` removes so no session is told to use a
+/// command this binary no longer has: agent mail's three, gone with it.
+pub const RETIRED_SKILLS: [&str; 3] = ["mail-send", "mail-read", "mail-reply"];
 
 /// The menu's exit status when its terminal went away: 128 + SIGHUP, what a shell reports
 /// for a hangup, so the door can tell it from a failure worth explaining.
@@ -138,35 +136,17 @@ fn main() -> ExitCode {
             contained(cmd_hook, log);
             ExitCode::SUCCESS
         }
-        // The mail hook has the same contract: fed by Claude Code, always 0, and the only thing
-        // it may say is its lines — one per new message, or a Stop's block.
-        "mail-hook" => {
-            std::panic::set_hook(Box::new(|info| {
-                log(&format!("mail-hook: panicked: {info}"))
-            }));
-            contained(
-                || {
-                    let mut payload = String::new();
-                    std::io::stdin()
-                        .take(1 << 20)
-                        .read_to_string(&mut payload)?;
-                    mail::hook(&payload, &mut std::io::stdout().lock(), &log)
-                },
-                |e| log(&format!("mail-{e}")),
-            );
-            ExitCode::SUCCESS
-        }
-        "mail-server" => report(mail::server()),
-        "mail" => {
-            match mail::cli(
-                &args[1..],
-                &mut std::io::stdin().lock(),
-                &mut std::io::stdout().lock(),
-            ) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e),
+        "router" => report(router::serve()),
+        // The name the hub's start ran agent mail's server by until 0.18.0, kept so a hub
+        // whose entrypoint still says it runs the router instead.
+        "mail-server" => report(router::serve()),
+        "peer-check" => match peer::check(args.get(1).map(String::as_str)) {
+            Ok(line) => {
+                say!("{line}");
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => fail(&e),
+        },
         "reconcile" => report(cmd_reconcile()),
         "doctor" => report(cmd_doctor()),
         // The menu, when there is a person at a terminal to drive it; the plain list when the
@@ -345,9 +325,12 @@ fn usage() -> String {
                                this one); the list below when not at a terminal
   claude-sessions offload-all  one offload pass in every container, over ssh; run from the
                   [--dry-run]  hub's timer every three minutes
-  claude-sessions mail-server  the hub's mail server (HUB_MAIL_LISTEN, default 0.0.0.0:8025),
-                               holding an agent in every container for who is live; run from
-                               the hub's start, for ever
+  claude-sessions router       carry Claude Code's own messages between containers, holding
+                               an agent in every container; run from the hub's start, for
+                               ever (HUB_QUEUE keeps what waits, default ~/queue)
+  claude-sessions peer-check [CLAUDE]
+                               start a claude (default: claude on PATH) and check it speaks
+                               the peer protocol the relay does; exits 1 if not
   claude-sessions install DIR  put this binary, its hooks drop-in and its skills in DIR, for
                                every container to mount
   claude-sessions agent        a container's half of the hub, run over ssh by the hub
@@ -363,10 +346,6 @@ fn usage() -> String {
   claude-sessions remote new [DIR] | open SLOT | resume ID CWD TITLE
                                open a session for the remote view, under the holder, then
                                be its tap; its first line names the slot, or why not
-  claude-sessions mail who|send|list|read|reply|wait|status
-                               agent mail, from a session to others; `mail` alone says how
-  claude-sessions mail-hook    fed by Claude Code's hooks on stdin; one line per message new
-                               to this session, nothing otherwise; always exits 0
   claude-sessions list         every slot here, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart
@@ -379,9 +358,8 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill [NAME] print a skill this binary ships (keepalive, mail-send,
-                               mail-read, mail-reply; default keepalive), as install writes
-                               it into skills/NAME/SKILL.md
+  claude-sessions skill [NAME] print a skill this binary ships (keepalive, the default), as
+                               install writes it into skills/NAME/SKILL.md
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status

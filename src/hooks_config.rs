@@ -49,19 +49,9 @@ fn timeout_secs(event: &str) -> Option<u32> {
     }
 }
 
-/// The events the mail hook (`mail::hook`) is on: a conversation opening, each prompt, and
-/// each turn's end, which it blocks once when mail has come. Synchronous, because its lines
-/// are its stdout, which Claude Code adds to the context — or reads as a `Stop`'s decision —
-/// only from a hook it waited for. Its own budget is one second (`mail::HOOK_BUDGET`); the
-/// timeout is a backstop above it.
-pub const MAIL_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "Stop"];
-const MAIL_TIMEOUT_SECS: u32 = 5;
-const _: () = assert!(MAIL_TIMEOUT_SECS as u64 > crate::mail::HOOK_BUDGET.as_secs());
-
 /// The settings document, with `exe` as the path to this binary.
 pub fn settings(exe: &str) -> Value {
     let command = format!("{} hook", shell_quote(exe));
-    let mail = format!("{} mail-hook", shell_quote(exe));
     let mut hooks = Value::obj();
     for event in EVENTS {
         let mut handler = Value::obj();
@@ -73,16 +63,7 @@ pub fn settings(exe: &str) -> Value {
         }
         let mut group = Value::obj();
         group.set("hooks", Value::Arr(vec![handler]));
-        let mut groups = vec![group];
-        if MAIL_EVENTS.contains(&event) {
-            let mut handler = Value::obj();
-            handler.set("type", Value::string("command"));
-            handler.set("command", Value::string(mail.as_str()));
-            handler.set("timeout", Value::num(MAIL_TIMEOUT_SECS));
-            let mut group = Value::obj();
-            group.set("hooks", Value::Arr(vec![handler]));
-            groups.push(group);
-        }
+        let groups = vec![group];
         hooks.set(event, Value::Arr(groups));
     }
     let mut doc = Value::obj();
@@ -99,6 +80,12 @@ pub fn settings(exe: &str) -> Value {
     // (seconds); Claude Code redraws only when the text changes.
     status.set("refreshInterval", Value::num(60));
     doc.set("statusLine", status);
+    // Agent messaging (owner, 2026-11-06): a message from another session is delivered
+    // whatever the permission modes on either side. Unset, Claude Code holds one from a
+    // sender in another permission class for approval, and a slot run headless has nowhere to
+    // approve it, so it expires unseen. Here rather than in infra's settings because it exists
+    // for the relay, and arrives and leaves with this binary's pin.
+    doc.set("crossSessionInbound", Value::string("accept"));
     doc
 }
 
@@ -208,10 +195,9 @@ mod tests {
         }
     }
 
-    /// The mail hook is a second handler on exactly the three events it announces on, waited
-    /// for (its stdout is the announcement) and timed out; the registry hook stays first.
+    /// One handler per event, the registry's: agent mail's hook went with it (0.18.0).
     #[test]
-    fn the_mail_hook_is_on_session_start_each_prompt_and_each_stop_and_is_waited_for() {
+    fn each_event_has_the_registry_hook_alone() {
         let doc = installed();
         for event in EVENTS {
             let groups = doc
@@ -225,31 +211,18 @@ mod tests {
                 .flatten()
                 .filter_map(|h| h.get("command").and_then(Value::as_str))
                 .collect();
-            if MAIL_EVENTS.contains(&event) {
-                assert_eq!(
-                    commands,
-                    [
-                        "/usr/local/bin/claude-sessions hook",
-                        "/usr/local/bin/claude-sessions mail-hook"
-                    ],
-                    "{event}"
-                );
-                let h = &groups[1].get("hooks").and_then(Value::as_arr).unwrap()[0];
-                assert_eq!(
-                    h.get("async"),
-                    None,
-                    "{event}: waited for, or its line is lost"
-                );
-                assert!(
-                    h.get("timeout")
-                        .and_then(Value::as_f64)
-                        .is_some_and(|t| t > 0.0),
-                    "{event}: a hub that does not answer must not hold the prompt for ever"
-                );
-            } else {
-                assert_eq!(commands, ["/usr/local/bin/claude-sessions hook"], "{event}");
-            }
+            assert_eq!(commands, ["/usr/local/bin/claude-sessions hook"], "{event}");
         }
+    }
+
+    #[test]
+    fn messages_from_other_sessions_are_accepted_whatever_the_modes() {
+        assert_eq!(
+            installed()
+                .get("crossSessionInbound")
+                .and_then(Value::as_str),
+            Some("accept")
+        );
     }
 
     #[test]

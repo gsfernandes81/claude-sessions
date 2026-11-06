@@ -1,9 +1,26 @@
 # Replacing agent mail with Claude Code's own messaging — investigation, 2026-11-06
 
-**First orders for the next session:** build design A below (relay into Claude Code's own
-messaging) with **the hub as router**. Nothing is built yet. The owner asked for "a design
-that links all sessions across all containers and does away with our custom mail work".
-Both experiments have passed (see the end). The decisions are below.
+**First orders for the next session:** the relay is **built** (design § *Agent messaging*:
+`src/peer.rs`, `src/router.rs`, `tests/peer.rs`), and agent mail is removed. Still open:
+
+1. **Release** when the owner asks for the bump (a version bump is a publish). The release
+   note's "For infra" section must say:
+   - the hub's entrypoint runs `claude-sessions router` (`mail-server` still works, as an
+     alias);
+   - `HUB_QUEUE` (default `$HOME/queue`) must be a persisted volume. The `mail` volume, its
+     tokens and `HUB_MAIL_*` can go;
+   - `hooks-config` output changes: no `mail-hook`, plus `crossSessionInbound: "accept"`.
+     Infra updates its drop-in row in decisions.md;
+   - the three mail skills are removed from the volume, so infra's base should stop linking
+     them;
+   - infra's managed mail text goes;
+   - `claude-sessions peer-check` is for `make verify` and dev-smoke.
+2. **The first run on the fleet** after infra pins it. Check that a slot in one container
+   lists another container's slots with `ListAgents`, and that a message and its reply cross.
+   Only the owner or infra bring it up.
+
+Delete this note once both are done. The durable reasoning is in the design; the research
+below stays until then as the record of how 2.1.311 behaves.
 
 ## Settled, 2026-11-06 (owner, and infra's agent infra/claude-14 by mail)
 
