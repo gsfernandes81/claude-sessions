@@ -930,7 +930,13 @@ impl Relay {
                     out.push(err("answered elsewhere"));
                     return;
                 };
-                let no = s(v, "x").unwrap_or_else(|| DENY.to_string());
+                // No, or Esc, with nothing typed for Claude stops the turn, as Claude Code's
+                // does (`Interrupted · What should Claude do instead?`); words for Claude let
+                // it go on with them, as Claude Code's "tell Claude what to do differently"
+                // does. A question declined is left as it was.
+                let typed = s(v, "x");
+                let interrupt = t == "perm" && typed.is_none();
+                let no = typed.unwrap_or_else(|| DENY.to_string());
                 let line = match (t, s(v, "a").as_deref()) {
                     ("perm", Some("y")) => sdk::allow(&r, input),
                     ("perm", Some("a")) => {
@@ -946,7 +952,7 @@ impl Relay {
                         };
                         sdk::answer_questions(&r, &input, &answers)
                     }
-                    _ => sdk::deny(&r, &no),
+                    _ => sdk::deny(&r, &no, interrupt),
                 };
                 to(line);
             }
@@ -2331,6 +2337,25 @@ mod tests {
                 "{lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn no_at_a_permission_prompt_stops_the_turn_and_words_for_claude_let_it_go_on() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        line(&mut r, epoch, 1, ASK);
+        // No, or Esc: denied, and the turn stops there, as Claude Code's does.
+        let said = to_claude(&client(&mut r, r#"{"t":"perm","r":"p1","a":"n"}"#));
+        assert!(said[0].contains(r#""behavior":"deny""#), "{said:?}");
+        assert!(said[0].contains(r#""interrupt":true"#), "{said:?}");
+        assert!(said[0].contains("STOP what you are doing"), "{said:?}");
+        // No with something typed for Claude: denied with those words, and the turn goes on.
+        let said = to_claude(&client(
+            &mut r,
+            r#"{"t":"perm","r":"p1","a":"n","x":"use a temp dir instead"}"#,
+        ));
+        assert!(said[0].contains("use a temp dir instead"), "{said:?}");
+        assert!(!said[0].contains("interrupt"), "{said:?}");
     }
 
     #[test]

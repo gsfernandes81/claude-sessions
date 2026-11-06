@@ -344,7 +344,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client; while a shell command runs, followed by claude's `background_tasks`, once claude can move it |
      | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
      | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in — for a shell command, once claude can move it — else its `interrupt` with `send_now` |
-     | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
+     | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told; `n` without `x` stops the turn (`interrupt`), as Claude Code's No does, and with it the turn goes on |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
      | `esc` · `exit` · `models` · `full {id}` | interrupt, end the session, the model list, a tool result whole |

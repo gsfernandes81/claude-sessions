@@ -1431,15 +1431,19 @@ pub fn allow_always(request_id: &str, input: Value, suggestions: &[Value]) -> Va
     )
 }
 
-/// Deny a tool call; `message` is what claude is told.
-pub fn deny(request_id: &str, message: &str) -> Value {
-    answer(
-        request_id,
-        obj(vec![
-            ("behavior", Value::string("deny")),
-            ("message", Value::string(message)),
-        ]),
-    )
+/// Deny a tool call; `message` is what claude is told. With `interrupt`, the turn stops
+/// there, as Claude Code's own No stops it: claude answers with `[Request interrupted by
+/// user for tool use]` and ends the turn (2.1.311, measured 2026-11-06). Without, as for
+/// Claude Code's No with something typed for Claude, the turn goes on with the denial.
+pub fn deny(request_id: &str, message: &str, interrupt: bool) -> Value {
+    let mut body = vec![
+        ("behavior", Value::string("deny")),
+        ("message", Value::string(message)),
+    ];
+    if interrupt {
+        body.push(("interrupt", Value::Bool(true)));
+    }
+    answer(request_id, obj(body))
 }
 
 /// Answer an `AskUserQuestion`: allowed, with its input and `answers` keyed by each
@@ -1539,7 +1543,7 @@ mod input_tests {
                 },
             ),
             (
-                deny("r3", "no"),
+                deny("r3", "no", false),
                 Input::Answer {
                     request_id: "r3".into(),
                     how: "denied".into(),
@@ -2136,8 +2140,12 @@ mod tests {
             r#"{"response":{"request_id":"r1","response":{"behavior":"allow","updatedInput":{"command":"touch x"}},"subtype":"success"},"type":"control_response"}"#
         );
         assert_eq!(
-            to_line(&deny("r1", "no")),
+            to_line(&deny("r1", "no", false)),
             r#"{"response":{"request_id":"r1","response":{"behavior":"deny","message":"no"},"subtype":"success"},"type":"control_response"}"#
+        );
+        assert_eq!(
+            to_line(&deny("r1", "no", true)),
+            r#"{"response":{"request_id":"r1","response":{"behavior":"deny","interrupt":true,"message":"no"},"subtype":"success"},"type":"control_response"}"#
         );
         let q = parse(r#"{"questions":[{"question":"Red or blue?"}]}"#).unwrap();
         let line = to_line(&answer_questions(
