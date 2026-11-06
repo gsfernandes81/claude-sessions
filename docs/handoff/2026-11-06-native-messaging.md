@@ -118,3 +118,38 @@ It's cheap to try on one container, but it's a fleet setting, so the owner and i
 2. From that listener, deliver a message to a scratch slot (a headless `claude -p` under the
    holder, cheap model), and have the slot reply. Confirm the reply reaches the stand-in,
    and see what happens without `crossSessionInbound: "accept"`.
+
+## Variant: no hub, signed messages between agents (owner's question, 2026-11-06)
+
+The hub does four jobs for mail: carrying messages between containers, proving who sent them,
+keeping the roster, and queueing for a container that is down. All four can move into the
+container agents, with signatures standing in for the container token. Dependencies are now
+allowed (owner, 2026-11-06), so the signing comes from a crate (`ed25519-dalek`, pure Rust,
+builds for musl), not hand-written cryptography.
+
+- **Keys.** Each container has an ed25519 key pair. The private key is that container's
+  alone. Every container holds the fleet's public keys, keyed by repo, and that list is the
+  trust root. Its source is infra's choice: generated at compose time and mounted read-only
+  (no hub at all), or written once by the hub into the shared install volume it already
+  writes (the hub at install time only, never in the message path).
+- **Envelope.** `{from: repo/slot, to: repo/slot, msg_id, sent_at, from_session, body}` in one
+  canonical byte form, plus the sender container's signature. The receiver checks:
+  - the signature against `keys[from.repo]`;
+  - that `to` names its own repo, so a message can't be redirected;
+  - that `sent_at` is inside a window (say 10 minutes);
+  - that `msg_id` hasn't been seen inside that window, so a message can't be replayed.
+- **Which slot sent it.** The container vouches for its own slots. The sending agent learns
+  the slot from the local stand-in connection: `SO_PEERCRED` gives the pid, the claude
+  registry gives the session, and our registry gives the slot. So no claude can claim
+  another slot's name, which is stronger than today's declared slot header.
+- **Transport.** Agent to agent over plain HTTP on the compose network. The signature
+  covers the message, not the connection, so a queued or forwarded envelope stays
+  verifiable. The sender's agent queues on disk and retries a container that is down.
+  Anything in between, including a hub kept as a plain forwarder or Cloudflare later, can
+  delay a message but can't forge one. mTLS (rustls) would encrypt and authenticate the
+  connection, but proves nothing about a message once it has been queued. It can be added
+  later if the link leaves the host.
+- **Roster.** Each agent serves its slots (name, status, live or offloaded) and the others
+  poll it, or get it pushed on a change. The list of peers is the public-key list.
+- **Not checked:** whether containers can reach each other directly on the compose
+  network. From here only `hub` was resolved.
