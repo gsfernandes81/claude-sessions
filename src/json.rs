@@ -1,14 +1,9 @@
-//! A small JSON reader and writer, because this crate has no dependencies.
+//! A small JSON reader and writer, written before the crate took dependencies.
 //!
-//! **Why hand-rolled.** Three reasons, in the order they matter. This binary is pulled into a
-//! container image by checksum and runs on the ssh path, so every dependency is a thing to
-//! audit and a thing that has to cross-compile to static musl. Hook payloads must be read
-//! *tolerantly* — Claude Code updates itself in place in these containers, so an unknown field
-//! or a renamed one has to degrade to "no evidence" rather than to an error on the door — and
-//! a `Value` tree does that more honestly than a struct with twelve `Option`s. And the
-//! development container this is written in has no C linker at all, so a crate with a build
-//! script or a proc macro cannot be compiled here; a zero-dependency crate builds and tests
-//! locally against `aarch64-unknown-linux-musl` with the toolchain's own `rust-lld`.
+//! Hook payloads must be read *tolerantly* — Claude Code updates itself in place in these
+//! containers, so an unknown field or a renamed one has to degrade to "no evidence" rather
+//! than to an error on the door — and a `Value` tree does that more honestly than a struct
+//! with twelve `Option`s. That holds with or without a JSON crate.
 //!
 //! It is deliberately small: enough for the registry's own files and for reading a hook
 //! payload. Not a general-purpose library, and it says so rather than growing into one.

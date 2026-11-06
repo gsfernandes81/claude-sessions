@@ -7,8 +7,8 @@
 //! — `tests/pty_harness.rs` calibrates it both ways before anything trusts it.
 //!
 //! Included by path (`#[path = "support/pty.rs"] mod pty;`) from integration tests, and from
-//! `src/term.rs`'s own tests, so it is std plus a few C functions declared here — this crate
-//! has no dependencies; see Cargo.toml.
+//! `src/term.rs`'s own tests, so it is std plus a few C functions declared here, written
+//! before the crate took dependencies.
 //!
 //! The pair is opened from `/dev/ptmx` with std's `File` rather than with `openpty(3)`,
 //! because std opens with `O_CLOEXEC` and musl's `openpty` does not: tests run in parallel

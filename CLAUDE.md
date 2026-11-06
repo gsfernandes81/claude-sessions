@@ -87,27 +87,25 @@ infra's.
 - **Never start, stop or offload anything on the fleet on your own initiative.** Bring-up is
   the owner's. This applies to a cloud session too: you can build and test, you cannot deploy.
 
-## Building, and why there are no dependencies
+## Building, and dependencies
 
-**This crate has no dependencies.** It was load-bearing: until 2026-10-27 the container it is
-developed in had **no C linker** — no `cc`, no libc-dev, and no `sudo` to install either — so
-a crate with a build script or a proc macro could not be compiled there, and a dependency on
-`serde` would have meant the tests could only ever run in CI. With nothing but `std`, the
-whole crate builds and its tests *run* against `aarch64-unknown-linux-musl` using the
-toolchain's own `rust-lld` and the bundled musl CRT. **The owner has since let a C toolchain
-into the image** (2026-10-27), so that reason no longer binds; whether the crate now takes
-dependencies is the owner's decision, not one to make in passing — until then, still none.
+**The crate may take dependencies** (owner, 2026-11-06). A crate has to cross-compile to the
+static musl release on both architectures, since that is what ships. Until then it took
+none — the dev container had no C linker before 2026-10-27 — which is why the libc calls
+below are declared by hand and `src/json.rs` exists; replace them with a crate when that is
+worth it.
 
 That container is `claude-sessions`, in infra's dev Compose project, built from
 `Dockerfile.dev` here: the shared base plus a pinned Rust toolchain, `gcc` and `libc6-dev` to
 link host tools, and a pinned `cargo-mutants`. Bump the toolchain and tools there, not with
 `rustup` or `cargo install` in a running container, which a rebuild would lose.
 
-`.cargo/config.toml` pins that target for the same reason, and it is also what ships: the
-release is a static musl build, so the thing under test is the thing published. CI names the
+`.cargo/config.toml` pins `aarch64-unknown-linux-musl`, linked with the toolchain's own
+`rust-lld`, because that is what ships: the release is a static musl build, so the thing
+under test is the thing published. CI names the
 target explicitly per job because the runner is x86_64.
 
-The syscalls are declared directly rather than taken from `libc`: `flock` in `src/lockfile.rs`,
+The syscalls declared by hand rather than taken from `libc`: `flock` in `src/lockfile.rs`,
 `kill` plus the two pidfd calls in `src/signal.rs`, `socket`, `send` and `recv` for the
 socket-diagnostics netlink in `src/sockdiag.rs`, `clock_gettime` in `src/clock.rs`, and the
 terminal's termios, `ioctl`, `poll`, `signal` and `read` in `src/term.rs`, each with a note on

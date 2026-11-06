@@ -7,28 +7,13 @@ description = "Several Claude Code sessions per box, cheap when idle, findable a
 repository = "https://github.com/gsfernandes81/claude-sessions"
 license = "AGPL-3.0-or-later"
 
-# NO DEPENDENCIES, and that is a decision rather than an accident. Three reasons, in the
-# order they matter:
-#
-#   1. This binary is pulled into a container image by checksum and is what an ssh login
-#      lands on. Every crate is a thing to audit and a thing that must cross-compile to
-#      static musl for two architectures.
-#   2. Hook payloads have to be read TOLERANTLY — Claude Code updates itself in place in
-#      these containers, so an unknown or renamed field must degrade to "no evidence"
-#      rather than to an error on the door. src/json.rs reads a Value tree, which does that
-#      more honestly than a struct of twelve Options.
-#   3. Until 2026-10-27 the container this is developed in HAD NO C LINKER, so a crate with
-#      a build script or a proc macro could not be compiled there at all, and a dependency
-#      on serde would have meant the tests only ever ran in CI. The owner has since let a C
-#      toolchain into the image; whether the crate now takes dependencies is the owner's
-#      call (CLAUDE.md), and until then it takes none. The tests still build and run
-#      against aarch64-unknown-linux-musl with the toolchain's own rust-lld — see
-#      .cargo/config.toml — which is what ships.
-#
-# The syscalls needed are declared directly, each with a note on why its layout is the same
-# on both targets: flock in src/lockfile.rs; kill and the pidfd calls in src/signal.rs;
-# socket, send and recv for the socket-diagnostics netlink in src/sockdiag.rs; clock_gettime
-# in src/clock.rs; termios, ioctl, poll, signal and read in src/term.rs.
+# Dependencies are allowed (owner, 2026-11-06). A crate must cross-compile to the static musl
+# release for both architectures (aarch64 and x86_64-unknown-linux-musl), since that is what
+# ships. Until that date the crate took none, so what it needed from libc is declared by hand,
+# each with a note on why its layout is the same on both targets: flock in src/lockfile.rs;
+# kill and the pidfd calls in src/signal.rs; socket, send and recv for the socket-diagnostics
+# netlink in src/sockdiag.rs; clock_gettime in src/clock.rs; termios, ioctl, poll, signal and
+# read in src/term.rs. Those can move to a crate when one is worth it.
 [dependencies]
 
 [profile.release]

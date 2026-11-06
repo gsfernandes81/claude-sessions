@@ -18,8 +18,8 @@ use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-// Declared here rather than taken from the `libc` crate, because this crate has no
-// dependencies — see Cargo.toml. These two values are part of Linux's ABI and cannot change:
+// Declared here rather than taken from the `libc` crate, written before the crate took
+// dependencies (see Cargo.toml). These two values are part of Linux's ABI and cannot change:
 // `flock(2)` has carried them since 4.2BSD.
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;

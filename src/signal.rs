@@ -9,8 +9,8 @@
 //! held by two processes at once. From then on a signal sent through it reaches that
 //! process or nobody.
 //!
-//! The syscalls are declared here rather than taken from the `libc` crate, because this crate
-//! has no dependencies — see Cargo.toml. `pidfd_open` (434) and `pidfd_send_signal` (424) are
+//! The syscalls are declared here rather than taken from the `libc` crate, written before the
+//! crate took dependencies (see Cargo.toml). `pidfd_open` (434) and `pidfd_send_signal` (424) are
 //! in the generic syscall table, so the numbers are the same on x86_64 and aarch64, the two
 //! targets this ships for. Both arrived in Linux 5.3; on an older kernel the `ENOSYS` falls
 //! back to `kill(2)` after the same start-time check, which is the best that kernel offers.

@@ -17,8 +17,8 @@
 //! `5` and `~` would type into the menu — and `Esc` quits it. The [`Decoder`] holds an
 //! incomplete sequence across reads and resolves it only after [`ESC_WAIT`] of silence.
 //!
-//! The C functions are declared here rather than taken from the `libc` crate, because this
-//! crate has no dependencies — see Cargo.toml. Every layout and constant below is the same on
+//! The C functions are declared here rather than taken from the `libc` crate, written before
+//! the crate took dependencies (see Cargo.toml). Every layout and constant below is the same on
 //! x86_64 and aarch64 Linux musl, the two targets this ships for; each says why.
 
 use crate::ui::{Key, Terminal};
