@@ -586,9 +586,13 @@ impl App {
                 // The conversation's ops.
                 if let Screen::Conv { c, ui, .. } = &mut self.screen {
                     // Scrolled back, the view stays on what it shows while lines arrive under
-                    // it; at the bottom it follows them.
+                    // it; at the bottom it follows them. Older history lands above the view,
+                    // and the scroll is measured from the bottom, so it holds by itself:
+                    // counted as arriving under it, each stretch threw the view back by all
+                    // of it, pages at a time on the phone (owner, 2026-11-06).
                     let (w, h) = term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize));
-                    let held = (ui.scroll > 0).then(|| convo::max_scroll(c, ui, w, h));
+                    let held =
+                        (ui.scroll > 0 && t != "old").then(|| convo::max_scroll(c, ui, w, h));
                     match c.apply(&v, now) {
                         Applied::TurnEnded(d) => c.local(Entry::Worked(format!(
                             "Worked for {} · done {}",
@@ -3293,6 +3297,55 @@ mod tests {
     }
 
     const TASKS: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","c":"for i in 1 2; do echo $i; done","st":"running","t0":1000},{"i":"m1","k":"monitor","d":"Watch it","c":"tail -f x","st":"running"}]}"#;
+
+    #[test]
+    fn scrolled_back_the_view_holds_while_older_history_arrives_above_it() {
+        // Lines loaded above the view as it nears the top: what is on screen stays, rather
+        // than jumping back by everything that came (owner's bug of 2026-11-06, on Termux).
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let add = format!(
+            r#"{{"t":"add","id":12,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let mut app = app_in(&[r#"{"t":"add","id":11,"k":"user","x":"count"}"#, &add]);
+        let (w, h) = term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize));
+        let shown = |app: &App| match &app.screen {
+            // The transcript's rows: the status line under the prompt changes as ops come.
+            Screen::Conv { c, ui, .. } => {
+                let mut l = convo::draw(c, ui, w, h, Instant::now()).lines;
+                l.truncate(h - 5);
+                l
+            }
+            _ => panic!("not in a conversation"),
+        };
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.scroll = 10;
+        }
+        let before = shown(&app);
+        let older: Vec<String> = (1..=30).map(|n| format!("old {n}")).collect();
+        let old = format!(
+            r#"{{"t":"old","o":[{{"t":"add","id":1,"k":"user","x":"before"}},{{"t":"add","id":2,"k":"text","x":"{}"}}]}}"#,
+            older.join("\\n")
+        );
+        app.heard(parse(&old).unwrap(), Instant::now());
+        assert_eq!(
+            ui_of(&app).scroll,
+            10,
+            "measured from the bottom, which did not move"
+        );
+        assert_eq!(
+            shown(&app),
+            before,
+            "the same lines, though thirty came above them"
+        );
+        // Calibration: lines under the view still hold it, as before.
+        app.heard(
+            parse(r#"{"t":"add","id":13,"k":"text","x":"newer"}"#).unwrap(),
+            Instant::now(),
+        );
+        assert!(ui_of(&app).scroll > 10);
+        assert_eq!(shown(&app), before);
+    }
 
     #[test]
     fn down_on_an_empty_prompt_focuses_the_pill_and_enter_opens_the_tasks_view() {
