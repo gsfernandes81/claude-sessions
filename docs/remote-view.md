@@ -85,7 +85,7 @@ to infra by agent mail on 2026-11-01. **A bump is a checklist**, run before the 
 The command line:
 
 ```sh
-CLAUDE_CODE_ENTRYPOINT=ssh-remote \
+CLAUDE_CODE_ENTRYPOINT=ssh-remote CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES=1 \
 claude -p --input-format stream-json --output-format stream-json --verbose \
   --include-partial-messages --permission-prompt-tool stdio \
   [--model M] [--effort L] [--resume ID | --session-id UUID]
@@ -358,7 +358,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text; claude's summary of a step's tool calls is `sum {id, x, g}` on each call it covers, `g` the step's first, which an older client skips |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -442,8 +442,19 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        its `psn`), failing closed. A listed block with no text is ordinary thinking, as in
        Claude Code. The hint is Claude Code's for a model without its `quizzical_shore`
        capability, Opus 5.5 among them; `/copy` leaves narration out, as it takes text blocks
-       alone. Claude Code's `tool_use_summary` lines (`CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES`)
-       are not this: its terminal ignores them, so the phone does too.
+       alone. Claude Code's `tool_use_summary` lines are something else, below.
+     - **A step's tool calls are said in claude's own words**, not counted: the owner's ask
+       of 2026-11-06, with Ctrl+O expanding them into the calls themselves. The holder runs
+       claude with `CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES=1`, and claude then sends, a moment
+       after each step, `tool_use_summary` — a few words (`Listed root, read hostname`) and the
+       tool-use ids of that step's calls (2.1.311, read 2026-11-06). Claude's SDK hosts draw
+       these; its terminal ignores them, so this departs from the terminal and from the
+       mockups' `Ran 2 shell commands, read 1 file`, on the owner's word. A run of calls is
+       drawn as a grey line per summarised step, in order; calls with no summary yet are
+       counted as before, and the call running is drawn as before, under way. Ctrl+O draws
+       every call with its result and no summaries. claude keeps them only on its stream,
+       not in the transcript, so history read back from the transcript — a stretch from
+       before the holder started — is counted.
      - Typing a command's name, the **suggestion list** stands over the prompt as Claude
        Code's does: claude's commands (`initialize`'s, with what each does, asked for when a
        conversation opens) and the phone's, those that start with what is typed first, then

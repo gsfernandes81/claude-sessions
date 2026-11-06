@@ -210,7 +210,8 @@ fn op_id(op: &Op) -> Option<u64> {
         | Op::SetText { id, .. }
         | Op::Result { id, .. }
         | Op::Resolved { id, .. }
-        | Op::Progress { id, .. } => Some(*id),
+        | Op::Progress { id, .. }
+        | Op::Summary { id, .. } => Some(*id),
         Op::State(_) | Op::Meta(_) | Op::Back { .. } | Op::Tasks(_) => None,
     }
 }

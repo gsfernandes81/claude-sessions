@@ -268,6 +268,9 @@ pub fn serve(
         .args(HEADLESS)
         .args(args)
         .env("CLAUDE_CODE_ENTRYPOINT", ENTRYPOINT)
+        // A short summary of each step's tool calls (`tool_use_summary`), which the view
+        // draws in place of counting them, as Claude's own SDK hosts do (owner, 2026-11-06).
+        .env("CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;

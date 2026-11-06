@@ -74,6 +74,9 @@ pub enum Op {
         uuid: String,
         queued: bool,
     },
+    /// claude's summary of one step's tool calls, on each call item it covers: `group` is
+    /// the first of them, so the view draws the step as one line of `text`.
+    Summary { id: u64, text: String, group: u64 },
 }
 
 /// One of claude's background tasks, as the tasks view is told of it.
@@ -849,6 +852,7 @@ impl Reducer {
                 | Msg::Limits { .. }
                 | Msg::Unknown(_)
                 | Msg::Lifecycle { .. }
+                | Msg::ToolSummary { .. }
                 | Msg::Response { .. }
         );
         if !quiet {
@@ -1276,6 +1280,23 @@ impl Reducer {
                 }
                 sdk::Input::Other => {}
             },
+            Msg::ToolSummary { summary, ids } if !summary.is_empty() => {
+                let mut items: Vec<u64> = ids
+                    .iter()
+                    .filter_map(|i| self.tools.get(i).copied())
+                    .collect();
+                items.sort_unstable();
+                if let Some(&group) = items.first() {
+                    for id in items {
+                        out.ops.push(Op::Summary {
+                            id,
+                            text: summary.clone(),
+                            group,
+                        });
+                    }
+                }
+            }
+            Msg::ToolSummary { .. } => {}
             Msg::Lifecycle { uuid, state } => match state.as_str() {
                 "queued" | "started" => {
                     if let Some(said) = self.said.get_mut(&uuid) {
@@ -1567,6 +1588,12 @@ impl Op {
                 }
                 v
             }
+            Op::Summary { id: n, text, group } => obj(vec![
+                ("t", Value::string("sum")),
+                id(n),
+                ("x", Value::string(text.clone())),
+                ("g", Value::num(*group as f64)),
+            ]),
             Op::Progress {
                 id: n,
                 lines,
@@ -2154,6 +2181,37 @@ mod tests {
             &[r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s"}"#],
         );
         assert!(!r.shell_running(), "the turn ended");
+    }
+
+    #[test]
+    fn a_tool_use_summary_goes_on_each_call_of_its_step() {
+        let mut r = Reducer::new();
+        let use_ = |id: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"ls"}}}}]}}}}"#
+            )
+        };
+        feed_all(&mut r, &[&use_("t1"), &use_("t2"), &use_("t3")]);
+        // As 2.1.311 sends one: a step's ids, a moment after the step.
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"tool_use_summary","summary":"Listed root, read hostname","preceding_tool_use_ids":["t2","t1"],"uuid":"u","session_id":"s"}"#,
+                r#"{"type":"tool_use_summary","summary":"x","preceding_tool_use_ids":["nope"],"uuid":"u","session_id":"s"}"#,
+            ],
+        );
+        let lines: Vec<String> = o
+            .ops
+            .iter()
+            .map(|op| crate::json::to_line(&op.to_value()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                r#"{"g":1,"id":1,"t":"sum","x":"Listed root, read hostname"}"#,
+                r#"{"g":1,"id":2,"t":"sum","x":"Listed root, read hostname"}"#,
+            ]
+        );
     }
 
     #[test]

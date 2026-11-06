@@ -116,6 +116,10 @@ pub enum Msg {
     /// `command_lifecycle`: where a prompt sent with a uuid has got to — `queued`, `started`,
     /// `cancelled` (an interrupt caught it, answered or not), and so on.
     Lifecycle { uuid: String, state: String },
+    /// `tool_use_summary`, with `CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES` set: a few words for
+    /// one step's tool calls (`Listed root, read hostname`), by their tool-use ids. It comes
+    /// a moment after the step, and only on the stream: the transcript keeps none.
+    ToolSummary { summary: String, ids: Vec<String> },
     /// A question answered before this claude started, read from the transcript's
     /// `toolUseResult` on a resume: no request comes for it, so it arrives settled.
     Answered {
@@ -509,6 +513,17 @@ pub fn classify(v: &Value) -> Msg {
             session_id: s(v, "session_id"),
         },
         "rate_limit_event" => limits(v),
+        "tool_use_summary" => Msg::ToolSummary {
+            summary: s(v, "summary").trim().to_string(),
+            ids: v
+                .get("preceding_tool_use_ids")
+                .and_then(Value::as_arr)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect(),
+        },
         "keep_alive" | "tool_progress" | "prompt_suggestion" => Msg::Noise,
         other => Msg::Unknown(other.to_string()),
     }

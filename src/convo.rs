@@ -229,6 +229,9 @@ pub enum Entry {
         arg: String,
         /// Whether it succeeded, its first lines, and how many lines in all.
         result: Option<(bool, Vec<String>, usize)>,
+        /// claude's summary of the step it was one of, and the step's first item, which
+        /// the step's calls share: drawn as one line in place of counting them.
+        summary: Option<(String, u64)>,
     },
     /// A subagent or workflow: its type or `Workflow`, its description, the lines under it
     /// as the relay last sent them, and `running`, `completed`, `failed` or `stopped`.
@@ -556,6 +559,7 @@ impl Convo {
                         name: s(v, "n"),
                         arg: s(v, "a"),
                         result: None,
+                        summary: None,
                     },
                     "agent" => Entry::Agent {
                         name: s(v, "n"),
@@ -620,6 +624,12 @@ impl Convo {
                     })
                     .filter(|t| !t.id.is_empty())
                     .collect();
+            }
+            "sum" => {
+                if let Some(Entry::Tool { summary, .. }) = self.at(id) {
+                    let group = v.get("g").and_then(Value::as_u64).unwrap_or(id);
+                    *summary = Some((s(v, "x"), group));
+                }
             }
             "prog" => {
                 if let Some(Entry::Agent { lines, state, .. }) = self.at(id) {
@@ -850,6 +860,13 @@ pub fn model_name(id: &str) -> String {
         out.push_str(&digits.join("."));
     }
     if out.is_empty() { id.to_string() } else { out }
+}
+
+/// One step of a run of tool calls: claude's summary of it and its first item, or `None`
+/// for calls not summarised, which are counted.
+struct Step<'a> {
+    summary: Option<(&'a str, u64)>,
+    tools: Vec<(&'a str, &'a str)>,
 }
 
 /// How a run of tool calls reads once collapsed: `Ran 2 shell commands, read 1 file`.
@@ -1339,7 +1356,9 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
         }
         let e = &c.entries[i];
         match e {
-            Entry::Tool { name, arg, result } if c.expanded => {
+            Entry::Tool {
+                name, arg, result, ..
+            } if c.expanded => {
                 i += 1;
                 if name == ASK_TOOL {
                     continue;
@@ -1349,14 +1368,29 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
                 continue;
             }
             Entry::Tool { .. } => {
-                let mut tools: Vec<(&str, &str)> = Vec::new();
+                // The run's steps in order: those claude summarised, a line each, and those
+                // it has not (yet), counted, as before summaries.
+                let mut steps: Vec<Step> = Vec::new();
                 let mut open: Option<(&str, &str)> = None;
-                while let Some(Entry::Tool { name, arg, result }) = c.entries.get(i) {
+                while let Some(Entry::Tool {
+                    name,
+                    arg,
+                    result,
+                    summary,
+                }) = c.entries.get(i)
+                {
                     // Claude Code draws a question as what was answered, not as a tool call.
                     if name != ASK_TOOL {
-                        tools.push((name, arg));
                         if result.is_none() {
                             open = Some((name, arg));
+                        }
+                        let key = summary.as_ref().map(|(x, g)| (x.as_str(), *g));
+                        match steps.last_mut() {
+                            Some(st) if st.summary == key => st.tools.push((name, arg)),
+                            _ => steps.push(Step {
+                                summary: key,
+                                tools: vec![(name, arg)],
+                            }),
                         }
                     }
                     i += 1;
@@ -1365,33 +1399,44 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
                         i += 1;
                     }
                 }
-                if tools.is_empty() {
+                if steps.is_empty() {
                     continue;
                 }
                 let last = i >= c.entries.len();
                 out.push(Vec::new());
-                match open.filter(|_| last && busy) {
-                    Some((name, arg)) => {
-                        let head = match waiting_perm {
-                            Some(d) if !d.is_empty() => d.to_string(),
-                            _ => tools_summary(&tools, true),
-                        };
-                        out.extend(wrapped(&head, "● ", "  ", w, PLAIN));
-                        out.extend(wrapped_by(
-                            &tool_line(name, arg),
-                            "  ⎿  ",
-                            "     ",
-                            w.saturating_sub(1),
-                            fg(GREY),
-                        ));
-                    }
-                    None => out.extend(wrapped(
-                        &tools_summary(&tools, false),
-                        "  ",
-                        "  ",
-                        w,
+                // Still running: the calls not yet summarised are said as under way, with
+                // the one running under them.
+                let running = open
+                    .filter(|_| last && busy)
+                    .map(|call| match steps.last() {
+                        Some(st) if st.summary.is_none() => (call, steps.len() - 1),
+                        _ => (call, 0),
+                    });
+                let done = running.map_or(steps.len(), |(_, from)| from);
+                for st in &steps[..done] {
+                    let head = match st.summary {
+                        Some((x, _)) => x.to_string(),
+                        None => tools_summary(&st.tools, false),
+                    };
+                    out.extend(wrapped(&head, "  ", "  ", w, fg(GREY)));
+                }
+                if let Some(((name, arg), from)) = running {
+                    let tools: Vec<(&str, &str)> = steps[from..]
+                        .iter()
+                        .flat_map(|st| st.tools.clone())
+                        .collect();
+                    let head = match waiting_perm {
+                        Some(d) if !d.is_empty() => d.to_string(),
+                        _ => tools_summary(&tools, true),
+                    };
+                    out.extend(wrapped(&head, "● ", "  ", w, PLAIN));
+                    out.extend(wrapped_by(
+                        &tool_line(name, arg),
+                        "  ⎿  ",
+                        "     ",
+                        w.saturating_sub(1),
                         fg(GREY),
-                    )),
+                    ));
                 }
                 continue;
             }
@@ -3095,6 +3140,67 @@ mod tests {
         let mut c = Convo::new("claude-sessions", "claude-3", "run");
         c.apply(&parse(r#"{"t":"n","n":0}"#).unwrap(), Instant::now());
         c
+    }
+
+    #[test]
+    fn a_step_claude_summarised_is_one_line_and_ctrl_o_shows_its_commands() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"look around"}"#,
+                r#"{"t":"st","s":"working"}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"Bash","a":"ls /"}"#,
+                r#"{"t":"add","id":3,"k":"tool","n":"Read","a":"/etc/hostname"}"#,
+                r#"{"t":"res","id":2,"ok":true,"p":["bin"],"l":1}"#,
+                r#"{"t":"res","id":3,"ok":true,"p":["box"],"l":1}"#,
+                r#"{"t":"add","id":4,"k":"tool","n":"Bash","a":"uname -a"}"#,
+                r#"{"t":"sum","id":2,"x":"Listed root, read hostname","g":2}"#,
+                r#"{"t":"sum","id":3,"x":"Listed root, read hostname","g":2}"#,
+            ],
+        );
+        let body = |c: &Convo| -> Vec<String> { transcript(c, 40).0.iter().map(plain).collect() };
+        // The summarised step a line; the call still running as before, under way.
+        let b = body(&c);
+        let at = b
+            .iter()
+            .position(|l| l == "  Listed root, read hostname")
+            .unwrap_or_else(|| panic!("{b:#?}"));
+        assert_eq!(
+            b[at + 1..at + 3],
+            ["● Running 1 shell command…", "  ⎿  $ uname -a"]
+        );
+        // Done, with the next step summarised too, and one call not yet: a line each.
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"res","id":4,"ok":true,"p":["Linux"],"l":1}"#,
+                r#"{"t":"add","id":5,"k":"tool","n":"Bash","a":"date"}"#,
+                r#"{"t":"res","id":5,"ok":true,"p":["Fri"],"l":1}"#,
+                r#"{"t":"sum","id":4,"x":"Checked kernel info","g":4}"#,
+                r#"{"t":"st","s":"idle"}"#,
+            ],
+        );
+        let b = body(&c);
+        let at = b
+            .iter()
+            .position(|l| l == "  Listed root, read hostname")
+            .unwrap();
+        assert_eq!(
+            b[at..],
+            [
+                "  Listed root, read hostname",
+                "  Checked kernel info",
+                "  Ran 1 shell command"
+            ]
+        );
+        // Ctrl+O: the commands themselves.
+        c.expanded = true;
+        let b = body(&c);
+        for call in ["● Bash(ls /)", "● Read(/etc/hostname)", "● Bash(uname -a)"] {
+            assert!(b.iter().any(|l| l == call), "{call}: {b:#?}");
+        }
+        assert!(!b.iter().any(|l| l.contains("Listed root")), "{b:#?}");
     }
 
     #[test]
