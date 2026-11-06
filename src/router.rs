@@ -38,6 +38,8 @@ use std::time::Duration;
 pub const MAX_QUEUE: usize = 200;
 /// How long a waiting message is kept: about what Claude Code keeps an unread one.
 pub const RETAIN_MS: u64 = 7 * 86_400_000;
+/// How often the router says it is alive, in `.beat` beside the queue.
+pub const BEAT: Duration = Duration::from_secs(60);
 
 fn say(line: &str) {
     let _ = writeln!(io::stdout(), "{} {line}", utc(clock::now()));
@@ -378,6 +380,26 @@ struct Router {
     queue: Mutex<Queue>,
 }
 
+impl Router {
+    /// One line for `.beat`: the time, how many containers answer, how many messages wait.
+    /// Made only by taking every lock the router's work takes, one at a time, so a router
+    /// wedged on one stops beating, and infra's health check sees it as stale rather than as
+    /// a process that is merely running.
+    fn pulse(&self) -> String {
+        let (up, all) = {
+            let fleet = lock(&self.fleet);
+            (fleet.up.values().filter(|u| **u).count(), fleet.up.len())
+        };
+        drop(lock(&self.conns));
+        drop(lock(&self.sent));
+        let waiting = lock(&self.queue).len();
+        format!(
+            "{} {up}/{all} answering, {waiting} waiting\n",
+            utc(clock::now())
+        )
+    }
+}
+
 /// Where waiting messages are kept: `HUB_QUEUE`, else `$HOME/queue`. A persisted volume, since
 /// every deploy recreates the hub.
 pub fn queue_dir() -> PathBuf {
@@ -422,6 +444,18 @@ pub fn serve() -> io::Result<()> {
     for host in hosts {
         let router = router.clone();
         std::thread::spawn(move || watch(&router, &host));
+    }
+    {
+        let router = router.clone();
+        let beat = dir.join(".beat");
+        std::thread::spawn(move || {
+            loop {
+                if let Err(e) = put(&beat, router.pulse().as_bytes()) {
+                    say(&format!("{} could not be written: {e}", beat.display()));
+                }
+                std::thread::sleep(BEAT);
+            }
+        });
     }
     loop {
         for item in lock(&router.queue).prune(clock::now()) {
@@ -778,6 +812,30 @@ mod tests {
             got,
             vec![("claude-1".into(), true), ("claude-2".into(), false)]
         );
+    }
+
+    #[test]
+    fn the_beat_says_who_answers_and_what_waits() {
+        let mut fleet = fleet();
+        fleet.up.insert("d".into(), false);
+        let mut queue = Queue::memory();
+        queue
+            .push(Item {
+                to: "b/claude-2".into(),
+                from: "a/claude-1".into(),
+                frame: json::parse(r#"{"type":"user"}"#).unwrap(),
+                at: 0,
+            })
+            .unwrap();
+        let router = Router {
+            fleet: Mutex::new(fleet),
+            conns: Mutex::new(HashMap::new()),
+            sent: Mutex::new(HashMap::new()),
+            queue: Mutex::new(queue),
+        };
+        let line = router.pulse();
+        assert!(line.ends_with(" 2/4 answering, 1 waiting\n"), "{line:?}");
+        assert!(line.starts_with("20"), "a UTC date first: {line:?}");
     }
 
     #[test]

@@ -398,6 +398,9 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     assert_eq!(field(&got, "from").as_deref(), Some(from.as_str()));
     assert!(content.starts_with(&format!("<cross-session-message from=\"{from}\"")));
     root.logs("a/claude-1 to b/claude-1: message handed on");
+    // The router's heartbeat, beside its queue, for infra's health check.
+    let beat = fs::read_to_string(root.dir.join("queue/.beat")).expect("the router beats");
+    assert!(beat.contains(" answering, "), "{beat:?}");
 
     // b's claude replies to that address, and it reaches a, from b/claude-1.
     let b_sock = root.d("b").join("in.sock");

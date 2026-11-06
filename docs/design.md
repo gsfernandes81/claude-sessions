@@ -1102,6 +1102,10 @@ the agent wire (`proto.rs`):
     recreates the hub.
   - At most 200 messages wait for one slot, for at most 7 days (about what Claude Code keeps
     an unread one).
+- **The heartbeat** is `$HUB_QUEUE/.beat`, rewritten every 60 s with the time, how many
+  containers answer, and how many messages wait. It is written only after taking each of the
+  router's locks in turn, so a router wedged on one stops beating. Infra's health check reads
+  how fresh it is (infra's request, 2026-11-06; mail had one in `$HUB_MAIL/.beat`).
 - **The log** is one line per frame, saying who to whom and what became of it, plus a line
   when a container stops or starts answering. It never carries a body. There is no separate
   record of the traffic: the owner reads messages in each session, or in the remote view
