@@ -160,6 +160,10 @@ struct Conv {
     started: bool,
     /// The history the holder serves backwards, before the log.
     history: History,
+    /// A prompt is waiting on a shell command claude cannot put in the background yet:
+    /// `background_tasks` goes the moment it can (`Reducer::shell_movable`), unless the
+    /// command ends first or the prompt is taken back.
+    background_wanted: bool,
 }
 
 /// A resumed conversation's history as the holder serves it (`holder::older`).
@@ -292,7 +296,11 @@ fn item_rows(ops: &[Op], w: usize) -> usize {
     };
     let mut rows = match ops.first() {
         Some(Op::Add { item, .. }) => match item {
-            Item::Prompt(t) | Item::Text(t) | Item::Note(t) | Item::Notice(t) => 1 + text_rows(t),
+            Item::Prompt(t)
+            | Item::Text(t)
+            | Item::Narration(t)
+            | Item::Note(t)
+            | Item::Notice(t) => 1 + text_rows(t),
             Item::Tool { .. } => 1,
             Item::Agent { .. } => 3,
             Item::Permission { .. } | Item::Ask { .. } => 4,
@@ -627,6 +635,7 @@ impl Relay {
                 next: HISTORY_IDS,
                 ..History::default()
             },
+            background_wanted: false,
         });
         // Answered at once: starting a holder and reading a long history into it takes
         // seconds, and a client that hears nothing for 5 thinks the link dead.
@@ -716,6 +725,17 @@ impl Relay {
         };
         let live = n >= c.live_from;
         let mut fed = c.reducer.feed(&v);
+        // The command a prompt waits on can be moved now, or ended by itself.
+        if c.background_wanted && !c.reducer.shell_running() {
+            c.background_wanted = false;
+        } else if c.background_wanted && live && c.reducer.shell_movable() {
+            c.background_wanted = false;
+            let id = format!("rv{}-bg{n}", std::process::id());
+            out.push(Effect::ToConv {
+                epoch,
+                line: sdk::background_tasks(&id),
+            });
+        }
         for (tool, op) in std::mem::take(&mut fed.sub) {
             c.agents.entry(tool.clone()).or_default().record(&op);
             if let Op::State(_) = op {
@@ -869,14 +889,25 @@ impl Relay {
         let mut to = |line: Value| out.push(Effect::ToConv { epoch, line });
         match t {
             // With the phone's uuid for it where it sent one, so Up can withdraw it by that.
+            // A prompt sent while a shell command runs puts the command in the background, as
+            // Ctrl+B would, so the turn takes the prompt in at once rather than when the
+            // command ends (owner, 2026-11-06: "should background the command even if that's
+            // not what claude does"). Anything else running — thinking, another tool, a
+            // subagent — the prompt waits behind, as in Claude Code.
             "say" => {
                 let uuid = s(v, "u")
                     .filter(|u| u.len() == 36)
                     .unwrap_or_else(crate::launch::fresh_session_id);
-                to(sdk::prompt(&s(v, "x").unwrap_or_default(), &uuid))
+                to(sdk::prompt(&s(v, "x").unwrap_or_default(), &uuid));
+                if c.reducer.shell_movable() {
+                    to(sdk::background_tasks(&id));
+                } else if c.reducer.shell_running() {
+                    c.background_wanted = true;
+                }
             }
             // Up on the phone: prompts waiting behind the turn leave claude's queue.
             "unqueue" => {
+                c.background_wanted = false;
                 let uuids = v.get("u").and_then(Value::as_arr).unwrap_or(&[]);
                 for (n, u) in uuids.iter().filter_map(Value::as_str).enumerate() {
                     to(sdk::cancel_async_message(&format!("{id}-{n}"), u));
@@ -887,6 +918,10 @@ impl Relay {
             // terminal, read 2026-11-02; headless claude's own `send_now` would stop the turn
             // and its call instead). With none running, `send_now` drops the turn quietly, as
             // the terminal does.
+            // A command claude cannot move yet is moved once it can, as for a prompt.
+            "now" if c.reducer.shell_running() && !c.reducer.shell_movable() => {
+                c.background_wanted = true;
+            }
             "now" if c.reducer.tool_running() => to(sdk::background_tasks(&id)),
             "now" => to(sdk::interrupt_send_now(&id)),
             "perm" | "ans" => {
@@ -1603,13 +1638,10 @@ mod tests {
         let fx = client(&mut r, r#"{"t":"now"}"#);
         let said = to_claude(&fx);
         assert!(said[0].contains(r#""send_now":true"#), "{said:?}");
-        // A call running: Ctrl+B's background_tasks, so the turn takes the prompt in.
-        line(
-            &mut r,
-            epoch,
-            1,
-            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 20"}}]}}"#,
-        );
+        // A command claude has made a task of: Ctrl+B's background_tasks, so the turn takes
+        // the prompt in.
+        line(&mut r, epoch, 1, &bash_use("t1"));
+        line(&mut r, epoch, 2, &shell_task("t1"));
         let fx = client(&mut r, r#"{"t":"now"}"#);
         let said = to_claude(&fx);
         assert!(
@@ -1617,6 +1649,116 @@ mod tests {
             "{said:?}"
         );
         assert!(!said[0].contains("send_now"));
+    }
+
+    fn bash_use(id: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"sleep 60"}}}}]}}}}"#
+        )
+    }
+
+    /// claude making a task of a foreground command, about three seconds into it, as 2.1.311
+    /// says it.
+    fn shell_task(id: &str) -> String {
+        format!(
+            r#"{{"type":"system","subtype":"task_started","task_id":"b{id}","run_id":"0mw5ft5yw-81ba4a5b","tool_use_id":"{id}","description":"Sleep","is_backgrounded":false,"task_type":"local_bash"}}"#
+        )
+    }
+
+    fn is_background(line: &str) -> bool {
+        line.contains(r#""subtype":"background_tasks""#)
+    }
+
+    #[test]
+    fn a_prompt_sent_while_a_command_runs_backgrounds_it_and_otherwise_waits_behind_the_turn() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let say =
+            r#"{"t":"say","x":"also check the docs","u":"00000000-0000-4000-8000-000000000001"}"#;
+        // Nothing running: the prompt alone, which claude queues behind the turn.
+        let said = to_claude(&client(&mut r, say));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("also check the docs"));
+        // A read running: still the prompt alone; only a command is put in the background.
+        line(
+            &mut r,
+            epoch,
+            1,
+            r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a"}}]}}"#,
+        );
+        assert_eq!(to_claude(&client(&mut r, say)).len(), 1);
+        // A command running that claude has made a task of: the prompt, then Ctrl+B's
+        // background_tasks, so the same turn takes the prompt in now.
+        line(&mut r, epoch, 2, &bash_use("t2"));
+        line(&mut r, epoch, 3, &shell_task("t2"));
+        let said = to_claude(&client(&mut r, say));
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("also check the docs"), "{said:?}");
+        assert!(is_background(&said[1]), "{said:?}");
+    }
+
+    #[test]
+    fn a_command_too_new_to_move_is_backgrounded_once_claude_can_move_it() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let say = r#"{"t":"say","x":"and this","u":"00000000-0000-4000-8000-000000000002"}"#;
+        // In its first seconds: the prompt alone, since a background_tasks now moves nothing.
+        line(&mut r, epoch, 1, &bash_use("t1"));
+        let said = to_claude(&client(&mut r, say));
+        assert_eq!(said.len(), 1, "{said:?}");
+        // Anything else claude says meanwhile sends nothing.
+        let said = to_claude(&line(
+            &mut r,
+            epoch,
+            2,
+            r#"{"type":"system","subtype":"status","status":null}"#,
+        ));
+        assert!(said.is_empty(), "{said:?}");
+        // claude makes a task of it: it goes to the background then, once.
+        let said = to_claude(&line(&mut r, epoch, 3, &shell_task("t1")));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(is_background(&said[0]), "{said:?}");
+        let said = to_claude(&line(
+            &mut r,
+            epoch,
+            4,
+            r#"{"type":"system","subtype":"status","status":null}"#,
+        ));
+        assert!(said.is_empty(), "{said:?}");
+
+        // A command that ends by itself first: nothing to move, and nothing sent later.
+        line(&mut r, epoch, 5, &bash_use("t2"));
+        client(&mut r, say);
+        line(
+            &mut r,
+            epoch,
+            6,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"done"}]}}"#,
+        );
+        line(&mut r, epoch, 7, &bash_use("t3"));
+        let said = to_claude(&line(&mut r, epoch, 8, &shell_task("t3")));
+        assert!(said.is_empty(), "{said:?}");
+
+        // A prompt taken back with Up: nothing moved for it either; and Ctrl+X Ctrl+S on a
+        // command too new waits for it the same way.
+        line(&mut r, epoch, 9, &bash_use("t4"));
+        client(&mut r, say);
+        client(
+            &mut r,
+            r#"{"t":"unqueue","u":["00000000-0000-4000-8000-000000000002"]}"#,
+        );
+        let said = to_claude(&line(&mut r, epoch, 10, &shell_task("t4")));
+        assert!(said.is_empty(), "{said:?}");
+        line(
+            &mut r,
+            epoch,
+            11,
+            r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s"}"#,
+        );
+        line(&mut r, epoch, 12, &bash_use("t5"));
+        assert!(to_claude(&client(&mut r, r#"{"t":"now"}"#)).is_empty());
+        let said = to_claude(&line(&mut r, epoch, 13, &shell_task("t5")));
+        assert!(said.len() == 1 && is_background(&said[0]), "{said:?}");
     }
 
     #[test]

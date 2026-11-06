@@ -220,6 +220,10 @@ pub struct Question {
 pub enum Entry {
     Prompt(String),
     Text(String),
+    /// The server's summary of the prose between tool calls (a narration thinking block):
+    /// drawn as text, with Claude Code's grey `· summary` after it, and left out of `/copy`,
+    /// which takes text blocks alone.
+    Narration(String),
     Tool {
         name: String,
         arg: String,
@@ -531,6 +535,9 @@ impl Convo {
                             self.pending.remove(i);
                         }
                         Entry::Prompt(x)
+                    }
+                    "text" if v.get("sm").and_then(Value::as_bool) == Some(true) => {
+                        Entry::Narration(s(v, "x"))
                     }
                     "text" => Entry::Text(s(v, "x")),
                     "note" => {
@@ -884,6 +891,21 @@ fn tools_summary(tools: &[(&str, &str)], running: bool) -> String {
         out.push('…');
     }
     out
+}
+
+/// The assistant's text as Claude Code draws it: `● `, then its markdown, kept clear of the
+/// last two columns as `wrapped` keeps them.
+fn assistant_text(text: &str, w: usize) -> Vec<Line> {
+    crate::markdown::render(text, w.saturating_sub(4))
+        .into_iter()
+        .enumerate()
+        .map(|(n, l)| {
+            let lead = if n == 0 { "● " } else { "  " };
+            let mut row: Line = vec![(lead.into(), PLAIN)];
+            row.extend(l);
+            row
+        })
+        .collect()
 }
 
 /// A tool call expanded, as Claude Code's Ctrl+O transcript draws one: `● Bash(ls)`, then
@@ -1380,16 +1402,22 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             }
             Entry::Text(text) => {
                 out.push(Vec::new());
-                // As `wrapped` keeps the last two columns clear, after the two of `● `.
-                for (n, l) in crate::markdown::render(text, w.saturating_sub(4))
-                    .into_iter()
-                    .enumerate()
-                {
-                    let lead = if n == 0 { "● " } else { "  " };
-                    let mut row: Line = vec![(lead.into(), PLAIN)];
-                    row.extend(l);
-                    out.push(row);
+                out.extend(assistant_text(text, w));
+            }
+            // As Claude Code 2.1.311 draws one for a model without the hint turned off:
+            // `· summary` in its `subtle` grey after the text (a no-break space there, a plain
+            // one here: the same on a terminal).
+            Entry::Narration(text) => {
+                out.push(Vec::new());
+                let mut rows = assistant_text(text, w);
+                const HINT: &str = " · summary";
+                match rows.last_mut() {
+                    Some(last) if width(&plain(last)) + width(HINT) <= w.saturating_sub(2) => {
+                        last.push((HINT.into(), fg(GREY)));
+                    }
+                    _ => rows.push(vec![("  ".into(), PLAIN), (HINT[1..].into(), fg(GREY))]),
                 }
+                out.extend(rows);
             }
             // Under what it interrupted, as Claude Code draws it, and in its words.
             Entry::Note(text) if text == "Interrupted" => {
@@ -3067,6 +3095,37 @@ mod tests {
         let mut c = Convo::new("claude-sessions", "claude-3", "run");
         c.apply(&parse(r#"{"t":"n","n":0}"#).unwrap(), Instant::now());
         c
+    }
+
+    #[test]
+    fn narration_is_drawn_as_text_with_a_grey_summary_hint_and_is_not_copied() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"fix it"}"#,
+                r#"{"t":"add","id":2,"k":"text","sm":true,"x":"Checking the relay next."}"#,
+                r#"{"t":"add","id":3,"k":"tool","n":"Bash","a":"ls"}"#,
+                r#"{"t":"res","id":3,"ok":true,"p":["a"],"l":1}"#,
+                r#"{"t":"add","id":4,"k":"text","sm":true,"x":"Reading every file in src/ now"}"#,
+                r#"{"t":"add","id":5,"k":"text","x":"Fixed."}"#,
+            ],
+        );
+        let lines = transcript(&c, 40).0;
+        let body: Vec<String> = lines.iter().map(plain).collect();
+        let at = body
+            .iter()
+            .position(|l| l == "● Checking the relay next. · summary")
+            .unwrap_or_else(|| panic!("{body:#?}"));
+        let hint = lines[at].last().unwrap();
+        assert_eq!((hint.0.as_str(), hint.1), (" · summary", fg(GREY)));
+        // It breaks a run of tool calls, as text does.
+        assert_eq!(body[at + 2], "  Ran 1 shell command");
+        // Too long for the last line: the hint goes on a line of its own.
+        let end = body.iter().position(|l| l == "● Fixed.").unwrap();
+        assert_eq!(body[end - 2], "  · summary", "{body:#?}");
+        // /copy takes text blocks alone, as Claude Code's does.
+        assert_eq!(c.responses(), ["Fixed."]);
     }
 
     #[test]

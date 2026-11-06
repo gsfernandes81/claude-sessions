@@ -329,6 +329,10 @@ pub enum Block {
         name: String,
         input: Value,
     },
+    /// A thinking block the server marked as narration: its summary of the prose between tool
+    /// calls, which Claude Code draws as the assistant's text with a grey `· summary` after it
+    /// (2.1.311). Its text, trimmed.
+    Narration(String),
     /// Thinking, redacted thinking, images: drawn as their kind, not their content.
     Other(String),
 }
@@ -436,12 +440,22 @@ pub fn classify(v: &Value) -> Msg {
         }
         "assistant" => {
             let msg = v.get("message");
+            // Claude Code's own list of the frame's narration blocks; a transcript line has
+            // none, and its blocks are read by their signatures, as Claude Code reads them.
+            let listed: Option<Vec<u64>> = v
+                .get("narration_block_indexes")
+                .and_then(Value::as_arr)
+                .map(|a| a.iter().filter_map(Value::as_u64).collect());
             let blocks = msg
                 .and_then(|m| m.get("content"))
                 .and_then(Value::as_arr)
                 .unwrap_or(&[])
                 .iter()
-                .map(block)
+                .enumerate()
+                .map(|(i, b)| match narration(b, i, listed.as_deref()) {
+                    Some(text) => Block::Narration(text),
+                    None => block(b),
+                })
                 .collect();
             Msg::Assistant {
                 message_id: msg.map(|m| s(m, "id")).unwrap_or_default(),
@@ -533,6 +547,105 @@ pub fn parent_tool_use_id(v: &Value) -> Option<&str> {
     v.get("parent_tool_use_id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
+}
+
+/// A thinking block's text when it is narration, as Claude Code 2.1.311 decides: listed in
+/// the frame's `narration_block_indexes` where the frame has that list, else the block's
+/// signature saying `narration` (its `uTe`); and only with text, since one without is ordinary
+/// thinking (its `K7e`).
+fn narration(b: &Value, index: usize, listed: Option<&[u64]>) -> Option<String> {
+    if b.get("type").and_then(Value::as_str) != Some("thinking") {
+        return None;
+    }
+    let text = b.get("thinking").and_then(Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let is = match listed {
+        Some(l) => l.contains(&(index as u64)),
+        None => b
+            .get("signature")
+            .and_then(Value::as_str)
+            .and_then(block_kind)
+            .is_some_and(|k| k == "narration"),
+    };
+    is.then(|| text.to_string())
+}
+
+/// The block kind a thinking signature carries: base64 of a protobuf whose field 2 holds a
+/// message whose field 1 holds the kind as field 8 — read as Claude Code 2.1.311 reads it
+/// (`psn`), the last of a repeated field winning. `None` for anything it cannot read, which
+/// is ordinary thinking, as Claude Code fails closed.
+fn block_kind(signature: &str) -> Option<String> {
+    let bytes = base64_decode(signature)?;
+    let outer = proto_field(&bytes, 2)?;
+    let inner = proto_field(outer, 1)?;
+    String::from_utf8(proto_field(inner, 8)?.to_vec()).ok()
+}
+
+/// The bytes of the last length-delimited field `want` in a protobuf message; `None` when the
+/// message is malformed or lacks it.
+fn proto_field(mut b: &[u8], want: u64) -> Option<&[u8]> {
+    fn varint(b: &mut &[u8]) -> Option<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let (&byte, rest) = b.split_first()?;
+            *b = rest;
+            v |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    let mut found = None;
+    while !b.is_empty() {
+        let key = varint(&mut b)?;
+        let skip = match key & 7 {
+            0 => {
+                varint(&mut b)?;
+                0
+            }
+            1 => 8,
+            2 => {
+                let len = usize::try_from(varint(&mut b)?).ok()?;
+                let (body, rest) = (b.get(..len)?, b.get(len..)?);
+                if key >> 3 == want {
+                    found = Some(body);
+                }
+                b = rest;
+                0
+            }
+            5 => 4,
+            _ => return None,
+        };
+        b = b.get(skip..)?;
+    }
+    found
+}
+
+/// Standard base64, padded or not; `None` for anything else.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes().take_while(|&c| c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 fn block(b: &Value) -> Block {
@@ -1612,6 +1725,62 @@ mod tests {
         );
         assert_eq!(blocks[1], Block::Other("thinking".into()));
         assert_eq!(blocks[2], Block::Text("done".into()));
+    }
+
+    /// Signatures shaped as 2.1.311's are: field 2, then field 1, then the block kind as field
+    /// 8, among fields of every wire type.
+    const NARRATION_SIG: &str = "CAQSFwoRCBMYAjgBQgluYXJyYXRpb24SAqq7GgMBAgM=";
+    const THINKING_SIG: &str = "CAQSFgoQCBMYAjgBQgh0aGlua2luZxICqrsaAwECAw==";
+
+    #[test]
+    fn a_thinking_signature_says_its_block_kind_and_anything_unreadable_says_none() {
+        assert_eq!(block_kind(NARRATION_SIG).as_deref(), Some("narration"));
+        assert_eq!(block_kind(THINKING_SIG).as_deref(), Some("thinking"));
+        // Cut short, as a length that runs past the end: fail closed, as Claude Code does.
+        assert_eq!(block_kind(&NARRATION_SIG[..20]), None);
+        assert_eq!(block_kind("not base64!"), None);
+        assert_eq!(block_kind(""), None);
+        assert_eq!(base64_decode("aGVsbG8=").as_deref(), Some(&b"hello"[..]));
+        assert_eq!(base64_decode("aGk").as_deref(), Some(&b"hi"[..]));
+    }
+
+    #[test]
+    fn narration_is_what_claude_code_lists_or_what_a_transcripts_signature_says() {
+        let blocks = |line: &str| match read(line) {
+            Msg::Assistant { blocks, .. } => blocks,
+            other => panic!("{other:?}"),
+        };
+        // A stream frame: Claude Code's own list says which blocks are narration.
+        let listed = blocks(
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"thinking","thinking":"Checking the relay next.\n\n","signature":"x"}]},"narration_block_indexes":[0]}"#,
+        );
+        assert_eq!(
+            listed,
+            [Block::Narration("Checking the relay next.".into())]
+        );
+        // Listed with no text: ordinary thinking, as Claude Code treats it.
+        let empty = blocks(
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"thinking","thinking":"  ","signature":"x"}]},"narration_block_indexes":[0]}"#,
+        );
+        assert_eq!(empty, [Block::Other("thinking".into())]);
+        // A transcript line has no list: its signature says.
+        let line = |sig: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m","content":[{{"type":"thinking","thinking":"Reading the reducer.","signature":"{sig}"}}]}}}}"#
+            )
+        };
+        assert_eq!(
+            blocks(&line(NARRATION_SIG)),
+            [Block::Narration("Reading the reducer.".into())]
+        );
+        assert_eq!(
+            blocks(&line(THINKING_SIG)),
+            [Block::Other("thinking".into())]
+        );
+        // A list that leaves the block out wins over its signature.
+        let unlisted =
+            line(NARRATION_SIG).replacen(r#"]}}"#, r#"]},"narration_block_indexes":[1]}"#, 1);
+        assert_eq!(blocks(&unlisted), [Block::Other("thinking".into())]);
     }
 
     #[test]

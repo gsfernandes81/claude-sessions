@@ -140,6 +140,9 @@ pub enum Item {
     Prompt(String),
     /// The assistant's text; may grow by `Append`.
     Text(String),
+    /// The server's summary of the prose between tool calls, sent as a narration thinking
+    /// block: drawn as text is, with Claude Code's grey `· summary` after it.
+    Narration(String),
     /// A tool call: its name and the one argument Claude Code shows beside it.
     Tool { name: String, arg: String },
     /// A subagent or a workflow: drawn on its own, as Claude Code does, not folded into a run
@@ -219,6 +222,8 @@ pub struct Reducer {
     /// Tool calls of the turn under way with no result yet: what Ctrl+X Ctrl+S puts in the
     /// background, as Claude Code's does, rather than stopping the turn (`relay.rs`).
     running: std::collections::HashSet<u64>,
+    /// Which tool call items are shell commands, which a prompt sent meanwhile backgrounds.
+    shells: std::collections::HashSet<u64>,
     /// Background tasks, in the order they started, and the list as last sent.
     bg: Vec<Bg>,
     bg_sent: Vec<BgTask>,
@@ -743,6 +748,24 @@ impl Reducer {
         !self.running.is_empty()
     }
 
+    /// Whether a shell command of the turn under way is still running.
+    pub fn shell_running(&self) -> bool {
+        self.running.iter().any(|i| self.shells.contains(i))
+    }
+
+    /// Whether a running shell command is one claude can put in the background yet. claude
+    /// makes a task of a foreground command (`task_started`, `is_backgrounded` false) about
+    /// three seconds after it starts, and a `background_tasks` before then moves nothing and
+    /// says so to no one (2.1.311, measured 2026-11-06). Claude Code's own terminal waits out
+    /// the same grace before it moves anything.
+    pub fn shell_movable(&self) -> bool {
+        self.bg.iter().any(|b| {
+            self.tools
+                .get(&b.tool_use_id)
+                .is_some_and(|i| self.running.contains(i) && self.shells.contains(i))
+        })
+    }
+
     pub fn waiting_input(&self, request_id: &str) -> Option<&Value> {
         self.waiting.get(request_id).map(|(_, input)| input)
     }
@@ -980,9 +1003,16 @@ impl Reducer {
                                 self.calls.insert(id.clone(), (name.clone(), cmd));
                             }
                             let arg = tool_arg(&name, &input);
+                            let shell = name == "Bash";
                             let item = self.add(&mut out, Item::Tool { name, arg });
                             self.tools.insert(id, item);
                             self.running.insert(item);
+                            if shell {
+                                self.shells.insert(item);
+                            }
+                        }
+                        Block::Narration(text) => {
+                            self.add(&mut out, Item::Narration(text));
                         }
                         Block::Other(_) => {}
                     }
@@ -1200,6 +1230,7 @@ impl Reducer {
                 }
                 self.streaming.clear();
                 self.running.clear();
+                self.shells.clear();
                 self.by_message.clear();
                 self.texts.clear();
                 self.set_state(&mut out, "idle");
@@ -1644,6 +1675,12 @@ impl Item {
         match self {
             Item::Prompt(x) => obj(vec![k("user"), ("x", Value::string(x.clone()))]),
             Item::Text(x) => obj(vec![k("text"), ("x", Value::string(x.clone()))]),
+            // Text to a client that does not know the flag.
+            Item::Narration(x) => obj(vec![
+                k("text"),
+                ("x", Value::string(x.clone())),
+                ("sm", Value::Bool(true)),
+            ]),
             Item::Note(x) => obj(vec![k("note"), ("x", Value::string(x.clone()))]),
             // A note to a client that does not know the flag.
             Item::Notice(x) => obj(vec![
@@ -2084,6 +2121,63 @@ mod tests {
             ],
         );
         assert!(!r.tool_running());
+    }
+
+    #[test]
+    fn only_a_running_shell_command_is_one_a_prompt_backgrounds() {
+        let mut r = Reducer::new();
+        let use_ = |id: &str, name: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{{"command":"sleep 20","file_path":"/a"}}}}]}}}}"#
+            )
+        };
+        let result = |id: &str| {
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ok"}}]}}}}"#
+            )
+        };
+        feed_all(&mut r, &[&use_("t1", "Read")]);
+        assert!(
+            r.tool_running() && !r.shell_running(),
+            "a read is not a command"
+        );
+        feed_all(&mut r, &[&use_("t2", "Bash")]);
+        assert!(r.shell_running());
+        feed_all(&mut r, &[&result("t2")]);
+        assert!(
+            !r.shell_running() && r.tool_running(),
+            "the read still runs"
+        );
+        feed_all(&mut r, &[&use_("t3", "Bash")]);
+        feed_all(
+            &mut r,
+            &[r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s"}"#],
+        );
+        assert!(!r.shell_running(), "the turn ended");
+    }
+
+    #[test]
+    fn narration_between_tool_calls_is_an_item_of_its_own_marked_as_a_summary() {
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"","signature":"x"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"thinking","thinking":"Checking the relay next.","signature":"x"}]},"narration_block_indexes":[0]}"#,
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ],
+        );
+        let lines: Vec<String> = o
+            .ops
+            .iter()
+            .map(|op| crate::json::to_line(&op.to_value()))
+            .collect();
+        assert_eq!(
+            lines[0],
+            r#"{"id":1,"k":"text","sm":true,"t":"add","x":"Checking the relay next."}"#
+        );
+        assert!(lines[1].contains(r#""k":"tool""#), "{lines:?}");
+        assert_eq!(lines.len(), 2, "ordinary thinking draws nothing: {lines:?}");
     }
 
     #[test]

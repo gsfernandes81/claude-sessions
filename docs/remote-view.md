@@ -341,9 +341,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `re {c, s, run, n}` | after a reconnect: slot `s`, the holder's run, and the last `n` the client holds |
      | `close` | back home; the conversation keeps running |
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
-     | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client |
+     | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client; while a shell command runs, followed by claude's `background_tasks`, once claude can move it |
      | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
-     | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in, else its `interrupt` with `send_now` |
+     | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in — for a shell command, once claude can move it — else its `interrupt` with `send_now` |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told |
      | `ans {r, a}` | `a` maps each question to its answer; anything else declines |
      | `model {m}` · `effort {e}` · `mode {m}` · `rename {x}` | as Claude's own requests; `e` null is the default |
@@ -358,7 +358,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -414,10 +414,36 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        Claude Code 2.1.311 does (driven in a pty, 2026-11-02), and withdraws them from
        claude's queue; the turn runs on. Claude Code's Esc Esc rewind
        picker is not built.
+     - **A prompt sent while a shell command runs puts the command in the background**, as
+       Ctrl+B would, and the same turn takes the prompt in at once — the owner's ask of
+       2026-11-06, "should background the command even if that's not what claude does"; the
+       terminal leaves it waiting until the command ends. Only a shell command: behind
+       thinking, another tool or a foreground subagent the prompt waits, as in Claude Code.
+       claude makes a task of a foreground command (`task_started`, `is_backgrounded` false)
+       about three seconds after it starts, and a `background_tasks` before then moves nothing
+       and says nothing (2.1.311, measured 2026-11-06: a prompt 3 s in waited out the whole
+       40 s command); Claude Code's own terminal waits out the same grace. So the relay sends
+       it the moment the task is announced, unless the command ended first or the prompt was
+       taken back with Up — and Ctrl+X Ctrl+S on a command that new waits the same way.
+       Measured end to end: a prompt sent 1 s into a 40 s command was answered 4 s later.
      - A prompt queued behind a turn of tool calls is taken in by claude between two of them,
        on its own: 2.1.311 headless, as the holder runs it, echoes it and marks it `started`
        after the call it waited behind, and the same turn answers it, as the TUI does. The
        phone draws it where claude takes it, between the calls; nothing is sent for it.
+     - **The narration between tool calls** is drawn as Claude Code 2.1.311 draws it: as
+       the assistant's text, `● ` and its markdown, with `· summary` after it in grey. With
+       thinking display `updates`, Opus 5.5 sends the prose it writes between tool calls as
+       the server's summary of it in a thinking block whose signature says `narration`, not
+       as a text block; through 0.17.1 the reducer dropped it with the rest of thinking, and the
+       phone lost every line Claude wrote between steps (owner, 2026-11-06). Which blocks are
+       narration is Claude Code's call, not the relay's: a stream frame lists them in
+       `narration_block_indexes`; a transcript line, read back for history, has only the
+       signature, read by Claude Code's own rule (base64, then protobuf fields 2, 1 and 8 —
+       its `psn`), failing closed. A listed block with no text is ordinary thinking, as in
+       Claude Code. The hint is Claude Code's for a model without its `quizzical_shore`
+       capability, Opus 5.5 among them; `/copy` leaves narration out, as it takes text blocks
+       alone. Claude Code's `tool_use_summary` lines (`CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES`)
+       are not this: its terminal ignores them, so the phone does too.
      - Typing a command's name, the **suggestion list** stands over the prompt as Claude
        Code's does: claude's commands (`initialize`'s, with what each does, asked for when a
        conversation opens) and the phone's, those that start with what is typed first, then
