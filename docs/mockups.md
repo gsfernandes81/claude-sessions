@@ -534,6 +534,10 @@ The owner's calls, each made in a comment on the page:
   40 (owner, 2026-11-01: "near the statusline or replacing the statusline depending on the
   available space"). The home says it the same way on its load line. After an Enter it adds
   `· not sent` and keeps the text typed.
+- **R5's picker says `The default for new sessions too.`** where it said `For this session
+  only.` (owner, 2026-11-06: "When setting a model, make sure it is set as default"): a pick
+  is saved as Claude Code's own `/model` saves one, in a short form of its words "Your pick
+  becomes the default for new sessions", which do not fit 40 columns.
 - **The client's home is the door's list** (R9). Nothing new starts from the hub's door: "The
   hub will never run on termux".
   - Sessions running in a terminal are dim with `term: ` and cannot be opened from the phone.
@@ -722,7 +726,7 @@ Esc to cancel
 
 ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
    Select model
-   For this session only.
+   The default for new sessions too.
 
    ↑ 2.  Opus 5.5 ✔
      3.  Fable 5.1

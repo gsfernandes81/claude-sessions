@@ -115,7 +115,7 @@ these lines, and its tests hold the exact shapes):
 | start | `control_request` `initialize` | commands (skills included), models with each one's `supportedEffortLevels`, account, output style: about 38 KB |
 | permission | claude sends `can_use_tool`: tool name, input, description, suggestions | `control_response` `{behavior:"allow", updatedInput}` or `{behavior:"deny", message}`. A read-only command such as `echo` is allowed without asking. |
 | question | `can_use_tool` with tool `AskUserQuestion`, `input.questions[]` | allow, with `updatedInput` = the input plus `answers: {question: label}` |
-| model | `set_model {model}` | `{model: <resolved id>}`, plus a `user` line `<local-command-stdout>Set model to …` |
+| model | `set_model {model}` | `{model: <resolved id>}`, plus a `user` line `<local-command-stdout>Set model to …`. It switches the session only: a headless claude saves no default, which its interactive `/model` does, so the holder does that (*Decisions*). |
 | effort | `apply_flag_settings {settings:{effortLevel}}`; `null` resets | success. There is no effort request of its own; Claude Code's own `/effort` sends exactly this to a remote session. |
 | rename | `rename_session {title, source:"host", session_id}` | success, and `system/session_title_changed {title}` |
 | compact | `/compact` as a user message | `system/status` compacting, the `SessionStart:compact` hooks, `system/compact_boundary {pre_tokens, post_tokens}`, the summary as a `user` line, `<local-command-stdout>Compacted`, a `result` |
@@ -260,6 +260,14 @@ the owner had already spoken (above). Two items need the owner, and both are moc
 - **The wire is JSON lines with short keys, through `ssh -C`.** A `v` and a feature list go both
   ways in the hello; unknown item types are dropped. `initialize`'s 38 KB answer is cached by
   its hash, and context usage is fetched only on demand.
+- **A model picked in the view becomes the default for new sessions**, as Claude Code's own
+  `/model` makes it in a terminal (owner, 2026-11-06; until then the picker said "For this
+  session only"). Headless claude only switches the session, since 2.1.311 saves a `/model`
+  pick only when interactive, and neither `set_model` nor `update_settings` can write the
+  model to user settings. So the holder notes each `set_model` a view sends and, once claude
+  answers it with success, writes `model` into `$CLAUDE_CONFIG_DIR/settings.json`, where
+  Claude Code's picker writes it; `default` takes the key out. The other settings are kept,
+  though our writer sorts their keys; a file that is not a JSON object is left alone.
 - **Opening an offloaded conversation goes through the launcher's plan**: under the slot's lock,
   never resuming a conversation that is already running, with the holder as the command.
 

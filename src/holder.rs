@@ -29,6 +29,11 @@
 //! written where Claude Code's workflow browser saves one, answered `H<TAB>{"type":"_saved",
 //! "path"|"error"}` (`save_workflow`).
 //!
+//! **A model a view picks becomes the default for new sessions**, as Claude Code's own
+//! `/model` makes it in a terminal (owner, 2026-11-06). A headless claude only switches the
+//! session, so once claude accepts a view's `set_model` the holder writes it as `model` in
+//! `$CLAUDE_CONFIG_DIR/settings.json` (`save_default_model`).
+//!
 //! **What the zmx session shows**: one plain line at start and at each change of what claude
 //! is doing, never on a timer, so attaching from the old menu explains the slot rather than
 //! showing a blank screen. Whatever is typed into the session is read and dropped, since
@@ -38,7 +43,7 @@
 //! (`Viewing`): `keep_until` re-stamped while a view is connected, and `last_attach` when it
 //! connects and when it goes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
@@ -178,6 +183,9 @@ struct Log {
     /// The prompts and questions claude is waiting on, by request id: the amber `!` is
     /// cleared once a view has answered the last of them (`asked`, `settled`).
     open: HashSet<String>,
+    /// The models a view asked claude to switch to, by request id, until claude answers:
+    /// one it accepts is saved as the default (`save_default_model`).
+    models: HashMap<String, String>,
 }
 
 impl Log {
@@ -208,6 +216,25 @@ impl Log {
                 false
             }
             _ => false,
+        }
+    }
+
+    /// Note a view's `set_model`, to save once claude accepts it. Only so many outstanding:
+    /// claude answers each, but a view that asks and asks while claude is stuck must not
+    /// grow this.
+    fn model_asked(&mut self, v: &Value) {
+        if let Some((id, model)) = set_model(v) {
+            if self.models.len() < 64 {
+                self.models.insert(id, model);
+            }
+        }
+    }
+
+    /// The model to save as the default, when `msg` is claude accepting a view's `set_model`.
+    fn model_answered(&mut self, msg: &Msg) -> Option<String> {
+        match msg {
+            Msg::Response { request_id, ok, .. } => self.models.remove(request_id).filter(|_| *ok),
+            _ => None,
         }
     }
 
@@ -256,6 +283,7 @@ pub fn serve(
         closed: false,
         answered: HashSet::new(),
         open: HashSet::new(),
+        models: HashMap::new(),
     };
     // A resume: the conversation so far is its transcript up to here, since claude sends none
     // of it again; claude appends to the same file from now on.
@@ -317,12 +345,18 @@ pub fn serve(
             .ok()
             .and_then(|l| json::parse(l.trim()).ok())
             .map(|v| sdk::classify(&v));
-        let settled = {
+        let (settled, model) = {
             let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
             log.append(&line)?;
-            msg.as_ref().is_some_and(|m| log.asked(m))
+            let model = msg.as_ref().and_then(|m| log.model_answered(m));
+            (msg.as_ref().is_some_and(|m| log.asked(m)), model)
         };
         shared.grew.notify_all();
+        if let Some(model) = model {
+            // Best effort, as the session has switched either way: a settings file this
+            // cannot read is left alone rather than written over.
+            let _ = save_default_model(&crate::live::config_dir().join("settings.json"), &model);
+        }
         if settled {
             prompt_answered(&shared.slot);
         }
@@ -587,6 +621,11 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
             settled = log.settled(id);
         }
     }
+    shared
+        .log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .model_asked(v);
     // Logged first, so whatever claude does with it comes after it in the log.
     let mut logged = Value::obj();
     logged.set("type", Value::string("_in"));
@@ -603,6 +642,54 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
         prompt_answered(&shared.slot);
     }
     Ok(())
+}
+
+/// A view's `set_model` request: its id and the model it names.
+fn set_model(v: &Value) -> Option<(String, String)> {
+    let req = v.get("request")?;
+    if v.get("type").and_then(Value::as_str) != Some("control_request")
+        || req.get("subtype").and_then(Value::as_str) != Some("set_model")
+    {
+        return None;
+    }
+    let id = v.get("request_id").and_then(Value::as_str)?;
+    let model = req.get("model").and_then(Value::as_str).unwrap_or_default();
+    Some((id.to_string(), model.to_string()))
+}
+
+/// Save `model` as the default for new sessions: `model` in Claude Code's user settings
+/// file, where its own `/model` writes it. `default`, or none, takes the key out, as picking
+/// Default there does. The other settings are kept; a file that is not a JSON object is an
+/// error and is not touched. Written whole to a temporary file and renamed over, so claude
+/// never reads half of it. Our writer sorts keys, so the file's keys may come back reordered.
+pub(crate) fn save_default_model(path: &Path, model: &str) -> io::Result<()> {
+    // A linked file is written where it points, so the link stays a link.
+    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut settings = match std::fs::read_to_string(path) {
+        Ok(text) if text.trim().is_empty() => Value::obj(),
+        Ok(text) => json::parse(&text).map_err(io::Error::other)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Value::obj(),
+        Err(e) => return Err(e),
+    };
+    let Value::Obj(map) = &mut settings else {
+        return Err(io::Error::other("settings are not a JSON object"));
+    };
+    let changed = if model.is_empty() || model == "default" {
+        map.remove("model").is_some()
+    } else {
+        map.insert("model".into(), Value::string(model)) != Some(Value::string(model))
+    };
+    if !changed {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, json::to_string_pretty(&settings))?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// The last prompt or question claude was waiting on is answered: clear the slot's amber `!`
@@ -946,6 +1033,96 @@ mod tests {
     }
 
     #[test]
+    fn a_model_claude_accepts_from_a_view_is_saved_and_one_it_refuses_is_not() {
+        let mut log = Log {
+            file: File::create(scratch("models").join("l")).unwrap(),
+            offsets: Vec::new(),
+            end: 0,
+            closed: false,
+            answered: HashSet::new(),
+            open: HashSet::new(),
+            models: HashMap::new(),
+        };
+        let v = |l: &str| json::parse(l).unwrap();
+        let msg = |l: &str| sdk::classify(&v(l));
+        let ok = |id: &str| {
+            msg(&format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}"}}}}"#
+            ))
+        };
+        // As the relay writes them (`sdk::set_model`).
+        log.model_asked(&sdk::set_model("c1", "opus"));
+        log.model_asked(&sdk::set_model("c2", "nonsense"));
+        log.model_asked(&sdk::set_effort("c3", Some("high")));
+        assert_eq!(
+            log.model_answered(&ok("c0")),
+            None,
+            "calibration: not asked"
+        );
+        assert_eq!(log.model_answered(&ok("c3")), None, "not a model");
+        assert_eq!(log.model_answered(&ok("c1")).as_deref(), Some("opus"));
+        assert_eq!(log.model_answered(&ok("c1")), None, "answered once");
+        let refused = msg(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"c2","error":"no such model"}}"#,
+        );
+        assert_eq!(log.model_answered(&refused), None);
+        assert!(log.models.is_empty(), "nothing left waiting");
+    }
+
+    #[test]
+    fn a_default_model_is_saved_where_claude_code_saves_it_keeping_the_rest() {
+        let d = scratch("default-model");
+        let f = d.join("cfg").join("settings.json");
+        let read = |p: &Path| json::parse(&std::fs::read_to_string(p).unwrap()).unwrap();
+        // No file, nor its directory, yet.
+        save_default_model(&f, "opus").unwrap();
+        assert_eq!(read(&f), json::parse(r#"{"model":"opus"}"#).unwrap());
+        std::fs::write(
+            &f,
+            r#"{"env":{"A":"1"},"model":"haiku","effortLevel":"high"}"#,
+        )
+        .unwrap();
+        save_default_model(&f, "claude-sonnet-5-5[1m]").unwrap();
+        assert_eq!(
+            read(&f),
+            json::parse(
+                r#"{"effortLevel":"high","env":{"A":"1"},"model":"claude-sonnet-5-5[1m]"}"#
+            )
+            .unwrap()
+        );
+        // The same model again leaves the file as it is, byte for byte.
+        std::fs::write(&f, r#"{"model":"opus", "z":1}"#).unwrap();
+        save_default_model(&f, "opus").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            r#"{"model":"opus", "z":1}"#
+        );
+        // Default takes the key out, as Claude Code's picker does.
+        save_default_model(&f, "default").unwrap();
+        assert_eq!(read(&f), json::parse(r#"{"z":1}"#).unwrap());
+        // A file it cannot read is an error, and is left alone.
+        std::fs::write(&f, "{not json").unwrap();
+        assert!(save_default_model(&f, "opus").is_err());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{not json");
+        // A linked file is written through, and stays linked.
+        let real = d.join("real.json");
+        std::fs::write(&real, "{}").unwrap();
+        let link = d.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        save_default_model(&link, "fable").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(&real), json::parse(r#"{"model":"fable"}"#).unwrap());
+        let left: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
+        assert_eq!(left.len(), 3, "no temporary file left behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn the_amber_mark_goes_when_the_last_open_prompt_is_answered_or_withdrawn() {
         let mut log = Log {
             file: File::create(scratch("open").join("l")).unwrap(),
@@ -954,6 +1131,7 @@ mod tests {
             closed: false,
             answered: HashSet::new(),
             open: HashSet::new(),
+            models: HashMap::new(),
         };
         let msg = |l: &str| sdk::classify(&json::parse(l).unwrap());
         let ask = |id: &str, tool: &str| {

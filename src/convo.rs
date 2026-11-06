@@ -2336,7 +2336,9 @@ fn model_dialog(
 ) -> Vec<Line> {
     let mut out = vec![rule(w, "▔", fg(LAVENDER))];
     out.push(line("   Select model", bold(LAVENDER)));
-    out.push(line("   For this session only.", fg(GREY)));
+    // Claude Code's own picker says "Your pick becomes the default for new sessions";
+    // the holder saves it so (`holder::save_default_model`).
+    out.push(line("   The default for new sessions too.", fg(GREY)));
     out.push(Vec::new());
     match list {
         None => out.push(line("   Loading models…", fg(GREY))),
