@@ -1074,7 +1074,10 @@ ours.
   until it matches again. It looks again every 10 s, and rewrites a stand-in record somebody
   removed. `claude-sessions peer-check [CLAUDE]` starts a claude with no prompt (no request
   is made), and checks that it speaks protocol 1 and that its inbox answers, for infra's
-  verify and smoke runs before a Claude Code pin moves.
+  verify and smoke runs before a Claude Code pin moves. It leaves nothing behind in a live
+  container (infra's finding of 2026-11-06): the claude runs with a scratch config, runtime
+  directory, caches, temporary directory and registry, is stopped by closing its input, and
+  the scratch directory goes after it.
 
 **The router (`src/router.rs`)**, `claude-sessions router`, in the hub, for ever, started by
 its entrypoint (`mail-server` still runs it, for a hub whose entrypoint says the old name). It

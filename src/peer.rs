@@ -765,17 +765,42 @@ pub enum Undelivered {
 /// How long `peer-check` waits for a claude's record.
 const CHECK_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a checked claude has to leave once its input closes, before it is killed.
+const CHECK_EXIT: Duration = Duration::from_secs(5);
+
 /// `claude-sessions peer-check [CLAUDE]`: start `claude` headless with no prompt (so no
 /// request is made), wait for its record, and check that it speaks [`PROTOCOL`] and that its
 /// inbox answers. For infra's verify and smoke runs, so a Claude Code bump that changes the
 /// protocol is caught before the pin, not by a relay that switched itself off.
+///
+/// **It leaves nothing behind**, since infra runs it in live containers. The claude gets a
+/// scratch `CLAUDE_CONFIG_DIR`, `XDG_RUNTIME_DIR`, caches, temporary directory and working
+/// directory, and this binary's hook a scratch registry, so its session record, key, inbox,
+/// project entry and caches never touch the container's own. It is stopped by closing its
+/// input, which ends a headless claude cleanly (killed only if it is still there after
+/// [`CHECK_EXIT`]), and then the scratch directory goes. The protocol is the binary's, so a
+/// scratch configuration checks the same thing the container's would.
 pub fn check(claude: Option<&str>) -> Result<String, String> {
     use std::process::{Command, Stdio};
     let program = claude.unwrap_or("claude");
-    let cwd =
+    let root =
         std::env::temp_dir().join(format!("claude-sessions-peer-check-{}", std::process::id()));
-    fs::create_dir_all(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
-    let mut child = Command::new(program)
+    let _ = fs::remove_dir_all(&root);
+    let made = (|| -> io::Result<()> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(root.join("run"))?;
+        for sub in ["cc", "work", "cache", "state", "data", "tmp", "registry"] {
+            fs::create_dir_all(root.join(sub))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = made {
+        let _ = fs::remove_dir_all(&root);
+        return Err(format!("{}: {e}", root.display()));
+    }
+    let spawned = Command::new(program)
         .args([
             "-p",
             "--input-format",
@@ -784,7 +809,18 @@ pub fn check(claude: Option<&str>) -> Result<String, String> {
             "stream-json",
             "--verbose",
         ])
-        .current_dir(&cwd)
+        .current_dir(root.join("work"))
+        .env("CLAUDE_CONFIG_DIR", root.join("cc"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        // Claude Code's caches and temporary files (a per-project cache directory, named by
+        // the scratch cwd, would otherwise pile up one per run), and this binary's own hook,
+        // which the managed drop-in runs for this claude too.
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("TMPDIR", root.join("tmp"))
+        .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
         .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
         .env_remove("CLAUDE_SESSIONS_SLOT")
@@ -792,9 +828,15 @@ pub fn check(claude: Option<&str>) -> Result<String, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-    let record = sessions_dir().join(format!("{}.json", child.id()));
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&root);
+            return Err(format!("could not run {program}: {e}"));
+        }
+    };
+    let record = root.join(format!("cc/sessions/{}.json", child.id()));
     let deadline = std::time::Instant::now() + CHECK_WAIT;
     let found = loop {
         let v = fs::read_to_string(&record)
@@ -836,9 +878,17 @@ pub fn check(claude: Option<&str>) -> Result<String, String> {
             }
         }
     };
-    let _ = child.kill();
+    // End of input ends a headless claude, which takes its record and inbox down itself.
+    drop(child.stdin.take());
+    let until = std::time::Instant::now() + CHECK_EXIT;
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
     let _ = child.wait();
-    let _ = fs::remove_dir_all(&cwd);
+    let _ = fs::remove_dir_all(&root);
     verdict
 }
 

@@ -478,7 +478,9 @@ impl Rig {
             ));
         }
         let stderr = fs::read_to_string(self.dir.join("claude.stderr")).unwrap_or_default();
-        out.push_str(&format!("claude's stderr: {}", stderr.trim()));
+        out.push_str(&format!("claude's stderr: {}\n", stderr.trim()));
+        let agent = fs::read_to_string(self.dir.join("registry/agent.log")).unwrap_or_default();
+        out.push_str(&format!("the agent's log: {}", agent.trim()));
         out
     }
 }
@@ -509,12 +511,18 @@ fn claude_publishes_an_inbox_speaking_peer_protocol_1() {
         rig.dir.join("run/cc-socks"),
         "inboxes are under $XDG_RUNTIME_DIR/cc-socks, where the agent puts its stand-ins"
     );
-    // And the check infra runs before a pin says the same of this claude.
+    // And the check infra runs before a pin says the same of this claude, leaving nothing in
+    // the home or the temporary directory it ran with (infra runs it in live containers).
+    let home = rig.dir.join("check-home");
+    let tmp = rig.dir.join("check-tmp");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
     let out = Command::new(BIN)
         .args(["peer-check", real_claude().unwrap().to_str().unwrap()])
-        .env("CLAUDE_CONFIG_DIR", rig.dir.join("cc"))
-        .env("XDG_RUNTIME_DIR", rig.dir.join("run"))
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("XDG_RUNTIME_DIR")
         .output()
         .unwrap();
     assert!(
@@ -522,6 +530,23 @@ fn claude_publishes_an_inbox_speaking_peer_protocol_1() {
         "peer-check: {}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    let left = |d: &Path| -> Vec<PathBuf> {
+        fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect()
+    };
+    assert_eq!(
+        left(&home),
+        Vec::<PathBuf>::new(),
+        "peer-check left this in the home"
+    );
+    assert_eq!(
+        left(&tmp),
+        Vec::<PathBuf>::new(),
+        "peer-check left this behind"
     );
 }
 
@@ -567,9 +592,12 @@ fn claudes_send_to_a_stand_in_reaches_the_agent_from_its_slot() {
         return;
     };
     rig.prompt("tell far hello");
-    let p = rig
-        .sent(|_| true)
-        .expect("the agent handed the hub what claude sent the stand-in");
+    let p = rig.sent(|_| true).unwrap_or_else(|| {
+        panic!(
+            "the agent never handed on what claude sent\n{}",
+            rig.story()
+        )
+    });
     assert_eq!(
         str_of(&p, &["from"]),
         Some(SLOT),
@@ -604,8 +632,12 @@ fn a_delivered_message_reaches_the_model_from_the_verified_sender() {
         "prompting",
         "hello near",
     ));
-    let seen = seen_by_model(&rig.api, "hello near", WAIT)
-        .expect("an idle claude took the delivered message as a turn");
+    let seen = seen_by_model(&rig.api, "hello near", WAIT).unwrap_or_else(|| {
+        panic!(
+            "an idle claude never took the delivered message as a turn\n{}",
+            rig.story()
+        )
+    });
     assert_eq!(attr(&seen, "from-name").as_deref(), Some(FAR), "{seen}");
     assert!(!seen.contains("a forged name"));
     let from = format!("uds:{stand_in}");
@@ -649,7 +681,7 @@ fn claudes_reply_to_a_delivered_message_comes_back_through_the_stand_in() {
     ));
     let p = rig
         .sent(|p| str_of(p, &["frame", "type"]) == Some("user"))
-        .expect("the reply reached the agent as sent to the stand-in");
+        .unwrap_or_else(|| panic!("the reply never reached the agent\n{}", rig.story()));
     assert_eq!(str_of(&p, &["from"]), Some(SLOT));
     let content = str_of(&p["frame"], &["message", "content"]).unwrap();
     assert_eq!(body(content), Some("pong"), "{content}");
@@ -681,7 +713,8 @@ fn the_shipped_settings_deliver_a_message_from_another_permission_class() {
     ));
     assert!(
         seen_by_model(&rig.api, "from a bypassing sender", WAIT).is_some(),
-        "crossSessionInbound: accept lets a message from another class through"
+        "crossSessionInbound: accept should let a message from another class through\n{}",
+        rig.story()
     );
 }
 
@@ -711,11 +744,12 @@ fn without_the_setting_a_message_from_another_permission_class_is_held_and_the_s
     rig.deliver(peer_frame("/elsewhere/9.sock", "x", "bypass", "held words"));
     assert!(
         first(&rig.claude_out, WAIT, is_hold).is_some(),
-        "a sender in another class is held while crossSessionInbound is unset"
+        "a sender in another class should be held while crossSessionInbound is unset\n{}",
+        rig.story()
     );
     let receipt = rig
         .sent(|p| str_of(p, &["frame", "type"]) == Some("control"))
-        .expect("the hold receipt reached the agent through the stand-in");
+        .unwrap_or_else(|| panic!("no hold receipt reached the agent\n{}", rig.story()));
     assert_eq!(
         str_of(&receipt["frame"], &["action"]),
         Some("peer_message_status")
