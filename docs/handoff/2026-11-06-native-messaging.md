@@ -3,18 +3,8 @@
 **First orders for the next session:** the relay is **built** (design § *Agent messaging*:
 `src/peer.rs`, `src/router.rs`, `tests/peer.rs`), and agent mail is removed. Still open:
 
-1. **Release** when the owner asks for the bump (a version bump is a publish). The release
-   note's "For infra" section must say:
-   - the hub's entrypoint runs `claude-sessions router` (`mail-server` still works, as an
-     alias);
-   - `HUB_QUEUE` (default `$HOME/queue`) must be a persisted volume. The `mail` volume, its
-     tokens and `HUB_MAIL_*` can go;
-   - `hooks-config` output changes: no `mail-hook`, plus `crossSessionInbound: "accept"`.
-     Infra updates its drop-in row in decisions.md;
-   - the three mail skills are removed from the volume, so infra's base should stop linking
-     them;
-   - infra's managed mail text goes;
-   - `claude-sessions peer-check` is for `make verify` and dev-smoke.
+1. ~~Release~~: **0.18.0**, its "For infra" section in `docs/releases/v0.18.0.md`. The pin was
+   requested from infra by mail on 2026-11-06.
 2. **The first run on the fleet** after infra pins it. Check that a slot in one container
    lists another container's slots with `ListAgents`, and that a message and its reply cross.
    Only the owner or infra bring it up.
