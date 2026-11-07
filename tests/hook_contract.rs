@@ -627,3 +627,62 @@ fn a_terminal_on_only_one_side_still_lists() {
     );
     assert!(said.starts_with("no slots."), "{said:?}");
 }
+
+/// `peer-context` is the one hook handler that speaks, and only its one line: whatever it is
+/// fed it exits 0, a subagent gets nothing, and a closed stdout is not a failure Claude Code
+/// would show anyone.
+#[test]
+fn peer_context_exits_zero_and_says_only_its_line() {
+    let dir = tmpdir("peer-context");
+    for payload in [
+        r#"{"hook_event_name":"SessionStart","source":"startup"}"#,
+        r#"{"hook_event_name":"SessionStart","source":"compact"}"#,
+        "rubbish",
+        "",
+    ] {
+        let out = run(&["peer-context"], &dir, None, payload);
+        assert_eq!(out.status.code(), Some(0), "{payload:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{payload:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(said.lines().count(), 1, "{payload:?}: {said}");
+        assert!(said.contains("\"additionalContext\""), "{said}");
+    }
+    let out = run(&["peer-context"], &dir, None, r#"{"agent_id":"a1"}"#);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "a subagent shares its parent's context"
+    );
+    // Its stdout closed before it writes.
+    let mut child = Command::new(BIN)
+        .arg("peer-context")
+        .env("CLAUDE_SESSIONS_DIR", &dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"source":"startup"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a closed stdout is not a failure"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

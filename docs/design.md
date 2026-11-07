@@ -1051,8 +1051,8 @@ Code's own, and a record naming it as `repo/slot`, with a `pidDomain` of
 `claude-sessions:<repo>` and a made-up pid above any real one. A live slot's record says `busy`
 or `idle`; an offloaded one's says nothing, since Claude Code shows `status` only when it is one
 of its own four (`busy`, `shell`, `idle`, `waiting`, read from 2.1.311) and drops any other.
-The skill `peers`, which every agent sees, says that a peer with no status is offloaded, and
-what messaging one costs. Claude Code takes a record from
+Every session is told what that means at its start (below, *What every session is told*).
+Claude Code takes a record from
 a foreign pid domain as present without a pid check, as long as its socket answers. A local
 claude therefore lists the whole fleet and messages it by name, with no skill or command of
 ours.
@@ -1133,6 +1133,26 @@ the agent wire (`proto.rs`):
   record of the traffic: the owner reads messages in each session, or in the remote view
   (owner, 2026-11-06).
 
+**What every session is told** (owner and infra, 2026-11-07). The facts an agent needs before
+it messages a peer: other containers' sessions are listed as `repo/slot`; a peer with no status
+is offloaded; a message wakes one where there is room, at about `mem::SESSION_COST` of that
+container's RAM and CPU on the shared host; so prefer a live peer and send one message, not
+several; and a `hub/router` notice is not a peer. Four lines, in `peer::context`.
+- **Where they go.** They are given by `claude-sessions peer-context`, a second `SessionStart`
+  handler in the drop-in, as `hookSpecificOutput.additionalContext`.
+- **Why there.** Not a skill, whose body loads only when invoked, while the "no status" fact is
+  needed while reading ListAgents. Not a managed CLAUDE.md, which is the fleet's one managed
+  memory slot and infra's.
+- **Its contract.** The registry hook stays silent (the rule with teeth); `peer-context` is the
+  one handler that speaks, and says nothing else. It always exits 0, catches a panic, says
+  nothing to a subagent, and is built from constants: no registry, no network, since it runs on
+  every session start.
+- **Measured against 2.1.311** (2026-11-07, and held by `tests/claude_peer.rs`):
+  - a SessionStart hook's context reaches the model under `claude -p`, as under the holder;
+  - SessionStart fires again with source `compact` after a compaction, and the context comes
+    back;
+  - a SessionStart hook that fails, or hangs past its timeout, does not stop the start.
+
 **Receive policy.** The drop-in sets `crossSessionInbound: "accept"` (owner, 2026-11-06).
 Left unset, Claude Code holds a message from a sender in another permission class for
 approval, and a headless slot has nowhere to approve it. Auto mode is in the `prompting`
@@ -1156,7 +1176,9 @@ account is used, and each test reads as the promise it checks:
 - the shipped settings deliver across permission classes, and without them the message is
   held, the hold receipt coming back through the stand-in;
 - an offloaded stand-in is listed with no status, a live one with its status;
-- a notice from `hub/router`, an address with no record, reaches the model.
+- a notice from `hub/router`, an address with no record, reaches the model;
+- the shipped settings give a session the four lines at its start and again after a
+  compaction.
 
 CI runs these at infra's pin (`CLAUDE_CODE_VERSION`), so a bump is mechanical when nothing
 changed, and names the broken behaviour when something did.
@@ -1198,25 +1220,24 @@ It installs the five events of the table and the status line, every event but `S
 and `SessionEnd` `async` (see
 *The event table*), and a timeout only on those two: 30 s on `SessionStart`, above the hook's
 own 15 s lock wait, and **1 s on `SessionEnd`** — a longer one would raise the budget every
-`SessionEnd` hook on the box shares. It also sets `crossSessionInbound: "accept"`
-(§ *Agent messaging*), which changes the file from 0.17's. `src/hooks_config.rs` has the reasons and the tests that hold it to the
-state machine. A drop-in rather
+`SessionEnd` hook on the box shares. For agent messaging (§ *Agent messaging*) it adds
+`peer-context` as a second `SessionStart` handler, with a 5 s timeout, and sets
+`crossSessionInbound: "accept"`. `src/hooks_config.rs` has the reasons, and the tests that
+hold it to the state machine. A drop-in rather
 than `managed-settings.json` itself because Claude Code merges `managed-settings.json` first and
 then every `managed-settings.d/*.json` alphabetically, and `infra` can own one file for this
 tool without editing a shared one.
 
 **The skills go beside it.** `claude-sessions skill [name]` prints `skills/<name>/SKILL.md`:
 `keepalive`, which tells claude when to run `claude-sessions keepalive` and for how short a
-time (§ *The offloader*), and `peers`, on messaging other containers' sessions and what
-waking an offloaded one costs (§ *Agent messaging*). Skills go in Claude Code's config
-directory, which in infra's
+time (§ *The offloader*). Skills go in Claude Code's config directory, which in infra's
 containers is a volume, so an image build cannot put them there. Infra's base **links** each one at the copy `install` put in the shared volume, at every
 container start, so a release's skills are live at the next invocation with no restart. Agent
 mail's three skills went with it in 0.18.0; `install` removes them from the volume, and a link
 infra's base made to one of them is left dangling until infra drops it:
 
 ```
-for s in keepalive peers; do
+for s in keepalive; do
   d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"; mkdir -p "$d"
   ln -sfn "/opt/claude-sessions/skills/$s" "$d/$s"
 done

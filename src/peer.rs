@@ -773,6 +773,42 @@ pub enum Undelivered {
     Never(String),
 }
 
+/// What every session is told at its start about messaging other containers' sessions (owner
+/// and infra, 2026-11-07): the facts an agent needs before it messages one, kept to four lines
+/// because every session pays for them. The cost is [`mem::SESSION_COST`](crate::mem), so the
+/// figure is the one the wake decides by. The why, and the figures of the moment, are in the
+/// router's notices.
+pub fn context() -> String {
+    let cost = crate::fmt::human(crate::mem::SESSION_COST);
+    format!(
+        "Sessions in other containers are listed by ListAgents as repo/slot, and SendMessage \
+         reaches them as it does local ones.\n\
+         A peer listed with no status (neither busy nor idle) is offloaded. A message to it is \
+         kept, and wakes it if its container has room: about {cost} of that container's RAM, \
+         and CPU on the host every container shares, until it is offloaded again.\n\
+         So prefer a live peer, wake an offloaded one only for something worth that, and send \
+         one message rather than several.\n\
+         A notice from {HUB}/router says what became of a message to an offloaded peer; it is \
+         not a peer, and a reply to it goes nowhere."
+    )
+}
+
+/// `claude-sessions peer-context`, on `SessionStart`: the line that gives the session
+/// [`context`], or nothing for a subagent, which shares its parent's context. Local and
+/// constant, since it runs on every session start: no registry, no network.
+pub fn session_context(payload: &str) -> Option<String> {
+    let ev = json::parse(payload).ok();
+    if ev.as_ref().is_some_and(|e| e.get("agent_id").is_some()) {
+        return None;
+    }
+    let mut out = Value::obj();
+    out.set("hookEventName", Value::string("SessionStart"));
+    out.set("additionalContext", Value::string(context()));
+    let mut line = Value::obj();
+    line.set("hookSpecificOutput", out);
+    Some(json::to_line(&line))
+}
+
 /// How long `peer-check` waits for a claude's record.
 const CHECK_WAIT: Duration = Duration::from_secs(30);
 
@@ -1122,6 +1158,40 @@ mod tests {
             Some("claude-2's claude speaks peer protocol 2, not 1")
         );
         assert!(mismatch(&[("claude-1".into(), at(None))]).is_some());
+    }
+
+    #[test]
+    fn every_session_is_told_what_an_offloaded_peer_is_and_costs() {
+        let line = session_context(r#"{"hook_event_name":"SessionStart","source":"startup"}"#)
+            .expect("a session gets the lines");
+        let v = json::parse(&line).unwrap();
+        let out = v.get("hookSpecificOutput").unwrap();
+        assert_eq!(
+            out.get("hookEventName").and_then(Value::as_str),
+            Some("SessionStart")
+        );
+        let text = out
+            .get("additionalContext")
+            .and_then(Value::as_str)
+            .unwrap();
+        for said in [
+            "repo/slot",
+            "no status",
+            "offloaded",
+            "250M",
+            "send one message",
+            "hub/router",
+        ] {
+            assert!(text.contains(said), "{said:?} in {text}");
+        }
+        assert_eq!(text.lines().count(), 4, "every session pays for each line");
+        assert!(!line.contains('\n'), "one line on stdout");
+        // A subagent shares its parent's context; a payload that cannot be read still gets it.
+        assert_eq!(
+            session_context(r#"{"agent_id":"a1","source":"startup"}"#),
+            None
+        );
+        assert!(session_context("not json").is_some());
     }
 
     #[test]

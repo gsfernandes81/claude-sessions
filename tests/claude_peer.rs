@@ -937,3 +937,47 @@ fn a_notice_from_the_hub_reaches_the_model() {
         "the hub's address is never listed: {names:?}"
     );
 }
+
+/// With the settings we ship, every session is told what an offloaded peer is and costs, by
+/// `peer-context` on SessionStart: at its start, and again after a compaction, when Claude Code
+/// fires SessionStart with source `compact`.
+#[test]
+fn the_shipped_settings_tell_a_session_about_offloaded_peers_at_start_and_after_compact() {
+    const LINE: &str = "A peer listed with no status (neither busy nor idle) is offloaded.";
+    let settings = Command::new(BIN)
+        .args(["hooks-config", BIN])
+        .output()
+        .unwrap();
+    let settings = String::from_utf8(settings.stdout).unwrap();
+    assert!(settings.contains("peer-context"), "calibration: {settings}");
+    let Some(mut rig) = Rig::start(
+        "context",
+        Arc::new(|_| Reply::Text("ok".into())),
+        Some(&settings),
+    ) else {
+        return;
+    };
+    rig.prompt("the first prompt, before any compaction");
+    rig.api
+        .wait_for(WAIT, |r| r.mentions("the first prompt") && r.mentions(LINE))
+        .unwrap_or_else(|| {
+            panic!(
+                "the lines were not in the session at its start\n{}",
+                rig.story()
+            )
+        });
+    rig.prompt("/compact");
+    rig.prompt("the prompt after compaction");
+    // After a compaction the first prompt is gone, so the lines there came back with it.
+    rig.api
+        .wait_for(WAIT, |r| {
+            r.mentions("the prompt after compaction") && !r.mentions("the first prompt")
+        })
+        .filter(|r| r.mentions(LINE))
+        .unwrap_or_else(|| {
+            panic!(
+                "the lines did not come back after a compaction\n{}",
+                rig.story()
+            )
+        });
+}

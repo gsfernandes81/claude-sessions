@@ -101,10 +101,7 @@ const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 /// still a placeholder (`install::pi_extension` fills it).
 pub const PI_EXTENSION: &str = include_str!("../extensions/claude-sessions.js");
 
-pub const SKILLS: [(&str, &str); 2] = [
-    ("keepalive", SKILL),
-    ("peers", include_str!("../skills/peers/SKILL.md")),
-];
+pub const SKILLS: [(&str, &str); 1] = [("keepalive", SKILL)];
 
 /// Skills earlier releases shipped, which `install` removes so no session is told to use a
 /// command this binary no longer has: agent mail's three, gone with it.
@@ -137,6 +134,29 @@ fn main() -> ExitCode {
         "hook" => {
             std::panic::set_hook(Box::new(|info| log(&format!("hook: panicked: {info}"))));
             contained(cmd_hook, log);
+            ExitCode::SUCCESS
+        }
+        // The one handler that speaks: what every session is told about messaging other
+        // containers. Fed by Claude Code's SessionStart, always 0, and nothing but its one line.
+        "peer-context" => {
+            std::panic::set_hook(Box::new(|info| {
+                log(&format!("peer-context: panicked: {info}"))
+            }));
+            contained(
+                || {
+                    let mut payload = String::new();
+                    std::io::stdin()
+                        .take(1 << 20)
+                        .read_to_string(&mut payload)?;
+                    if let Some(line) = peer::session_context(&payload) {
+                        let mut out = std::io::stdout().lock();
+                        writeln!(out, "{line}")?;
+                        out.flush()?;
+                    }
+                    Ok(())
+                },
+                |e| log(&format!("peer-context: {e}")),
+            );
             ExitCode::SUCCESS
         }
         "router" => report(router::serve()),
@@ -351,6 +371,8 @@ fn usage() -> String {
                                be its tap; its first line names the slot, or why not
   claude-sessions list         every slot here, one line each
   claude-sessions hook         fed by Claude Code's hooks on stdin; always exits 0
+  claude-sessions peer-context fed by Claude Code's SessionStart; what every session is told
+                               about messaging other containers; always exits 0
   claude-sessions reconcile    make the registry agree with reality after a restart
   claude-sessions doctor       what is visible, per slot, and what is not
   claude-sessions close SLOT   mark a slot closed (refuses one that is still running)
@@ -361,8 +383,8 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill [NAME] print a skill this binary ships (keepalive, the default, or
-                               peers), as install writes it into skills/NAME/SKILL.md
+  claude-sessions skill [NAME] print a skill this binary ships (keepalive, the default), as
+                               install writes it into skills/NAME/SKILL.md
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status

@@ -49,6 +49,12 @@ fn timeout_secs(event: &str) -> Option<u32> {
     }
 }
 
+/// The second `SessionStart` handler: `peer-context`, what every session is told about
+/// messaging other containers' sessions (`peer::context`, design § *Agent messaging*). The
+/// registry hook stays silent; this is the one that speaks. Synchronous, since only a hook
+/// Claude Code waits for adds context; it prints a constant, so its timeout is a backstop.
+const PEER_CONTEXT_TIMEOUT_SECS: u32 = 5;
+
 /// The settings document, with `exe` as the path to this binary.
 pub fn settings(exe: &str) -> Value {
     let command = format!("{} hook", shell_quote(exe));
@@ -63,7 +69,19 @@ pub fn settings(exe: &str) -> Value {
         }
         let mut group = Value::obj();
         group.set("hooks", Value::Arr(vec![handler]));
-        let groups = vec![group];
+        let mut groups = vec![group];
+        if event == "SessionStart" {
+            let mut handler = Value::obj();
+            handler.set("type", Value::string("command"));
+            handler.set(
+                "command",
+                Value::string(format!("{} peer-context", shell_quote(exe))),
+            );
+            handler.set("timeout", Value::num(PEER_CONTEXT_TIMEOUT_SECS));
+            let mut group = Value::obj();
+            group.set("hooks", Value::Arr(vec![handler]));
+            groups.push(group);
+        }
         hooks.set(event, Value::Arr(groups));
     }
     let mut doc = Value::obj();
@@ -195,9 +213,10 @@ mod tests {
         }
     }
 
-    /// One handler per event, the registry's: agent mail's hook went with it (0.18.0).
+    /// The registry hook on every event, first; and on `SessionStart` only, `peer-context`
+    /// after it, waited for (its line is the context) and timed out.
     #[test]
-    fn each_event_has_the_registry_hook_alone() {
+    fn the_registry_hook_is_on_every_event_and_peer_context_on_session_start() {
         let doc = installed();
         for event in EVENTS {
             let groups = doc
@@ -211,7 +230,24 @@ mod tests {
                 .flatten()
                 .filter_map(|h| h.get("command").and_then(Value::as_str))
                 .collect();
-            assert_eq!(commands, ["/usr/local/bin/claude-sessions hook"], "{event}");
+            if event == "SessionStart" {
+                assert_eq!(
+                    commands,
+                    [
+                        "/usr/local/bin/claude-sessions hook",
+                        "/usr/local/bin/claude-sessions peer-context"
+                    ]
+                );
+                let h = &groups[1].get("hooks").and_then(Value::as_arr).unwrap()[0];
+                assert_eq!(h.get("async"), None, "waited for, or its context is lost");
+                assert!(
+                    h.get("timeout")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|t| t > 0.0)
+                );
+            } else {
+                assert_eq!(commands, ["/usr/local/bin/claude-sessions hook"], "{event}");
+            }
         }
     }
 
