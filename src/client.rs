@@ -950,6 +950,7 @@ impl App {
         };
         ui.status = None;
         ui.toast = None;
+        let left_armed = std::mem::take(&mut ui.left);
         let mut out: Vec<Value> = Vec::new();
         let mut leave = false;
         // Ctrl+X Ctrl+S, Claude Code's send-now: what waits behind the turn goes now. Ctrl+X
@@ -1160,6 +1161,17 @@ impl App {
                 }
                 None => match k {
                     Key::Char('\x03') | Key::Char('\x04') if ui.input.is_empty() => leave = true,
+                    // Left twice on an empty prompt goes home, as Ctrl+\\ does: Claude Code's
+                    // double Left to its agents view. The first says so; any other key between
+                    // them starts again.
+                    Key::Left if ui.input.is_empty() && viewing.is_none() => {
+                        if left_armed {
+                            leave = true;
+                        } else {
+                            ui.left = true;
+                            ui.status = Some("Left again to disconnect".into());
+                        }
+                    }
                     Key::Char('\x03') => {
                         ui.input.clear();
                         ui.cursor = 0;
@@ -3642,6 +3654,48 @@ mod tests {
         let mut app = app_in(&[]);
         type_in(&mut app, "/disconnect");
         assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn left_twice_on_an_empty_prompt_leaves_for_the_home() {
+        let home = |app: &App| matches!(app.screen, Screen::Home);
+        let mut app = app_in(&[]);
+        app.key(Key::Left, Instant::now());
+        assert!(!home(&app), "one Left stays");
+        assert_eq!(
+            ui_of(&app).status.as_deref(),
+            Some("Left again to disconnect")
+        );
+        app.key(Key::Left, Instant::now());
+        assert!(home(&app), "a second goes home");
+        assert!(!app.quit, "and only home, the client still up");
+
+        // Calibration: another key between them starts again.
+        let mut app = app_in(&[]);
+        app.key(Key::Left, Instant::now());
+        app.key(Key::Right, Instant::now());
+        app.key(Key::Left, Instant::now());
+        assert!(!home(&app));
+        assert!(ui_of(&app).status.is_some(), "armed again, and saying so");
+
+        // A prompt with text in it: Left moves the cursor, however often.
+        let mut app = app_in(&[]);
+        for ch in "hi".chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        app.key(Key::Left, Instant::now());
+        app.key(Key::Left, Instant::now());
+        app.key(Key::Left, Instant::now());
+        assert!(!home(&app));
+        assert_eq!(ui_of(&app).cursor, 0);
+
+        // Left closing a dialog is the dialog's, and does not count.
+        let mut app = app_in(&[]);
+        type_in(&mut app, "/effort");
+        app.key(Key::Esc, Instant::now());
+        app.key(Key::Left, Instant::now());
+        assert!(!home(&app));
+        assert!(ui_of(&app).status.is_some(), "the prompt's first Left");
     }
 
     #[test]
