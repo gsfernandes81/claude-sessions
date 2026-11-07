@@ -433,10 +433,7 @@ impl App {
                     .collect();
                 if let Screen::Conv { c, ui, .. } = &mut self.screen {
                     if let Some(Dialog::Model { sel, list: l }) = &mut ui.dialog {
-                        *sel = list
-                            .iter()
-                            .position(|(v, d)| convo::is_current(&c.meta.model, v, d))
-                            .unwrap_or(0);
+                        *sel = convo::current_model(&c.meta, &list).unwrap_or(0);
                         *l = Some(list.clone());
                     }
                 }
@@ -1632,10 +1629,7 @@ fn submit(
             c.local(Entry::Prompt(text.into()));
             let sel = models
                 .as_ref()
-                .and_then(|l| {
-                    l.iter()
-                        .position(|(v, d)| convo::is_current(&c.meta.model, v, d))
-                })
+                .and_then(|l| convo::current_model(&c.meta, l))
                 .unwrap_or(0);
             ui.dialog = Some(Dialog::Model {
                 sel,
@@ -1649,10 +1643,7 @@ fn submit(
         "/model" => Submit::Send(vec![m("model", vec![("m", Value::string(rest))])]),
         "/effort" if rest.is_empty() => {
             c.local(Entry::Prompt(text.into()));
-            let sel = convo::EFFORTS
-                .iter()
-                .position(|e| *e == c.meta.effort)
-                .unwrap_or(1);
+            let sel = convo::effort_index(&c.meta);
             ui.dialog = Some(Dialog::Effort { sel });
             Submit::Nothing
         }
@@ -2291,11 +2282,16 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 sel: sel.saturating_sub(1),
             }),
             Key::Right => Some(Dialog::Effort {
-                sel: (sel + 1).min(convo::EFFORTS.len() - 1),
+                sel: (sel + 1).min(convo::EFFORT_CHOICES.len() - 1),
             }),
             Key::Esc => None,
             Key::Enter => {
-                out.push(m("effort", vec![("e", Value::string(convo::EFFORTS[sel]))]));
+                // `auto` takes the effort out, so the model's own applies.
+                let e = match convo::EFFORT_CHOICES[sel] {
+                    "auto" => Value::Null,
+                    level => Value::string(level),
+                };
+                out.push(m("effort", vec![("e", e)]));
                 None
             }
             _ => Some(Dialog::Effort { sel }),

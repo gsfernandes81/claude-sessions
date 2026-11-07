@@ -758,12 +758,15 @@ Esc to cancel
    Effort
 
    Faster                    Smarter
-   ───────▲──────────────────────────
-   low  medium  high  xhigh  max
+   ─────────────▲────────────────────
+   auto  low  medium  high  xhigh  max
 
    ←/→ to adjust · Enter to confirm ·
    Esc to cancel
 ```
+
+`auto` is the model's own effort, where a session with no effort set sits, and choosing it
+takes the effort out (owner, 2026-11-07: `/effort` marks the session's own, as `/model` does).
 
 ### Mockup R7 — Scrolled back
 ```

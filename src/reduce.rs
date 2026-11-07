@@ -123,6 +123,10 @@ pub const PROMPT_MAX: usize = 400;
 pub struct Meta {
     pub session_id: String,
     pub model: String,
+    /// The model as chosen rather than as resolved: the alias in force (`default`, `opus`, …),
+    /// from the holder's start line (`_cfg`) and from a view's `/model`. claude's `init` says
+    /// only the model it resolved to, so `/model` marks the session's own entry by this.
+    pub chosen: String,
     pub permission_mode: String,
     pub title: String,
     /// The effort a view set, empty for the model's default: claude's own lines never say it.
@@ -844,6 +848,22 @@ impl Reducer {
                 _ => return out,
             }
         }
+        // The holder's first line: the model and effort claude was started with.
+        if v.get("type").and_then(Value::as_str) == Some("_cfg") {
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let meta = Meta {
+                chosen: s("model"),
+                effort: s("effort"),
+                ..self.meta.clone()
+            };
+            self.set_meta(&mut out, meta);
+            return out;
+        }
         let msg = sdk::classify(v);
         let quiet = matches!(
             msg,
@@ -1254,6 +1274,7 @@ impl Reducer {
                 }
                 sdk::Input::Model(model) => {
                     let meta = Meta {
+                        chosen: model.clone(),
                         model,
                         ..self.meta.clone()
                     };
@@ -1632,6 +1653,10 @@ impl Op {
                     ("cwd", Value::string(m.cwd.clone())),
                     ("ver", Value::string(m.version.clone())),
                 ]);
+                // Only when known, as `sc` below: an older client reads the op without it.
+                if !m.chosen.is_empty() {
+                    v.set("ch", Value::string(m.chosen.clone()));
+                }
                 // Only when there are some: an older client reads the op without it.
                 if !m.commands.is_empty() {
                     v.set(
@@ -2687,6 +2712,37 @@ mod tests {
     }
 
     #[test]
+    fn the_model_and_effort_claude_started_with_are_known_before_its_first_turn() {
+        let mut r = Reducer::new();
+        let cfg = parse(r#"{"type":"_cfg","model":"default","effort":""}"#).unwrap();
+        let out = r.feed(&cfg);
+        assert_eq!(
+            wire(&out.ops),
+            [
+                r#"{"ch":"default","cwd":"","e":"","m":"","pm":"","sid":"","t":"meta","ti":"","ver":""}"#
+            ]
+        );
+        // claude's `init` says the model it resolved to and leaves the alias as chosen.
+        feed_all(&mut r, TURN);
+        assert_eq!(r.meta().chosen, "default");
+        assert!(!r.meta().model.is_empty());
+        // A view's `/model` chooses anew; an effort the holder read is kept until one is set.
+        let mut r = Reducer::new();
+        r.feed(&parse(r#"{"type":"_cfg","model":"sonnet","effort":"high"}"#).unwrap());
+        assert_eq!(
+            (r.meta().chosen.as_str(), r.meta().effort.as_str()),
+            ("sonnet", "high")
+        );
+        let line =
+            |v: Value| parse(&format!(r#"{{"type":"_in","line":{}}}"#, to_line(&v))).unwrap();
+        r.feed(&line(sdk::set_model("c1", "opus")));
+        assert_eq!(
+            (r.meta().chosen.as_str(), r.meta().effort.as_str()),
+            ("opus", "high")
+        );
+    }
+
+    #[test]
     fn a_change_a_view_sent_shows_at_once_and_effort_survives_the_next_init() {
         let mut r = Reducer::new();
         feed_all(&mut r, TURN);
@@ -2696,7 +2752,7 @@ mod tests {
         assert_eq!(
             wire(&out.ops),
             [
-                r#"{"cwd":"","e":"","m":"claude-opus-5-5","pm":"default","sid":"s1","t":"meta","ti":"","ver":""}"#
+                r#"{"ch":"claude-opus-5-5","cwd":"","e":"","m":"claude-opus-5-5","pm":"default","sid":"s1","t":"meta","ti":"","ver":""}"#
             ]
         );
         r.feed(&line(sdk::set_effort("c2", Some("high"))));

@@ -308,6 +308,9 @@ impl Task {
 pub struct Meta {
     pub session_id: String,
     pub model: String,
+    /// The model as chosen, `default` or an alias, where the server knows it (`ch`): what
+    /// `/model` marks, since `model` is only what it resolved to.
+    pub chosen: String,
     pub mode: String,
     pub title: String,
     pub effort: String,
@@ -742,6 +745,7 @@ impl Convo {
                 self.meta = Meta {
                     session_id: s(v, "sid"),
                     model: s(v, "m"),
+                    chosen: s(v, "ch"),
                     mode: s(v, "pm"),
                     title: s(v, "ti"),
                     effort: s(v, "e"),
@@ -1067,7 +1071,28 @@ fn perm_title(tool: &str) -> String {
     }
 }
 
-pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// `/effort`'s stops: `auto`, the model's own default, which is where a session with no
+/// effort set sits, then the levels.
+pub const EFFORT_CHOICES: [&str; 6] = ["auto", "low", "medium", "high", "xhigh", "max"];
+
+/// Where `/effort` starts: the session's effort, or `auto` when none is set.
+pub fn effort_index(meta: &Meta) -> usize {
+    EFFORT_CHOICES
+        .iter()
+        .position(|e| *e == meta.effort)
+        .unwrap_or(0)
+}
+
+/// The session's own entry in `/model`'s list: the alias it was given when that is known,
+/// else the entry its model resolves to. One entry at most, so `/model` ticks one.
+pub fn current_model(meta: &Meta, list: &[(String, String)]) -> Option<usize> {
+    if !meta.chosen.is_empty() {
+        if let Some(i) = list.iter().position(|(v, _)| *v == meta.chosen) {
+            return Some(i);
+        }
+    }
+    list.iter().position(|(v, d)| is_current(&meta.model, v, d))
+}
 
 /// Claude Code's effort glyphs (read from 2.1.311).
 pub fn effort_glyph(level: &str) -> &'static str {
@@ -1903,6 +1928,27 @@ fn window(v: Option<&Value>) -> Option<crate::sdk::Window> {
 
 /// The footer's usage, `5h 12% · 7d 72%`: each window claude has read and that has not
 /// reset since, so an old reading is not drawn as now's.
+/// The session's model and effort, for the footer: `Opus 5.5 ● high`, or the model alone
+/// while the effort is the model's own. `None` until the model is known, as resolved or as
+/// chosen.
+fn settings(m: &Meta) -> Option<String> {
+    // Before claude's first `init` the model is known only as chosen.
+    let model = if m.model.is_empty() {
+        &m.chosen
+    } else {
+        &m.model
+    };
+    if model.is_empty() {
+        return None;
+    }
+    let name = model_name(model);
+    Some(if m.effort.is_empty() {
+        name
+    } else {
+        format!("{name} {} {}", effort_glyph(&m.effort), m.effort)
+    })
+}
+
 fn usage(m: &Meta, now_ms: u64) -> Option<String> {
     let parts: Vec<String> = [("5h", m.five_hour), ("7d", m.seven_day)]
         .into_iter()
@@ -2117,14 +2163,24 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
         foot.truncate(1);
     }
     let mut foot = clip(foot, w.saturating_sub(2));
-    // The usage at the right, two columns short of the edge as the rest is, when it fits.
-    if let Some(u) = usage {
-        let used = width(&plain(&foot));
-        let room = w.saturating_sub(2).saturating_sub(used);
-        if room >= width(&u) + 2 {
-            foot.push((" ".repeat(room - width(&u)), PLAIN));
-            foot.push((u, fg(GREY)));
-        }
+    // At the right, two columns short of the edge as the rest is: the model and effort, then
+    // the usage (owner, 2026-11-07). The model and effort go first when both do not fit.
+    let right: Vec<String> = [settings(&c.meta), usage.clone()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let used = width(&plain(&foot));
+    let room = w.saturating_sub(2).saturating_sub(used);
+    let fits = |t: &str| room >= width(t) + 2;
+    let both = right.join(" · ");
+    let shown = if !right.is_empty() && fits(&both) {
+        Some(both)
+    } else {
+        usage.filter(|u| fits(u))
+    };
+    if let Some(r) = shown {
+        foot.push((" ".repeat(room - width(&r)), PLAIN));
+        foot.push((r, fg(GREY)));
     }
     out.push(foot);
     // The agent strip under it while agents run.
@@ -2349,8 +2405,9 @@ fn model_dialog(
                 .saturating_sub(SHOWN - 2)
                 .min(list.len().saturating_sub(SHOWN));
             let hi = (lo + SHOWN).min(list.len());
-            for (i, (value, name)) in list.iter().enumerate().take(hi).skip(lo) {
-                let current = is_current(&c.meta.model, value, name);
+            let own = current_model(&c.meta, list);
+            for (i, (_, name)) in list.iter().enumerate().take(hi).skip(lo) {
+                let current = own == Some(i);
                 let mark = if i == sel {
                     "❯"
                 } else if i == lo && lo > 0 {
@@ -2467,8 +2524,12 @@ fn copy_dialog(sel: usize, choices: &[(String, String)], w: usize) -> Vec<Line> 
 }
 
 fn effort_dialog(sel: usize, w: usize) -> Vec<Line> {
-    let level = EFFORTS[sel.min(EFFORTS.len() - 1)];
-    let tag = format!(" {} {level} · /effort ", effort_glyph(level));
+    let level = EFFORT_CHOICES[sel.min(EFFORT_CHOICES.len() - 1)];
+    let tag = if level == "auto" {
+        " auto · /effort ".to_string()
+    } else {
+        format!(" {} {level} · /effort ", effort_glyph(level))
+    };
     let left = w.saturating_sub(width(&tag) + 1);
     let mut out = vec![vec![
         ("▔".repeat(left), fg(LAVENDER)),
@@ -2484,7 +2545,7 @@ fn effort_dialog(sel: usize, w: usize) -> Vec<Line> {
     // The labels, and the slider's mark under the chosen one.
     let mut labels = String::new();
     let mut at = 0;
-    for (i, l) in EFFORTS.iter().enumerate() {
+    for (i, l) in EFFORT_CHOICES.iter().enumerate() {
         if i > 0 {
             labels.push_str("  ");
         }
@@ -2940,9 +3001,17 @@ mod tests {
         let mut ui = Ui::new();
         let f = draw(&c, &ui, 80, 24, Instant::now());
         let t = text(&f);
-        assert_eq!(t[23], "  ⏵⏵ auto mode on · 2 shells, 1 monitor");
+        let left = "  ⏵⏵ auto mode on · 2 shells, 1 monitor";
+        assert_eq!(
+            t[23],
+            format!(
+                "{left}{}Opus 5.5",
+                " ".repeat(78 - width(left) - width("Opus 5.5"))
+            )
+        );
         let last = &f.lines[23];
-        assert_eq!(last.last().unwrap().1.fg, Some(crate::tasks::CYAN));
+        let shells = last.iter().find(|(t, _)| t.contains("shells")).unwrap();
+        assert_eq!(shells.1.fg, Some(crate::tasks::CYAN));
         assert!(
             t.iter()
                 .any(|l| l == "✻ Worked for 1s · done 3:43 AM · 2 shells, 1 monitor still running"),
@@ -2954,7 +3023,11 @@ mod tests {
         // Focused by Down, the pill is drawn inverse: its colour behind it.
         ui.focus = Focus::Pill;
         let f = draw(&c, &ui, 80, 24, Instant::now());
-        assert_eq!(f.lines[23].last().unwrap().1.bg, Some(crate::tasks::CYAN));
+        let pill = f.lines[23]
+            .iter()
+            .find(|(t, _)| t.contains("shells"))
+            .unwrap();
+        assert_eq!(pill.1.bg, Some(crate::tasks::CYAN));
         // A subagent running adds the way to see it; the turn's line says only the shells.
         feed(
             &mut c,
@@ -2962,7 +3035,14 @@ mod tests {
         );
         let t = text(&draw(&c, &Ui::new(), 80, 24, Instant::now()));
         // And the agent strip under it: `main`, then the agent.
-        assert_eq!(t[20], "  ⏵⏵ auto mode on · /tasks to see subagents");
+        let left = "  ⏵⏵ auto mode on · /tasks to see subagents";
+        assert_eq!(
+            t[20],
+            format!(
+                "{left}{}Opus 5.5",
+                " ".repeat(78 - width(left) - width("Opus 5.5"))
+            )
+        );
         assert_eq!(t[21], "");
         assert_eq!(t[22], "  ● main");
         assert_eq!(t[23], "  ◯ agent  survey");
@@ -3287,25 +3367,89 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        // At 40 the mode line's hint gives way to it; at 80 both fit.
+        // At 40 the mode line's hint gives way to the usage, and the model, not fitting beside
+        // it, goes first; at 80 all of it fits, the model before the usage.
         assert_eq!(last(&c, &ui, 40), "  ⏵⏵ auto mode on      5h 12% · 7d 72%");
         assert_eq!(
             last(&c, &ui, 80),
             format!(
-                "  ⏵⏵ auto mode on (/auto to cycle){}5h 12% · 7d 72%",
-                " ".repeat(29)
+                "  ⏵⏵ auto mode on (/auto to cycle){}Opus 5.5 · 5h 12% · 7d 72%",
+                " ".repeat(18)
             )
         );
-        // From the 5-hour reset, only the week is drawn; from both, nothing is.
+        // From the 5-hour reset, only the week is drawn, and now the model fits beside it.
         ui.wall = Some(FIVE_HOUR_RESETS * 1000);
         assert_eq!(
             last(&c, &ui, 40),
-            format!("  ⏵⏵ auto mode on{}7d 72%", " ".repeat(15))
+            format!("  ⏵⏵ auto mode on{}Opus 5.5 · 7d 72%", " ".repeat(4))
         );
         feed(&mut c, &[&meta_used("fix the door", "default", 12, 72)]);
-        assert_eq!(last(&c, &ui, 40), format!("{}7d 72%", " ".repeat(32)));
+        assert_eq!(
+            last(&c, &ui, 40),
+            format!("{}Opus 5.5 · 7d 72%", " ".repeat(21))
+        );
+        // From both resets, no usage: the model alone.
         ui.wall = Some(WEEK_RESETS * 1000);
-        assert_eq!(last(&c, &ui, 40), "");
+        assert_eq!(last(&c, &ui, 40), format!("{}Opus 5.5", " ".repeat(30)));
+    }
+
+    #[test]
+    fn the_footer_says_the_model_and_an_effort_that_is_set() {
+        let m = |model: &str, chosen: &str, effort: &str| Meta {
+            model: model.into(),
+            chosen: chosen.into(),
+            effort: effort.into(),
+            ..Meta::default()
+        };
+        assert_eq!(
+            settings(&m("claude-opus-5-5", "default", "")).as_deref(),
+            Some("Opus 5.5")
+        );
+        assert_eq!(
+            settings(&m("claude-sonnet-5-5", "sonnet", "high")).as_deref(),
+            Some("Sonnet 5.5 ● high")
+        );
+        // Before claude's first `init`, the model as chosen; with neither, nothing.
+        assert_eq!(settings(&m("", "haiku", "")).as_deref(), Some("Haiku"));
+        assert_eq!(settings(&m("", "", "low")), None);
+    }
+
+    #[test]
+    fn model_and_effort_pickers_open_on_the_sessions_own() {
+        let list: Vec<(String, String)> = [
+            ("default", "Default (recommended)"),
+            ("opus", "Opus"),
+            ("fable", "Fable"),
+            ("sonnet", "Sonnet"),
+        ]
+        .iter()
+        .map(|(v, d)| (v.to_string(), d.to_string()))
+        .collect();
+        let m = |model: &str, chosen: &str| Meta {
+            model: model.into(),
+            chosen: chosen.into(),
+            ..Meta::default()
+        };
+        // On the default model, Default is the session's own, though it resolves to Opus.
+        assert_eq!(
+            current_model(&m("claude-opus-5-5", "default"), &list),
+            Some(0)
+        );
+        assert_eq!(current_model(&m("claude-opus-5-5", "opus"), &list), Some(1));
+        // A model chosen as a full id, or before the chosen one is known: as resolved.
+        assert_eq!(
+            current_model(&m("claude-sonnet-5-5", "claude-sonnet-5-5"), &list),
+            Some(3)
+        );
+        assert_eq!(current_model(&m("claude-fable-5-1", ""), &list), Some(2));
+        assert_eq!(current_model(&m("", ""), &list), None);
+        // Effort: the session's own level, or auto while none is set.
+        let e = |effort: &str| Meta {
+            effort: effort.into(),
+            ..Meta::default()
+        };
+        assert_eq!(EFFORT_CHOICES[effort_index(&e(""))], "auto");
+        assert_eq!(EFFORT_CHOICES[effort_index(&e("xhigh"))], "xhigh");
     }
 
     #[test]
@@ -4089,7 +4233,7 @@ mod tests {
 
         c.entries.clear();
         c.local(Entry::Prompt("/effort".into()));
-        ui.dialog = Some(Dialog::Effort { sel: 1 });
+        ui.dialog = Some(Dialog::Effort { sel: 2 });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(got[15..], mockup("R6")[15..]);
     }

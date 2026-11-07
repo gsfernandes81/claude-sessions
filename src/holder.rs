@@ -276,7 +276,7 @@ pub fn serve(
     // slot's name is free when it starts.
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
-    let log = Log {
+    let mut log = Log {
         file: log_file,
         offsets: Vec::new(),
         end: 0,
@@ -292,6 +292,20 @@ pub fn serve(
         (len > 0).then(|| (p.to_path_buf(), len))
     });
 
+    // The model and effort claude starts with, as it decides them, first in the log: claude's
+    // own lines never say the alias or the effort, so `/model` and `/effort` could not mark
+    // the session's own without it.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (model, effort) = configured(args, &|k| std::env::var(k).ok(), &settings_layers(&cwd));
+    {
+        let mut start = Value::obj();
+        start.set("type", Value::string("_cfg"));
+        start.set("model", Value::string(model));
+        start.set("effort", Value::string(effort));
+        let mut l = json::to_line(&start).into_bytes();
+        l.push(b'\n');
+        let _ = log.append(&l);
+    }
     let mut child: Child = Command::new(program)
         .args(HEADLESS)
         .args(args)
@@ -644,6 +658,81 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
     Ok(())
 }
 
+/// Claude Code's settings files that can set `model` or `effortLevel`, lowest precedence
+/// first, each with whether it is the user's own: the user's, the project's, the project's
+/// local one, then the managed file and its drop-ins in name order (managed outranks the rest,
+/// local outranks project outranks user). A file that is missing or is not JSON is skipped.
+fn settings_layers(cwd: &Path) -> Vec<(bool, Value)> {
+    let mut paths = vec![
+        crate::live::config_dir().join("settings.json"),
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+        PathBuf::from("/etc/claude-code/managed-settings.json"),
+    ];
+    let mut drop_ins: Vec<PathBuf> = std::fs::read_dir("/etc/claude-code/managed-settings.d")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    drop_ins.sort();
+    paths.extend(drop_ins);
+    paths
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| Some((i == 0, std::fs::read_to_string(p).ok()?)))
+        .filter_map(|(user, t)| Some((user, json::parse(&t).ok()?)))
+        .collect()
+}
+
+/// The model alias and effort claude starts with, decided as it decides them, measured
+/// against 2.1.311 (2026-11-07, held by `tests/claude_model.rs`), which decides the two
+/// differently:
+///
+/// - **model**: `--model`, then `ANTHROPIC_MODEL`, then the highest settings layer that sets
+///   `model`, else `default`;
+/// - **effort**: `CLAUDE_CODE_EFFORT_LEVEL`, then `--effort`, then the highest layer but the
+///   user's that sets `effortLevel` (headless claude ignores the user's), else empty: the
+///   model's own.
+///
+/// `layers` are lowest first, each with whether it is the user's (`settings_layers`).
+fn configured(
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+    layers: &[(bool, Value)],
+) -> (String, String) {
+    let flag = |name: &str| -> Option<String> {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == name {
+                return it.next().cloned();
+            }
+            if let Some(v) = a.strip_prefix(&format!("{name}=")) {
+                return Some(v.to_string());
+            }
+        }
+        None
+    };
+    let setting = |key: &str, with_user: bool| -> Option<String> {
+        layers
+            .iter()
+            .rev()
+            .filter(|(user, _)| with_user || !user)
+            .find_map(|(_, l)| l.get(key).and_then(Value::as_str).map(str::to_string))
+    };
+    let nonempty = |v: Option<String>| v.filter(|v| !v.trim().is_empty());
+    let model = nonempty(flag("--model"))
+        .or_else(|| nonempty(env("ANTHROPIC_MODEL")))
+        .or_else(|| nonempty(setting("model", true)))
+        .unwrap_or_else(|| "default".into());
+    let effort = nonempty(env("CLAUDE_CODE_EFFORT_LEVEL"))
+        .or_else(|| nonempty(flag("--effort")))
+        .or_else(|| nonempty(setting("effortLevel", false)))
+        .unwrap_or_default();
+    (model, effort)
+}
+
 /// A view's `set_model` request: its id and the model it names.
 fn set_model(v: &Value) -> Option<(String, String)> {
     let req = v.get("request")?;
@@ -938,12 +1027,18 @@ mod tests {
 
         let (mut a, mut a_out) = connect(&sock, 0, "");
         let header = json::parse(&line(&mut a)).unwrap();
-        assert_eq!(header.get("next").and_then(Value::as_u64), Some(1));
+        assert_eq!(header.get("next").and_then(Value::as_u64), Some(2));
         let run = header
             .get("run")
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
+        // The holder's own first line: the model and effort claude was started with.
+        let cfg = line(&mut a);
+        assert!(
+            cfg.starts_with("1\t") && cfg.contains(r#""type":"_cfg""#),
+            "{cfg}"
+        );
 
         // As the holder writes a line on: one JSON object, its keys in the writer's order.
         let canon = |l: &str| json::to_line(&json::parse(l).unwrap());
@@ -957,37 +1052,38 @@ mod tests {
             .unwrap();
         assert_eq!(
             line(&mut a),
-            format!("1\t{}", inp(prompt)),
+            format!("2\t{}", inp(prompt)),
             "what a view sent, first"
         );
         assert_eq!(
             line(&mut a),
-            format!("2\t{prompt}"),
+            format!("3\t{prompt}"),
             "then claude's own line"
         );
         let done = &canon(r#"{"type":"result","subtype":"success","session_id":"s"}"#);
         a_out.write_all(format!("{done}\n").as_bytes()).unwrap();
         assert_eq!(
             line(&mut a),
-            format!("3\t{}", inp(done)),
+            format!("4\t{}", inp(done)),
             "the line that was not JSON was dropped"
         );
-        assert_eq!(line(&mut a), format!("4\t{done}"));
+        assert_eq!(line(&mut a), format!("5\t{done}"));
 
-        // A second tap of the same run, from line 4, gets 4 and then what follows.
-        let (mut b, _b_out) = connect(&sock, 4, &run);
+        // A second tap of the same run, from line 5, gets 5 and then what follows.
+        let (mut b, _b_out) = connect(&sock, 5, &run);
         assert_eq!(
             json::parse(&line(&mut b))
                 .unwrap()
                 .get("next")
                 .and_then(Value::as_u64),
-            Some(5)
+            Some(6)
         );
-        assert_eq!(line(&mut b), format!("4\t{done}"));
+        assert_eq!(line(&mut b), format!("5\t{done}"));
         // A tap naming another run is sent everything from the start.
-        let (mut c, mut c_out) = connect(&sock, 4, "an-older-run");
+        let (mut c, mut c_out) = connect(&sock, 5, "an-older-run");
         line(&mut c);
-        assert_eq!(line(&mut c), format!("1\t{}", inp(prompt)));
+        line(&mut c);
+        assert_eq!(line(&mut c), format!("2\t{}", inp(prompt)));
 
         // Two views answer one request: the first reaches claude, the second nothing.
         let yes = &canon(
@@ -995,16 +1091,20 @@ mod tests {
         );
         let no = r#"{"type":"control_response","response":{"subtype":"success","request_id":"r1","response":{"behavior":"deny"}}}"#;
         a_out.write_all(format!("{yes}\n").as_bytes()).unwrap();
-        assert_eq!(line(&mut a), format!("5\t{}", inp(yes)));
-        assert_eq!(line(&mut a), format!("6\t{yes}"));
+        assert_eq!(line(&mut a), format!("6\t{}", inp(yes)));
+        assert_eq!(line(&mut a), format!("7\t{yes}"));
         c_out.write_all(format!("{no}\n").as_bytes()).unwrap();
 
         a_out.write_all(b"{\"quit\":1}\n").unwrap();
         assert_eq!(holder.join().unwrap(), 3, "claude's own exit status");
         assert!(!sock.exists(), "the socket goes with the holder");
         let quit = &canon(r#"{"quit":1}"#);
+        // First the holder's `_cfg` line, whose values are this machine's settings.
+        let written = std::fs::read_to_string(&log).unwrap();
+        let (cfg, rest) = written.split_once('\n').unwrap();
+        assert!(cfg.contains(r#""type":"_cfg""#), "{cfg}");
         assert_eq!(
-            std::fs::read_to_string(&log).unwrap(),
+            rest,
             format!(
                 "{}\n{prompt}\n{}\n{done}\n{}\n{yes}\n{}\n",
                 inp(prompt),
@@ -1067,6 +1167,60 @@ mod tests {
         );
         assert_eq!(log.model_answered(&refused), None);
         assert!(log.models.is_empty(), "nothing left waiting");
+    }
+
+    #[test]
+    fn the_model_and_effort_claude_starts_with_are_decided_as_it_decides_them() {
+        let none = |_: &str| None;
+        let layers = |l: &[(bool, &str)]| -> Vec<(bool, Value)> {
+            l.iter()
+                .map(|(u, t)| (*u, json::parse(t).unwrap()))
+                .collect()
+        };
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        // Nothing set: Claude Code's default model, and the model's own effort.
+        assert_eq!(
+            configured(&[], &none, &[]),
+            ("default".into(), String::new())
+        );
+        // The user's settings choose the model but not the effort, which headless claude
+        // takes only from the other layers.
+        let user = layers(&[(true, r#"{"model":"haiku","effortLevel":"high"}"#)]);
+        assert_eq!(
+            configured(&[], &none, &user),
+            ("haiku".into(), String::new())
+        );
+        // The highest layer that sets it wins.
+        let l = layers(&[
+            (true, r#"{"model":"haiku","effortLevel":"high"}"#),
+            (false, r#"{"model":"sonnet","effortLevel":"low"}"#),
+            (false, r#"{"other":1}"#),
+        ]);
+        assert_eq!(configured(&[], &none, &l), ("sonnet".into(), "low".into()));
+        // The environment over every file; a flag over the environment for the model, and
+        // the environment over a flag for the effort.
+        let env = |k: &str| match k {
+            "ANTHROPIC_MODEL" => Some("opus".to_string()),
+            "CLAUDE_CODE_EFFORT_LEVEL" => Some("max".to_string()),
+            _ => None,
+        };
+        assert_eq!(configured(&[], &env, &l), ("opus".into(), "max".into()));
+        assert_eq!(
+            configured(
+                &a(&["--resume", "x", "--model", "fable", "--effort=high"]),
+                &env,
+                &l
+            ),
+            ("fable".into(), "max".into())
+        );
+        assert_eq!(
+            configured(&a(&["--effort", "high"]), &none, &l).1,
+            "high",
+            "a flag over the files"
+        );
+        // An empty value is no value.
+        let blank = |k: &str| (k == "ANTHROPIC_MODEL").then(|| " ".to_string());
+        assert_eq!(configured(&[], &blank, &[]).0, "default");
     }
 
     #[test]
@@ -1173,9 +1327,10 @@ mod tests {
         });
         let (mut a, mut a_out) = connect(&sock, 0, "");
         line(&mut a);
+        line(&mut a); // the holder's `_cfg` line
         a_out.write_all(b"{\"entrypoint\":1}\n").unwrap();
         line(&mut a);
-        assert_eq!(line(&mut a), "2\t{\"ep\":\"ssh-remote\"}");
+        assert_eq!(line(&mut a), "3\t{\"ep\":\"ssh-remote\"}");
         a_out.write_all(b"{\"quit\":1}\n").unwrap();
         holder.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

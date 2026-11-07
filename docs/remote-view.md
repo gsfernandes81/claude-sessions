@@ -268,6 +268,22 @@ the owner had already spoken (above). Two items need the owner, and both are moc
   answers it with success, writes `model` into `$CLAUDE_CONFIG_DIR/settings.json`, where
   Claude Code's picker writes it; `default` takes the key out. The other settings are kept,
   though our writer sorts their keys; a file that is not a JSON object is left alone.
+- **`/model` and `/effort` open on the session's own** (owner, 2026-11-07). claude's `init`
+  names only the model it resolved to (`claude-opus-5-5`, whether it was chosen as `opus` or
+  is the default), says nothing of effort, and comes only with a turn. So the holder writes,
+  as its log's first line, `{"type":"_cfg","model":…,"effort":…}`: the alias and effort claude
+  starts with, decided as it decides them.
+  - **Model:** `--model`, then `ANTHROPIC_MODEL`, then the highest settings layer (managed over
+    local over project over user) that sets `model`, else `default`.
+  - **Effort:** `CLAUDE_CODE_EFFORT_LEVEL`, then `--effort`, then the highest layer that sets
+    `effortLevel`, except the user's, which headless claude ignores; else none, the model's own.
+  - **Measured, not assumed.** Measured against 2.1.311, whose request to the API carries the
+    model and `output_config.effort` it used, and held there by `tests/claude_model.rs`, which
+    runs the real holder over the real claude.
+  - **What the view does with it.** The reducer keeps it as `chosen` (and `effort`), sent as
+    `meta`'s `ch`, and a view's `/model` replaces it. `/model` marks the entry whose value is the
+    alias, falling back to the one the resolved model names. `/effort` has an `auto` stop first,
+    the model's own, where a session with no effort set sits; choosing it takes the effort out.
 - **Opening an offloaded conversation goes through the launcher's plan**: under the slot's lock,
   never resuming a conversation that is already running, with the holder as the command.
 
@@ -370,7 +386,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text; claude's summary of a step's tool calls is `sum {id, x, g}` on each call it covers, `g` the step's first, which an older client skips |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them, and `ch`, the model as chosen (`default` or an alias), only once known; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text; claude's summary of a step's tool calls is `sum {id, x, g}` on each call it covers, `g` the step's first, which an older client skips |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -536,6 +552,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      runs, one gone from it has ended. A monitor is a `local_bash` task whose call was
      `Monitor`, which only the call says. A task's start is its `run_id`'s first part,
      base-36 epoch milliseconds (measured against its `end_time`), so no clock is needed.
+     - **The model and effort** at the mode line's right, before the usage (owner,
+       2026-11-07): `Opus 5.5 ● high`, or the model alone while the effort is the model's
+       own, the model as chosen until claude's first `init`. When it does not fit beside the
+       usage it is not drawn, so the usage keeps its place.
      - **Usage** at the mode line's right, two columns short of the edge, grey:
        `5h 12% · 7d 72%`, the account's 5-hour and weekly limits as headless claude's
        `rate_limit_event` reads them (`unifiedWindows`, each `utilization` a fraction that
