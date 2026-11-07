@@ -485,8 +485,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        before the holder started — is counted.
      - Typing a command's name, the **suggestion list** stands over the prompt as Claude
        Code's does: claude's commands (`initialize`'s, with what each does, asked for when a
-       conversation opens) and the phone's, those that start with what is typed first, then
-       those that have it further in; the name in a column 40% of the width, what it does in
+       conversation opens) and the phone's, the one named exactly what is typed first, then
+       those that start with it, then those that have it further in — claude's
+       `auto-mode-setup` and `autocompact`, two lines each on a phone, otherwise hid `/auto`; the name in a column 40% of the width, what it does in
        two lines at most, five lines of list at most, the chosen one `❯` and lavender. Up and
        Down choose, Tab puts it in the prompt with its argument hint grey after it, Enter
        sends it, Esc puts the list away. Claude Code also orders by what was used lately,

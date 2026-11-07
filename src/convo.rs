@@ -1670,8 +1670,8 @@ const CLIENT_ABOUT: [(&str, &str); 14] = [
 ];
 
 /// What the suggestion list offers for the prompt now: while its first word is a `/` and the
-/// start of a name, claude's commands and this client's that start with it, then those that
-/// have it further in, each in claude's order. Nothing once a space is typed, in a dialog, or
+/// start of a name, the command of that exact name, then claude's commands and this client's
+/// that start with it, then those that have it further in, each in claude's order. Nothing once a space is typed, in a dialog, or
 /// after Esc.
 pub fn suggestions(ui: &Ui) -> Vec<Command> {
     let Some(query) = ui.input.strip_prefix('/') else {
@@ -1695,7 +1695,11 @@ pub fn suggestions(ui: &Ui) -> Vec<Command> {
         .into_iter()
         .filter(|c| c.name.to_lowercase().contains(&q))
         .partition(|c| c.name.to_lowercase().starts_with(&q));
-    starts.into_iter().chain(rest).collect()
+    // A name typed whole comes first: claude's `auto-mode-setup` and `autocompact`, two lines
+    // each on a phone, otherwise filled the list and hid `/auto` under them.
+    let (exact, starts): (Vec<Command>, Vec<Command>) =
+        starts.into_iter().partition(|c| c.name.to_lowercase() == q);
+    exact.into_iter().chain(starts).chain(rest).collect()
 }
 
 /// The suggestion list, as Claude Code draws it over the prompt: the name in a column 40% of
@@ -4041,6 +4045,39 @@ mod tests {
             hint: h.to_string(),
         })
         .collect()
+    }
+
+    #[test]
+    fn a_name_typed_whole_comes_first_in_the_suggestion_list() {
+        // claude 2.1.311's two `auto…` commands, two lines each at 40 wide: they filled the
+        // five rows, and `/auto` typed whole showed only them.
+        let mut ui = Ui::new();
+        ui.catalog = [
+            (
+                "auto-mode-setup",
+                "Teach auto mode about your environment, plus optional rule tweaks",
+            ),
+            ("autocompact", "Configure the auto-compact window size"),
+        ]
+        .iter()
+        .map(|(n, a)| Command {
+            name: n.to_string(),
+            about: a.to_string(),
+            hint: String::new(),
+        })
+        .collect();
+        let names =
+            |ui: &Ui| -> Vec<String> { suggestions(ui).into_iter().map(|c| c.name).collect() };
+        ui.input = "/auto".into();
+        assert_eq!(names(&ui), ["auto", "auto-mode-setup", "autocompact"]);
+        let drawn: Vec<String> = suggest_lines(&suggestions(&ui), 0, 40)
+            .iter()
+            .map(plain)
+            .collect();
+        assert!(drawn[0].starts_with("  ❯ /auto "), "{drawn:?}");
+        // Calibration: short of the whole name, claude's order stands, the client's after.
+        ui.input = "/au".into();
+        assert_eq!(names(&ui), ["auto-mode-setup", "autocompact", "auto"]);
     }
 
     #[test]
