@@ -505,15 +505,20 @@ RAM: 1.9G / 3.0G, Load: 2.3, dev
 ([`remote-view.md`](remote-view.md)). The order of authority for this set was Claude Code's own
 design first, then a Fable advisor, then the owner. So **R1–R7 copy the fullscreen renderer of
 Claude Code 2.1.311**, the pinned version, from captures of its real screens at both widths. R4c,
-R8, R9 and R10 have no Claude equivalent.
+R8, R9, R10 and R11 have no Claude equivalent.
 
 The owner's calls, each made in a comment on the page:
 
 - **R1–R7 are approved as drawn**, with tool calls collapsed (`Ran 1 shell command`) as Claude's
   fullscreen mode draws them: "collapsed but later expandable". Expanding one comes after the
   MVP.
-- **The mode line keeps Claude's name, icon and yellow**, with `/auto to cycle` where Claude says
-  shift+tab ("Shift tab is inconvenient on termux"). `/auto` cycles the mode.
+- **The mode line keeps Claude's name, icon and yellow**, with `/mode to change` where Claude says
+  shift+tab ("Shift tab is inconvenient on termux"). `/mode` picks the mode from a list
+  (owner, 2026-11-07, retiring `/auto`, which cycled it). It stays through a turn, as Claude
+  Code 2.1.311's does (driven 2026-11-07, which also showed it no longer says `esc to
+  interrupt` there): R2 said `esc to interrupt` in its place until then, and the owner chose
+  Claude Code's way, since a mode changed mid-turn could not be seen. The default mode is
+  `⏸ manual mode on`, grey `949494` and with no hint, as Claude Code draws it.
 - **Question options may be long, and they scroll** around the cursor whatever Claude does, with
   `↑ 1 more` and `↓ 2 more` at the edges. Claude's preview layout is drawn side by side at 80
   columns (R4b) and stacked under the list at 40 (R4c), because side by side "is always mangled
@@ -554,7 +559,7 @@ theme (the `claude` binary's own palette, read from 2.1.311): orange `d77757` fo
 and spinner, lavender `b1b9f9` for dialogs, grey `999999` for secondary text and `⎿` lines,
 green `4eba65` for success, red `ff6b80` for errors and failures, and each permission mode
 in its own colour (auto yellow `ffc107`, accept edits purple `af87ff`, plan teal `48968c`,
-bypass red). There is no list of approved colours beyond that: the owner, 2026-11-01,
+bypass red, manual grey `949494`). There is no list of approved colours beyond that: the owner, 2026-11-01,
 "Remove the approved mockup colours list. Termux is not so limited." A new element takes
 the colour Claude Code gives it.
 
@@ -594,7 +599,7 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ❯ now run clippy
 ────────────────────────────────────────
   RAM: 0.9G / 2.0G, Load: 0.7
-  ⏵⏵ auto mode on (/auto to cycle)
+  ⏵⏵ auto mode on (/mode to change)
 ```
 
 ### Mockup R2 — Working
@@ -622,7 +627,7 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ❯
 ────────────────────────────────────────
   RAM: 1.2G / 2.0G, Load: 0.7
-  esc to interrupt     5h 12% · 7d 72%
+  ⏵⏵ auto mode on      5h 12% · 7d 72%
 ```
 
 ### Mockup R3 — A permission prompt
@@ -793,7 +798,7 @@ takes the effort out (owner, 2026-11-07: `/effort` marks the session's own, as `
 ❯
 ────────────────────────────────────────
   RAM: 0.9G / 2.0G, Load: 0.7
-  ⏵⏵ auto mode on (/auto to cycle)
+  ⏵⏵ auto mode on (/mode to change)
 ```
 
 ### Mockup R8 — Reconnecting
@@ -821,7 +826,7 @@ takes the effort out (owner, 2026-11-07: `/effort` marks the session's own, as `
 ❯ now run clippy
 ────────────────────────────────────────
   ⠋ Reconnecting… (8s) · not sent
-  ⏵⏵ auto mode on (/auto to cycle)
+  ⏵⏵ auto mode on (/mode to change)
 ```
 
 ### Mockup R9 — The phone client's home
@@ -861,3 +866,35 @@ Runs in a terminal: attach it from
 ssh dev, or end it there to open here
 RAM: 1.9G / 3.0G, Load: 2.3, dev
 ```
+
+### Mockup R11 — /mode
+```
+❯ /mode
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Permission mode
+
+     1.  Manual
+     2.  Accept edits
+     3.  Plan
+   ❯ 4.  Auto ✔
+
+   Enter to select · Esc to cancel
+```
+
+The four modes as R5 lists models, in Claude Code's shift+tab order, the session's own ticked
+and the cursor starting on it (owner, 2026-11-07: a picker named `/mode` in place of `/auto`,
+which cycled the mode). `/mode plan` and the like set one without the list.

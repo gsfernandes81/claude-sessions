@@ -1104,26 +1104,44 @@ pub fn effort_glyph(level: &str) -> &'static str {
     }
 }
 
-/// The mode line, as Claude Code words it, with `/auto` where it says shift+tab.
+/// The mode line, as Claude Code words it, with `/mode` where it says shift+tab; the default
+/// mode is `manual mode on`, grey and with no hint, as 2.1.311 draws it (driven 2026-11-07).
 pub fn mode_line(mode: &str) -> Option<(String, u32)> {
     // Each in the colour Claude Code gives it: auto `warning`, accept edits `autoAccept`,
-    // bypass `error`, plan `planMode`.
+    // bypass `error`, plan `planMode`, manual its `inactive` grey.
     let (glyph, words, colour) = match mode {
+        "default" => return Some(("⏸ manual mode on".into(), MANUAL_GREY)),
         "auto" => ("⏵⏵", "auto mode on", YELLOW),
         "acceptEdits" => ("⏵⏵", "accept edits on", PURPLE),
         "bypassPermissions" => ("⏵⏵", "bypass permissions on", RED),
         "plan" => ("⏸", "plan mode on", TEAL),
         _ => return None,
     };
-    Some((format!("{glyph} {words} (/auto to cycle)"), colour))
+    Some((format!("{glyph} {words}{MODE_HINT}"), colour))
 }
 
-/// The modes `/auto` steps through, in Claude Code's shift+tab order.
-pub const MODES: [&str; 4] = ["default", "acceptEdits", "plan", "auto"];
+/// What the mode line says after a mode other than manual, where Claude Code says
+/// `(shift+tab to cycle)`.
+pub const MODE_HINT: &str = " (/mode to change)";
 
-pub fn next_mode(mode: &str) -> &'static str {
-    let i = MODES.iter().position(|m| *m == mode).unwrap_or(0);
-    MODES[(i + 1) % MODES.len()]
+/// Claude Code's grey for `manual mode on`, a shade off its secondary text's.
+const MANUAL_GREY: u32 = 0x94_9494;
+
+/// `/mode`'s choices, in Claude Code's shift+tab order: the mode claude takes, the name the
+/// picker gives it, and the word `/mode WORD` takes for it.
+pub const MODES: [(&str, &str, &str); 4] = [
+    ("default", "Manual", "manual"),
+    ("acceptEdits", "Accept edits", "accept"),
+    ("plan", "Plan", "plan"),
+    ("auto", "Auto", "auto"),
+];
+
+/// The mode `/mode WORD` names: the picker's word, its name, or claude's own.
+pub fn mode_named(word: &str) -> Option<&'static str> {
+    let w = word.to_lowercase();
+    MODES.iter().find_map(|(mode, name, short)| {
+        (w == *short || w == name.to_lowercase() || w == mode.to_lowercase()).then_some(*mode)
+    })
 }
 
 const VERBS: [&str; 12] = [
@@ -1165,6 +1183,8 @@ pub enum Dialog {
     },
     /// `/effort`: the level the slider is on.
     Effort { sel: usize },
+    /// `/mode`: the cursor in `MODES`.
+    Mode { sel: usize },
     /// `/copy` of a response with code blocks: what to copy, each a label and its text, the
     /// whole response first.
     Copy {
@@ -1647,8 +1667,8 @@ const CLIENT_ABOUT: [(&str, &str); 14] = [
     ),
     ("exit", "End the session"),
     (
-        "auto",
-        "Cycle the permission mode (shift+tab in Claude Code)",
+        "mode",
+        "Choose the permission mode (shift+tab in Claude Code)",
     ),
     ("home", "Back to the home; the session keeps running"),
     ("disconnect", "Back to the home; the session keeps running"),
@@ -1761,7 +1781,7 @@ fn suggest_lines(list: &[Command], sel: usize, w: usize) -> Vec<Line> {
 pub const CLIENT_COMMANDS: [&str; 14] = [
     "model",
     "effort",
-    "auto",
+    "mode",
     "rename",
     "exit",
     "quit",
@@ -2107,7 +2127,6 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             fg(GREY),
         ));
     }
-    let busy = matches!(c.state.as_str(), "working" | "compacting");
     let pill = crate::tasks::pill(&c.tasks);
     let subagents = crate::tasks::subagents_running(&c.tasks);
     // The mode line, then claude's background shells after ` · ` in cyan, as Claude Code
@@ -2124,15 +2143,13 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             ),
             fg(GREY),
         ));
-    } else if busy {
-        foot.push(("  esc to interrupt".into(), fg(GREY)));
     } else if let Some((m, colour)) = mode_line(&c.meta.mode) {
         // The hint goes too when the usage would not fit beside it.
         let crowded = usage.as_ref().is_some_and(|u| {
             pill.is_none() && !subagents && 2 + width(&m) + 2 + width(u) > w.saturating_sub(2)
         });
         let m = if pill.is_some() || subagents || crowded {
-            m.replace(" (/auto to cycle)", "")
+            m.replace(MODE_HINT, "")
         } else {
             m
         };
@@ -2531,6 +2548,33 @@ fn copy_dialog(sel: usize, choices: &[(String, String)], w: usize) -> Vec<Line> 
     out
 }
 
+/// `/mode`: the four modes as `/model` lists its models, the session's own ticked.
+fn mode_dialog(c: &Convo, sel: usize, w: usize) -> Vec<Line> {
+    let mut out = vec![rule(w, "▔", fg(LAVENDER))];
+    out.push(line("   Permission mode", bold(LAVENDER)));
+    out.push(Vec::new());
+    for (i, (mode, name, _)) in MODES.iter().enumerate() {
+        let mark = if i == sel { "❯" } else { " " };
+        let st = if i == sel { fg(LAVENDER) } else { PLAIN };
+        let mut l = vec![(format!("   {mark} {}.  {name}", i + 1), st)];
+        if *mode == c.meta.mode {
+            l.push((" ✔".into(), fg(GREEN)));
+        }
+        out.push(l);
+    }
+    out.push(Vec::new());
+    out.extend(hints(&["Enter to select", "Esc to cancel"], "   ", w));
+    out
+}
+
+/// Where `/mode` opens: on the session's own mode, or the first.
+pub fn mode_index(meta: &Meta) -> usize {
+    MODES
+        .iter()
+        .position(|(m, _, _)| *m == meta.mode)
+        .unwrap_or(0)
+}
+
 fn effort_dialog(sel: usize, w: usize) -> Vec<Line> {
     let level = EFFORT_CHOICES[sel.min(EFFORT_CHOICES.len() - 1)];
     let tag = if level == "auto" {
@@ -2675,6 +2719,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
     let bottom: Vec<Line> = match (&ui.dialog, waiting) {
         (Some(Dialog::Model { sel, list }), _) => model_dialog(c, *sel, list, w),
         (Some(Dialog::Effort { sel }), _) => effort_dialog(*sel, w),
+        (Some(Dialog::Mode { sel }), _) => mode_dialog(c, *sel, w),
         (Some(Dialog::Copy { sel, choices }), _) => copy_dialog(*sel, choices, w),
         (Some(Dialog::Tasks(v)), _) => crate::tasks::draw(c, v, w, h, ui.now_ms()),
         (
@@ -3093,7 +3138,7 @@ mod tests {
         assert_eq!(colour("acceptEdits"), Some(PURPLE));
         assert_eq!(colour("plan"), Some(TEAL));
         assert_eq!(colour("bypassPermissions"), Some(RED));
-        assert_eq!(colour("default"), None);
+        assert_eq!(colour("default"), Some(MANUAL_GREY));
 
         let mut c = Convo::new("h", "claude-3", "r");
         c.expanded = true;
@@ -3381,8 +3426,8 @@ mod tests {
         assert_eq!(
             last(&c, &ui, 80),
             format!(
-                "  ⏵⏵ auto mode on (/auto to cycle){}Opus 5.5 · 5h 12% · 7d 72%",
-                " ".repeat(18)
+                "  ⏵⏵ auto mode on (/mode to change){}Opus 5.5 · 5h 12% · 7d 72%",
+                " ".repeat(17)
             )
         );
         // From the 5-hour reset, only the week is drawn, and now the model fits beside it.
@@ -3392,13 +3437,13 @@ mod tests {
             format!("  ⏵⏵ auto mode on{}Opus 5.5 · 7d 72%", " ".repeat(4))
         );
         feed(&mut c, &[&meta_used("fix the door", "default", 12, 72)]);
-        assert_eq!(
-            last(&c, &ui, 40),
-            format!("{}Opus 5.5 · 7d 72%", " ".repeat(21))
-        );
+        assert_eq!(last(&c, &ui, 40), "  ⏸ manual mode on   Opus 5.5 · 7d 72%");
         // From both resets, no usage: the model alone.
         ui.wall = Some(WEEK_RESETS * 1000);
-        assert_eq!(last(&c, &ui, 40), format!("{}Opus 5.5", " ".repeat(30)));
+        assert_eq!(
+            last(&c, &ui, 40),
+            format!("  ⏸ manual mode on{}Opus 5.5", " ".repeat(12))
+        );
     }
 
     #[test]
@@ -4049,15 +4094,15 @@ mod tests {
 
     #[test]
     fn a_name_typed_whole_comes_first_in_the_suggestion_list() {
-        // claude 2.1.311's two `auto…` commands, two lines each at 40 wide: they filled the
-        // five rows, and `/auto` typed whole showed only them.
+        // claude 2.1.311's two `auto…` commands, two lines each at 40 wide, filled the five
+        // rows, and `/auto` typed whole showed only them; `/mode` has `/model` before it.
         let mut ui = Ui::new();
         ui.catalog = [
+            ("model", "Set the AI model for Claude Code"),
             (
                 "auto-mode-setup",
                 "Teach auto mode about your environment, plus optional rule tweaks",
             ),
-            ("autocompact", "Configure the auto-compact window size"),
         ]
         .iter()
         .map(|(n, a)| Command {
@@ -4068,16 +4113,16 @@ mod tests {
         .collect();
         let names =
             |ui: &Ui| -> Vec<String> { suggestions(ui).into_iter().map(|c| c.name).collect() };
-        ui.input = "/auto".into();
-        assert_eq!(names(&ui), ["auto", "auto-mode-setup", "autocompact"]);
+        ui.input = "/mode".into();
+        assert_eq!(names(&ui), ["mode", "model", "auto-mode-setup"]);
         let drawn: Vec<String> = suggest_lines(&suggestions(&ui), 0, 40)
             .iter()
             .map(plain)
             .collect();
-        assert!(drawn[0].starts_with("  ❯ /auto "), "{drawn:?}");
+        assert!(drawn[0].starts_with("  ❯ /mode "), "{drawn:?}");
         // Calibration: short of the whole name, claude's order stands, the client's after.
-        ui.input = "/au".into();
-        assert_eq!(names(&ui), ["auto-mode-setup", "autocompact", "auto"]);
+        ui.input = "/mod".into();
+        assert_eq!(names(&ui), ["model", "mode", "auto-mode-setup"]);
     }
 
     #[test]
@@ -4140,8 +4185,8 @@ mod tests {
         ui.input = "/mod".into();
         assert_eq!(
             names(&ui),
-            ["model", "auto-mode-setup"],
-            "as Claude Code's `/mod`"
+            ["model", "mode", "auto-mode-setup"],
+            "as Claude Code's `/mod`, with the view's own `/mode`"
         );
         ui.input = "/co".into();
         assert_eq!(
@@ -4277,6 +4322,14 @@ mod tests {
         ui.dialog = Some(Dialog::Effort { sel: 2 });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(got[15..], mockup("R6")[15..]);
+
+        // `/mode`, a turn running in auto mode: the session's own ticked, the cursor on it.
+        c.entries.clear();
+        c.local(Entry::Prompt("/mode".into()));
+        feed(&mut c, &[&meta("fix the door", "auto")]);
+        ui.dialog = Some(Dialog::Mode { sel: 3 });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert_eq!(got[13..], mockup("R11")[13..], "{got:#?}");
     }
 
     #[test]
@@ -4385,9 +4438,15 @@ mod tests {
         assert_eq!(model_name("claude-opus-5-5"), "Opus 5.5");
         assert_eq!(model_name("claude-haiku-4-5-20251001"), "Haiku 4.5");
         assert_eq!(model_name("claude-sonnet-5-5[1m]"), "Sonnet 5.5");
-        assert_eq!(next_mode("default"), "acceptEdits");
-        assert_eq!(next_mode("auto"), "default");
-        assert_eq!(next_mode("bypassPermissions"), "acceptEdits");
+        assert_eq!(mode_named("manual"), Some("default"));
+        assert_eq!(mode_named("Accept"), Some("acceptEdits"));
+        assert_eq!(mode_named("accept edits"), Some("acceptEdits"));
+        assert_eq!(mode_named("bypassPermissions"), None);
+        assert_eq!(
+            mode_line("default"),
+            Some(("⏸ manual mode on".into(), MANUAL_GREY))
+        );
+        assert_eq!(mode_line(""), None, "nothing before claude says");
         assert!(is_current("claude-opus-5-5", "opus", "Opus 5.5"));
         assert!(!is_current("claude-opus-5-5", "fable", "Fable 5.1"));
         assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);

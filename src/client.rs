@@ -1683,10 +1683,20 @@ fn submit(
             };
             Submit::Send(vec![m("effort", vec![("e", e)])])
         }
-        "/auto" => {
-            let next = convo::next_mode(&c.meta.mode);
-            Submit::Send(vec![m("mode", vec![("m", Value::string(next))])])
+        "/mode" if rest.is_empty() => {
+            c.local(Entry::Prompt(text.into()));
+            ui.dialog = Some(Dialog::Mode {
+                sel: convo::mode_index(&c.meta),
+            });
+            Submit::Nothing
         }
+        "/mode" => match convo::mode_named(rest) {
+            Some(mode) => Submit::Send(vec![m("mode", vec![("m", Value::string(mode))])]),
+            None => {
+                ui.status = Some("/mode takes manual, accept, plan or auto".into());
+                Submit::Nothing
+            }
+        },
         "/rename" if rest.is_empty() => {
             ui.status = Some("/rename takes the new title".into());
             Submit::Nothing
@@ -2323,6 +2333,21 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 None
             }
             _ => Some(Dialog::Effort { sel }),
+        },
+        Dialog::Mode { sel } => match k {
+            Key::Up => Some(Dialog::Mode {
+                sel: sel.saturating_sub(1),
+            }),
+            Key::Down => Some(Dialog::Mode {
+                sel: (sel + 1).min(convo::MODES.len() - 1),
+            }),
+            Key::Esc => None,
+            Key::Enter => {
+                let mode = convo::MODES[sel.min(convo::MODES.len() - 1)].0;
+                out.push(m("mode", vec![("m", Value::string(mode))]));
+                None
+            }
+            _ => Some(Dialog::Mode { sel }),
         },
         // Taken by `conv_key`, which can open an agent's view from it.
         d @ Dialog::Tasks(_) => Some(d),
@@ -3267,9 +3292,33 @@ mod tests {
             _ => vec![],
         };
         assert_eq!(
-            sent(submit(&mut c, &mut ui, "/auto", &None)),
+            sent(submit(&mut c, &mut ui, "/mode plan", &None)),
+            [r#"{"m":"plan","t":"mode"}"#]
+        );
+        assert_eq!(
+            sent(submit(&mut c, &mut ui, "/mode acceptEdits", &None)),
+            [r#"{"m":"acceptEdits","t":"mode"}"#],
+            "claude's own name for it too"
+        );
+        assert!(sent(submit(&mut c, &mut ui, "/mode yolo", &None)).is_empty());
+        assert_eq!(
+            ui.status.as_deref(),
+            Some("/mode takes manual, accept, plan or auto")
+        );
+        // Bare, the picker, on the session's own mode; Down and Enter choose the next.
+        assert!(sent(submit(&mut c, &mut ui, "/mode", &None)).is_empty());
+        let Some(d @ Dialog::Mode { sel: 0 }) = ui.dialog.take() else {
+            panic!("{:?}", ui.dialog)
+        };
+        let mut out = Vec::new();
+        let d = dialog_key(&c, d, Key::Down, &mut out).unwrap();
+        assert_eq!(dialog_key(&c, d, Key::Enter, &mut out), None);
+        assert_eq!(
+            out.iter().map(line).collect::<Vec<_>>(),
             [r#"{"m":"acceptEdits","t":"mode"}"#]
         );
+        // `/auto` is retired: claude's, like any name the view does not serve.
+        assert!(!convo::CLIENT_COMMANDS.contains(&"auto"));
         assert_eq!(
             sent(submit(&mut c, &mut ui, "/model", &None)),
             [r#"{"t":"models"}"#],

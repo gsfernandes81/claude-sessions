@@ -346,7 +346,7 @@ Approved with the 40-column set in [`mockups.md`](mockups.md), § *The remote vi
 ❯ now run clippy
 ────────────────────────────────────────────────────────────────────────────────
   claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7
-  ⏵⏵ auto mode on (/auto to cycle)
+  ⏵⏵ auto mode on (/mode to change)
 ```
 
 ### Mockup R4b — A question with a preview

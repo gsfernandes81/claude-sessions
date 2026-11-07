@@ -41,7 +41,8 @@ The owner's decisions, in the session of 2026-11-01:
   first; since 0.13.7 it is lazy end to end (§ *Lazy history*, the owner's ask of
   2026-11-02).
 - **No key chords for the phone.** The mode line keeps Claude's name and icon, but its hint is
-  `/auto to cycle` instead of shift+tab, which is awkward in Termux.
+  `/mode to change` instead of shift+tab, which is awkward in Termux; `/mode` opens a
+  picker of the four modes.
 - **Question options may be long, and they scroll** around the cursor whatever Claude Code does.
   Claude's preview layout is drawn side by side at 80 columns and stacked under the list at 40.
 - **Anything not essential is deferred** from the MVP, with a list kept for later.
@@ -487,7 +488,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        Code's does: claude's commands (`initialize`'s, with what each does, asked for when a
        conversation opens) and the phone's, the one named exactly what is typed first, then
        those that start with it, then those that have it further in — claude's
-       `auto-mode-setup` and `autocompact`, two lines each on a phone, otherwise hid `/auto`; the name in a column 40% of the width, what it does in
+       `auto-mode-setup` and `autocompact`, two lines each on a phone, otherwise hid the view's `/auto`; the name in a column 40% of the width, what it does in
        two lines at most, five lines of list at most, the chosen one `❯` and lavender. Up and
        Down choose, Tab puts it in the prompt with its argument hint grey after it, Enter
        sends it, Esc puts the list away. Claude Code also orders by what was used lately,
@@ -531,7 +532,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      2026-11-07): the first says `Left again to disconnect` where the status goes for two
      seconds, about Claude Code's window, and a second after that, or any other key between
      the two, starts again. `/model`,
-     `/effort [level]`, `/auto`, `/rename TITLE`, `/exit`; **`/copy [N]`** copies the Nth
+     `/effort [level]`, **`/mode [manual|accept|plan|auto]`** — bare, a list of the four
+     modes as `/model`'s, the session's own ticked; it replaced `/auto`, which cycled them
+     and could not be seen to land mid-turn (owner, 2026-11-07) — `/rename TITLE`, `/exit`; **`/copy [N]`** copies the Nth
      response back, 1 the latest, a response being a turn's text without its tool calls,
      and offers its code blocks one by one when it has any (OSC 52, and
      `termux-clipboard-set` under Termux); **`/btw QUESTION`** asks a side question, shown
@@ -567,8 +570,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        Claude Code rounds to a percentage, and its `resetsAt`). A window claude does not
        read again keeps its last reading, and is no longer drawn from its reset, so a stale
        figure is never shown as now's; until claude has read one, nothing is drawn. Asked
-       for by the owner on 2026-11-04; mockup R2 shows it. It fits beside `esc to interrupt` at 40 columns; beside a mode line,
-       `(/auto to cycle)` goes first, as it does for the pill, and when it still will not
+       for by the owner on 2026-11-04; mockup R2 shows it. Beside a mode line, `(/mode to change)` goes first, as it does for the pill, and when it still will not
        fit — the strip's hints — it is left out.
      - **The pill**: running shells and monitors on the mode line after ` · `, in Claude
        Code's cyan `00cccc` — `2 shells, 1 monitor` — and `/tasks to see subagents` while
