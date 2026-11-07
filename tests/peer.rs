@@ -161,6 +161,10 @@ case $1 in
       printf 'name=%s\tpid=%s\tclients=%s\tcreated=1\n' "${{f##*/}}" "$pid" "$clients"
     done
     exit 0 ;;
+  attach)
+    # A start that takes a while and fails: a wake with room stays in flight this long.
+    sleep 1
+    exit 2 ;;
 esac
 exit 2"#,
                 d = d.display()
@@ -517,7 +521,6 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     root.live("a", "claude-1");
     root.live("b", "claude-1");
     root.offloaded("b", "claude-2");
-    root.offloaded("b", "claude-3");
     // b has 100 MB free: too little for another session, which costs about 250 MB.
     fs::write(root.d("b").join("cgroup/memory.max"), "4294967296\n").unwrap();
     fs::write(
@@ -546,35 +549,13 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     assert!(!record_of("b/claude-2").contains("\"status\""));
 
     let a_sock = root.d("a").join("in.sock");
-    // Two at once: one wake at a time across the fleet, the second asked for only once the
-    // first has answered.
     send(
         &root.stand_in("a", "b/claude-2"),
         &frame(&a_sock, "x", "wake up"),
     );
-    send(
-        &root.stand_in("a", "b/claude-3"),
-        &frame(&a_sock, "x", "you too"),
-    );
-    root.logs("a/claude-1 to b/claude-3: message kept");
-    root.logs("did not wake b/claude-3: no-room");
-    let asked2 = root
-        .seen
-        .find("asked b to wake b/claude-2")
-        .expect("b/claude-2 asked for");
-    let answered2 = root
-        .seen
-        .find("did not wake b/claude-2")
-        .expect("and answered");
-    let asked3 = root
-        .seen
-        .find("asked b to wake b/claude-3")
-        .expect("b/claude-3 asked for");
-    assert!(
-        asked2 < answered2 && answered2 < asked3,
-        "one at a time:\n{}",
-        root.seen
-    );
+    root.logs("a/claude-1 to b/claude-2: message kept");
+    root.logs("asked b to wake b/claude-2");
+    root.logs("did not wake b/claude-2: no-room");
     let got = delivered(&a_in, &mut root);
     let content = field(&got, "content").expect("a notice");
     assert!(content.contains("from-name=\"hub/router\""), "{content}");
@@ -583,6 +564,37 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     // Still kept: it reaches the slot once it runs.
     root.live("b", "claude-2");
     root.logs("a/claude-1 to b/claude-2: message handed on (was waiting)");
+}
+
+#[test]
+fn a_second_wake_is_asked_for_only_once_the_first_has_answered() {
+    let mut root = Root::new("one");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.live("b", "claude-1");
+    root.offloaded("b", "claude-2");
+    root.offloaded("b", "claude-3");
+    let _a_in = root.inbox("a", 1);
+    let _b_in = root.inbox("b", 1);
+    root.route("a b");
+    let to2 = root.stand_in("a", "b/claude-2");
+    let to3 = root.stand_in("a", "b/claude-3");
+    // b has room, so the first wake starts its slot, which takes a second: the second
+    // message arrives while that wake is in flight, and its wake waits for the answer.
+    let a_sock = root.d("a").join("in.sock");
+    send(&to2, &frame(&a_sock, "x", "wake up"));
+    root.logs("asked b to wake b/claude-2");
+    send(&to3, &frame(&a_sock, "x", "you too"));
+    root.logs("a/claude-1 to b/claude-3: message kept");
+    root.logs("did not wake b/claude-2");
+    root.logs("asked b to wake b/claude-3");
+    let at = |text: &str| root.seen.find(text).unwrap();
+    assert!(
+        at("did not wake b/claude-2") < at("asked b to wake b/claude-3"),
+        "one at a time:\n{}",
+        root.seen
+    );
 }
 
 #[test]
