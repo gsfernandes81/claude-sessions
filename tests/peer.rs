@@ -288,6 +288,24 @@ exit 2"#,
         }
     }
 
+    /// What to read when a test fails: everything the router said, and each container's
+    /// agent log, which says what its relay took, bounced or dropped, and why.
+    fn story(&mut self) -> String {
+        if let Some(rx) = self.log.as_ref() {
+            while let Ok(l) = rx.try_recv() {
+                self.seen.push_str(&l);
+                self.seen.push('\n');
+            }
+        }
+        let mut out = format!("the router said:\n{}", self.seen);
+        for host in ["a", "b"] {
+            let log =
+                fs::read_to_string(self.d(host).join("registry/agent.log")).unwrap_or_default();
+            out.push_str(&format!("{host}'s agent log:\n{}\n", log.trim()));
+        }
+        out
+    }
+
     /// The stand-in socket `host`'s agent holds for `addr`, once its record is there.
     fn stand_in(&self, host: &str, addr: &str) -> PathBuf {
         let until = Instant::now() + WAIT;
@@ -333,7 +351,7 @@ fn send(sock: &Path, line: &str) {
 }
 
 /// The next line delivered to `inbox`.
-fn delivered(inbox: &UnixListener) -> String {
+fn delivered(inbox: &UnixListener, root: &mut Root) -> String {
     inbox.set_nonblocking(true).unwrap();
     let until = Instant::now() + WAIT;
     loop {
@@ -346,7 +364,9 @@ fn delivered(inbox: &UnixListener) -> String {
                 return s.trim_end().to_string();
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < until, "nothing was delivered");
+                if Instant::now() >= until {
+                    panic!("nothing was delivered\n{}", root.story());
+                }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => panic!("{e}"),
@@ -384,7 +404,7 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     // a/claude-1 writes to its stand-in for b/claude-1, claiming a name of its own.
     let a_sock = root.d("a").join("in.sock");
     send(&to_b1, &frame(&a_sock, "the owner", "hello from a"));
-    let got = delivered(&b_in);
+    let got = delivered(&b_in, &mut root);
     let content = field(&got, "content").expect("a message");
     assert!(
         content.contains("from-name=\"a/claude-1\""),
@@ -405,7 +425,7 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     // b's claude replies to that address, and it reaches a, from b/claude-1.
     let b_sock = root.d("b").join("in.sock");
     send(&back, &frame(&b_sock, "whoever", "pong"));
-    let got = delivered(&a_in);
+    let got = delivered(&a_in, &mut root);
     let content = field(&got, "content").unwrap();
     assert!(content.contains("from-name=\"b/claude-1\""), "{content}");
     assert!(content.ends_with("\npong\n</cross-session-message>"));
@@ -434,7 +454,7 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     root.route("a b");
     root.logs("1 waiting");
     root.live("b", "claude-2");
-    let got = delivered(&b_in);
+    let got = delivered(&b_in, &mut root);
     let content = field(&got, "content").unwrap();
     assert!(
         content.ends_with("\nfor later\n</cross-session-message>"),
@@ -519,7 +539,7 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     root.logs("a/claude-1 to b/claude-2: message kept");
     root.logs("asked b to wake b/claude-2");
     root.logs("did not wake b/claude-2: no-room");
-    let got = delivered(&a_in);
+    let got = delivered(&a_in, &mut root);
     let content = field(&got, "content").expect("a notice");
     assert!(content.contains("from-name=\"hub/router\""), "{content}");
     assert!(content.contains("has no room to wake it"), "{content}");
