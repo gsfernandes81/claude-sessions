@@ -580,9 +580,12 @@ fn claude_lists_the_agents_stand_in_for_a_slot_in_another_container() {
         .into_iter()
         .find(|(n, _)| n == "ListAgents")
         .unwrap();
+    let row = text.lines().find(|l| l.contains(FAR)).unwrap_or_else(|| {
+        panic!("a record from a foreign pid domain whose socket answers is listed: {text}")
+    });
     assert!(
-        text.contains(FAR),
-        "a record from a foreign pid domain whose socket answers is listed by its name: {text}"
+        row_fields(row).iter().any(|f| f == "idle"),
+        "a live stand-in's status is shown: {row}"
     );
 }
 
@@ -819,5 +822,118 @@ fn a_send_from_a_claude_in_no_slot_is_not_carried() {
     assert!(
         first(&rig.agent_out, QUIET, |v| v.get("peer").is_some()).is_none(),
         "a claude in no slot was given an address"
+    );
+}
+
+/// An offloaded slot's stand-in carries no status (Claude Code shows only its own four), and
+/// Claude Code still lists it, with none, rather than dropping the record or calling it idle.
+#[test]
+fn claude_lists_an_offloaded_stand_in_with_no_status() {
+    let script: Script = Arc::new(|r: &Request| {
+        if r.results().iter().any(|(n, _)| n == "ListAgents") {
+            Reply::Text("done".into())
+        } else {
+            Reply::Tool {
+                name: "ListAgents".into(),
+                input: Value::obj(),
+            }
+        }
+    });
+    let Some(mut rig) = Rig::start("offloaded", script, None) else {
+        return;
+    };
+    let mut far = Value::obj();
+    far.set("repo", Value::string("far"));
+    far.set("slot", Value::string("claude-3"));
+    far.set("live", Value::Bool(false));
+    rig.tell(obj(vec![("roster", Value::Arr(vec![far]))]));
+    // The record is rewritten without a status.
+    let until = Instant::now() + WAIT;
+    loop {
+        let has_status = fs::read_dir(rig.dir.join("cc/sessions"))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .find(|t| t.contains(&format!("\"{FAR}\"")))
+            .is_some_and(|t| t.contains("\"status\""));
+        if !has_status {
+            break;
+        }
+        assert!(Instant::now() < until, "the stand-in kept its status");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    rig.prompt("who is there?");
+    let listed = rig
+        .api
+        .wait_for(WAIT, |r| r.results().iter().any(|(n, _)| n == "ListAgents"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the model was never given ListAgents' result\n{}",
+                rig.story()
+            )
+        });
+    let (_, text) = listed
+        .results()
+        .into_iter()
+        .find(|(n, _)| n == "ListAgents")
+        .unwrap();
+    let row = text
+        .lines()
+        .find(|l| l.contains(FAR))
+        .unwrap_or_else(|| panic!("an offloaded stand-in was not listed: {text}"));
+    let fields = row_fields(row);
+    assert!(
+        fields.iter().any(|f| f == "interactive"),
+        "calibration, the row reads as fields: {row}"
+    );
+    for status in ["busy", "idle", "shell", "waiting"] {
+        assert!(!fields.iter().any(|f| f == status), "{row}");
+    }
+}
+
+/// A ListAgents row's fields, as Claude Code joins them with `·`.
+fn row_fields(row: &str) -> Vec<String> {
+    row.split('\u{b7}').map(|f| f.trim().to_string()).collect()
+}
+
+/// The hub's notices come from `hub/router`, an address with no record behind it: Claude Code
+/// takes a delivered message whatever records there are, so the notice reaches the model.
+#[test]
+fn a_notice_from_the_hub_reaches_the_model() {
+    let Some(mut rig) = Rig::start("notice", Arc::new(|_| Reply::Text("ok".into())), None) else {
+        return;
+    };
+    rig.tell(obj(vec![(
+        "deliver",
+        obj(vec![
+            ("to", Value::string(SLOT)),
+            ("from", Value::string("hub/router")),
+            (
+                "frame",
+                peer_frame(
+                    "/hub",
+                    "hub/router",
+                    "prompting",
+                    "far/claude-3 is offloaded",
+                ),
+            ),
+        ]),
+    )]));
+    let seen = seen_by_model(&rig.api, "far/claude-3 is offloaded", WAIT)
+        .unwrap_or_else(|| panic!("the hub's notice never reached the model\n{}", rig.story()));
+    assert_eq!(
+        attr(&seen, "from-name").as_deref(),
+        Some("hub/router"),
+        "{seen}"
+    );
+    let names: Vec<String> = fs::read_dir(rig.dir.join("cc/sessions"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .filter(|t| t.contains("hub/router"))
+        .collect();
+    assert!(
+        names.is_empty(),
+        "the hub's address is never listed: {names:?}"
     );
 }

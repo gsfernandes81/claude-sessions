@@ -1048,7 +1048,11 @@ another.
 **The stand-ins (`src/peer.rs`).** For each claude slot in every other container, running or
 offloaded, the container's agent holds a stand-in: a socket `<16 hex>.sock` beside Claude
 Code's own, and a record naming it as `repo/slot`, with a `pidDomain` of
-`claude-sessions:<repo>` and a made-up pid above any real one. Claude Code takes a record from
+`claude-sessions:<repo>` and a made-up pid above any real one. A live slot's record says `busy`
+or `idle`; an offloaded one's says nothing, since Claude Code shows `status` only when it is one
+of its own four (`busy`, `shell`, `idle`, `waiting`, read from 2.1.311) and drops any other.
+The skill `peers`, which every agent sees, says that a peer with no status is offloaded, and
+what messaging one costs. Claude Code takes a record from
 a foreign pid domain as present without a pid check, as long as its socket answers. A local
 claude therefore lists the whole fleet and messages it by name, with no skill or command of
 ours.
@@ -1100,6 +1104,21 @@ the agent wire (`proto.rs`):
   not answering (whose slots stay listed as it was last heard), is kept on disk and delivered
   when the slot is next live. So is one an agent bounced. Control frames are about now, so they
   are dropped instead.
+- **A message wakes an offloaded slot where there is room** (owner, 2026-11-07). The router
+  asks the slot's agent to wake it, once until that wake's answer comes. The agent resumes it
+  headless under the holder (`launch::remote_open`, the remote view's Enter, with its slot
+  lock), only where the container has room for another session, the menu's own rule
+  (`mem::SESSION_COST`). Wakes in one container take turns, so each reads the memory the last
+  one left. A woken slot is the remote view's until it is offloaded again (owner's choice over
+  a detached terminal slot), and the kept message is delivered once it is live.
+- **The sender is told** in a notice, a peer message from `hub/router`, sent to each slot with
+  a message waiting:
+  - woken, with what it costs: about 250 MB of the container's memory, the memory that was
+    free, and CPU on the shared host until it is offloaded again;
+  - not woken, and why (no room, with the figures, or another reason);
+  - or its container not answering.
+  `hub/router` has a socket in each container but no record, so it is never listed. A reply
+  to it is dropped, and a notice is never kept.
   - The queue is `HUB_QUEUE`, default `$HOME/queue`: one file per message, fsynced with its
     directory, read whole at start. It must be a persisted volume, since every deploy
     recreates the hub.
@@ -1135,7 +1154,9 @@ account is used, and each test reads as the promise it checks:
 - a delivered message reaches the model from the verified sender;
 - the reply comes back through the stand-in;
 - the shipped settings deliver across permission classes, and without them the message is
-  held, the hold receipt coming back through the stand-in.
+  held, the hold receipt coming back through the stand-in;
+- an offloaded stand-in is listed with no status, a live one with its status;
+- a notice from `hub/router`, an address with no record, reaches the model.
 
 CI runs these at infra's pin (`CLAUDE_CODE_VERSION`), so a bump is mechanical when nothing
 changed, and names the broken behaviour when something did.
@@ -1149,7 +1170,10 @@ containers' agents over a stand-in ssh:
 - a malformed message never delivered;
 - a message to an offloaded slot kept through a router restart, then delivered once the slot
   is live;
-- a relay that switches itself off for a claude speaking another protocol, its message kept.
+- a relay that switches itself off for a claude speaking another protocol, its message kept;
+- a message to an offloaded slot in a full container: the wake asked for and refused for lack
+  of room, the sender told so from `hub/router` with the figures, and the message delivered
+  once the slot runs.
 
 ## Where the hooks live: `/etc/claude-code/managed-settings.d/`
 
@@ -1183,14 +1207,16 @@ tool without editing a shared one.
 
 **The skills go beside it.** `claude-sessions skill [name]` prints `skills/<name>/SKILL.md`:
 `keepalive`, which tells claude when to run `claude-sessions keepalive` and for how short a
-time (§ *The offloader*). Skills go in Claude Code's config directory, which in infra's
+time (§ *The offloader*), and `peers`, on messaging other containers' sessions and what
+waking an offloaded one costs (§ *Agent messaging*). Skills go in Claude Code's config
+directory, which in infra's
 containers is a volume, so an image build cannot put them there. Infra's base **links** each one at the copy `install` put in the shared volume, at every
 container start, so a release's skills are live at the next invocation with no restart. Agent
 mail's three skills went with it in 0.18.0; `install` removes them from the volume, and a link
 infra's base made to one of them is left dangling until infra drops it:
 
 ```
-for s in keepalive; do
+for s in keepalive peers; do
   d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"; mkdir -p "$d"
   ln -sfn "/opt/claude-sessions/skills/$s" "$d/$s"
 done

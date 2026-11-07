@@ -11,8 +11,9 @@
 //! - `managed-settings.d/claude-sessions.json` — the hooks and the status line naming
 //!   `DIR/bin/claude-sessions` (`hooks-config`), for a container to mount at
 //!   `/etc/claude-code/managed-settings.d/`;
-//! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, for a container's start to
-//!   link into Claude Code's config directory. A skill an earlier release shipped and this one
+//! - `skills/<name>/SKILL.md` — the skills (`skill`): `keepalive`, and `peers` on messaging
+//!   other containers' sessions, for a container's start to link into Claude Code's config
+//!   directory. A skill an earlier release shipped and this one
 //!   does not (agent mail's three, `RETIRED_SKILLS`) is removed, so no session is told to run
 //!   a command that is gone. A file here it did not write — a skill infra keeps beside these —
 //!   is left alone;
@@ -214,6 +215,7 @@ mod tests {
             "extensions",
             "skills",
             "skills/keepalive",
+            "skills/peers",
         ] {
             assert_eq!(mode(&dir.join(d)), 0o755, "{d}");
         }

@@ -101,7 +101,10 @@ const SKILL: &str = include_str!("../skills/keepalive/SKILL.md");
 /// still a placeholder (`install::pi_extension` fills it).
 pub const PI_EXTENSION: &str = include_str!("../extensions/claude-sessions.js");
 
-pub const SKILLS: [(&str, &str); 1] = [("keepalive", SKILL)];
+pub const SKILLS: [(&str, &str); 2] = [
+    ("keepalive", SKILL),
+    ("peers", include_str!("../skills/peers/SKILL.md")),
+];
 
 /// Skills earlier releases shipped, which `install` removes so no session is told to use a
 /// command this binary no longer has: agent mail's three, gone with it.
@@ -358,8 +361,8 @@ fn usage() -> String {
                                keep the slot this runs in from being offloaded for DURATION
                                (90s, 25m, 2h; at most 12h; 0 ends it), for work that waits
                                quietly
-  claude-sessions skill [NAME] print a skill this binary ships (keepalive, the default), as
-                               install writes it into skills/NAME/SKILL.md
+  claude-sessions skill [NAME] print a skill this binary ships (keepalive, the default, or
+                               peers), as install writes it into skills/NAME/SKILL.md
   claude-sessions statusline   RAM, load and host, for Claude Code's status line
   claude-sessions hooks-config [PATH]
                                the Claude Code settings that install the hooks and the status

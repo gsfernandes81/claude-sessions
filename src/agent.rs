@@ -187,6 +187,16 @@ pub fn serve() -> io::Result<()> {
                 .set_roster(entries);
             continue;
         }
+        if let Some(slot) = msg
+            .get("wake")
+            .and_then(|w| w.get("slot"))
+            .and_then(Value::as_str)
+        {
+            let out = agent.out.clone();
+            let slot = slot.to_string();
+            std::thread::spawn(move || out.send(&wake(&slot)));
+            continue;
+        }
         if let Some(d) = msg.get("deliver") {
             let Some(relay) = relay.clone() else {
                 continue;
@@ -272,6 +282,45 @@ fn deliver(relay: &Arc<peer::Relay>, out: &Out, d: &Value) {
     let mut msg = Value::obj();
     msg.set("bounce", b);
     out.send(&msg);
+}
+
+/// Wakes in this container, one at a time: each reads the memory the last one left.
+static WAKING: Mutex<()> = Mutex::new(());
+
+/// Resume offloaded `slot` headless under the holder, as the remote view's Enter does, for a
+/// message waiting at the hub (`docs/design.md` § *Agent messaging*). Only where there is
+/// room for another session, the menu's own rule. The answer carries the container's memory
+/// either way, so the sender can be told what waking cost or why it did not happen.
+fn wake(slot: &str) -> Value {
+    let _one = WAKING.lock().unwrap_or_else(|p| p.into_inner());
+    let m = mem::read();
+    let mut w = Value::obj();
+    w.set("slot", Value::string(slot));
+    w.set("cost", Value::num(mem::SESSION_COST as f64));
+    if let Some(free) = m.headroom() {
+        w.set("free", Value::num(free as f64));
+    }
+    if let Some(limit) = m.limit {
+        w.set("limit", Value::num(limit as f64));
+    }
+    let outcome = if !zmx::is_slot_name(slot) {
+        Err(format!("{slot:?} is not a slot"))
+    } else if !m.room_for(mem::SESSION_COST) {
+        Err("no-room".to_string())
+    } else {
+        launch::remote_open(slot, &launch::Deps::from_env()).map(|_| ())
+    };
+    match &outcome {
+        Ok(()) => log(&format!("peer: woke {slot} for a waiting message")),
+        Err(why) => log(&format!("peer: did not wake {slot}: {why}")),
+    }
+    w.set("ok", Value::Bool(outcome.is_ok()));
+    if let Err(why) = outcome {
+        w.set("why", Value::string(why));
+    }
+    let mut msg = Value::obj();
+    msg.set("woke", w);
+    msg
 }
 
 /// The agent's terminal is the owner's at the hub: a child is sent there to run.

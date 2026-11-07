@@ -428,6 +428,9 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
         &frame(&a_sock, "x", "for later"),
     );
     root.logs("a/claude-1 to b/claude-2: message kept");
+    // The router asks b to wake it; the stand-in zmx here cannot, and the slot is put back as
+    // it was. Waited for, so that putting it back cannot land after the slot is made live below.
+    root.logs("did not wake b/claude-2");
     root.route("a b");
     root.logs("1 waiting");
     root.live("b", "claude-2");
@@ -458,11 +461,11 @@ fn a_relay_switches_itself_off_for_a_claude_that_speaks_another_protocol() {
     root.claim_protocol("b", 2);
     root.logs("b's relay is off: claude-1's claude speaks peer protocol 2, not 1");
     let until = Instant::now() + WAIT;
-    while !root.stand_ins("b").is_empty() {
+    // Its record goes first, then its socket.
+    while !root.stand_ins("b").is_empty() || to_a1.exists() {
         assert!(Instant::now() < until, "b's stand-ins stayed");
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!to_a1.exists());
     // A message for b is bounced by its agent, and kept rather than lost.
     let a_sock = root.d("a").join("in.sock");
     send(
@@ -471,4 +474,57 @@ fn a_relay_switches_itself_off_for_a_claude_that_speaks_another_protocol() {
     );
     root.logs("a/claude-1 to b/claude-1: message kept: bounced");
     assert!(quiet(&b_in));
+}
+
+#[test]
+fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not() {
+    let mut root = Root::new("wake");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.live("b", "claude-1");
+    root.offloaded("b", "claude-2");
+    // b has 100 MB free: too little for another session, which costs about 250 MB.
+    fs::write(root.d("b").join("cgroup/memory.max"), "4294967296\n").unwrap();
+    fs::write(
+        root.d("b").join("cgroup/memory.current"),
+        format!("{}\n", 4294967296u64 - 100 * 1024 * 1024),
+    )
+    .unwrap();
+    let a_in = root.inbox("a", 1);
+    let _b_in = root.inbox("b", 1);
+    root.route("a b");
+    // Offloaded, the stand-in claims no status, so nothing calls it idle; a live one does.
+    root.stand_in("a", "b/claude-2");
+    root.stand_in("a", "b/claude-1");
+    let record_of = |name: &str| -> String {
+        fs::read_dir(root.d("a").join("cc/sessions"))
+            .unwrap()
+            .flatten()
+            .map(|e| fs::read_to_string(e.path()).unwrap_or_default())
+            .find(|t| field(t, "name").as_deref() == Some(name))
+            .unwrap()
+    };
+    assert!(
+        record_of("b/claude-1").contains("\"status\":\"idle\""),
+        "calibration"
+    );
+    assert!(!record_of("b/claude-2").contains("\"status\""));
+
+    let a_sock = root.d("a").join("in.sock");
+    send(
+        &root.stand_in("a", "b/claude-2"),
+        &frame(&a_sock, "x", "wake up"),
+    );
+    root.logs("a/claude-1 to b/claude-2: message kept");
+    root.logs("asked b to wake b/claude-2");
+    root.logs("did not wake b/claude-2: no-room");
+    let got = delivered(&a_in);
+    let content = field(&got, "content").expect("a notice");
+    assert!(content.contains("from-name=\"hub/router\""), "{content}");
+    assert!(content.contains("has no room to wake it"), "{content}");
+    assert!(content.contains("100M free of 4.0G"), "{content}");
+    // Still kept: it reaches the slot once it runs.
+    root.live("b", "claude-2");
+    root.logs("a/claude-1 to b/claude-2: message handed on (was waiting)");
 }

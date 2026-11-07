@@ -21,13 +21,13 @@
 //! **Never a body in the log.** One line per frame: who to whom, and what became of it.
 
 use crate::clock;
-use crate::fmt::utc;
+use crate::fmt::{human, utc};
 use crate::hub::{self, Conn, Event};
 use crate::json::{self, Value};
 use crate::peer::{self, Entry};
 use crate::proto::Snapshot;
 use crate::ui::RowKey;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -334,6 +334,15 @@ impl Queue {
         }
     }
 
+    /// Who has a message waiting for `to`, each once.
+    pub fn senders_for(&self, to: &str) -> BTreeSet<String> {
+        self.items
+            .values()
+            .filter(|i| i.to == to)
+            .map(|i| i.from.clone())
+            .collect()
+    }
+
     /// Drop what has waited past [`RETAIN_MS`]; what was dropped.
     pub fn prune(&mut self, now: u64) -> Vec<Item> {
         self.take_where(|i| now.saturating_sub(i.at) > RETAIN_MS)
@@ -378,6 +387,8 @@ struct Router {
     /// The roster each agent was last sent, so it is sent again only when it changes.
     sent: Mutex<HashMap<String, Value>>,
     queue: Mutex<Queue>,
+    /// Offloaded slots asked to wake, whose answer has not come: asked once until it does.
+    waking: Mutex<HashSet<String>>,
 }
 
 impl Router {
@@ -414,7 +425,7 @@ pub fn queue_dir() -> PathBuf {
 pub fn serve() -> io::Result<()> {
     let mut hosts = hub::hosts();
     hosts.retain(|h| {
-        let ok = peer::is_name(h);
+        let ok = peer::is_name(h) && h != peer::HUB;
         if !ok {
             say(&format!(
                 "{h:?} is not relayed: not a name a container may have"
@@ -440,6 +451,7 @@ pub fn serve() -> io::Result<()> {
         conns: Mutex::new(HashMap::new()),
         sent: Mutex::new(HashMap::new()),
         queue: Mutex::new(queue),
+        waking: Mutex::new(HashSet::new()),
     });
     for host in hosts {
         let router = router.clone();
@@ -600,7 +612,12 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
         let fleet = lock(&router.fleet).clone();
         match route(&fleet, host, p, clock::now()) {
             Route::Deliver(repo, item) => send(router, &repo, item, ""),
-            Route::Keep(item) => keep(router, item, "not live now"),
+            Route::Keep(item) => {
+                let to = item.to.clone();
+                let sender = item.from.clone();
+                keep(router, item, "not live now");
+                wake_or_say(router, &fleet, &to, &sender);
+            }
             Route::Drop(why) => {
                 let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
                 say(&format!(
@@ -618,6 +635,14 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
                 .to_string()
         };
         let Some(frame) = b.get("frame") else { return };
+        if s("from") == HUB_ADDR {
+            say(&format!(
+                "notice to {host}/{}: dropped: {}",
+                s("to"),
+                s("why")
+            ));
+            return;
+        }
         let item = Item {
             to: format!("{host}/{}", s("to")),
             from: s("from"),
@@ -629,7 +654,160 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
         if let Some(off) = r.get("off").and_then(Value::as_str) {
             say(&format!("{host}'s relay is off: {off}"));
         }
+    } else if let Some(w) = msg.get("woke") {
+        let Some(slot) = w.get("slot").and_then(Value::as_str) else {
+            return;
+        };
+        let addr = format!("{host}/{slot}");
+        lock(&router.waking).remove(&addr);
+        let ok = w.get("ok").and_then(Value::as_bool) == Some(true);
+        let why = w.get("why").and_then(Value::as_str).unwrap_or("?");
+        say(&if ok {
+            format!("woke {addr} for its waiting messages")
+        } else {
+            format!("did not wake {addr}: {why}")
+        });
+        let text = wake_notice(&addr, w);
+        let senders = lock(&router.queue).senders_for(&addr);
+        for sender in senders {
+            notify(router, &sender, &text);
+        }
     }
+}
+
+/// The address the hub's notices come from. It is never a container's slot, and replies to it
+/// are dropped.
+pub const HUB_ADDR: &str = "hub/router";
+
+/// A message was kept for `to`: wake it when its container answers and it is offloaded (once,
+/// until that wake's answer comes), else tell the sender its container is not answering.
+fn wake_or_say(router: &Router, fleet: &Fleet, to: &str, sender: &str) {
+    let Some((repo, slot)) = peer::split_addr(to) else {
+        return;
+    };
+    if !fleet.up.get(repo).copied().unwrap_or(false) {
+        notify(router, sender, &down_notice(to));
+        return;
+    }
+    if !lock(&router.waking).insert(to.to_string()) {
+        return;
+    }
+    let mut w = Value::obj();
+    w.set("slot", Value::string(slot));
+    let mut msg = Value::obj();
+    msg.set("wake", w);
+    let told = lock(&router.conns).get(repo).cloned().map(|c| c.tell(&msg));
+    if matches!(told, Some(Ok(()))) {
+        say(&format!("asked {repo} to wake {to} for a waiting message"));
+    } else {
+        lock(&router.waking).remove(to);
+    }
+}
+
+/// A notice from the hub to `to`, a live slot, about a message it sent; not kept if it cannot
+/// be given now.
+fn notify(router: &Router, to: &str, text: &str) {
+    let Some((repo, slot)) = peer::split_addr(to) else {
+        return;
+    };
+    let fleet = lock(&router.fleet).clone();
+    if !fleet.reachable(repo, slot) {
+        say(&format!("notice to {to}: dropped, not live"));
+        return;
+    }
+    let item = notice(to, text, clock::now());
+    let told = lock(&router.conns)
+        .get(repo)
+        .cloned()
+        .map(|c| c.tell(&item.deliver()));
+    match told {
+        Some(Ok(())) => say(&format!("notice to {to}: handed on")),
+        _ => say(&format!(
+            "notice to {to}: dropped, {repo} could not be told"
+        )),
+    }
+}
+
+/// The hub's notice to `to`, as a peer message from [`HUB_ADDR`].
+pub fn notice(to: &str, text: &str, now: u64) -> Item {
+    let from = "uds:/hub";
+    let w = peer::Wrapper {
+        from: Some(from.into()),
+        from_name: Some(HUB_ADDR.into()),
+        body: text.to_string(),
+        ..peer::Wrapper::default()
+    };
+    let mut message = Value::obj();
+    message.set("role", Value::string("user"));
+    message.set("content", Value::string(w.render()));
+    let mut frame = Value::obj();
+    frame.set("msgV", Value::num(1));
+    frame.set(
+        "msg_id",
+        Value::string(format!("hub-{now}-{}", peer::stand_in_pid(to))),
+    );
+    frame.set("type", Value::string("user"));
+    frame.set("message", message);
+    frame.set("priority", Value::string("next"));
+    frame.set("from", Value::string(from));
+    Item {
+        to: to.to_string(),
+        from: HUB_ADDR.to_string(),
+        frame,
+        at: now,
+    }
+}
+
+/// How the hub signs a notice, so an agent knows what is speaking and that it is not a peer.
+const SIGNED: &str = "-- claude-sessions' hub, which carries messages between containers. \
+     This is a notice; replies to it go nowhere.";
+
+/// What a sender is told when the slot it wrote to was asked to wake: whether it woke, what
+/// that costs, or why not. `w` is the agent's answer (`agent::wake`).
+pub fn wake_notice(addr: &str, w: &Value) -> String {
+    let n = |k: &str| w.get(k).and_then(Value::as_u64);
+    let repo = addr.split('/').next().unwrap_or(addr);
+    let cost = n("cost").map(human).unwrap_or_else(|| "250M".into());
+    let room = match (n("free"), n("limit")) {
+        (Some(free), Some(limit)) => format!("{} free of {}", human(free), human(limit)),
+        _ => "its memory could not be read".into(),
+    };
+    let days = RETAIN_MS / 86_400_000;
+    let kept = format!(
+        "Your message is kept and delivered when {addr} next runs (when the owner opens it, or \
+         a later message finds room), for up to {days} days."
+    );
+    if w.get("ok").and_then(Value::as_bool) == Some(true) {
+        format!(
+            "{addr} was offloaded, so it has been woken to take your message. It now runs \
+             headless (the owner sees it in the remote view), using about {cost} of {repo}'s \
+             memory ({room} before it woke) and CPU on the host every container shares, until \
+             it has been quiet for 10 minutes and is offloaded again. Your message is delivered \
+             as soon as it is up. Waking costs that every time: wake an offloaded session only \
+             for something worth it.\n{SIGNED}"
+        )
+    } else {
+        match w.get("why").and_then(Value::as_str) {
+            Some("no-room") => format!(
+                "{addr} is offloaded, and {repo} has no room to wake it: a session needs about \
+                 {cost}, and it has {room}. {kept}\n{SIGNED}"
+            ),
+            why => format!(
+                "{addr} is offloaded and could not be woken ({}). {kept}\n{SIGNED}",
+                why.unwrap_or("no reason given")
+            ),
+        }
+    }
+}
+
+/// What a sender is told when the slot it wrote to is in a container that is not answering.
+pub fn down_notice(addr: &str) -> String {
+    let repo = addr.split('/').next().unwrap_or(addr);
+    format!(
+        "{repo}, where {addr} runs, is not answering just now. Your message is kept and \
+         delivered when it is back, for up to {} days.\n{SIGNED}",
+        RETAIN_MS / 86_400_000
+    )
 }
 
 #[cfg(test)]
@@ -815,6 +993,93 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_notice_says_what_waking_cost_or_why_it_did_not_happen() {
+        let answer =
+            |pairs: &str| json::parse(&format!(r#"{{"slot":"claude-5",{pairs}}}"#)).unwrap();
+        let gb = 1u64 << 30;
+        let room = format!(r#""cost":262144000,"free":{},"limit":{}"#, 2 * gb, 4 * gb);
+        let woke = wake_notice("infra/claude-5", &answer(&format!(r#""ok":true,{room}"#)));
+        for said in [
+            "has been woken",
+            "250M of infra's memory",
+            "2.0G free of 4.0G",
+            "offloaded again",
+            "worth it",
+            "replies to it go nowhere",
+        ] {
+            assert!(woke.contains(said), "{said:?} in {woke}");
+        }
+        let full = format!(
+            r#""cost":262144000,"free":{},"limit":{}"#,
+            100 << 20,
+            4 * gb
+        );
+        let no = wake_notice(
+            "infra/claude-5",
+            &answer(&format!(r#""ok":false,"why":"no-room",{full}"#)),
+        );
+        for said in [
+            "has no room to wake it",
+            "about 250M",
+            "100M free of 4.0G",
+            "kept",
+            "7 days",
+        ] {
+            assert!(no.contains(said), "{said:?} in {no}");
+        }
+        assert!(!no.contains("has been woken"));
+        let other = wake_notice(
+            "infra/claude-5",
+            &answer(r#""ok":false,"why":"claude-5 is gone""#),
+        );
+        assert!(
+            other.contains("could not be woken (claude-5 is gone)"),
+            "{other}"
+        );
+        let down = down_notice("infra/claude-5");
+        assert!(
+            down.contains("infra, where infra/claude-5 runs, is not answering"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn a_notice_is_a_peer_message_claude_code_takes_from_the_hubs_address() {
+        let item = notice("a/claude-1", "hello", 5);
+        assert_eq!(item.from, HUB_ADDR);
+        assert!(item.is_message());
+        let content = item
+            .frame
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap();
+        let w = peer::Wrapper::parse(content).expect("canonical, or no claude would take it");
+        assert_eq!(w.from_name.as_deref(), Some(HUB_ADDR));
+        assert_eq!(w.body, "hello");
+        // What the receiving agent writes into the inbox passes the same test.
+        let out = peer::rewrite(&item.frame, Path::new("/s/ab.sock"), HUB_ADDR).unwrap();
+        assert!(out.get("from").is_some());
+    }
+
+    #[test]
+    fn each_sender_with_a_message_waiting_is_told_once() {
+        let mut q = Queue::memory();
+        for from in ["a/claude-1", "c/claude-2", "a/claude-1"] {
+            q.push(Item {
+                to: "b/claude-2".into(),
+                from: from.into(),
+                frame: json::parse(r#"{"type":"user"}"#).unwrap(),
+                at: 0,
+            })
+            .unwrap();
+        }
+        let got: Vec<String> = q.senders_for("b/claude-2").into_iter().collect();
+        assert_eq!(got, ["a/claude-1", "c/claude-2"]);
+        assert!(q.senders_for("b/claude-9").is_empty());
+    }
+
+    #[test]
     fn the_beat_says_who_answers_and_what_waits() {
         let mut fleet = fleet();
         fleet.up.insert("d".into(), false);
@@ -832,6 +1097,7 @@ mod tests {
             conns: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
             queue: Mutex::new(queue),
+            waking: Mutex::new(HashSet::new()),
         };
         let line = router.pulse();
         assert!(line.ends_with(" 2/4 answering, 1 waiting\n"), "{line:?}");

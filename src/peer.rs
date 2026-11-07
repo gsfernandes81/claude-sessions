@@ -49,6 +49,9 @@ pub const PROTOCOL: u64 = 1;
 /// The pid domain every stand-in's record carries, before its repo. Not the container's own,
 /// so Claude Code never checks the made-up pid.
 pub const DOMAIN_PREFIX: &str = "claude-sessions:";
+/// The repo name of the hub's own address, `hub/router`, from which it sends notices: never a
+/// container's (the router refuses a host by that name).
+pub const HUB: &str = "hub";
 /// The tag Claude Code wraps a peer's message in.
 const TAG: &str = "cross-session-message";
 /// Claude Code's own cap on one line to an inbox.
@@ -201,10 +204,15 @@ pub fn record(e: &Entry, sock: &Path, now_ms: u64) -> Value {
     v.set("name", Value::string(&addr));
     v.set("nameSource", Value::string("user"));
     v.set("nameSince", n(now_ms));
-    v.set(
-        "status",
-        Value::string(if e.busy { "busy" } else { "idle" }),
-    );
+    // Claude Code shows `status` only when it is one of its own (busy, shell, idle, waiting),
+    // so an offloaded slot has none rather than one that says idle. The `peers` skill tells
+    // agents that a peer listed with no status is offloaded.
+    if e.live {
+        v.set(
+            "status",
+            Value::string(if e.busy { "busy" } else { "idle" }),
+        );
+    }
     v.set("updatedAt", n(now_ms));
     v.set("statusUpdatedAt", n(now_ms));
     v
@@ -604,7 +612,10 @@ impl Relay {
             sock,
             stop: stop.clone(),
         };
-        self.write_record(&s)?;
+        // The hub's own address sends notices and is never listed, so it gets no record.
+        if e.repo != HUB {
+            self.write_record(&s)?;
+        }
         let relay = self.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -1070,6 +1081,19 @@ mod tests {
             0,
         );
         assert_eq!(at(&busy, &["status"]).as_str(), Some("busy"));
+        let offloaded = record(
+            &Entry {
+                live: false,
+                ..e.clone()
+            },
+            sock,
+            0,
+        );
+        assert_eq!(
+            offloaded.get("status"),
+            None,
+            "an offloaded slot is not called idle"
+        );
         assert_eq!(Entry::from_value(&e.to_value()), Some(e));
         let mut bad = Value::obj();
         bad.set("repo", Value::string("../x"));

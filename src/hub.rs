@@ -104,7 +104,8 @@ pub enum Event {
     /// The container stopped answering, or never did, and what was said about it.
     Down(String, String),
     /// What its relay said (`peer.rs`): a frame a local claude sent another container's slot,
-    /// a delivery it bounced, or that it switched itself off. Only the router acts on these.
+    /// a delivery it bounced, that it switched itself off, or how a wake went. Only the router
+    /// acts on these.
     Relay(Value),
 }
 
@@ -209,7 +210,7 @@ pub fn connect(host: &str, events: Sender<Event>, wake: fn()) -> Arc<Conn> {
                     wake();
                     continue;
                 }
-                if ["peer", "bounce", "relay"]
+                if ["peer", "bounce", "relay", "woke"]
                     .iter()
                     .any(|k| msg.get(k).is_some())
                 {
