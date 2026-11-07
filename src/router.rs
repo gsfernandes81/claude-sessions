@@ -24,6 +24,7 @@ use crate::clock;
 use crate::fmt::{human, utc};
 use crate::hub::{self, Conn, Event};
 use crate::json::{self, Value};
+use crate::mem;
 use crate::peer::{self, Entry};
 use crate::proto::Snapshot;
 use crate::ui::RowKey;
@@ -38,6 +39,15 @@ use std::time::Duration;
 pub const MAX_QUEUE: usize = 200;
 /// How long a waiting message is kept: about what Claude Code keeps an unread one.
 pub const RETAIN_MS: u64 = 7 * 86_400_000;
+/// How often kept messages for live slots are tried again.
+const RETRY_TICK: Duration = Duration::from_secs(5);
+/// How long a slot that bounced a message is left before it is tried again, so a message
+/// stuck behind, say, a relay that is off is not handed on and bounced every tick: twice the
+/// hub's retry for a container that does not answer (`CLAUDE_SESSIONS_RETRY_MS`, 15 s), so 30 s.
+fn bounce_backoff_ms() -> u64 {
+    crate::run::retry().as_millis() as u64 * 2
+}
+
 /// How often the router says it is alive, in `.beat` beside the queue.
 pub const BEAT: Duration = Duration::from_secs(60);
 
@@ -387,8 +397,14 @@ struct Router {
     /// The roster each agent was last sent, so it is sent again only when it changes.
     sent: Mutex<HashMap<String, Value>>,
     queue: Mutex<Queue>,
-    /// Offloaded slots asked to wake, whose answer has not come: asked once until it does.
+    /// Slots that bounced a message, and when they may next be tried.
+    backoff: Mutex<HashMap<String, u64>>,
+    /// The offloaded slot asked to wake, whose answer has not come. One at a time across the
+    /// fleet (infra's finding (k), 2026-11-07), so each wake reads the memory the last one left.
     waking: Mutex<HashSet<String>>,
+    /// Slots with a message waiting to be woken once the wake in flight has answered, oldest
+    /// first, each once.
+    to_wake: Mutex<Vec<String>>,
 }
 
 impl Router {
@@ -451,7 +467,9 @@ pub fn serve() -> io::Result<()> {
         conns: Mutex::new(HashMap::new()),
         sent: Mutex::new(HashMap::new()),
         queue: Mutex::new(queue),
+        backoff: Mutex::new(HashMap::new()),
         waking: Mutex::new(HashSet::new()),
+        to_wake: Mutex::new(Vec::new()),
     });
     for host in hosts {
         let router = router.clone();
@@ -469,16 +487,24 @@ pub fn serve() -> io::Result<()> {
             }
         });
     }
+    // Kept messages for slots that are live are tried again on a short tick, so one an agent
+    // bounced for a moment (no inbox yet, a relay starting) does not wait for that container's
+    // next snapshot, which can be a minute away. Old ones are pruned hourly.
+    let mut pruned = std::time::Instant::now();
     loop {
-        for item in lock(&router.queue).prune(clock::now()) {
-            say(&format!(
-                "{} to {}: dropped, kept past {} days",
-                item.from,
-                item.to,
-                RETAIN_MS / 86_400_000
-            ));
+        flush(&router);
+        if pruned.elapsed() >= Duration::from_secs(3600) {
+            pruned = std::time::Instant::now();
+            for item in lock(&router.queue).prune(clock::now()) {
+                say(&format!(
+                    "{} to {}: dropped, kept past {} days",
+                    item.from,
+                    item.to,
+                    RETAIN_MS / 86_400_000
+                ));
+            }
         }
-        std::thread::sleep(Duration::from_secs(3600));
+        std::thread::sleep(RETRY_TICK);
     }
 }
 
@@ -559,8 +585,16 @@ fn rosters(router: &Router) {
 /// Hand on what was waiting for slots now live.
 fn flush(router: &Router) {
     let fleet = lock(&router.fleet).clone();
-    let ready = lock(&router.queue)
-        .take(|to| peer::split_addr(to).is_some_and(|(repo, slot)| fleet.reachable(repo, slot)));
+    let now = clock::now();
+    let backoff = {
+        let mut b = lock(&router.backoff);
+        b.retain(|_, until| *until > now);
+        b.clone()
+    };
+    let ready = lock(&router.queue).take(|to| {
+        !backoff.contains_key(to)
+            && peer::split_addr(to).is_some_and(|(repo, slot)| fleet.reachable(repo, slot))
+    });
     for item in ready {
         let repo = peer::split_addr(&item.to)
             .map(|(r, _)| r.to_string())
@@ -649,6 +683,7 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
             frame: frame.clone(),
             at: clock::now(),
         };
+        lock(&router.backoff).insert(item.to.clone(), clock::now() + bounce_backoff_ms());
         keep(router, item, &format!("bounced: {}", s("why")));
     } else if let Some(r) = msg.get("relay") {
         if let Some(off) = r.get("off").and_then(Value::as_str) {
@@ -672,7 +707,82 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
         for sender in senders {
             notify(router, &sender, &text);
         }
+        wake_next(router);
     }
+}
+
+/// The next slot waiting to be woken, now the wake in flight has answered: one that is still
+/// offloaded, in a container that answers, with a message still waiting for it.
+fn wake_next(router: &Router) {
+    loop {
+        let next = {
+            let mut later = lock(&router.to_wake);
+            if later.is_empty() {
+                return;
+            }
+            later.remove(0)
+        };
+        let fleet = lock(&router.fleet).clone();
+        let Some((repo, slot)) = peer::split_addr(&next) else {
+            continue;
+        };
+        let offloaded = fleet.up.get(repo).copied().unwrap_or(false)
+            && fleet.slot(repo, slot).is_some_and(|s| !s.live);
+        let Some(sender) = lock(&router.queue).senders_for(&next).into_iter().next() else {
+            continue;
+        };
+        if offloaded {
+            wake_or_say(router, &fleet, &next, &sender);
+            return;
+        }
+    }
+}
+
+/// What the host must have free besides a session's own cost before a wake is asked for: a
+/// margin, since the figure moves while the session starts and other things run there.
+pub const HOST_MARGIN: u64 = 512 * 1024 * 1024;
+
+/// The pool's memory, where infra mounts it (`CLAUDE_SESSIONS_POOL`): every dev container's
+/// parent cgroup, once infra's pool exists.
+fn pool_room() -> Option<mem::Memory> {
+    let dir = std::env::var("CLAUDE_SESSIONS_POOL")
+        .ok()
+        .filter(|d| !d.is_empty())?;
+    Some(mem::read_at(&dir))
+}
+
+/// Whether the host has room for one more session: its available memory (`/proc/meminfo`)
+/// covers a session and [`HOST_MARGIN`], and so does the pool's headroom where there is a
+/// pool. A figure that cannot be read does not refuse, as the menu's own check does not.
+pub fn host_room(available: Option<u64>, pool: Option<mem::Memory>) -> Result<(), String> {
+    let want = mem::SESSION_COST + HOST_MARGIN;
+    if let Some(free) = available.filter(|f| *f < want) {
+        return Err(format!(
+            "the host has {} available, and a session needs about {} with {} kept free",
+            human(free),
+            human(mem::SESSION_COST),
+            human(HOST_MARGIN)
+        ));
+    }
+    if let Some(free) = pool.and_then(|p| p.headroom()).filter(|f| *f < want) {
+        return Err(format!(
+            "the containers' pool has {} free, and a session needs about {} with {} kept free",
+            human(free),
+            human(mem::SESSION_COST),
+            human(HOST_MARGIN)
+        ));
+    }
+    Ok(())
+}
+
+/// What a sender is told when the host had no room to wake the slot it wrote to.
+pub fn host_notice(addr: &str, why: &str) -> String {
+    format!(
+        "{addr} is offloaded, and it was not woken: {why}. Your message is kept and \
+         delivered when {addr} next runs (when the owner opens it, or a later message finds \
+         room), for up to {} days.\n{SIGNED}",
+        RETAIN_MS / 86_400_000
+    )
 }
 
 /// The address the hub's notices come from. It is never a container's slot, and replies to it
@@ -689,8 +799,31 @@ fn wake_or_say(router: &Router, fleet: &Fleet, to: &str, sender: &str) {
         notify(router, sender, &down_notice(to));
         return;
     }
-    if !lock(&router.waking).insert(to.to_string()) {
-        return;
+    {
+        let mut waking = lock(&router.waking);
+        if waking.contains(to) {
+            return;
+        }
+        if !waking.is_empty() {
+            // One wake at a time: this one when the wake in flight has answered.
+            let mut later = lock(&router.to_wake);
+            if !later.iter().any(|t| t == to) {
+                later.push(to.to_string());
+            }
+            return;
+        }
+        // The host's room, before any container's own: each container's ceiling is only
+        // that, and together they come to more than the host has.
+        if let Err(why) = host_room(mem::host_available(), pool_room()) {
+            drop(waking);
+            say(&format!("did not ask to wake {to}: {why}"));
+            let text = host_notice(to, &why);
+            for sender in lock(&router.queue).senders_for(to) {
+                notify(router, &sender, &text);
+            }
+            return;
+        }
+        waking.insert(to.to_string());
     }
     let mut w = Value::obj();
     w.set("slot", Value::string(slot));
@@ -1063,6 +1196,34 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_needs_room_on_the_host_and_in_the_pool_besides_the_containers_own() {
+        let mb = 1024 * 1024;
+        let want = mem::SESSION_COST + HOST_MARGIN;
+        assert_eq!(
+            host_room(Some(want), None),
+            Ok(()),
+            "calibration: exactly enough"
+        );
+        assert_eq!(host_room(None, None), Ok(()), "unreadable does not refuse");
+        let why = host_room(Some(600 * mb), None).unwrap_err();
+        assert!(why.contains("the host has 600M available"), "{why}");
+        assert!(why.contains("about 250M with 512M kept free"), "{why}");
+        let pool = |current: u64| mem::Memory {
+            limit: Some(4096 * mb),
+            current: Some(current),
+            reclaimable: Some(0),
+        };
+        assert_eq!(host_room(Some(4096 * mb), Some(pool(1024 * mb))), Ok(()));
+        let why = host_room(Some(4096 * mb), Some(pool(3700 * mb))).unwrap_err();
+        assert!(why.contains("pool has 396M free"), "{why}");
+        let text = host_notice("b/claude-2", &why);
+        assert!(
+            text.contains("b/claude-2 is offloaded, and it was not woken: the containers' pool")
+        );
+        assert!(text.contains("kept"));
+    }
+
+    #[test]
     fn each_sender_with_a_message_waiting_is_told_once() {
         let mut q = Queue::memory();
         for from in ["a/claude-1", "c/claude-2", "a/claude-1"] {
@@ -1097,7 +1258,9 @@ mod tests {
             conns: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
             queue: Mutex::new(queue),
+            backoff: Mutex::new(HashMap::new()),
             waking: Mutex::new(HashSet::new()),
+            to_wake: Mutex::new(Vec::new()),
         };
         let line = router.pulse();
         assert!(line.ends_with(" 2/4 answering, 1 waiting\n"), "{line:?}");

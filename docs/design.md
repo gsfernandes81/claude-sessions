@@ -1104,26 +1104,42 @@ the agent wire (`proto.rs`):
   not answering (whose slots stay listed as it was last heard), is kept on disk and delivered
   when the slot is next live. So is one an agent bounced. Control frames are about now, so they
   are dropped instead.
-- **A message wakes an offloaded slot where there is room** (owner, 2026-11-07). The router
-  asks the slot's agent to wake it, once until that wake's answer comes. The agent resumes it
-  headless under the holder (`launch::remote_open`, the remote view's Enter, with its slot
-  lock), only where the container has room for another session, the menu's own rule
-  (`mem::SESSION_COST`). Wakes in one container take turns, so each reads the memory the last
-  one left. A woken slot is the remote view's until it is offloaded again (owner's choice over
-  a detached terminal slot), and the kept message is delivered once it is live.
-- **The sender is told** in a notice, a peer message from `hub/router`, sent to each slot with
-  a message waiting:
-  - woken, with what it costs: about 250 MB of the container's memory, the memory that was
-    free, and CPU on the shared host until it is offloaded again;
-  - not woken, and why (no room, with the figures, or another reason);
-  - or its container not answering.
-  `hub/router` has a socket in each container but no record, so it is never listed. A reply
-  to it is dropped, and a notice is never kept.
   - The queue is `HUB_QUEUE`, default `$HOME/queue`: one file per message, fsynced with its
     directory, read whole at start. It must be a persisted volume, since every deploy
     recreates the hub.
   - At most 200 messages wait for one slot, for at most 7 days (about what Claude Code keeps
     an unread one).
+  - Kept messages for slots that are live are tried again every 5 s, so one an agent bounced
+    for a moment (no inbox yet, a relay starting) is not left until that container's next
+    snapshot, which can be a minute away. A slot that bounced one is left twice the hub's
+    retry (30 s) before the next try, so a message stuck behind a relay that is off is not
+    bounced every tick.
+- **A message wakes an offloaded slot where there is room** (owner, 2026-11-07). The router
+  asks the slot's agent to wake it, once until that wake's answer comes. The agent resumes it
+  headless under the holder (`launch::remote_open`, the remote view's Enter, with its slot
+  lock), only where the container has room for another session, the menu's own rule
+  (`mem::SESSION_COST`).
+- **The host must have room too** (infra's finding (k), 2026-11-07). Each container's memory
+  ceiling is a ceiling, not a reservation, and together they come to more than the host has,
+  so several containers could each pass their own check at once. So before any agent is asked:
+  - **one wake at a time across the fleet**: a wake asked for while another is in flight waits
+    for that one's answer, so each reads the memory the last one left;
+  - **the host's available memory** (`MemAvailable` in the hub's `/proc/meminfo`, which
+    describes the host) must cover a session and a 512 MB margin (`router::HOST_MARGIN`);
+  - **the pool's headroom** must too, where infra mounts the pool (`CLAUDE_SESSIONS_POOL`);
+  - a figure that cannot be read does not refuse, as the menu's own check does not.
+  A refusal is said to the senders in a notice, with the figures.
+- **A woken slot** is the remote view's until it is offloaded again (owner's choice over
+  a detached terminal slot), and the kept message is delivered once it is live.
+- **The sender is told** in a notice, a peer message from `hub/router`, sent to each slot with
+  a message waiting:
+  - woken, with what it costs: about 250 MB of the container's memory, the memory that was
+    free, and CPU on the shared host until it is offloaded again;
+  - not woken, and why (no room in the container or on the host, with the figures, or
+    another reason);
+  - or its container not answering.
+  `hub/router` has a socket in each container but no record, so it is never listed. A reply
+  to it is dropped, and a notice is never kept.
 - **The heartbeat** is `$HUB_QUEUE/.beat`, rewritten every 60 s with the time, how many
   containers answer, and how many messages wait. It is written only after taking each of the
   router's locks in turn, so a router wedged on one stops beating. Infra's health check reads

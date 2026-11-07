@@ -242,7 +242,19 @@ exit 2"#,
         .unwrap();
     }
 
+    /// The host's available memory as the router reads it, in MB.
+    fn host_free(&self, mb: u64) {
+        fs::write(
+            self.dir.join("meminfo"),
+            format!("MemTotal: 8388608 kB\nMemAvailable: {} kB\n", mb * 1024),
+        )
+        .unwrap();
+    }
+
     fn route(&mut self, hosts: &str) {
+        if !self.dir.join("meminfo").exists() {
+            self.host_free(8192);
+        }
         if let Some(mut old) = self.router.take() {
             let _ = old.kill();
             let _ = old.wait();
@@ -255,6 +267,7 @@ exit 2"#,
             .env("CLAUDE_SESSIONS_RETRY_MS", "1000")
             .env("CLAUDE_SESSIONS_DIR", self.dir.join("hub-registry-unused"))
             .env("HUB_QUEUE", self.dir.join("queue"))
+            .env("CLAUDE_SESSIONS_MEMINFO", self.dir.join("meminfo"))
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -504,6 +517,7 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     root.live("a", "claude-1");
     root.live("b", "claude-1");
     root.offloaded("b", "claude-2");
+    root.offloaded("b", "claude-3");
     // b has 100 MB free: too little for another session, which costs about 250 MB.
     fs::write(root.d("b").join("cgroup/memory.max"), "4294967296\n").unwrap();
     fs::write(
@@ -532,13 +546,35 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     assert!(!record_of("b/claude-2").contains("\"status\""));
 
     let a_sock = root.d("a").join("in.sock");
+    // Two at once: one wake at a time across the fleet, the second asked for only once the
+    // first has answered.
     send(
         &root.stand_in("a", "b/claude-2"),
         &frame(&a_sock, "x", "wake up"),
     );
-    root.logs("a/claude-1 to b/claude-2: message kept");
-    root.logs("asked b to wake b/claude-2");
-    root.logs("did not wake b/claude-2: no-room");
+    send(
+        &root.stand_in("a", "b/claude-3"),
+        &frame(&a_sock, "x", "you too"),
+    );
+    root.logs("a/claude-1 to b/claude-3: message kept");
+    root.logs("did not wake b/claude-3: no-room");
+    let asked2 = root
+        .seen
+        .find("asked b to wake b/claude-2")
+        .expect("b/claude-2 asked for");
+    let answered2 = root
+        .seen
+        .find("did not wake b/claude-2")
+        .expect("and answered");
+    let asked3 = root
+        .seen
+        .find("asked b to wake b/claude-3")
+        .expect("b/claude-3 asked for");
+    assert!(
+        asked2 < answered2 && answered2 < asked3,
+        "one at a time:\n{}",
+        root.seen
+    );
     let got = delivered(&a_in, &mut root);
     let content = field(&got, "content").expect("a notice");
     assert!(content.contains("from-name=\"hub/router\""), "{content}");
@@ -547,4 +583,63 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
     // Still kept: it reaches the slot once it runs.
     root.live("b", "claude-2");
     root.logs("a/claude-1 to b/claude-2: message handed on (was waiting)");
+}
+
+#[test]
+fn a_wake_is_not_asked_for_when_the_host_has_no_room_whatever_the_container_says() {
+    let mut root = Root::new("host");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.live("b", "claude-1");
+    root.offloaded("b", "claude-2");
+    // b's own cgroup has room to spare (8G ceiling, 1G used), but the host has 300 MB.
+    root.host_free(300);
+    let a_in = root.inbox("a", 1);
+    let _b_in = root.inbox("b", 1);
+    root.route("a b");
+    let a_sock = root.d("a").join("in.sock");
+    send(
+        &root.stand_in("a", "b/claude-2"),
+        &frame(&a_sock, "x", "wake up"),
+    );
+    root.logs("a/claude-1 to b/claude-2: message kept");
+    root.logs("did not ask to wake b/claude-2: the host has 300M available");
+    assert!(
+        !root.seen.contains("asked b to wake"),
+        "no container was asked:\n{}",
+        root.seen
+    );
+    let got = delivered(&a_in, &mut root);
+    let content = field(&got, "content").expect("a notice");
+    assert!(content.contains("from-name=\"hub/router\""), "{content}");
+    assert!(
+        content.contains("it was not woken: the host has 300M available"),
+        "{content}"
+    );
+}
+
+#[test]
+fn a_message_bounced_for_a_moment_is_tried_again_without_waiting_for_a_snapshot() {
+    let mut root = Root::new("retry");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.live("b", "claude-1");
+    let _a_in = root.inbox("a", 1);
+    root.route("a b");
+    let to_b1 = root.stand_in("a", "b/claude-1");
+    root.stand_in("b", "a/claude-1");
+    // b's claude has no inbox yet: the message is bounced, and kept.
+    let a_sock = root.d("a").join("in.sock");
+    send(&to_b1, &frame(&a_sock, "x", "early"));
+    root.logs("a/claude-1 to b/claude-1: message kept: bounced");
+    // Its inbox comes; nothing in b's rows changes, so no snapshot would hand it on.
+    let b_in = root.inbox("b", 1);
+    let got = delivered(&b_in, &mut root);
+    let content = field(&got, "content").unwrap();
+    assert!(
+        content.ends_with("\nearly\n</cross-session-message>"),
+        "{content}"
+    );
 }

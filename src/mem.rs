@@ -125,12 +125,38 @@ fn oom_kill_in(events: &str) -> Option<u64> {
     stat_field(events, "oom_kill")
 }
 
+/// The host's available memory, `MemAvailable` in `/proc/meminfo`, which inside a container
+/// describes the host (the module header). `CLAUDE_SESSIONS_MEMINFO` names another file, for
+/// the tests. `None` when it cannot be read.
+pub fn host_available() -> Option<u64> {
+    let path = std::env::var("CLAUDE_SESSIONS_MEMINFO")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/proc/meminfo".into());
+    available_in(&fs::read_to_string(path).ok()?)
+}
+
+fn available_in(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|l| {
+        let rest = l.strip_prefix("MemAvailable:")?;
+        let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+        Some(kb * 1024)
+    })
+}
+
 /// What one idle session costs, with the agent view off.
 pub const SESSION_COST: u64 = 250 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hosts_available_memory_is_read_from_meminfo() {
+        let m = "MemTotal:        3997696 kB\nMemFree:           25600 kB\nMemAvailable:     979200 kB\n";
+        assert_eq!(available_in(m), Some(979_200 * 1024));
+        assert_eq!(available_in("MemTotal: 1 kB\n"), None);
+    }
 
     #[test]
     fn the_cgroup_is_this_containers_unless_a_test_says_otherwise() {
