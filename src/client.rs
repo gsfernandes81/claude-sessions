@@ -47,6 +47,10 @@ const SPIN_EVERY: Duration = Duration::from_millis(120);
 const OUTPUT_EVERY: Duration = Duration::from_secs(2);
 /// Ctrl+\\, zmx's detach key: out of a conversation to the home, and from the home out.
 const DETACH: char = '\x1c';
+/// How long a first Left on an empty prompt waits for the second, about Claude Code's.
+const LEFT_AGAIN: Duration = Duration::from_secs(2);
+/// What the first Left says while it waits.
+const LEFT_HINT: &str = "Left again to disconnect";
 /// Ctrl+X, then Ctrl+S: Claude Code's send-now chord. Raw mode turns off XON/XOFF, so Ctrl+S
 /// arrives as a byte rather than stopping the terminal.
 const CTRL_X: char = '\x18';
@@ -780,6 +784,18 @@ impl App {
 
     // ── keys ─────────────────────────────────────────────────────────────────
 
+    /// A first Left on an empty prompt that waited out `LEFT_AGAIN`: its hint goes.
+    fn expire_left(&mut self, now: Instant) {
+        if let Screen::Conv { ui, .. } = &mut self.screen {
+            if ui.left.is_some_and(|at| now >= at + LEFT_AGAIN) {
+                ui.left = None;
+                if ui.status.as_deref() == Some(LEFT_HINT) {
+                    ui.status = None;
+                }
+            }
+        }
+    }
+
     fn key(&mut self, k: Key, now: Instant) {
         // A key after a long silence: make sure the link is there before relying on it.
         if self.up() && now.duration_since(self.last_heard) > QUIET_PROBE {
@@ -835,7 +851,7 @@ impl App {
                     if ui.dialog.is_some() {
                         // A dialog's text field takes it typed, on one line.
                         for c in text.chars() {
-                            self.conv_key(Key::Char(if c == '\n' { ' ' } else { c }));
+                            self.conv_key(Key::Char(if c == '\n' { ' ' } else { c }), now);
                         }
                     } else if agent_in_view {
                         // A prompt that takes nothing takes no paste either.
@@ -855,7 +871,7 @@ impl App {
         }
         match &mut self.screen {
             Screen::Home => self.home_key(k),
-            Screen::Conv { .. } => self.conv_key(k),
+            Screen::Conv { .. } => self.conv_key(k, now),
         }
     }
 
@@ -944,13 +960,13 @@ impl App {
         self.drawn.clear();
     }
 
-    fn conv_key(&mut self, k: Key) {
+    fn conv_key(&mut self, k: Key, now: Instant) {
         let Screen::Conv { c, ui, .. } = &mut self.screen else {
             return;
         };
         ui.status = None;
         ui.toast = None;
-        let left_armed = std::mem::take(&mut ui.left);
+        let left_armed = ui.left.take().is_some_and(|at| now < at + LEFT_AGAIN);
         let mut out: Vec<Value> = Vec::new();
         let mut leave = false;
         // Ctrl+X Ctrl+S, Claude Code's send-now: what waits behind the turn goes now. Ctrl+X
@@ -1162,14 +1178,14 @@ impl App {
                 None => match k {
                     Key::Char('\x03') | Key::Char('\x04') if ui.input.is_empty() => leave = true,
                     // Left twice on an empty prompt goes home, as Ctrl+\\ does: Claude Code's
-                    // double Left to its agents view. The first says so; any other key between
-                    // them starts again.
+                    // double Left to its agents view. The first says so for `LEFT_AGAIN`; any
+                    // other key between them, or a second after it, starts again.
                     Key::Left if ui.input.is_empty() && viewing.is_none() => {
                         if left_armed {
                             leave = true;
                         } else {
-                            ui.left = true;
-                            ui.status = Some("Left again to disconnect".into());
+                            ui.left = Some(now);
+                            ui.status = Some(LEFT_HINT.into());
                         }
                     }
                     Key::Char('\x03') => {
@@ -2589,6 +2605,9 @@ impl App {
             if !c.pending.is_empty() {
                 soon(now + SPIN_EVERY);
             }
+            if let Some(at) = ui.left {
+                soon(at + LEFT_AGAIN);
+            }
         }
         if matches!(self.screen, Screen::Home)
             && (!self.greeted || self.down_since.is_some() || self.working.is_some())
@@ -2686,6 +2705,7 @@ pub fn run(name: &str) -> Result<(), String> {
         }
         app.want_older();
         app.want_output(now);
+        app.expire_left(now);
         if app.paint(&mut term, now).is_err() {
             break;
         }
@@ -3677,6 +3697,37 @@ mod tests {
         app.key(Key::Left, Instant::now());
         assert!(!home(&app));
         assert!(ui_of(&app).status.is_some(), "armed again, and saying so");
+
+        // The second must come within two seconds; after, the hint goes and Left starts again.
+        let mut app = app_in(&[]);
+        let t0 = Instant::now();
+        app.key(Key::Left, t0);
+        assert_eq!(
+            app.next_wake(t0),
+            Some(LEFT_AGAIN),
+            "woken to take the hint down"
+        );
+        app.key(Key::Left, t0 + Duration::from_millis(1900));
+        assert!(home(&app), "inside the window");
+        let mut app = app_in(&[]);
+        app.key(Key::Left, t0);
+        app.expire_left(t0 + Duration::from_millis(1999));
+        assert!(ui_of(&app).status.is_some(), "still waiting");
+        app.expire_left(t0 + LEFT_AGAIN);
+        assert!(ui_of(&app).status.is_none() && ui_of(&app).left.is_none());
+        assert_eq!(
+            app.next_wake(t0 + LEFT_AGAIN),
+            None,
+            "and nothing more to wake for"
+        );
+        app.key(Key::Left, t0 + Duration::from_millis(2100));
+        assert!(!home(&app), "too late: a first Left again");
+        assert_eq!(ui_of(&app).status.as_deref(), Some(LEFT_HINT));
+        // Late without the loop's expiry, too.
+        let mut app = app_in(&[]);
+        app.key(Key::Left, t0);
+        app.key(Key::Left, t0 + Duration::from_millis(2500));
+        assert!(!home(&app));
 
         // A prompt with text in it: Left moves the cursor, however often.
         let mut app = app_in(&[]);

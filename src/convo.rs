@@ -1266,9 +1266,9 @@ pub struct Ui {
     pub status: Option<String>,
     /// Ctrl+X was pressed: the first half of a chord, Ctrl+X Ctrl+S being send-now.
     pub chord: bool,
-    /// Left was pressed on an empty prompt: a second Left straight after goes home, as Ctrl+\\
-    /// does, Claude Code's double Left to its agents view.
-    pub left: bool,
+    /// When Left was pressed on an empty prompt: a second within `LEFT_AGAIN`, no other key
+    /// between, goes home, as Ctrl+\\ does, Claude Code's double Left to its agents view.
+    pub left: Option<std::time::Instant>,
     /// Pastes standing in the prompt as `[Pasted text #N +L lines]`, by number, as Claude
     /// Code's are: put back whole when the prompt is sent.
     pub pastes: Vec<(u32, String)>,
@@ -1298,7 +1298,7 @@ impl Ui {
             load: None,
             status: None,
             chord: false,
-            left: false,
+            left: None,
             pastes: Vec::new(),
             catalog: Vec::new(),
             suggest: 0,

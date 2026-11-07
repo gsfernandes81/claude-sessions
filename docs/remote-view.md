@@ -527,8 +527,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      anywhere in a conversation, a dialog open or not, the session left running, as zmx's
      detach key does in `ssh dev`; Ctrl+\\ on the home quits the client. Left twice on an
      empty prompt goes home too, as Claude Code's double Left goes to its agents view (owner,
-     2026-11-07): the first says `Left again to disconnect` where the status goes, and any
-     other key between the two starts again. `/model`,
+     2026-11-07): the first says `Left again to disconnect` where the status goes for two
+     seconds, about Claude Code's window, and a second after that, or any other key between
+     the two, starts again. `/model`,
      `/effort [level]`, `/auto`, `/rename TITLE`, `/exit`; **`/copy [N]`** copies the Nth
      response back, 1 the latest, a response being a turn's text without its tool calls,
      and offers its code blocks one by one when it has any (OSC 52, and
