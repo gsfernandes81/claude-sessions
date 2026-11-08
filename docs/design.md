@@ -588,8 +588,15 @@ possible, host total otherwise)"):
   cgroup v2 directory the hub already reads for its home's header): its working set against
   its ceiling, read as the menu reads a container (`mem.rs`). Where a session's container has
   no pool mounted, the line falls back to that container's own figure against its limit — or
-  the host's total and available memory where there is no limit; the door falls back to every
-  answering container's figures added up. **For a session's line to show the pool, infra
+  the host's total and available memory where there is no limit; the door falls back to what
+  the machines have, each counted once as the load is (below): the host's used (`MemTotal`
+  less `MemAvailable`) and total memory, which every container's `/proc/meminfo` reports
+  alike, carried in each agent's header beside its machine's load and read by the hub itself
+  (`statusline::total_memory`). Until 2026-11-08 the door added up every answering container's
+  ceilings, which on a 4 GB Pi with eight 2 GB containers read 16 GB (owner, 2026-11-08: "The
+  total real accounting incorrectly says 16G and Swap 32G"); only containers whose agents are
+  too old to say what their machine has are still added up that way. **For a session's line
+  to show the pool, infra
   mounts the pool read-only into each dev container and sets `CLAUDE_SESSIONS_POOL` there**,
   as it does in the hub; until it does, a session's line shows its own container's figure.
 - **Swap is read from where RAM is**, and said beside it, never added to it (`memory.current`
@@ -598,17 +605,18 @@ possible, host total otherwise)"):
   with no memory limit, the host's `SwapTotal` less `SwapFree`. No swap at all is
   `Swap: none`. An agent sends its container's swap in its header beside its memory, only
   where it has a memory limit (absent from an older agent: unknown); the door's figure for
-  the remote view is the pool's, else those added up. Containers whose swap ceiling is
-  `max` each say the host's whole swap, so that sum can overstate it, as a sum of memory
-  ceilings can overstate the host's RAM.
+  the remote view is the pool's, else the machines' own swap (`SwapTotal` less `SwapFree`,
+  and `SwapTotal`), counted once per machine as the memory is — eight containers with 4 GB
+  of swap each on a host with 10 GB have 10 GB between them, not 32 — else, from older
+  agents, those added up.
 - **Load is the one-minute load average, counted once per machine.** `/proc/loadavg` is not
   namespaced: every container on one host reads the same host-wide figure, so a sum over
   containers would count that host once per container. Each reading carries the kernel's
   `boot_id`, and the total adds one reading per `boot_id` (`statusline::total_load`). On a
   fleet of one host that is the host's load — "host total otherwise" — which is what a
   session's line reads directly; the door also adds the machines its containers report, each
-  agent sending its machine's load, core count and `boot_id` in its header (absent from an
-  older agent, which then counts as unknown, not zero).
+  agent sending its machine's load, core count, `boot_id` and, since 2026-11-08, its memory and
+  swap in its header (absent from an older agent, which then counts as unknown, not zero).
 - The last part names where the line is read: the container's hostname in a session, the
   hub's at the door. Anything unreadable is a `?`.
 

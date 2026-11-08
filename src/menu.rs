@@ -1913,6 +1913,8 @@ mod tests {
                 centi,
                 cores: None,
                 boot: boot.into(),
+                memory: None,
+                swap: None,
             })
         };
         let mut m = hub_menu(vec![]);

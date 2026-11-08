@@ -180,28 +180,42 @@ pub fn header_to(h: &Header) -> Value {
         if let Some(cores) = l.cores {
             load.set("cores", Value::num(cores as f64));
         }
+        for (key, figure) in [("memory", l.memory), ("swap", l.swap)] {
+            if let Some((used, total)) = figure {
+                load.set(
+                    key,
+                    arr([Value::num(used as f64), Value::num(total as f64)]),
+                );
+            }
+        }
         o.set("load", load);
     }
     o
 }
 
+/// `[used, total]` under `key`, or nothing: a figure an older agent does not send is unknown,
+/// never zero.
+fn pair(v: &Value, key: &str) -> Option<(u64, u64)> {
+    v.get(key).and_then(Value::as_arr).and_then(|m| match m {
+        [used, limit] => Some((used.as_u64()?, limit.as_u64()?)),
+        _ => None,
+    })
+}
+
 pub fn header_from(v: &Value) -> Header {
-    let pair = |key: &str| {
-        v.get(key).and_then(Value::as_arr).and_then(|m| match m {
-            [used, limit] => Some((used.as_u64()?, limit.as_u64()?)),
-            _ => None,
-        })
-    };
-    let memory = pair("memory");
+    let memory = pair(v, "memory");
     // An agent older than the swap figure sends none: unknown, never zero.
-    let swap = pair("swap");
+    let swap = pair(v, "swap");
     // An agent older than the load line sends none, and its machine's load is then unknown —
-    // not zero, which would be a guess.
+    // not zero, which would be a guess. One older than the machine's memory in the reading
+    // (2026-11-08) sends a reading without it, read the same way.
     let load = v.get("load").and_then(|l| {
         Some(HostLoad {
             centi: l.get("centi")?.as_u64()?,
             cores: l.get("cores").and_then(Value::as_u64).map(|c| c as usize),
             boot: s(l, "boot").filter(|b| !b.is_empty())?,
+            memory: pair(l, "memory"),
+            swap: pair(l, "swap"),
         })
     });
     Header {
@@ -524,6 +538,8 @@ mod tests {
                 centi: 231,
                 cores: Some(4),
                 boot: "6f1c0e8a-pi".into(),
+                memory: Some((1500 << 20, 4000 << 20)),
+                swap: Some((1 << 30, 10 << 30)),
             }),
         };
         let rows = vec![row(RowKey::Slot("claude-1".into()))];
@@ -558,6 +574,10 @@ mod tests {
             header_from(&named).load.map(|l| (l.centi, l.cores)),
             Some((50, None))
         );
+        // A reading from an agent older than the machine's memory in it (2026-11-08) has none:
+        // unknown, never zero.
+        let named = header_from(&named).load.unwrap();
+        assert_eq!((named.memory, named.swap), (None, None));
         assert_eq!(snapshot_from(&Value::obj(), "x"), None, "not a snapshot");
     }
 

@@ -165,9 +165,10 @@ pub struct Header {
     pub load: Option<HostLoad>,
 }
 
-/// One machine's load, as a container on it reads it. Containers share their host's kernel, and
-/// `/proc/loadavg` is not namespaced, so every container on one machine reads the same figure:
-/// `boot` — the kernel's `boot_id` — says which machine, so a total counts each one once.
+/// One machine's load and memory, as a container on it reads them. Containers share their
+/// host's kernel, and neither `/proc/loadavg` nor `/proc/meminfo` is namespaced, so every
+/// container on one machine reads the same figures: `boot` — the kernel's `boot_id` — says
+/// which machine, so a total counts each one once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostLoad {
     /// The one-minute load average, in hundredths: a whole number, so a header compares exactly.
@@ -175,6 +176,13 @@ pub struct HostLoad {
     /// The machine's logical CPUs, which the load is judged against.
     pub cores: Option<usize>,
     pub boot: String,
+    /// The machine's memory, used (`MemTotal` less `MemAvailable`) and total, in bytes
+    /// (2026-11-08). `None` from an agent too old to send it, or where `/proc/meminfo` cannot
+    /// be read.
+    pub memory: Option<(u64, u64)>,
+    /// Its swap, used (`SwapTotal` less `SwapFree`) and total; `Some((0, 0))` where it has
+    /// none.
+    pub swap: Option<(u64, u64)>,
 }
 
 /// A question in a frame over the list. It names the session by its title: nothing on the

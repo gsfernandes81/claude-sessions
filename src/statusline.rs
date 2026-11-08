@@ -8,11 +8,14 @@
 //! is mounted (`CLAUDE_SESSIONS_POOL`, a cgroup v2 directory, read as the menu reads a
 //! container: the working set, page cache the kernel reclaims first set aside — `mem.rs`).
 //! Where it is not, a session's line falls back to its own container's limit, or the host's
-//! total and available memory where there is no limit, and the door to the sum of what each
-//! container's agent said. Swap is read from the same place as RAM — the cgroup's
-//! `memory.swap.current` against its `memory.swap.max`, capped at the host's `SwapTotal`, or
-//! the host's `SwapTotal` less `SwapFree` — and `Swap: none` where there is no swap. Load is
-//! the one-minute load average, **counted once per machine**:
+//! total and available memory where there is no limit, and the door to what the machines
+//! have — the host's used and total memory, which every container's `/proc/meminfo` reports
+//! alike, **counted once per machine** as the load is ([`total_memory`]; owner, 2026-11-08:
+//! eight containers' 2 GB ceilings on a 4 GB Pi are not 16 GB) — or, from agents too old to
+//! say what their machine has, to the sum of what each said. Swap is read from the same place
+//! as RAM — the cgroup's `memory.swap.current` against its `memory.swap.max`, capped at the
+//! host's `SwapTotal`, or the host's `SwapTotal` less `SwapFree` — and `Swap: none` where
+//! there is no swap. Load is the one-minute load average, counted once per machine too:
 //! `/proc/loadavg` is not namespaced, so every container on one host reads the same host-wide
 //! figure, and adding them would count that host once per container. The kernel's `boot_id`
 //! says which machine a reading is from ([`total_load`]). The last part names where the line is
@@ -160,9 +163,41 @@ pub fn total_load<'a>(
     (!seen.is_empty()).then_some((load, cores))
 }
 
-/// The door's figures: the pool's memory and swap where the hub can read it, else every
-/// container's working set and ceiling, and swap, added up — those that said; and the load of
-/// every machine, the hub's own reading first, since it is the freshest (a container's arrives
+/// A figure of memory or swap: used and total, in bytes.
+pub type UsedTotal = (u64, u64);
+
+/// The memory and swap of every machine the readings come from, used and total, each machine
+/// counted once as [`total_load`] counts it — by the first reading of it that carries the
+/// figure, since an older agent's reading has none. A figure no reading had is `None`.
+pub fn total_memory<'a>(
+    readings: impl IntoIterator<Item = &'a HostLoad>,
+) -> (Option<UsedTotal>, Option<UsedTotal>) {
+    let mut memory: Option<UsedTotal> = None;
+    let mut swap: Option<UsedTotal> = None;
+    let mut seen = (Vec::new(), Vec::new());
+    for r in readings {
+        for (figure, said, seen) in [
+            (&mut memory, r.memory, &mut seen.0),
+            (&mut swap, r.swap, &mut seen.1),
+        ] {
+            let Some((used, total)) = said else { continue };
+            if seen.contains(&r.boot.as_str()) {
+                continue;
+            }
+            seen.push(&r.boot);
+            let (u, t) = figure.unwrap_or((0, 0));
+            *figure = Some((u + used, t + total));
+        }
+    }
+    (memory, swap)
+}
+
+/// The door's figures: the pool's memory and swap where the hub can read it, else the
+/// machines' own — each counted once, from the hub's reading and the containers' — since the
+/// containers' ceilings together come to more than their host has (eight 2 GB containers on
+/// a 4 GB Pi are not 16 GB; owner, 2026-11-08), else, from containers too old to say what
+/// their machine has, their working sets and ceilings added up; and the load of every
+/// machine, the hub's own reading first, since it is the freshest (a container's arrives
 /// with its rows).
 pub fn door<'a>(
     own: Option<HostLoad>,
@@ -172,6 +207,10 @@ pub fn door<'a>(
     place: &str,
 ) -> Figures {
     let containers: Vec<&crate::ui::Header> = containers.into_iter().collect();
+    let readings: Vec<&HostLoad> = own
+        .iter()
+        .chain(containers.iter().filter_map(|h| h.load.as_ref()))
+        .collect();
     let sum = |said: Vec<(u64, u64)>| {
         (!said.is_empty()).then(|| {
             (
@@ -180,31 +219,19 @@ pub fn door<'a>(
             )
         })
     };
+    let (machines, machines_swap) = total_memory(readings.iter().copied());
+    let memory = match pool {
+        Some(pool) => Some(pool),
+        None => machines.or_else(|| sum(containers.iter().filter_map(|h| h.memory).collect())),
+    };
     let swap = match pool {
         Some(_) => pool_swap,
-        None => sum(containers.iter().filter_map(|h| h.swap).collect()),
+        None => machines_swap.or_else(|| sum(containers.iter().filter_map(|h| h.swap).collect())),
     };
-    let (used, total) = match pool {
-        Some((used, total)) => (Some(used), Some(total)),
-        None => {
-            let said: Vec<(u64, u64)> = containers.iter().filter_map(|h| h.memory).collect();
-            if said.is_empty() {
-                (None, None)
-            } else {
-                (
-                    Some(said.iter().map(|m| m.0).sum()),
-                    Some(said.iter().map(|m| m.1).sum()),
-                )
-            }
-        }
-    };
-    let total_load = total_load(
-        own.iter()
-            .chain(containers.iter().filter_map(|h| h.load.as_ref())),
-    );
+    let total_load = total_load(readings.iter().copied());
     Figures {
-        used,
-        total,
+        used: memory.map(|m| m.0),
+        total: memory.map(|m| m.1),
         swap,
         load: total_load.map(|t| t.0),
         cores: total_load.and_then(|t| t.1),
@@ -277,8 +304,10 @@ fn loadavg_centi(text: &str) -> Option<u64> {
     (l.is_finite() && l >= 0.0).then(|| (l * 100.0).round() as u64)
 }
 
-/// This machine's load, as this container reads it. `None` without a load average or a
-/// `boot_id`: a reading that cannot say which machine it is could only be double-counted.
+/// This machine's load and memory, as this container reads them. `None` without a load
+/// average or a `boot_id`: a reading that cannot say which machine it is could only be
+/// double-counted. The memory is from `/proc/meminfo`, which describes the host, used (total
+/// less available) and total; the swap the same way.
 pub fn host_load() -> Option<HostLoad> {
     host_load_at(Path::new("/"))
 }
@@ -286,10 +315,14 @@ pub fn host_load() -> Option<HostLoad> {
 /// [`host_load`] with `/proc` and `/sys` under `root`.
 fn host_load_at(root: &Path) -> Option<HostLoad> {
     let read = |p: &str| std::fs::read_to_string(root.join(p)).ok();
+    let meminfo = read("proc/meminfo");
+    let used_of = |(total, spare): (u64, u64)| (total.saturating_sub(spare), total);
     Some(HostLoad {
         centi: loadavg_centi(&read("proc/loadavg")?)?,
         cores: read("sys/devices/system/cpu/online").and_then(|s| cpu_count(&s)),
         boot: read("proc/sys/kernel/random/boot_id")?.trim().to_string(),
+        memory: meminfo.as_deref().and_then(host_memory).map(used_of),
+        swap: meminfo.as_deref().and_then(host_swap).map(used_of),
     })
     .filter(|h| !h.boot.is_empty())
 }
@@ -638,14 +671,26 @@ mod tests {
         let t = Tree::new("host");
         t.put("proc/loadavg", "1.25 1 1 1/1 1\n")
             .put("sys/devices/system/cpu/online", "0-3\n")
-            .put("proc/sys/kernel/random/boot_id", "b-1\n");
+            .put("proc/sys/kernel/random/boot_id", "b-1\n")
+            .put(
+                "proc/meminfo",
+                "MemTotal: 4000 kB\nMemFree: 100 kB\nMemAvailable: 2500 kB\nSwapTotal: 10000 kB\nSwapFree: 9000 kB\n",
+            );
         assert_eq!(
             host_load_at(&t.0),
             Some(HostLoad {
                 centi: 125,
                 cores: Some(4),
-                boot: "b-1".into()
+                boot: "b-1".into(),
+                memory: Some((1500 * 1024, 4000 * 1024)),
+                swap: Some((1000 * 1024, 10000 * 1024)),
             })
+        );
+        // The memory is a nicety too: without meminfo the reading still counts the load.
+        let _ = std::fs::remove_file(t.0.join("proc/meminfo"));
+        assert_eq!(
+            host_load_at(&t.0).map(|h| (h.centi, h.memory, h.swap)),
+            Some((125, None, None))
         );
         // Cores are a nicety; the boot id is not, since without it the load cannot be told
         // from another container's reading of the same machine.
@@ -695,7 +740,47 @@ mod tests {
             centi,
             cores,
             boot: boot.to_string(),
+            memory: None,
+            swap: None,
         }
+    }
+
+    /// A reading from a machine with `total` of RAM, `used` of it, and ten times as much swap,
+    /// a tenth used.
+    fn machine(boot: &str, used: u64, total: u64) -> HostLoad {
+        HostLoad {
+            memory: Some((used, total)),
+            swap: Some((total, 10 * total)),
+            ..on(boot, 100, Some(4))
+        }
+    }
+
+    #[test]
+    fn a_machines_memory_is_counted_once_however_many_containers_read_it() {
+        // Three containers on one 4 GB Pi each read its one figure: 4 GB, not 12.
+        let pi = [
+            machine("pi", G + G / 2, 4 * G),
+            machine("pi", G, 4 * G),
+            machine("pi", 2 * G, 4 * G),
+        ];
+        assert_eq!(
+            total_memory(&pi),
+            (Some((G + G / 2, 4 * G)), Some((4 * G, 40 * G)))
+        );
+        // Calibration: two machines add up, and a reading too old to carry the figure leaves
+        // its machine to one that does, wherever it comes in the order.
+        let two = [
+            on("pi", 300, Some(4)),
+            machine("nuc", 8 * G, 32 * G),
+            machine("pi", G, 4 * G),
+        ];
+        assert_eq!(
+            total_memory(&two),
+            (Some((9 * G, 36 * G)), Some((36 * G, 360 * G)))
+        );
+        // No reading carries it: unknown, not zero.
+        assert_eq!(total_memory(&[on("pi", 300, Some(4))]), (None, None));
+        assert_eq!(total_memory(&[]), (None, None));
     }
 
     #[test]
@@ -751,7 +836,8 @@ mod tests {
             f.line(false),
             "RAM: 2.0G / 3.0G, Swap: 0.5G / 4.0G, Load: 2.5, dev"
         );
-        // No pool: what each container said, added up; a container too old to say is left out.
+        // No pool, and no reading says what the machine has (agents from before 2026-11-08): what
+        // each container said, added up; a container too old to say anything is left out.
         let f = door(None, None, None, [&a, &b, &old], "dev");
         assert_eq!(
             f.line(false),
@@ -762,5 +848,74 @@ mod tests {
             door(None, None, None, [&old], "dev").line(false),
             "RAM: ?, Swap: ?, Load: ?, dev"
         );
+    }
+
+    #[test]
+    fn the_door_says_what_the_machines_have_not_their_containers_ceilings_added_up() {
+        // Eight containers with 2 GB ceilings and 4 GB of swap each on one 4 GB Pi with 10 GB
+        // of swap: not 16 GB and 32 GB (owner, 2026-11-08), but the Pi's own figures, read by
+        // the hub and by every container alike, counted once.
+        let pi = HostLoad {
+            memory: Some((G + G / 2, 4 * G)),
+            swap: Some((G, 10 * G)),
+            ..on("pi", 200, Some(4))
+        };
+        let fleet: Vec<Header> = (0..8)
+            .map(|_| Header {
+                host: "c".to_string(),
+                memory: Some((G / 2, 2 * G)),
+                swap: Some((G / 2, 4 * G)),
+                load: Some(pi.clone()),
+            })
+            .collect();
+        let f = door(Some(pi.clone()), None, None, &fleet, "zero");
+        assert_eq!(
+            f.line(false),
+            "RAM: 1.5G / 4.0G, Swap: 1.0G / 10.0G, Load: 2.0, zero"
+        );
+        // Calibration: the ceilings do add up to the wrong figure where no reading, the hub's
+        // or a container's, says what the machine has.
+        let old_fleet: Vec<Header> = fleet
+            .iter()
+            .map(|h| Header {
+                load: Some(on("pi", 200, Some(4))),
+                ..h.clone()
+            })
+            .collect();
+        let f = door(Some(on("pi", 200, Some(4))), None, None, &old_fleet, "zero");
+        assert_eq!(f.ram().0, "RAM: 4.0G / 16.0G");
+        assert_eq!(f.swap().0, "Swap: 4.0G / 32.0G");
+        // One container's agent saying what the Pi has is enough to put that right.
+        let f = door(None, None, None, [&old_fleet[0], &fleet[0]], "zero");
+        assert_eq!(f.ram().0, "RAM: 1.5G / 4.0G");
+        // The hub's own reading alone says it, with no container answering; and a second
+        // machine's containers add theirs.
+        assert_eq!(
+            door(Some(pi.clone()), None, None, [], "zero").ram().0,
+            "RAM: 1.5G / 4.0G"
+        );
+        let nuc = Header {
+            load: Some(HostLoad {
+                memory: Some((8 * G, 32 * G)),
+                swap: Some((0, 0)),
+                ..on("nuc", 100, Some(8))
+            }),
+            ..fleet[0].clone()
+        };
+        let f = door(Some(pi), None, None, [&fleet[0], &nuc], "zero");
+        assert_eq!(
+            f.line(false),
+            "RAM: 9.5G / 36.0G, Swap: 1.0G / 10.0G, Load: 3.0, zero"
+        );
+        // The pool, where the hub reads one, still comes first.
+        let f = door(
+            Some(machine("pi", G, 4 * G)),
+            Some((2 * G, 3 * G)),
+            Some((G / 2, 4 * G)),
+            &fleet,
+            "zero",
+        );
+        assert_eq!(f.ram().0, "RAM: 2.0G / 3.0G");
+        assert_eq!(f.swap().0, "Swap: 0.5G / 4.0G");
     }
 }
