@@ -807,8 +807,8 @@ and the start, attach and close paths again against the real zmx in `tests/zmx_r
   `?` the keys. **`q` also quits and is listed nowhere** (owner, 2026-10-01): it is the first
   key anybody tries, it costs nothing to accept, and it would spend a column in a 40-column
   hint line that `Esc` already covers. It is written here so it is not folklore.
-- **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys or the
-  mouse; `Enter` opens the highlighted row, and `c` puts it a step away. **It only ever selects
+- **The cursor is a highlighted row** (owner, 2026-10-02), moved with the arrow keys, `j` and
+  `k` as in vi (owner, 2026-11-08; unlisted, like the arrows), or the mouse; `Enter` opens the highlighted row, and `c` puts it a step away. **It only ever selects
   a session, or the Archived heading** — or, at the home, a container (owner, 2026-10-03): it is an index into the rows, never a
   screen line, and the Archived heading is a row of its own so that `Enter` can open it, so
   the arrows step over every other heading and the blank lines, and a click on one of those or

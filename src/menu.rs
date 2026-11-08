@@ -638,8 +638,9 @@ impl Menu {
         }
         let page = self.capacity().max(1);
         match key {
-            Key::Up | Key::WheelUp => self.move_to(self.cursor.saturating_sub(1)),
-            Key::Down | Key::WheelDown => self.move_to(self.cursor + 1),
+            // `k` and `j` as vi has them (owner, 2026-11-08), unlisted beside the arrows.
+            Key::Up | Key::WheelUp | Key::Char('k') => self.move_to(self.cursor.saturating_sub(1)),
+            Key::Down | Key::WheelDown | Key::Char('j') => self.move_to(self.cursor + 1),
             Key::PageUp => self.move_to(self.cursor.saturating_sub(page)),
             Key::PageDown => self.move_to(self.cursor + page),
             Key::Home => self.move_to(0),
@@ -1369,6 +1370,20 @@ mod tests {
         assert_eq!(m.key(Key::WheelUp), Action::Redraw);
         assert_eq!(m.view().cursor, 0);
         assert_eq!(m.key(Key::End), Action::Redraw);
+        assert_eq!(m.view().cursor, 1);
+        assert_eq!(
+            m.key(Key::Char('j')),
+            Action::None,
+            "j stops at the bottom too"
+        );
+        assert_eq!(m.key(Key::Char('k')), Action::Redraw);
+        assert_eq!(m.view().cursor, 0);
+        assert_eq!(
+            m.key(Key::Char('k')),
+            Action::None,
+            "k stops at the top too"
+        );
+        assert_eq!(m.key(Key::Char('j')), Action::Redraw);
         assert_eq!(m.view().cursor, 1);
     }
 
