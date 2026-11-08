@@ -491,12 +491,71 @@ pub fn mismatch(inboxes: &[(String, Inbox)]) -> Option<String> {
 
 /// The local claudes in slots: each live claude slot's name and pid.
 fn local_claudes() -> Vec<(String, u32)> {
+    running_claudes()
+        .into_iter()
+        .filter_map(|r| Some((r.slot, r.pid?)))
+        .collect()
+}
+
+fn running_claudes() -> Vec<registry::SlotRecord> {
     registry::all()
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.state.is_running() && r.harness == crate::harness::Harness::Claude)
-        .filter_map(|r| Some((r.slot, r.pid?)))
         .collect()
+}
+
+/// Give a local claude's own session record `name`, the name the other sessions here list it
+/// by and message it by (owner, 2026-11-08: "fix up sessions in the same container too").
+/// `Ok(true)` when the record was changed.
+///
+/// **Only the record, never the session's own name.** Claude Code's `rename` control is a
+/// `/rename`: it writes a custom title into the transcript (2.1.311), which would become the
+/// session's title in the menu and in Claude Code's own picker, and come back into its address.
+/// The record is what `ListAgents` and `SendMessage` read. Claude Code merges each update of
+/// its own into the record as it finds it, so the name stays until Claude Code names the
+/// session itself (a `/rename`, its generated title), and the relay writes it again at its next
+/// look. The name it had goes first in `formerNames`, which `ListAgents` shows beside the new
+/// one for ten minutes.
+pub fn name_local(sessions: &Path, pid: u32, name: &str, now_ms: u64) -> io::Result<bool> {
+    let path = sessions.join(format!("{pid}.json"));
+    let text = fs::read_to_string(&path)?;
+    let mut v = json::parse(&text).map_err(io::Error::other)?;
+    let old = v
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if old == name || v.get("messagingSocketPath").is_none() {
+        return Ok(false);
+    }
+    let mut former: Vec<Value> = v
+        .get("formerNames")
+        .and_then(Value::as_arr)
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| {
+            let n = f.get("name").and_then(Value::as_str);
+            n != Some(name) && n != Some(old.as_str())
+        })
+        .cloned()
+        .collect();
+    if !old.is_empty() {
+        let mut f = Value::obj();
+        f.set("name", Value::string(&old));
+        f.set("until", Value::num(now_ms as f64));
+        if let Some(s) = v.get("sessionId").cloned() {
+            f.set("sessionId", s);
+        }
+        former.insert(0, f);
+    }
+    former.truncate(FORMER_NAMES);
+    v.set("name", Value::string(name));
+    v.set("nameSource", Value::string("user"));
+    v.set("nameSince", Value::num(now_ms as f64));
+    v.set("formerNames", Value::Arr(former));
+    put(&path, json::to_line(&v).as_bytes())?;
+    Ok(true)
 }
 
 // ── the relay ───────────────────────────────────────────────────────────────
@@ -525,6 +584,8 @@ impl Drop for StandIn {
 struct State {
     lock: Option<SlotLock>,
     roster: Vec<Entry>,
+    /// This container's repo, as the hub names it: what its local sessions are listed under.
+    repo: Option<String>,
     stand_ins: HashMap<String, StandIn>,
     off: Option<String>,
 }
@@ -549,6 +610,7 @@ impl Relay {
             state: Mutex::new(State {
                 lock: None,
                 roster: Vec::new(),
+                repo: None,
                 stand_ins: HashMap::new(),
                 off: None,
             }),
@@ -624,9 +686,16 @@ impl Relay {
         st.lock = None;
     }
 
-    /// The hub's roster: every slot in the other containers.
-    pub fn set_roster(self: &Arc<Self>, roster: Vec<Entry>) {
-        self.lock().roster = roster;
+    /// The hub's roster: every slot in the other containers; and this container's own repo,
+    /// when the hub says it.
+    pub fn set_roster(self: &Arc<Self>, roster: Vec<Entry>, repo: Option<String>) {
+        {
+            let mut st = self.lock();
+            st.roster = roster;
+            if repo.is_some() {
+                st.repo = repo;
+            }
+        }
         self.apply();
     }
 
@@ -690,6 +759,31 @@ impl Relay {
                     }
                     Err(err) => log(&format!("peer: stand-in for {addr}: {err}")),
                 },
+            }
+        }
+        let repo = st.repo.clone();
+        drop(st);
+        if let Some(repo) = repo {
+            self.name_locals(&repo);
+        }
+    }
+
+    /// Give each local claude's record its name, as another container lists it: its
+    /// `repo/slot` and title (`name_local`).
+    fn name_locals(&self, repo: &str) {
+        for r in running_claudes() {
+            let Some(pid) = r.pid else { continue };
+            let (title, named) = r.row_titles();
+            let name = listed_name(
+                &format!("{repo}/{}", r.slot),
+                if named { &title } else { "" },
+            );
+            match name_local(&self.sessions, pid, &name, crate::clock::now()) {
+                Ok(true) => log(&format!("peer: {} is listed here as {name:?}", r.slot)),
+                Ok(false) => {}
+                // No record yet: a claude just starting, named at the next look.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => log(&format!("peer: naming {}: {e}", r.slot)),
             }
         }
     }
@@ -895,9 +989,9 @@ pub enum Undelivered {
 pub fn context() -> String {
     let cost = crate::fmt::human(crate::mem::SESSION_COST);
     format!(
-        "Sessions in other containers are listed by ListAgents as repo/slot and then the title \
-         of what each is working on; SendMessage reaches one by that whole name, as listed, \
-         which changes when its title does, so list again if a name is not found.\n\
+        "Sessions, in this container and the others, are listed by ListAgents as repo/slot and \
+         then the title of what each is working on; SendMessage reaches one by that whole name, \
+         as listed, which changes when its title does, so list again if a name is not found.\n\
          A peer listed with no status (neither busy nor idle) is offloaded. A message to it is \
          kept, and wakes it if its container has room: about {cost} of that container's RAM, \
          and CPU on the host every container shares, until it is offloaded again.\n\
@@ -1218,6 +1312,52 @@ mod tests {
         // Counted in characters, as Claude Code counts them.
         let wide = listed_name("a/claude-1", &"é".repeat(100));
         assert_eq!(wide.chars().count(), MAX_LISTED);
+    }
+
+    #[test]
+    fn a_local_claudes_record_takes_its_name_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("cs-name-local-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("42.json");
+        fs::write(
+            &path,
+            r#"{"pid":42,"sessionId":"s1","messagingSocketPath":"/tmp/cc-socks/42.sock","name":"workspace-01","nameSource":"derived","status":"busy","formerNames":[{"name":"older","until":1}]}"#,
+        )
+        .unwrap();
+        let read = || json::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(name_local(&dir, 42, "near/claude-1 t", 9).unwrap());
+        let v = read();
+        assert_eq!(at(&v, &["name"]).as_str(), Some("near/claude-1 t"));
+        assert_eq!(at(&v, &["nameSource"]).as_str(), Some("user"));
+        assert_eq!(at(&v, &["nameSince"]).as_u64(), Some(9));
+        assert_eq!(
+            at(&v, &["status"]).as_str(),
+            Some("busy"),
+            "Claude Code's own fields"
+        );
+        assert_eq!(at(&v, &["sessionId"]).as_str(), Some("s1"));
+        let former = v.get("formerNames").and_then(Value::as_arr).unwrap();
+        assert_eq!(at(&former[0], &["name"]).as_str(), Some("workspace-01"));
+        assert_eq!(at(&former[0], &["until"]).as_u64(), Some(9));
+        assert_eq!(at(&former[0], &["sessionId"]).as_str(), Some("s1"));
+        assert_eq!(at(&former[1], &["name"]).as_str(), Some("older"));
+
+        // Already so: not written again.
+        let before = fs::read_to_string(&path).unwrap();
+        assert!(!name_local(&dir, 42, "near/claude-1 t", 10).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        // A record naming no inbox is not a messaging session's, and is left alone; one that
+        // is not there is an error the relay passes over.
+        fs::write(dir.join("43.json"), r#"{"pid":43,"name":"x"}"#).unwrap();
+        assert!(!name_local(&dir, 43, "near/claude-2", 10).unwrap());
+        assert_eq!(
+            name_local(&dir, 44, "near/claude-3", 10)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

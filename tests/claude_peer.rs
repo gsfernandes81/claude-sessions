@@ -168,6 +168,43 @@ fn send_message(to: impl Fn(&Request) -> String + Send + Sync + 'static, message
     })
 }
 
+/// A headless claude in the rig's `dir`, talking to the fake model at `api`: its scratch
+/// config and runtime directory, so the shared `~/.claude` is never touched.
+fn claude_command(claude: &Path, dir: &Path, api: &str, settings: Option<&str>) -> Command {
+    let mut cmd = Command::new(claude);
+    cmd.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "ListAgents,SendMessage,ToolSearch",
+    ]);
+    if let Some(s) = settings {
+        fs::write(dir.join("settings.json"), s).unwrap();
+        cmd.arg("--settings").arg(dir.join("settings.json"));
+    }
+    for k in [
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_SESSIONS_SLOT",
+        "ZMX_SESSION",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        cmd.env_remove(k);
+    }
+    cmd.current_dir(dir.join("work"))
+        .env("CLAUDE_CONFIG_DIR", dir.join("cc"))
+        .env("XDG_RUNTIME_DIR", dir.join("run"))
+        .env("ANTHROPIC_BASE_URL", api)
+        .env("ANTHROPIC_API_KEY", "sk-ant-test-not-a-key")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    cmd
+}
+
 /// A real claude in a slot, the real agent beside it, and the fake model.
 struct Rig {
     dir: PathBuf,
@@ -242,39 +279,8 @@ impl Rig {
         fs::write(dir.join("cgroup/memory.max"), "8589934592\n").unwrap();
         fs::write(dir.join("cgroup/memory.current"), "1073741824\n").unwrap();
         let api = FakeApi::start(script);
-
-        let mut cmd = Command::new(&claude);
-        cmd.args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--allowedTools",
-            "ListAgents,SendMessage,ToolSearch",
-        ]);
-        if let Some(s) = settings {
-            fs::write(dir.join("settings.json"), s).unwrap();
-            cmd.arg("--settings").arg(dir.join("settings.json"));
-        }
-        for k in [
-            "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_CODE_MESSAGING_TOKEN",
-            "CLAUDE_SESSIONS_SLOT",
-            "ZMX_SESSION",
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-        ] {
-            cmd.env_remove(k);
-        }
+        let mut cmd = claude_command(&claude, &dir, &api.url, settings);
         let mut c = cmd
-            .current_dir(dir.join("work"))
-            .env("CLAUDE_CONFIG_DIR", dir.join("cc"))
-            .env("XDG_RUNTIME_DIR", dir.join("run"))
-            .env("ANTHROPIC_BASE_URL", &api.url)
-            .env("ANTHROPIC_API_KEY", "sk-ant-test-not-a-key")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(fs::File::create(dir.join("claude.stderr")).unwrap())
@@ -283,7 +289,6 @@ impl Rig {
         let pid = c.id();
         let claude_in = c.stdin.take().unwrap();
         let claude_out = lines(c.stdout.take().unwrap());
-
         // Its record, naming its inbox: what everything below stands on.
         let record = dir.join(format!("cc/sessions/{pid}.json"));
         let until = Instant::now() + WAIT;
@@ -1153,4 +1158,145 @@ fn a_renamed_peer_is_not_reached_by_its_old_name_but_found_again_by_listing() {
         str_of(p, &["frame", "message", "content"]).is_some_and(|c| body(c) == Some("msg 3"))
     })
     .unwrap_or_else(|| panic!("the new name reaches it\n{}", rig.story()));
+}
+
+/// The local slot's claude, as the agent names it once the hub says the container is `near`:
+/// its `repo/slot` and the title its registry record holds (`t`).
+const NEAR: &str = "near/claude-1 t";
+
+impl Rig {
+    /// The rig's claude's own session record.
+    fn own_record(&self) -> Value {
+        let text = fs::read_to_string(
+            self.dir
+                .join(format!("cc/sessions/{}.json", self.claude.id())),
+        )
+        .unwrap_or_default();
+        json::parse(&text).unwrap_or(Value::Null)
+    }
+
+    /// The hub tells the agent its container is `near`; back once the claude's record says so.
+    fn named_near(&mut self) {
+        let mut far = Value::obj();
+        far.set("repo", Value::string("far"));
+        far.set("slot", Value::string("claude-3"));
+        far.set("live", Value::Bool(true));
+        self.tell(obj(vec![
+            ("roster", Value::Arr(vec![far])),
+            ("you", Value::string("near")),
+        ]));
+        let until = Instant::now() + WAIT;
+        while str_of(&self.own_record(), &["name"]) != Some(NEAR) {
+            assert!(
+                Instant::now() < until,
+                "the local claude's record was never named: {:?}\n{}",
+                self.own_record(),
+                self.story()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[test]
+fn a_local_claudes_record_is_named_as_other_containers_list_it_and_keeps_it_through_a_turn() {
+    let script: Script = Arc::new(|r: &Request| {
+        if r.results().iter().any(|(n, _)| n == "ListAgents") {
+            Reply::Text("done".into())
+        } else {
+            Reply::Tool {
+                name: "ListAgents".into(),
+                input: Value::obj(),
+            }
+        }
+    });
+    let Some(mut rig) = Rig::start("localname", script, None) else {
+        return;
+    };
+    let before = str_of(&rig.own_record(), &["name"]).map(str::to_string);
+    assert!(
+        before.as_deref().is_some_and(|n| n != NEAR),
+        "calibration: Claude Code's own name first: {before:?}"
+    );
+    rig.named_near();
+    let record = rig.own_record();
+    assert_eq!(
+        record
+            .get("formerNames")
+            .and_then(Value::as_arr)
+            .and_then(|f| f.first())
+            .and_then(|f| str_of(f, &["name"])),
+        before.as_deref(),
+        "the name it had is kept for the listing"
+    );
+    // A turn: Claude Code writes its status and more into the record, and the name stays.
+    rig.turn("who is there?");
+    std::thread::sleep(Duration::from_secs(1));
+    let after = rig.own_record();
+    assert_eq!(str_of(&after, &["name"]), Some(NEAR), "{after:?}");
+    assert!(
+        str_of(&after, &["messagingSocketPath"]).is_some()
+            && str_of(&after, &["sessionId"]).is_some(),
+        "Claude Code's own fields are all still there: {after:?}"
+    );
+}
+
+#[test]
+fn another_local_claude_lists_a_named_one_and_reaches_it_by_that_name() {
+    let Some(mut rig) = Rig::start("localpeer", Arc::new(|_| Reply::Text("ok".into())), None)
+    else {
+        return;
+    };
+    rig.named_near();
+    // A second claude in the same container, in no slot: it only lists and sends.
+    let api = FakeApi::start(on_each_prompt());
+    let mut other = claude_command(&real_claude().unwrap(), &rig.dir, &api.url, None)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(fs::File::create(rig.dir.join("other.stderr")).unwrap())
+        .spawn()
+        .expect("a second claude runs");
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut other_in = other.stdin.take().unwrap();
+    let other_out = lines(other.stdout.take().unwrap());
+    let _other = Kill(other);
+    let mut ask = |text: &str| {
+        let v = obj(vec![
+            ("type", Value::string("user")),
+            (
+                "message",
+                obj(vec![
+                    ("role", Value::string("user")),
+                    ("content", Value::string(text)),
+                ]),
+            ),
+        ]);
+        writeln!(other_in, "{}", json::to_line(&v)).unwrap();
+        other_in.flush().unwrap();
+        first(&other_out, WAIT, |v| str_of(v, &["type"]) == Some("result"))
+            .unwrap_or_else(|| panic!("the second claude's turn for {text:?} never ended"));
+    };
+    ask("list");
+    let listed = api
+        .wait_for(WAIT, |r| r.results().iter().any(|(n, _)| n == "ListAgents"))
+        .expect("the second claude listed");
+    let (_, text) = listed
+        .results()
+        .into_iter()
+        .find(|(n, _)| n == "ListAgents")
+        .unwrap();
+    assert!(
+        text.lines().any(|l| l.contains(NEAR)),
+        "the slot's claude is listed by its name: {text}"
+    );
+    ask(&format!("send to {NEAR}"));
+    let seen = seen_by_model(&rig.api, "msg 1", WAIT)
+        .unwrap_or_else(|| panic!("the named claude never got the message\n{}", rig.story()));
+    assert!(seen.contains("msg 1"));
 }

@@ -179,12 +179,18 @@ pub fn serve() -> io::Result<()> {
         };
         if let Some(roster) = msg.get("roster").and_then(Value::as_arr) {
             let entries = roster.iter().filter_map(peer::Entry::from_value).collect();
+            // From a router older than the field, none: local sessions keep Claude Code's names.
+            let you = msg
+                .get("you")
+                .and_then(Value::as_str)
+                .filter(|r| peer::is_name(r))
+                .map(str::to_string);
             relay
                 .get_or_insert_with(|| {
                     let out = agent.out.clone();
                     peer::Relay::start(Arc::new(move |v| out.send(&v)))
                 })
-                .set_roster(entries);
+                .set_roster(entries, you);
             continue;
         }
         if let Some(slot) = msg

@@ -530,6 +530,23 @@ fn a_slot_renamed_in_one_container_is_listed_by_its_new_name_in_the_other() {
         |root: &Root| -> Vec<String> { root.stand_ins("a").into_iter().map(|p| p.0).collect() };
     assert_eq!(names(&root), ["b/claude-1 claude-1 at work"], "calibration");
 
+    // b's own claude is named in its record as a lists it, under the repo the hub calls b.
+    let own = root
+        .d("b")
+        .join(format!("cc/sessions/{}.json", std::process::id()));
+    let until = Instant::now() + WAIT;
+    while record_name(&fs::read_to_string(&own).unwrap()).as_deref()
+        != Some("b/claude-1 claude-1 at work")
+    {
+        assert!(
+            Instant::now() < until,
+            "b's own claude was never named: {}\n{}",
+            fs::read_to_string(&own).unwrap(),
+            root.story()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     // The owner renames it: its registry record's title, as the hook would write it.
     let rec = root.d("b").join("registry/claude-1.json");
     let text = fs::read_to_string(&rec).unwrap();
@@ -561,6 +578,18 @@ fn a_slot_renamed_in_one_container_is_listed_by_its_new_name_in_the_other() {
         record.contains(r#""formerNames":[{"name":"b/claude-1 claude-1 at work","#),
         "{record}"
     );
+    // And b's own claude's record follows, at the relay's next look.
+    let until = Instant::now() + Duration::from_secs(25);
+    while record_name(&fs::read_to_string(&own).unwrap()).as_deref()
+        != Some("b/claude-1 tunnel cert renewal")
+    {
+        assert!(
+            Instant::now() < until,
+            "b's own claude kept its old name: {}",
+            fs::read_to_string(&own).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 #[test]

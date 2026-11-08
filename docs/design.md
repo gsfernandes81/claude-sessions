@@ -1080,6 +1080,19 @@ conversation's own name: `infra/claude-4 tunnel cert renewal` (`peer::listed_nam
   that name ("No agent named … is reachable. Use ListAgents"), so the record keeps the names
   it had as `formerNames`, which `ListAgents` shows for ten minutes beside the new one ("says
   it was … until … ago"), and every session is told to list again when a name is not found.
+- **In the same container** (owner, 2026-11-08: "fix up sessions in the same container
+  too"). A local claude is listed by the same name, under its own container's repo, which the
+  router adds to each roster (`"you"`; an agent from before reads only the roster, and a
+  container without it keeps Claude Code's own names). The relay writes the name into the
+  claude's own session record, at each look (every 10 s) where it differs, keeping the name it
+  had in `formerNames` (`peer::name_local`). Only the record: Claude Code's `rename` control is
+  a `/rename`, which writes a custom title into the transcript (2.1.311), so it would replace
+  the owner's titles in the menu and in Claude Code's picker and come back into the address.
+  Claude Code merges each update of its own into the record as it finds it, so the name stays
+  until Claude Code names the session itself, and is written again within ten seconds. The
+  session's own idea of its name is untouched, so a message one local session sends another
+  directly, with no relay between, still carries Claude Code's name for the sender in
+  `from-name`; a reply goes to its `from`, which is unaffected.
 - **From a peer.** A delivered message's `from-name` is the name the sender's stand-in here is
   listed by, so it reads as the listing does. It starts with the address the hub verified;
   the title after it is the sender's conversation's, which is the owner's or Claude Code's to
@@ -1119,7 +1132,7 @@ the agent wire (`proto.rs`):
 
 | | |
 |---|---|
-| `{"roster":[{repo,slot,title,busy,live}…]}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent; `title` is the conversation's own name, empty while it has none |
+| `{"roster":[{repo,slot,title,busy,live}…],"you":repo}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent; `title` is the conversation's own name, empty while it has none; `you` is the container's own repo |
 | `{"peer":{from,to,frame}}` | agent → hub: a frame local slot `from` wrote to the stand-in for `to` |
 | `{"deliver":{to,from,frame}}` | hub → agent: write `frame`, from `from`, into local slot `to` |
 | `{"bounce":{to,from,frame,why}}` | agent → hub: it could not be written yet (no claude or inbox, relay off) |
@@ -1179,7 +1192,7 @@ the agent wire (`proto.rs`):
   (owner, 2026-11-06).
 
 **What every session is told** (owner and infra, 2026-11-07). The facts an agent needs before
-it messages a peer: other containers' sessions are listed as `repo/slot` and their title, and
+it messages a peer: sessions, local and in other containers, are listed as `repo/slot` and their title, and
 reached by that whole name, which changes with the title, so list again when it is not found; a
 peer with no status
 is offloaded; a message wakes one where there is room, at about `mem::SESSION_COST` of that
@@ -1218,6 +1231,8 @@ account is used, and each test reads as the promise it checks:
 - a stand-in is listed, and a dead one is not;
 - a stand-in is listed by its address and title, and reached by that name in another case
   with hyphens for spaces;
+- a local claude's own record named so, kept through a turn, and another local claude listing
+  it and reaching it by that name;
 - a renamed stand-in is refused by its old name, even by a session that sent to it under
   that name, and listed by its new name with the old one beside it, which then reaches it;
 - a send to a stand-in reaches the agent from the sender's slot, and nothing is carried from
@@ -1239,7 +1254,7 @@ containers' agents over a stand-in ssh:
 - stand-ins for the other container's slots, listed by address and title, and none for a
   container's own;
 - a slot renamed in one container listed by its new name in the other, through the same
-  stand-in, with the name it had kept;
+  stand-in, with the name it had kept, and its own claude's record named and renamed to match;
 - a message delivered with its verified sender, and the sender's own claim of a name
   discarded;
 - the reply coming back;

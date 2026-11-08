@@ -583,6 +583,9 @@ fn rosters(router: &Router) {
         }
         let mut msg = Value::obj();
         msg.set("roster", entries.clone());
+        // The container's own repo, which it cannot name itself: its local sessions are listed
+        // under it (`peer::local_name`). An agent older than that reads only the roster.
+        msg.set("you", Value::string(&host));
         if conn.tell(&msg).is_ok() {
             lock(&router.sent).insert(host, entries);
         }
