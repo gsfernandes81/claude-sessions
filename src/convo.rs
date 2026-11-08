@@ -1168,14 +1168,16 @@ pub enum Dialog {
     /// Claude's permission prompt, the cursor on option `sel`, and how far a plan in it is
     /// scrolled.
     Perm { sel: usize, top: usize },
-    /// A question: which one, the cursor, the answers so far, what is typed for "Type
-    /// something.", and the multi-select ticks.
+    /// A question: the tab in view (a question, or the Submit tab after the last where there
+    /// are several), the cursor, each question's answer so far, what is typed for "Type
+    /// something.", and each multi-select's ticks. Answers and ticks are by question, and
+    /// may be shorter than the questions: what is missing is not answered yet.
     Ask {
         q: usize,
         sel: usize,
-        answers: Vec<(String, String)>,
+        answers: Vec<Option<String>>,
         typing: Option<String>,
-        ticked: Vec<bool>,
+        ticked: Vec<Vec<bool>>,
     },
     /// `/model`: the cursor, and the list once the relay has sent it.
     Model {
@@ -2334,33 +2336,183 @@ pub fn perm_options(always: &str) -> Vec<String> {
     v
 }
 
-/// The options a question's list has: its own, then "Type something.", then "Submit" for a
-/// multi-select. "Chat about this" is drawn apart, under the list.
-pub fn ask_options(q: &Question) -> Vec<String> {
+/// The options a question's list has: its own, then "Type something.", then for a
+/// multi-select "Submit", or "Next" where there are `several` questions, as Claude Code
+/// says. "Chat about this" is drawn apart, under the list.
+pub fn ask_options(q: &Question, several: bool) -> Vec<String> {
     let mut v: Vec<String> = q.options.iter().map(|o| o.0.clone()).collect();
     v.push("Type something.".into());
     if q.multi {
-        v.push("Submit".into());
+        v.push(if several { "Next" } else { "Submit" }.into());
     }
     v
 }
 
-fn ask_dialog(q: &Question, d: &Dialog, w: usize, room: usize) -> Vec<Line> {
+/// Question `i`'s answer as it would be sent, if it has one: the label chosen or the text
+/// typed, or for a multi-select the labels ticked and anything typed, joined with ", ".
+pub fn ask_answer(
+    questions: &[Question],
+    i: usize,
+    answers: &[Option<String>],
+    ticked: &[Vec<bool>],
+) -> Option<String> {
+    let q = questions.get(i)?;
+    let typed = answers.get(i).cloned().flatten();
+    if !q.multi {
+        return typed;
+    }
+    let ticks = ticked.get(i).map_or(&[][..], Vec::as_slice);
+    let mut said: Vec<String> = q
+        .options
+        .iter()
+        .zip(ticks)
+        .filter(|(_, t)| **t)
+        .map(|(o, _)| o.0.clone())
+        .collect();
+    said.extend(typed);
+    (!said.is_empty()).then(|| said.join(", "))
+}
+
+/// The tabs over several questions, as Claude Code 2.1.311 draws them: `←`, each header
+/// with `☐`, or `☒` once answered, then `✔ Submit` and `→`, the one in view black on
+/// lavender and an arrow grey where there is nowhere further to go. Headers not in view
+/// are cut, longest first, until the row fits.
+fn ask_tabs(questions: &[Question], d: &Dialog, w: usize) -> Line {
+    let Dialog::Ask {
+        q, answers, ticked, ..
+    } = d
+    else {
+        return Vec::new();
+    };
+    let n = questions.len();
+    let mut tabs: Vec<(char, String)> = questions
+        .iter()
+        .enumerate()
+        .map(|(i, qq)| {
+            let mark = if ask_answer(questions, i, answers, ticked).is_some() {
+                '☒'
+            } else {
+                '☐'
+            };
+            (mark, qq.header.clone())
+        })
+        .collect();
+    tabs.push(('✔', "Submit".into()));
+    // `← ` and ` →`, and each tab ` m header `.
+    let total = |t: &[(char, String)]| 4 + t.iter().map(|(_, h)| 4 + width(h)).sum::<usize>();
+    while total(&tabs) > w {
+        let longest = (0..n)
+            .filter(|i| *i != *q)
+            .max_by_key(|i| (width(&tabs[*i].1), std::cmp::Reverse(*i)));
+        match longest {
+            Some(i) if width(&tabs[i].1) > 1 => {
+                let h = &tabs[i].1;
+                tabs[i].1 = cut(h, width(h) - 1);
+            }
+            _ => break,
+        }
+    }
+    let arrow = |dead: bool| if dead { fg(GREY) } else { PLAIN };
+    let mut out: Line = vec![("← ".into(), arrow(*q == 0))];
+    for (i, (mark, h)) in tabs.iter().enumerate() {
+        let st = if i == *q {
+            St {
+                fg: Some(0),
+                bg: Some(LAVENDER),
+                ..PLAIN
+            }
+        } else {
+            PLAIN
+        };
+        out.push((format!(" {mark} {h} "), st));
+    }
+    out.push((" →".into(), arrow(*q >= n)));
+    out
+}
+
+/// The Submit tab: what has been answered, a warning while anything is not, and Submit or
+/// Cancel, as Claude Code 2.1.311 draws it.
+fn ask_review(questions: &[Question], d: &Dialog, w: usize) -> Vec<Line> {
     let Dialog::Ask {
         sel,
-        typing,
+        answers,
         ticked,
         ..
     } = d
     else {
         return Vec::new();
     };
+    let mut out = vec![rule(w, "─", fg(LAVENDER)), ask_tabs(questions, d, w)];
+    out.push(Vec::new());
+    out.push(line(
+        "Review your answers",
+        St {
+            bold: true,
+            ..PLAIN
+        },
+    ));
+    out.push(Vec::new());
+    let said: Vec<(usize, String)> = (0..questions.len())
+        .filter_map(|i| ask_answer(questions, i, answers, ticked).map(|a| (i, a)))
+        .collect();
+    if said.len() < questions.len() {
+        out.push(line("⚠ You have not answered all questions", fg(YELLOW)));
+        out.push(Vec::new());
+    }
+    if !said.is_empty() {
+        for (i, a) in &said {
+            out.extend(wrapped(&questions[*i].question, " ● ", "   ", w, PLAIN));
+            out.extend(wrapped(a, "   → ", "     ", w, fg(GREEN)));
+        }
+        out.push(Vec::new());
+    }
+    out.push(line("Ready to submit your answers?", fg(GREY)));
+    out.push(Vec::new());
+    for (i, opt) in ["Submit answers", "Cancel"].iter().enumerate() {
+        let n = i + 1;
+        out.push(if i == *sel {
+            line(format!("❯ {n}. {opt}"), fg(LAVENDER))
+        } else {
+            line(format!("  {n}. {opt}"), PLAIN)
+        });
+    }
+    out
+}
+
+fn ask_dialog(questions: &[Question], d: &Dialog, w: usize, room: usize) -> Vec<Line> {
+    let Dialog::Ask {
+        q: at,
+        sel,
+        typing,
+        answers,
+        ticked,
+    } = d
+    else {
+        return Vec::new();
+    };
+    let several = questions.len() > 1;
+    let Some(q) = questions.get(*at) else {
+        return if several {
+            ask_review(questions, d, w)
+        } else {
+            Vec::new()
+        };
+    };
+    let ticked = ticked.get(*at).map_or(&[][..], Vec::as_slice);
+    let typed = answers.get(*at).cloned().flatten();
+    // What was typed, kept on its row once Enter took it; a label chosen is not that.
+    let typed = typed.filter(|t| q.multi || !q.options.iter().any(|o| o.0 == *t));
+    let chosen = answers.get(*at).cloned().flatten();
     let mut head = vec![rule(w, "─", fg(LAVENDER))];
-    head.push(line(format!(" ☐ {}", q.header), bold(LAVENDER)));
+    if several {
+        head.push(ask_tabs(questions, d, w));
+    } else {
+        head.push(line(format!(" ☐ {}", q.header), bold(LAVENDER)));
+    }
     head.push(Vec::new());
     head.extend(wrapped(&q.question, "", "", w, PLAIN));
     head.push(Vec::new());
-    let opts = ask_options(q);
+    let opts = ask_options(q, several);
     let n_opts = opts.len();
     // Each option's block: its label line(s), then its description, indented five.
     let blocks: Vec<Vec<Line>> = opts
@@ -2376,10 +2528,15 @@ fn ask_dialog(q: &Question, d: &Dialog, w: usize, room: usize) -> Vec<Line> {
             } else {
                 ""
             };
-            let label = match (typing, i == q.options.len()) {
-                (Some(t), true) if i == *sel => format!("{t}▏"),
+            let typed_row = i == q.options.len();
+            let label = match (typing, typed_row, &typed) {
+                (Some(t), true, _) if i == *sel => format!("{t}▏"),
+                (_, true, Some(t)) => t.clone(),
                 _ => label.clone(),
             };
+            // A single choice made, or text typed, has Claude Code's green `✔` after it.
+            let done = (typed_row && typed.is_some() && typing.is_none())
+                || (!q.multi && i < q.options.len() && chosen.as_deref() == Some(&q.options[i].0));
             let n = i + 1;
             let (first, st) = if i == *sel {
                 (format!("❯ {n}. {mark}"), fg(LAVENDER))
@@ -2387,6 +2544,11 @@ fn ask_dialog(q: &Question, d: &Dialog, w: usize, room: usize) -> Vec<Line> {
                 (format!("  {n}. {mark}"), PLAIN)
             };
             let mut b = wrapped(&label, &first, "     ", w, st);
+            if done {
+                if let Some(last) = b.last_mut() {
+                    last.push((" ✔".into(), fg(GREEN)));
+                }
+            }
             if let Some((_, desc, _)) = q.options.get(i) {
                 if !desc.is_empty() {
                     b.extend(wrapped(desc, "     ", "     ", w, fg(GREY)));
@@ -2419,11 +2581,18 @@ fn ask_dialog(q: &Question, d: &Dialog, w: usize, room: usize) -> Vec<Line> {
         if chat_sel { fg(LAVENDER) } else { PLAIN },
     ));
     tail.push(Vec::new());
-    tail.extend(hints(
-        &["Enter to select", "↑/↓ to navigate", "Esc to cancel"],
-        "",
-        w,
-    ));
+    let nav = if several {
+        "Tab/Arrow keys to navigate"
+    } else {
+        "↑/↓ to navigate"
+    };
+    if several {
+        // Claude Code word-wraps this one, mid-hint, where the others break between hints.
+        let all = format!("Enter to select · {nav} · Esc to cancel");
+        tail.extend(wrapped(&all, "", "", w, fg(GREY)));
+    } else {
+        tail.extend(hints(&["Enter to select", nav, "Esc to cancel"], "", w));
+    }
     // The list scrolls around the cursor, with `↑ 1 more` and `↓ 2 more` at its edges.
     let fixed = head.len() + tail.len();
     let list_room = room.saturating_sub(fixed).max(3);
@@ -2791,12 +2960,9 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
             }),
             _,
         ) => btw_dialog(question, answer, *top, w, h),
-        (Some(d @ Dialog::Ask { q, .. }), Some(Entry::Ask { questions, .. })) => {
+        (Some(d @ Dialog::Ask { .. }), Some(Entry::Ask { questions, .. })) => {
             ask_top = true;
-            match questions.get(*q) {
-                Some(qq) => ask_dialog(qq, d, w, h.saturating_sub(3)),
-                None => Vec::new(),
-            }
+            ask_dialog(questions, d, w, h.saturating_sub(3))
         }
         (Some(Dialog::Perm { sel, top }), Some(e @ Entry::Perm { .. })) => {
             perm_dialog(e, *sel, *top, w, h)
@@ -3276,6 +3442,16 @@ mod tests {
         );
     }
 
+    /// The frame's rows without the blank ones under a dialog drawn from the top, which a
+    /// mockup's fence does not keep.
+    fn drawn(f: &Frame) -> Vec<String> {
+        let mut t = text(f);
+        while t.last().is_some_and(String::is_empty) {
+            t.pop();
+        }
+        t
+    }
+
     fn text(f: &Frame) -> Vec<String> {
         f.lines
             .iter()
@@ -3690,6 +3866,102 @@ mod tests {
         });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(got, mockup("R4"));
+    }
+
+    /// Mockups R4d and R4e: three questions, drawn as Claude Code 2.1.311 draws them.
+    fn three_questions() -> Convo {
+        let mut c = convo();
+        let q = r#"{"t":"add","id":2,"k":"ask","r":"q1","q":[{"q":"Which colour should the button be?","h":"Colour","m":false,"o":[["Red","Warm and loud"],["Blue","Calm"]]},{"q":"Which sizes should ship?","h":"Sizes","m":true,"o":[["Small",""],["Medium",""],["Large",""]]},{"q":"What should it be called?","h":"Name","m":false,"o":[["Go",""],["Start",""]]}]}"#;
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"user","x":"set up the new button"}"#,
+                q,
+                r#"{"t":"st","s":"waiting"}"#,
+            ],
+        );
+        c
+    }
+
+    #[test]
+    fn r4d_several_questions_have_a_tab_each_and_keep_their_answers() {
+        let c = three_questions();
+        let mut ui = Ui::new();
+        // Back on the first after answering it and ticking Medium on the second.
+        let at = |q: usize| Dialog::Ask {
+            q,
+            sel: 0,
+            answers: vec![Some("Red".into()), None, None],
+            typing: None,
+            ticked: vec![vec![], vec![false, true, false], vec![]],
+        };
+        ui.dialog = Some(at(0));
+        let got = draw(&c, &ui, 40, 24, Instant::now());
+        assert_eq!(drawn(&got), mockup("R4d"));
+        // The tab in view is black on lavender, and `←` is grey with nowhere to go.
+        let tabs = got
+            .lines
+            .iter()
+            .find(|l| l.first().is_some_and(|s| s.0 == "← "))
+            .unwrap();
+        assert_eq!(tabs[0].1, fg(GREY));
+        assert_eq!(tabs[1].0, " ☒ Colour ");
+        assert_eq!(tabs[1].1.bg, Some(LAVENDER));
+        assert_eq!(tabs[1].1.fg, Some(0));
+        assert_eq!(tabs[2].1, PLAIN);
+        // The choice made has a green `✔`.
+        let red = got
+            .lines
+            .iter()
+            .find(|l| plain(l).contains("1. Red"))
+            .unwrap();
+        assert_eq!(red.last().unwrap(), &(" ✔".to_string(), fg(GREEN)));
+        // At 80 nothing is cut, and the multi-select's ticks are kept.
+        ui.dialog = Some(at(1));
+        let got = text(&draw(&c, &ui, 80, 24, Instant::now()));
+        assert!(
+            got.contains(&"←  ☒ Colour  ☒ Sizes  ☐ Name  ✔ Submit  →".to_string()),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.contains("2. [✔] Medium")));
+        assert!(got.iter().any(|l| l == "  5. Next"));
+    }
+
+    #[test]
+    fn r4e_the_submit_tab_reviews_what_is_answered() {
+        let c = three_questions();
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Ask {
+            q: 3,
+            sel: 0,
+            answers: vec![Some("Red".into()), None, None],
+            typing: None,
+            ticked: vec![vec![], vec![false, true, false], vec![]],
+        });
+        let got = draw(&c, &ui, 40, 24, Instant::now());
+        assert_eq!(drawn(&got), mockup("R4e"));
+        let warn = got
+            .lines
+            .iter()
+            .find(|l| plain(l).starts_with("⚠"))
+            .unwrap();
+        assert_eq!(warn[0].1, fg(YELLOW));
+        let red = got.lines.iter().find(|l| plain(l) == "   → Red").unwrap();
+        assert_eq!(red[0].1, fg(GREEN));
+        // Every question answered: no warning, and each answer listed.
+        ui.dialog = Some(Dialog::Ask {
+            q: 3,
+            sel: 1,
+            answers: vec![Some("Red".into()), None, Some("Launch".into())],
+            typing: None,
+            ticked: vec![vec![], vec![true, true, false], vec![]],
+        });
+        let got = text(&draw(&c, &ui, 80, 24, Instant::now()));
+        assert!(!got.iter().any(|l| l.starts_with("⚠")), "{got:?}");
+        assert!(got.contains(&"   → Small, Medium".to_string()));
+        assert!(got.contains(&"   → Launch".to_string()));
+        assert!(got.contains(&"❯ 2. Cancel".to_string()));
     }
 
     #[test]

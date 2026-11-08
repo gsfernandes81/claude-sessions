@@ -408,6 +408,7 @@ fn parse_csi(b: &[u8]) -> Parsed {
         b'D' => Some(Key::Left),
         b'H' => Some(Key::Home),
         b'F' => Some(Key::End),
+        b'Z' => Some(Key::BackTab),
         b'~' => match first {
             // 1 and 4 are the VT220's Find and Select, which xterm sends for Home and End;
             // 7 and 8 are rxvt's.
@@ -1112,6 +1113,7 @@ mod tests {
     #[test]
     fn left_right_and_delete_are_keys_for_the_remote_views_prompt() {
         assert_eq!(decode(b"\x1b[C\x1b[D"), vec![Key::Right, Key::Left]);
+        assert_eq!(decode(b"\x1b[Z"), vec![Key::BackTab], "Shift-Tab");
         assert_eq!(decode(b"\x1bOC\x1bOD"), vec![Key::Right, Key::Left]);
         assert_eq!(
             decode(b"\x1b[1;2D\x1b[1;2A"),

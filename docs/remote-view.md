@@ -45,6 +45,9 @@ The owner's decisions, in the session of 2026-11-01:
   picker of the four modes.
 - **Question options may be long, and they scroll** around the cursor whatever Claude Code does.
   Claude's preview layout is drawn side by side at 80 columns and stacked under the list at 40.
+- **Several questions have a tab each**, as in Claude Code: answered in any order, moved
+  between with Left and Right (or Tab), and sent from a last Submit tab that reviews them,
+  unanswered ones left out (mockups R4d and R4e, owner 2026-11-08).
 - **Anything not essential is deferred** from the MVP, with a list kept for later.
 
 ## The pin

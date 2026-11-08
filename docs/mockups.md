@@ -528,6 +528,17 @@ The owner's calls, each made in a comment on the page:
   `↑ 1 more` and `↓ 2 more` at the edges. Claude's preview layout is drawn side by side at 80
   columns (R4b) and stacked under the list at 40 (R4c), because side by side "is always mangled
   in portrait".
+- **Several questions are answered in any order, as Claude Code's are** (owner, 2026-11-08:
+  "look ahead and behind at other questions and answer them in any order like Claude Code's
+  tool does"). R4d and R4e copy Claude Code 2.1.311's screens, captured that day: a tab row
+  in place of the ` ☐ header` line — `←`, each header with `☐`, `☒` once answered, then
+  `✔ Submit` and `→`, the tab in view black on lavender, an arrow grey where there is no
+  further to go, and headers not in view cut, longest first, to fit. Left and Right, or Tab
+  and Shift-Tab, move between them; a choice moves on to the next tab and keeps Claude's
+  green `✔` when the question is seen again; a multi-select's last row says `Next`. The
+  Submit tab lists what is answered, says `⚠ You have not answered all questions` in
+  Claude's yellow while any is not, and sends what there is on `Submit answers`; `Cancel`
+  declines, as Esc does anywhere. One question keeps R4's screen and goes when answered.
 - **A new prompt goes under what came before**, not to the top of an emptied screen (owner,
   2026-11-01: "stop pushing the entire transcript off screen on a new user message"). The
   transcript's end sits on the input box, and one that fits is drawn from the top, logo and
@@ -576,7 +587,7 @@ the colour Claude Code gives it.
 The rule that amber means only *waiting for you* belongs to the menu. R9 and R10 keep it, with
 every other style as mockups 12 and 13 have it.
 
-**The glyphs** are the ones Claude Code draws (`❯ ● ⎿ ✻ ✢ ◐ ⏵ ▔ ╌ ▲ ☐ ✔ ↑ ↓ …` and its logo),
+**The glyphs** are the ones Claude Code draws (`❯ ● ⎿ ✻ ✢ ◐ ⏵ ▔ ╌ ▲ ☐ ☒ ✔ ⚠ ← → ↑ ↓ …` and its logo),
 which the owner's word of 2026-10-27 covers, plus the box-drawing set the mockups already use.
 
 **Nothing is colour-only.** A waiting session still has its `!`, a terminal session its
@@ -722,6 +733,51 @@ take to a container?
 Enter to select · ↑/↓ to navigate ·
 Esc to cancel
 
+```
+
+### Mockup R4d — Several questions, a tab each
+```
+ ▝▝   ▝▝   ~/workspace
+
+❯ set up the new button
+────────────────────────────────────────
+←  ☒ Colour  ☒ Siz…  ☐ Name  ✔ Submit  →
+
+Which colour should the button be?
+
+❯ 1. Red ✔
+     Warm and loud
+  2. Blue
+     Calm
+  3. Type something.
+────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to
+navigate · Esc to cancel
+```
+
+### Mockup R4e — Several questions, the Submit tab
+```
+ ▝▝   ▝▝   ~/workspace
+
+❯ set up the new button
+────────────────────────────────────────
+←  ☒ Colo…  ☒ Sizes  ☐ Name  ✔ Submit  →
+
+Review your answers
+
+⚠ You have not answered all questions
+
+ ● Which colour should the button be?
+   → Red
+ ● Which sizes should ship?
+   → Medium
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
 ```
 
 ### Mockup R5 — /model

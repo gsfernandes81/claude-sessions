@@ -339,6 +339,8 @@ pub enum Key {
     /// for them.
     Left,
     Right,
+    /// Shift-Tab: back a tab among a question's several, as in Claude Code.
+    BackTab,
     Delete,
     Enter,
     Esc,

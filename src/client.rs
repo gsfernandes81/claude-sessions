@@ -1636,9 +1636,12 @@ fn follow_prompts(c: &Convo, ui: &mut Ui) {
             ui.dialog = Some(Dialog::Ask {
                 q: 0,
                 sel: 0,
-                answers: Vec::new(),
+                answers: vec![None; questions.len()],
                 typing: None,
-                ticked: vec![false; questions.first().map_or(0, |q| q.options.len())],
+                ticked: questions
+                    .iter()
+                    .map(|q| vec![false; q.options.len()])
+                    .collect(),
             })
         }
         (Some(Dialog::Perm { .. } | Dialog::Ask { .. }), None) => ui.dialog = None,
@@ -2209,9 +2212,15 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             else {
                 return None;
             };
-            let question = questions.get(q)?;
-            let opts = convo::ask_options(question);
-            let n = opts.len();
+            // As Claude Code does with several questions: a tab each and a Submit tab after
+            // them, moved between with Left and Right or Tab, answered in any order, and sent
+            // from the Submit tab. One question has no tabs and goes as soon as it is answered.
+            let several = questions.len() > 1;
+            answers.resize(questions.len(), None);
+            ticked.resize(questions.len(), Vec::new());
+            for (t, qq) in ticked.iter_mut().zip(questions) {
+                t.resize(qq.options.len(), false);
+            }
             let decline = |out: &mut Vec<Value>| {
                 out.push(m(
                     "ans",
@@ -2224,21 +2233,67 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                     ],
                 ));
             };
+            let ask = |q, sel, answers, typing, ticked| {
+                Some(Dialog::Ask {
+                    q,
+                    sel,
+                    answers,
+                    typing,
+                    ticked,
+                })
+            };
+            let tab = match (&typing, k) {
+                (None, Key::Left | Key::BackTab) if several => Some(q.saturating_sub(1)),
+                (None, Key::Right | Key::Char('\t')) if several => {
+                    Some((q + 1).min(questions.len()))
+                }
+                _ => None,
+            };
+            if let Some(to) = tab {
+                let sel = if to == q { sel } else { 0 };
+                return ask(to, sel, answers, None, ticked);
+            }
+            // The Submit tab: what is answered goes, or Cancel declines the lot.
+            let Some(question) = questions.get(q) else {
+                let chosen = match k {
+                    Key::Up => return ask(q, 0, answers, None, ticked),
+                    Key::Down => return ask(q, 1, answers, None, ticked),
+                    Key::Esc => Some(1),
+                    Key::Enter => Some(sel),
+                    k => digit(k).filter(|i| *i <= 1),
+                };
+                return match chosen {
+                    Some(0) => send_answers(request_id, questions, &answers, &ticked, out),
+                    Some(_) => {
+                        decline(out);
+                        None
+                    }
+                    None => ask(q, sel, answers, None, ticked),
+                };
+            };
+            let opts = convo::ask_options(question, several);
+            let n = opts.len();
+            let own = question.options.len();
+            // The answer goes in and the next tab comes up, or with one question it is sent.
+            let advance = |answers: Vec<Option<String>>, ticked: Vec<Vec<bool>>, out| {
+                if several {
+                    ask(q + 1, 0, answers, None, ticked)
+                } else {
+                    send_answers(request_id, questions, &answers, &ticked, out)
+                }
+            };
             // Typing the answer for "Type something."
             if let Some(mut t) = typing {
                 match k {
-                    Key::Esc => {
-                        return Some(Dialog::Ask {
-                            q,
-                            sel,
-                            answers,
-                            typing: None,
-                            ticked,
-                        });
-                    }
+                    Key::Esc => return ask(q, sel, answers, None, ticked),
                     Key::Enter => {
-                        answers.push((question.question.clone(), t));
-                        return next_question(request_id, questions, q, answers, out);
+                        let given = !t.is_empty();
+                        answers[q] = given.then_some(t);
+                        // A multi-select keeps its tab: what is typed joins what is ticked.
+                        if question.multi || !given {
+                            return ask(q, sel, answers, None, ticked);
+                        }
+                        return advance(answers, ticked, out);
                     }
                     Key::Char('\x7f') | Key::Char('\x08') => {
                         t.pop();
@@ -2246,33 +2301,11 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                     Key::Char(ch) if !ch.is_control() => t.push(ch),
                     _ => {}
                 }
-                return Some(Dialog::Ask {
-                    q,
-                    sel,
-                    answers,
-                    typing: Some(t),
-                    ticked,
-                });
+                return ask(q, sel, answers, Some(t), ticked);
             }
             let chosen = match k {
-                Key::Up => {
-                    return Some(Dialog::Ask {
-                        q,
-                        sel: sel.saturating_sub(1),
-                        answers,
-                        typing: None,
-                        ticked,
-                    });
-                }
-                Key::Down => {
-                    return Some(Dialog::Ask {
-                        q,
-                        sel: (sel + 1).min(n),
-                        answers,
-                        typing: None,
-                        ticked,
-                    });
-                }
+                Key::Up => return ask(q, sel.saturating_sub(1), answers, None, ticked),
+                Key::Down => return ask(q, (sel + 1).min(n), answers, None, ticked),
                 Key::Esc => {
                     decline(out);
                     return None;
@@ -2281,55 +2314,30 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 k => digit(k).filter(|i| *i <= n),
             };
             let Some(i) = chosen else {
-                return Some(Dialog::Ask {
-                    q,
-                    sel,
-                    answers,
-                    typing: None,
-                    ticked,
-                });
+                return ask(q, sel, answers, None, ticked);
             };
-            let own = question.options.len();
             if i == n {
                 // Chat about this.
                 decline(out);
                 return None;
             }
             if i == own {
-                return Some(Dialog::Ask {
-                    q,
-                    sel: i,
-                    answers,
-                    typing: Some(String::new()),
-                    ticked,
-                });
+                // What was typed before comes back to be edited; a label chosen does not.
+                let before = answers[q]
+                    .clone()
+                    .filter(|t| question.multi || !question.options.iter().any(|o| o.0 == *t))
+                    .unwrap_or_default();
+                return ask(q, i, answers, Some(before), ticked);
             }
-            if question.multi && i < own {
-                if let Some(t) = ticked.get_mut(i) {
-                    *t = !*t;
+            if question.multi {
+                if i < own {
+                    ticked[q][i] = !ticked[q][i];
+                    return ask(q, i, answers, None, ticked);
                 }
-                return Some(Dialog::Ask {
-                    q,
-                    sel: i,
-                    answers,
-                    typing: None,
-                    ticked,
-                });
+                return advance(answers, ticked, out);
             }
-            let answer = if question.multi {
-                question
-                    .options
-                    .iter()
-                    .zip(&ticked)
-                    .filter(|(_, t)| **t)
-                    .map(|(o, _)| o.0.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                question.options[i].0.clone()
-            };
-            answers.push((question.question.clone(), answer));
-            next_question(request_id, questions, q, answers, out)
+            answers[q] = Some(question.options[i].0.clone());
+            advance(answers, ticked, out)
         }
         Dialog::Model { sel, list } => {
             let len = list.as_ref().map_or(0, Vec::len);
@@ -2393,27 +2401,20 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
     }
 }
 
-/// The next of several questions, or every answer sent once the last is answered.
-fn next_question(
+/// Every answer given, keyed by its question's text; a question left unanswered is left out,
+/// as Claude Code leaves it.
+fn send_answers(
     request_id: &str,
     questions: &[convo::Question],
-    q: usize,
-    answers: Vec<(String, String)>,
+    answers: &[Option<String>],
+    ticked: &[Vec<bool>],
     out: &mut Vec<Value>,
 ) -> Option<Dialog> {
-    if q + 1 < questions.len() {
-        let ticked = vec![false; questions[q + 1].options.len()];
-        return Some(Dialog::Ask {
-            q: q + 1,
-            sel: 0,
-            answers,
-            typing: None,
-            ticked,
-        });
-    }
     let mut a = Value::obj();
-    for (question, answer) in answers {
-        a.set(&question, Value::string(answer));
+    for (i, q) in questions.iter().enumerate() {
+        if let Some(said) = convo::ask_answer(questions, i, answers, ticked) {
+            a.set(&q.question, Value::string(said));
+        }
     }
     out.push(App::msg(
         "ans",
@@ -3286,47 +3287,118 @@ mod tests {
     }
 
     #[test]
-    fn questions_are_answered_in_turn_typed_ticked_or_declined() {
+    fn questions_are_answered_in_any_order_then_submitted_from_their_own_tab() {
         let c = convo_with(&[
-            r#"{"t":"add","id":1,"k":"ask","r":"q1","q":[{"q":"Colour?","h":"C","m":false,"o":[["Red",""],["Blue",""]]},{"q":"Sizes?","h":"S","m":true,"o":[["S",""],["M",""],["L",""]]}]}"#,
+            r#"{"t":"add","id":1,"k":"ask","r":"q1","q":[{"q":"Colour?","h":"C","m":false,"o":[["Red",""],["Blue",""]]},{"q":"Sizes?","h":"S","m":true,"o":[["S",""],["M",""],["L",""]]},{"q":"Name?","h":"N","m":false,"o":[["Go",""],["Start",""]]}]}"#,
+        ]);
+        let mut ui = Ui::new();
+        follow_prompts(&c, &mut ui);
+        let start = ui.dialog.clone().unwrap();
+        let keys = |keys: &[Key], out: &mut Vec<Value>| {
+            let mut d = Some(start.clone());
+            for k in keys {
+                d = dialog_key(&c, d.expect("the dialog is open"), *k, out);
+            }
+            d
+        };
+        let tab = |d: &Option<Dialog>| match d {
+            Some(Dialog::Ask { q, .. }) => *q,
+            _ => panic!("{d:?}"),
+        };
+        // Answered in turn: Blue moves on, S and L ticked then Next, Go moves on, and the
+        // Submit tab sends the lot.
+        let mut out = Vec::new();
+        let d = keys(
+            &[
+                Key::Char('2'),
+                Key::Char('1'),
+                Key::Char('3'),
+                Key::Char('5'),
+                Key::Char('1'),
+            ],
+            &mut out,
+        );
+        assert_eq!(tab(&d), 3, "the Submit tab");
+        assert!(out.is_empty(), "nothing goes before Submit");
+        let d = dialog_key(&c, d.unwrap(), Key::Enter, &mut out);
+        assert_eq!(d, None);
+        assert_eq!(
+            line(&out[0]),
+            r#"{"a":{"Colour?":"Blue","Name?":"Go","Sizes?":"S, L"},"r":"q1","t":"ans"}"#
+        );
+        // Out of order: Right and Tab skip ahead, Left and Shift-Tab come back, nothing
+        // goes past either end, and an answer changed is the one sent.
+        let mut out = Vec::new();
+        let d = keys(
+            &[
+                Key::Left,
+                Key::Right,
+                Key::Char('\t'),
+                Key::Char('2'),
+                Key::Right,
+                Key::Right,
+                Key::BackTab,
+                Key::BackTab,
+                Key::BackTab,
+                Key::BackTab,
+                Key::Char('1'),
+                Key::Left,
+                Key::Char('2'),
+                Key::Right,
+                Key::Right,
+            ],
+            &mut out,
+        );
+        assert_eq!(tab(&d), 3);
+        dialog_key(&c, d.unwrap(), Key::Char('1'), &mut out);
+        assert_eq!(
+            line(&out[0]),
+            r#"{"a":{"Colour?":"Blue","Name?":"Start"},"r":"q1","t":"ans"}"#,
+            "a question left unanswered is left out"
+        );
+        // "Type something." takes what is typed, and moves on.
+        let mut out = Vec::new();
+        let d = keys(
+            &[
+                Key::Char('3'),
+                Key::Char('t'),
+                Key::Char('e'),
+                Key::Char('a'),
+                Key::Enter,
+            ],
+            &mut out,
+        );
+        assert_eq!(tab(&d), 1);
+        // Cancel on the Submit tab declines, and so does Esc anywhere.
+        for ks in [
+            &[Key::Right, Key::Right, Key::Right, Key::Down, Key::Enter][..],
+            &[Key::Esc],
+        ] {
+            let mut out = Vec::new();
+            assert_eq!(keys(ks, &mut out), None);
+            assert!(
+                line(&out[0]).contains(r#""t":"ans""#) && !line(&out[0]).contains(r#""a":"#),
+                "{ks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_question_has_no_tabs_and_goes_as_soon_as_it_is_answered() {
+        let c = convo_with(&[
+            r#"{"t":"add","id":1,"k":"ask","r":"q1","q":[{"q":"Sizes?","h":"S","m":true,"o":[["S",""],["M",""]]}]}"#,
         ]);
         let mut ui = Ui::new();
         follow_prompts(&c, &mut ui);
         let mut d = ui.dialog.clone().unwrap();
         let mut out = Vec::new();
-        // Blue for the first; S and L ticked, then Submit, for the second.
-        for k in [
-            Key::Char('2'),
-            Key::Char('1'),
-            Key::Char('3'),
-            Key::Char('5'),
-        ] {
-            d = dialog_key(&c, d, k, &mut out).unwrap_or(Dialog::Effort { sel: 0 });
-        }
-        assert_eq!(
-            line(&out[0]),
-            r#"{"a":{"Colour?":"Blue","Sizes?":"S, L"},"r":"q1","t":"ans"}"#
-        );
-        // "Type something." takes what is typed.
-        let mut out = Vec::new();
-        let mut d = ui.dialog.clone().unwrap();
-        for k in [
-            Key::Char('3'),
-            Key::Char('t'),
-            Key::Char('e'),
-            Key::Char('a'),
-            Key::Enter,
-        ] {
+        // Left and Right go nowhere; M ticked, then Submit, sends it.
+        for k in [Key::Right, Key::Left, Key::Char('2')] {
             d = dialog_key(&c, d, k, &mut out).unwrap();
         }
-        assert!(matches!(d, Dialog::Ask { q: 1, .. }));
-        // Esc declines the lot.
-        let mut out = Vec::new();
-        assert_eq!(
-            dialog_key(&c, ui.dialog.clone().unwrap(), Key::Esc, &mut out),
-            None
-        );
-        assert!(line(&out[0]).contains(r#""t":"ans""#) && !line(&out[0]).contains(r#""a":"#));
+        assert!(matches!(d, Dialog::Ask { q: 0, .. }));
+        assert_eq!(dialog_key(&c, d, Key::Char('4'), &mut out), None);
+        assert_eq!(line(&out[0]), r#"{"a":{"Sizes?":"M"},"r":"q1","t":"ans"}"#);
     }
 
     #[test]
