@@ -1667,8 +1667,9 @@ fn tasks_key(
         (None, Key::Down) => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
         (None, Key::Enter) => {
             if let Some((_, t)) = rows.get(v.sel) {
-                // A finished agent opens its conversation, as Claude Code's does.
-                if t.kind == "agent" && !t.running() {
+                // A finished agent opens its conversation, as Claude Code's does: the only
+                // finished rows listed are agents' (`tasks::listed`).
+                if !t.running() {
                     *fg = Some((*t).clone());
                     return None;
                 }
@@ -6271,5 +6272,90 @@ mod tests {
         app.gone(app.epoch, String::new(), now);
         assert!(!app.up());
         assert_eq!(ui_of(&app).status.as_deref(), Some("as it was"));
+    }
+
+    #[test]
+    fn the_focus_follows_the_task_list_off_a_pill_or_strip_that_is_gone() {
+        let mut app = app_in(&[TASKS]);
+        set_ui(&mut app, |ui| ui.focus = Focus::Pill);
+        hear(
+            &mut app,
+            r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"}]}"#,
+        );
+        assert_eq!(
+            ui_of(&app).focus,
+            Focus::Pill,
+            "a pill still there keeps it"
+        );
+        hear(&mut app, r#"{"t":"tasks","l":[]}"#);
+        assert_eq!(ui_of(&app).focus, Focus::Prompt);
+        let mut app = app_in(&[AGENTS]);
+        set_ui(&mut app, |ui| ui.focus = Focus::Strip(2));
+        hear(
+            &mut app,
+            r#"{"t":"tasks","l":[{"i":"ag1","k":"agent","d":"slow reader","st":"running"}]}"#,
+        );
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1), "on the last row left");
+        hear(&mut app, r#"{"t":"tasks","l":[]}"#);
+        assert_eq!(ui_of(&app).focus, Focus::Prompt);
+    }
+
+    const MIXED: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"},{"i":"m1","k":"monitor","d":"Watch it","st":"running"},{"i":"ag1","k":"agent","d":"slow reader","st":"running"},{"i":"ag2","k":"agent","d":"done reader","st":"completed"},{"i":"b2","k":"shell","d":"Old","st":"completed"}]}"#;
+
+    #[test]
+    fn closing_details_with_esc_says_which_were_dismissed_and_nothing_else_does() {
+        let app = app_in(&[MIXED]);
+        let c = conv_of(&app);
+        for (id, k, direct, want) in [
+            ("b1", Key::Esc, false, Some("Shell details dismissed")),
+            ("m1", Key::Esc, false, Some("Monitor details dismissed")),
+            ("ag1", Key::Esc, false, Some("Agent details dismissed")),
+            ("b1", Key::Enter, false, None),
+            ("b1", Key::Esc, true, None),
+        ] {
+            let mut v = tasks::View {
+                direct,
+                ..tasks::View::default()
+            };
+            open_task(&mut v, c.tasks.iter().find(|t| t.id == id).unwrap());
+            let mut toast = None;
+            let d = tasks_key(c, v, k, &mut Vec::new(), &mut toast, &mut None);
+            assert!(d.is_none(), "{id} {k:?}: closed");
+            assert_eq!(toast.as_deref(), want, "{id} {k:?} direct {direct}");
+        }
+    }
+
+    #[test]
+    fn f_brings_a_running_agent_into_view_and_enter_a_finished_ones_conversation() {
+        let app = app_in(&[MIXED]);
+        let c = conv_of(&app);
+        let task = |id: &str| c.tasks.iter().find(|t| t.id == id).unwrap().clone();
+        // `f` in details: only a running agent's.
+        for (id, fg_wanted) in [("ag1", true), ("ag2", false), ("b1", false)] {
+            let mut v = tasks::View::default();
+            open_task(&mut v, &task(id));
+            let mut fg = None;
+            let d = tasks_key(c, v, Key::Char('f'), &mut Vec::new(), &mut None, &mut fg);
+            assert_eq!(fg.map(|t| t.id), fg_wanted.then(|| id.to_string()), "{id}");
+            assert_eq!(d.is_none(), fg_wanted, "{id}: the view closes for it");
+        }
+        // Enter on the list: a finished agent's conversation, else the details.
+        let rows = tasks::listed(&c.tasks);
+        for (id, fg_wanted) in [("ag2", true), ("ag1", false), ("b1", false)] {
+            let sel = rows.iter().position(|(_, t)| t.id == id).unwrap();
+            let v = tasks::View {
+                sel,
+                ..tasks::View::default()
+            };
+            let mut fg = None;
+            let d = tasks_key(c, v, Key::Enter, &mut Vec::new(), &mut None, &mut fg);
+            assert_eq!(fg.map(|t| t.id), fg_wanted.then(|| id.to_string()), "{id}");
+            if !fg_wanted {
+                assert!(
+                    matches!(&d, Some(Dialog::Tasks(v)) if v.open.as_deref() == Some(id)),
+                    "{id}: {d:?}"
+                );
+            }
+        }
     }
 }
