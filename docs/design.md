@@ -1175,8 +1175,9 @@ the agent wire (`proto.rs`):
 
 - **Who sent it is the hub's to say.** The connection a frame arrives on names the container,
   and the sending slot must be live in that container's own rows. One repo's slots are one
-  trust domain, as they were for mail. A frame to a slot in the sender's own container is not
-  routed, since Claude Code reaches it directly.
+  trust domain, as they were for mail. A frame to a slot in the sender's own container is
+  routed back into it like any other (0.19.0; its relay fronts every live local inbox, above);
+  one a slot addresses to itself is dropped, since no session is listed to itself.
 - **Kept until it can be given.** A message to an offloaded slot, or to a container that is
   not answering (whose slots stay listed as it was last heard), is kept on disk and delivered
   when the slot is next live. So is one an agent bounced. Control frames are about now, so they
