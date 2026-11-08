@@ -2721,12 +2721,15 @@ fn took(d: Duration) -> String {
 fn clock_time() -> String {
     let out = Command::new("date").arg("+%I:%M %p").output();
     match out {
-        Ok(o) if o.status.success() => {
-            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            t.strip_prefix('0').map(str::to_string).unwrap_or(t)
-        }
+        Ok(o) if o.status.success() => twelve_hour(&String::from_utf8_lossy(&o.stdout)),
         _ => String::new(),
     }
+}
+
+/// `date +%I:%M %p`'s `01:12 AM` as Claude Code writes it, `1:12 AM`.
+fn twelve_hour(said: &str) -> String {
+    let t = said.trim();
+    t.strip_prefix('0').unwrap_or(t).to_string()
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -6835,5 +6838,14 @@ mod tests {
             d = keys(d.unwrap(), &[Key::Down]).0;
         }
         assert_eq!(typing(&d), (0, 3, None));
+    }
+
+    #[test]
+    fn the_time_a_turn_ended_is_claude_codes_twelve_hour_clock() {
+        assert_eq!(twelve_hour("01:12 AM\n"), "1:12 AM");
+        assert_eq!(twelve_hour("11:05 PM\n"), "11:05 PM");
+        // From `date`, whose AM or PM the locale decides.
+        let now = clock_time();
+        assert!(now.contains(':') && !now.starts_with('0'), "{now:?}");
     }
 }
