@@ -5477,4 +5477,332 @@ mod tests {
             Some("elsewhere".into())
         );
     }
+
+    #[test]
+    fn a_key_after_two_minutes_of_silence_first_checks_the_link_with_a_ping() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now() + QUIET_PROBE * 2;
+        for (quiet, want) in [
+            (
+                QUIET_PROBE + Duration::from_secs(1),
+                vec![r#"{"t":"ping"}"#],
+            ),
+            (QUIET_PROBE - Duration::from_secs(1), vec![]),
+        ] {
+            app.last_heard = now - quiet;
+            app.key(Key::End, now);
+            assert_eq!(sent(&mut app, &rx), want, "{quiet:?} quiet");
+        }
+    }
+
+    #[test]
+    fn only_a_drag_over_the_conversation_selects_and_a_key_puts_the_selection_away() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        let now = Instant::now();
+        let press = |app: &mut App, keys: &[Key]| {
+            for k in keys {
+                app.key(*k, now);
+            }
+            app.clip.take()
+        };
+        let (click, drag, release) = (
+            |c| Key::Click { row: 5, col: c },
+            |c| Key::Drag { row: 5, col: c },
+            |c| Key::Release { row: 5, col: c },
+        );
+        // Row 5 is `❯ hello there`, under the banner.
+        assert_eq!(press(&mut app, &[click(2), release(2)]), None, "a click");
+        assert_eq!(app.select, None);
+        assert_eq!(
+            press(&mut app, &[click(2), release(6)]),
+            None,
+            "a press and a release with no motion between"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(6), drag(2), release(2)]),
+            None,
+            "a drag that ends where it began"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(6), release(2)]),
+            Some("h".into()),
+            "one that came back to it before letting go: the cell it began on"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(4), release(6)]),
+            Some("hello".into())
+        );
+        // On the home a click is the menu's.
+        app.home(None);
+        app.key(click(2), now);
+        assert_eq!(app.select, None);
+        // Held over a paste's markers, put away by a key.
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        app.key(click(2), now);
+        app.key(drag(4), now);
+        app.key(Key::PasteStart, now);
+        app.key(Key::PasteEnd, now);
+        assert!(app.select.is_some());
+        app.key(Key::Char('a'), now);
+        assert_eq!(app.select, None);
+    }
+
+    #[test]
+    fn a_paste_is_text_whatever_keys_it_holds_and_a_dialogs_field_takes_it_on_one_line() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "hi");
+        let now = Instant::now();
+        for k in [Key::PasteStart, Key::Left, Key::Char('x'), Key::PasteEnd] {
+            app.key(k, now);
+        }
+        assert_eq!(ui_of(&app).input, "hix");
+        // A plan's "Tell Claude what to change".
+        let mut app = app_in(&[]);
+        hear(
+            &mut app,
+            r##"{"t":"add","id":1,"k":"perm","r":"p1","n":"ExitPlanMode","a":"# Plan"}"##,
+        );
+        app.key(Key::Char('3'), now);
+        pasted(&mut app, "a\nb");
+        assert!(
+            matches!(dialog(&app), Some(Dialog::Perm { typing: Some(f), .. }) if f.text == "a b"),
+            "{:?}",
+            dialog(&app)
+        );
+    }
+
+    /// A home with one container and `rows` in it, the relay's hello said.
+    fn home_with(rows: &[Row]) -> App {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        // As the client's loop does on a change of containers.
+        app.rebuild_menu(40, 24);
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", rows));
+        app.heard(snap, Instant::now());
+        app
+    }
+
+    #[test]
+    fn c_on_the_home_offloads_a_session_only_while_the_link_is_up() {
+        let rows = [row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut app = home_with(&rows);
+        app.key(Key::Char('c'), Instant::now());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("not connected: try again once it is")
+        );
+        assert!(app.working.is_none());
+        let mut app = home_with(&rows);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.key(Key::Char('c'), Instant::now());
+        assert_eq!(
+            sent(&mut app, &rx),
+            [r#"{"c":"claude-sessions","k":{"slot":"claude-3"},"t":"offload"}"#]
+        );
+        assert!(app.working.is_some(), "its spinner turns");
+    }
+
+    #[test]
+    fn ctrl_x_then_ctrl_s_sends_what_waits_behind_the_turn_now() {
+        let mut app = app_in(&[r#"{"t":"st","s":"working"}"#]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        // Nothing queued: the chord sends nothing.
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char(CTRL_S), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("next", now);
+        }
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char(CTRL_S), now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"now"}"#]);
+        // Ctrl+X then anything else: that key, as itself.
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char('a'), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(ui_of(&app).input, "a");
+    }
+
+    #[test]
+    fn the_suggestion_list_has_the_arrows_tab_esc_and_enter_while_it_shows() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        type_in_only(&mut app, "/");
+        let list = convo::suggestions(ui_of(&app));
+        assert!(list.len() > 2);
+        app.key(Key::Up, now);
+        assert_eq!(ui_of(&app).suggest, 0, "nothing above the first");
+        app.key(Key::Down, now);
+        assert_eq!(ui_of(&app).suggest, 1);
+        for _ in 0..list.len() + 2 {
+            app.key(Key::Down, now);
+        }
+        assert_eq!(
+            ui_of(&app).suggest,
+            list.len() - 1,
+            "nothing below the last"
+        );
+        app.key(Key::Up, now);
+        assert_eq!(ui_of(&app).suggest, list.len() - 2);
+        app.key(Key::Char('\t'), now);
+        let want = format!("/{} ", list[list.len() - 2].name);
+        assert_eq!(
+            (ui_of(&app).input.clone(), ui_of(&app).cursor),
+            (want.clone(), want.chars().count()),
+            "Tab takes the chosen name"
+        );
+        assert!(
+            convo::suggestions(ui_of(&app)).is_empty(),
+            "and the list goes"
+        );
+        // Esc puts the list away, and only that.
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "/");
+        app.key(Key::Esc, now);
+        assert!(ui_of(&app).suggest_off);
+        assert_eq!(ui_of(&app).input, "/");
+        // A choice past the end of a list that shrank under it is the last.
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "/");
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.suggest = 999;
+        }
+        app.key(Key::Char('\t'), now);
+        assert_eq!(
+            ui_of(&app).input,
+            format!("/{} ", list[list.len() - 1].name)
+        );
+    }
+
+    #[test]
+    fn enter_on_the_list_sends_the_chosen_command_unless_one_was_typed_whole() {
+        let catalog = vec![convo::Command {
+            name: "design:ux-copy".into(),
+            about: String::new(),
+            hint: String::new(),
+        }];
+        let mut app = app_in(&[]);
+        app.catalog = catalog.clone();
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.catalog = catalog.clone();
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        // `/cop`, the second chosen: Enter sends that.
+        type_in_only(&mut app, "/cop");
+        app.key(Key::Down, now);
+        app.key(Key::Enter, now);
+        let uuid = conv_of(&app).pending[0].uuid.clone();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [format!(
+                r#"{{"t":"say","u":"{uuid}","x":"/design:ux-copy"}}"#
+            )]
+        );
+        // `/copy` typed whole is `/copy`, whatever is chosen.
+        type_in_only(&mut app, "/copy");
+        app.key(Key::Down, now);
+        app.key(Key::Enter, now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(ui_of(&app).status.as_deref(), Some("Nothing to copy yet"));
+    }
+
+    const SHELL_AND_AGENT: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running","t0":1000},{"i":"ag1","k":"agent","d":"slow reader","c":"general-purpose","st":"running","t0":1000},{"i":"wf1","k":"workflow","d":"Two agents","c":"two-readers","st":"running","an":2,"t0":1000}]}"#;
+
+    #[test]
+    fn down_goes_from_the_pill_to_the_strip_and_up_comes_back_the_same_way() {
+        let mut app = app_in(&[SHELL_AND_AGENT]);
+        let now = Instant::now();
+        let focus = |app: &mut App, k: Key| {
+            app.key(k, now);
+            ui_of(app).focus
+        };
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Strip(0));
+        assert_eq!(focus(&mut app, Key::Up), Focus::Pill, "back to the pill");
+        assert_eq!(focus(&mut app, Key::Up), Focus::Prompt, "and off it");
+        // A pill with no strip under it keeps the focus on Down.
+        let mut app = app_in(&[TASKS]);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+    }
+
+    #[test]
+    fn up_or_esc_on_the_pill_only_put_the_focus_away() {
+        let mut app = app_in(&[TASKS, r#"{"t":"st","s":"working"}"#]);
+        app.history = vec!["sent before".into()];
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        for k in [Key::Up, Key::Esc] {
+            app.key(Key::Down, now);
+            assert_eq!(ui_of(&app).focus, Focus::Pill);
+            app.key(k, now);
+            assert_eq!(ui_of(&app).focus, Focus::Prompt, "{k:?}");
+            assert_eq!(ui_of(&app).input, "", "{k:?}: not back into what was sent");
+            assert_eq!(
+                sent(&mut app, &rx),
+                Vec::<String>::new(),
+                "{k:?}: no interrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn x_on_an_agents_row_of_the_strip_stops_it_and_on_main_is_typed() {
+        let mut app = app_in(&[AGENTS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.key(Key::Down, now);
+        app.key(Key::Down, now);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1));
+        app.key(Key::Char('x'), now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"ag1","t":"tstop"}"#]);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1), "the focus stays on it");
+        app.key(Key::Up, now);
+        app.key(Key::Char('x'), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(
+            (ui_of(&app).focus, ui_of(&app).input.as_str()),
+            (Focus::Prompt, "x")
+        );
+    }
+
+    #[test]
+    fn the_tasks_view_counts_as_waiting_only_the_notices_since_it_opened() {
+        for (keys, open) in [
+            (&[Key::Down, Key::Enter][..], None),
+            (
+                &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Enter][..],
+                Some("wf1"),
+            ),
+        ] {
+            let mut app = app_in(&[SHELL_AND_AGENT]);
+            if let Screen::Conv { c, .. } = &mut app.screen {
+                c.notices = 3;
+            }
+            for k in keys {
+                app.key(*k, Instant::now());
+            }
+            let Some(Dialog::Tasks(v)) = dialog(&app) else {
+                panic!("{keys:?}: {:?}", dialog(&app))
+            };
+            assert_eq!(v.open.as_deref(), open);
+            assert_eq!(v.notices_at, 3, "{keys:?}");
+        }
+    }
 }
