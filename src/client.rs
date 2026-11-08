@@ -6566,4 +6566,107 @@ mod tests {
         );
         assert_eq!(ui2.status, said("Copied 5 characters to the clipboard"));
     }
+
+    #[test]
+    fn the_pickers_move_within_their_choices_and_enter_sends_the_one_chosen() {
+        let c = convo_with(&[]);
+        let key = |d: Dialog, k: Key| {
+            let mut out = Vec::new();
+            let d = dialog_key(&c, d, k, &mut out);
+            (d, out.iter().map(line).collect::<Vec<_>>().join(" "))
+        };
+        let list = Some(vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ]);
+        let model = |sel| Dialog::Model {
+            sel,
+            list: list.clone(),
+        };
+        assert_eq!(key(model(0), Key::Up), (Some(model(0)), String::new()));
+        assert_eq!(key(model(0), Key::Down), (Some(model(1)), String::new()));
+        assert_eq!(key(model(1), Key::Down), (Some(model(1)), String::new()));
+        assert_eq!(key(model(1), Key::Up), (Some(model(0)), String::new()));
+        assert_eq!(
+            key(model(1), Key::Char('q')),
+            (Some(model(1)), String::new())
+        );
+        assert_eq!(key(model(1), Key::Esc), (None, String::new()));
+        assert_eq!(
+            key(model(1), Key::Enter),
+            (None, r#"{"m":"sonnet","t":"model"}"#.into())
+        );
+        let none = Dialog::Model { sel: 0, list: None };
+        assert_eq!(key(none, Key::Enter), (None, String::new()), "no list yet");
+        let effort = |sel| Dialog::Effort { sel };
+        let last = convo::EFFORT_CHOICES.len() - 1;
+        assert_eq!(key(effort(0), Key::Left).0, Some(effort(0)));
+        assert_eq!(key(effort(0), Key::Right).0, Some(effort(1)));
+        assert_eq!(key(effort(last), Key::Right).0, Some(effort(last)));
+        assert_eq!(key(effort(2), Key::Left).0, Some(effort(1)));
+        assert_eq!(key(effort(2), Key::Up).0, Some(effort(2)));
+        assert_eq!(key(effort(2), Key::Esc), (None, String::new()));
+        assert_eq!(
+            key(effort(0), Key::Enter).1,
+            r#"{"e":null,"t":"effort"}"#,
+            "auto: the model's own"
+        );
+        assert_eq!(key(effort(3), Key::Enter).1, r#"{"e":"high","t":"effort"}"#);
+        let mode = |sel| Dialog::Mode { sel };
+        let last = convo::MODES.len() - 1;
+        assert_eq!(key(mode(0), Key::Up).0, Some(mode(0)));
+        assert_eq!(key(mode(last), Key::Down).0, Some(mode(last)));
+        assert_eq!(key(mode(2), Key::Up).0, Some(mode(1)));
+        assert_eq!(key(mode(2), Key::Left).0, Some(mode(2)));
+        assert_eq!(key(mode(2), Key::Esc), (None, String::new()));
+        assert_eq!(key(mode(last), Key::Enter).1, r#"{"m":"auto","t":"mode"}"#);
+    }
+
+    #[test]
+    fn a_permission_dialogs_keys_stay_within_its_options_and_its_plan_scrolls_within_its_lines() {
+        let c = convo_with(&[
+            r#"{"t":"add","id":1,"k":"perm","r":"p1","n":"Bash","a":"touch x","d":"","al":"Yes, and don't ask again for touch commands in this project"}"#,
+        ]);
+        let perm = |sel, top| Dialog::Perm {
+            sel,
+            top,
+            typing: None,
+        };
+        let key = |c: &Convo, d: Dialog, k: Key| {
+            let mut out = Vec::new();
+            let d = dialog_key(c, d, k, &mut out);
+            (d, out.len())
+        };
+        assert_eq!(key(&c, perm(1, 0), Key::Up), (Some(perm(0, 0)), 0));
+        assert_eq!(key(&c, perm(0, 0), Key::Up), (Some(perm(0, 0)), 0));
+        assert_eq!(key(&c, perm(2, 0), Key::Down), (Some(perm(2, 0)), 0));
+        for k in ['0', '4', '9', 'y'] {
+            assert_eq!(
+                key(&c, perm(1, 0), Key::Char(k)),
+                (Some(perm(1, 0)), 0),
+                "{k}"
+            );
+        }
+        let lines: Vec<String> = (1..=30).map(|n| format!("{n}. step")).collect();
+        let plan = convo_with(&[&format!(
+            r#"{{"t":"add","id":1,"k":"perm","r":"p1","n":"ExitPlanMode","a":"{}"}}"#,
+            lines.join("\\n")
+        )]);
+        let mut d = perm(0, 0);
+        for (k, want) in [
+            (Key::PageDown, 10),
+            (Key::WheelDown, 11),
+            (Key::PageUp, 1),
+            (Key::WheelUp, 0),
+            (Key::WheelUp, 0),
+        ] {
+            d = key(&plan, d, k).0.unwrap();
+            assert_eq!(d, perm(0, want), "{k:?}");
+        }
+        for _ in 0..5 {
+            d = key(&plan, d, Key::PageDown).0.unwrap();
+        }
+        assert_eq!(d, perm(0, 30), "held to its lines");
+        assert_eq!(key(&plan, perm(0, 99), Key::PageUp).0, Some(perm(0, 20)));
+    }
 }
