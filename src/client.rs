@@ -5196,4 +5196,285 @@ mod tests {
             assert_eq!(ui_of(&app).scroll, 0);
         }
     }
+
+    #[test]
+    fn the_menu_rebuilt_for_the_screen_lists_every_container_as_the_phones_home() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let rows = [row(RowKey::Slot("claude-3".into()), false, false)];
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", &rows));
+        app.heard(snap, Instant::now());
+        app.rebuild_menu(80, 30);
+        let v = app.menu.view();
+        assert_eq!((v.width, v.height, v.remote), (80, 30, true));
+        assert!(
+            app.menu
+                .all_rows()
+                .iter()
+                .any(|r| r.title == "term: immich upgrade"),
+            "{:?}",
+            app.menu.all_rows()
+        );
+    }
+
+    #[test]
+    fn the_conversations_status_line_totals_the_containers_answering_under_its_own_name() {
+        let mut app = app_in(&[]);
+        let place = |host: &str, reach: Reach, used: u64| {
+            let mut p = Place::new(host);
+            p.header.host = format!("{host}-host");
+            p.header.memory = Some((used << 30, 4 << 30));
+            p.reach = reach;
+            p
+        };
+        app.places.insert("h".into(), place("h", Reach::Up, 1));
+        app.places
+            .insert("x".into(), place("x", Reach::Down("gone".into()), 2));
+        hear(&mut app, r#"{"t":"pong"}"#);
+        let load = ui_of(&app).load.clone().expect("a status line");
+        assert_eq!(load.place, "h-host", "the container's own name");
+        assert_eq!(load.used, Some(1 << 30), "only what answers counts");
+    }
+
+    #[test]
+    fn a_drag_over_the_conversation_copies_what_it_covers_and_over_nothing_copies_nothing() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        let (w, _) = size();
+        let now = Instant::now();
+        // Under the banner, the prompt sent: row 5.
+        app.key(Key::Click { row: 4, col: 0 }, now);
+        app.key(Key::Drag { row: 5, col: 5 }, now);
+        app.key(
+            Key::Release {
+                row: 6,
+                col: w as u16 - 1,
+            },
+            now,
+        );
+        let clip = app.clip.take().expect("copied");
+        assert!(clip.contains("hello there"), "{clip:?}");
+        assert_eq!(ui_of(&app).status, Some(selection_copied(&clip)));
+        // Over blank rows only: nothing to copy, and the selection goes.
+        app.key(Key::Click { row: 8, col: 0 }, now);
+        app.key(Key::Drag { row: 9, col: 5 }, now);
+        app.key(Key::Release { row: 9, col: 9 }, now);
+        assert_eq!(app.clip, None);
+        assert_eq!(app.select, None);
+    }
+
+    #[test]
+    fn an_open_shells_output_is_asked_for_now_and_every_two_seconds_while_up() {
+        let mut app = app_in(&[TASKS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let open = |app: &mut App, i: usize| {
+            if let Screen::Conv { c, ui, .. } = &mut app.screen {
+                let mut v = tasks::View::default();
+                open_task(&mut v, &c.tasks[i]);
+                ui.dialog = Some(Dialog::Tasks(v));
+            }
+        };
+        let t0 = Instant::now();
+        open(&mut app, 0);
+        app.want_output(t0);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        app.want_output(t0 + Duration::from_secs(1));
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new(), "not yet");
+        app.want_output(t0 + OUTPUT_EVERY);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        // Another task's details: asked for at once.
+        open(&mut app, 1);
+        app.want_output(t0 + OUTPUT_EVERY + Duration::from_millis(500));
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"m1","t":"tout"}"#]);
+        // The link down: nothing goes, and it is asked for once it is back.
+        open(&mut app, 0);
+        app.down_since = Some(t0);
+        app.want_output(t0 + OUTPUT_EVERY * 3);
+        app.down_since = None;
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        app.want_output(t0 + OUTPUT_EVERY * 3);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        // Closed: nothing is wanted.
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = None;
+        }
+        app.want_output(t0 + OUTPUT_EVERY * 9);
+        assert_eq!(app.output_for, None);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_workflows_browser_asks_for_its_phases_and_the_open_agents_previews() {
+        let mut app = app_in(&[AGENTS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["read"],"ag":[{"l":"a","ph":1},{"l":"b","ph":1}]}"#).unwrap(),
+        ));
+        v.pane = tasks::Pane::Agents;
+        v.agent = 1;
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Tasks(v));
+        }
+        let t0 = Instant::now();
+        app.want_output(t0);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"wf1","t":"wf"}"#]);
+        if let Some(Dialog::Tasks(v)) = app_dialog_mut(&mut app) {
+            v.pane = tasks::Pane::Agent;
+        }
+        app.want_output(t0);
+        assert_eq!(
+            sent(&mut app, &rx),
+            [r#"{"a":1,"i":"wf1","t":"wf"}"#],
+            "its pane open: that agent's previews too, at once"
+        );
+    }
+
+    /// A conversation of `n` lines of text, its history said to go further back.
+    fn long_app(n: usize) -> App {
+        let lines: Vec<String> = (1..=n).map(|n| n.to_string()).collect();
+        let add = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"count"}"#, &add]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.more = true;
+        }
+        app
+    }
+
+    fn top(app: &App) -> usize {
+        let (w, h) = size();
+        let Screen::Conv { c, ui, .. } = &app.screen else {
+            panic!()
+        };
+        convo::max_scroll(c, ui, w, h)
+    }
+
+    #[test]
+    fn older_history_is_asked_for_once_fewer_than_five_screens_are_above_the_view() {
+        let (_, h) = size();
+        // Two or three screens above: asked for, once.
+        let mut app = long_app(3 * h);
+        assert!(
+            top(&app) > AHEAD + h && top(&app) < AHEAD * h,
+            "{}",
+            top(&app)
+        );
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"older"}"#]);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new(), "already asked");
+        // Nothing further back: nothing to ask for.
+        let mut app = long_app(3 * h);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.more = false;
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        // Plenty above already.
+        let mut app = long_app(8 * h);
+        assert!(top(&app) >= AHEAD * h);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        // No link: not asked, so asked once it is back.
+        let mut app = long_app(3 * h);
+        app.want_older();
+        assert!(!conv_of(&app).asking);
+    }
+
+    #[test]
+    fn a_draft_comes_back_unless_something_was_typed_before_the_conversation_was_known() {
+        let file = scratch_drafts("typed");
+        let kept = Draft {
+            text: "kept".into(),
+            cursor: 4,
+            pastes: Vec::new(),
+        };
+        drafts::save(&file, "h", "s1", Some(&kept), crate::clock::now());
+        let mut app = App::new("dev", 40, 24, 1);
+        app.drafts = Some(file.clone());
+        // Opened, its id not yet known, nothing typed: the kept draft comes back with it.
+        reopen(&mut app, &[]);
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "kept");
+        // Typed and rubbed out before the id came: the empty prompt is the newer.
+        reopen(&mut app, &[]);
+        type_in_only(&mut app, "x");
+        app.note_draft(Instant::now());
+        app.key(Key::Char('\x7f'), Instant::now());
+        app.note_draft(Instant::now());
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "");
+        // Typed in the same moment the id came: what was typed stays.
+        reopen(&mut app, &[]);
+        type_in_only(&mut app, "new");
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "new");
+    }
+
+    fn type_in_only(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+    }
+
+    #[test]
+    fn more_typed_into_a_kept_draft_waits_for_a_pause_too() {
+        let file = scratch_drafts("more");
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        let t0 = Instant::now();
+        app.note_draft(t0);
+        type_in_only(&mut app, "half");
+        app.note_draft(t0);
+        app.note_draft(t0 + DRAFT_QUIET);
+        let saved = || drafts::load(&file, "h", "s1").map(|d| d.text);
+        assert_eq!(saved(), Some("half".into()));
+        type_in_only(&mut app, "f");
+        app.note_draft(t0 + DRAFT_QUIET * 2);
+        assert_eq!(saved(), Some("half".into()), "still typing");
+        app.note_draft(t0 + DRAFT_QUIET * 3);
+        assert_eq!(saved(), Some("halff".into()));
+    }
+
+    #[test]
+    fn an_empty_prompt_never_wipes_the_draft_kept_for_another_conversation() {
+        let file = scratch_drafts("other");
+        let elsewhere = Draft {
+            text: "elsewhere".into(),
+            cursor: 0,
+            pastes: Vec::new(),
+        };
+        drafts::save(&file, "h", "s2", Some(&elsewhere), crate::clock::now());
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        app.note_draft(Instant::now());
+        // The slot's conversation changes under it, and it goes home in the same moment.
+        hear(&mut app, &meta("s2"));
+        app.home(None);
+        assert_eq!(
+            drafts::load(&file, "h", "s2").map(|d| d.text),
+            Some("elsewhere".into())
+        );
+    }
 }
