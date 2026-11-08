@@ -1631,7 +1631,13 @@ fn workflow_key(
 fn follow_prompts(c: &Convo, ui: &mut Ui) {
     let waiting = c.waiting();
     match (&ui.dialog, waiting) {
-        (None, Some(Entry::Perm { .. })) => ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 }),
+        (None, Some(Entry::Perm { .. })) => {
+            ui.dialog = Some(Dialog::Perm {
+                sel: 0,
+                top: 0,
+                typing: None,
+            })
+        }
         (None, Some(Entry::Ask { questions, .. })) => {
             ui.dialog = Some(Dialog::Ask {
                 q: 0,
@@ -2132,9 +2138,10 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
         _ => None,
     };
     match d {
-        Dialog::Perm { sel, top } => {
+        Dialog::Perm { sel, top, typing } => {
             let Some(Entry::Perm {
                 request_id,
+                tool,
                 always,
                 arg,
                 ..
@@ -2142,60 +2149,73 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             else {
                 return None;
             };
-            let opts = convo::perm_options(always);
+            let plan = tool == crate::reduce::PLAN_TOOL;
+            let opts: Vec<String> = if plan {
+                convo::PLAN_OPTIONS.iter().map(|o| o.to_string()).collect()
+            } else {
+                convo::perm_options(always)
+            };
+            let send = |out: &mut Vec<Value>, pairs: Vec<(&str, Value)>| {
+                let mut v = vec![("r", Value::string(request_id))];
+                v.extend(pairs);
+                out.push(m("perm", v));
+            };
+            let perm = |sel, top, typing| Some(Dialog::Perm { sel, top, typing });
+            // Typing on a plan's "Tell Claude what to change": Enter sends it as a No with
+            // words for Claude, which plans again with them; Esc goes back to the options.
+            if let Some(mut t) = typing {
+                match k {
+                    Key::Esc => return perm(sel, top, None),
+                    Key::Enter if t.trim().is_empty() => return perm(sel, top, None),
+                    Key::Enter => {
+                        send(
+                            out,
+                            vec![("a", Value::string("n")), ("x", Value::string(t.trim()))],
+                        );
+                        return None;
+                    }
+                    Key::Char('\x7f') | Key::Char('\x08') => {
+                        t.pop();
+                    }
+                    Key::Char(ch) if !ch.is_control() => t.push(ch),
+                    _ => {}
+                }
+                return perm(sel, top, Some(t));
+            }
             // A plan scrolls; held to its line count here, and to the screen when drawn.
             let most = arg.lines().count();
-            let answer = |i: usize| -> &'static str {
-                match (i, opts.len()) {
-                    (0, _) => "y",
-                    (1, 3) => "a",
-                    _ => "n",
-                }
-            };
             let pick = match k {
-                Key::Up => {
-                    return Some(Dialog::Perm {
-                        sel: sel.saturating_sub(1),
-                        top,
-                    });
-                }
-                Key::Down => {
-                    return Some(Dialog::Perm {
-                        sel: (sel + 1).min(opts.len() - 1),
-                        top,
-                    });
-                }
+                Key::Up => return perm(sel.saturating_sub(1), top, None),
+                Key::Down => return perm((sel + 1).min(opts.len() - 1), top, None),
                 Key::PageUp | Key::WheelUp => {
                     let step = if k == Key::PageUp { 10 } else { 1 };
-                    return Some(Dialog::Perm {
-                        sel,
-                        top: top.min(most).saturating_sub(step),
-                    });
+                    return perm(sel, top.min(most).saturating_sub(step), None);
                 }
                 Key::PageDown | Key::WheelDown => {
                     let step = if k == Key::PageDown { 10 } else { 1 };
-                    return Some(Dialog::Perm {
-                        sel,
-                        top: (top + step).min(most),
-                    });
+                    return perm(sel, (top + step).min(most), None);
                 }
                 Key::Enter => Some(sel),
-                Key::Esc => Some(opts.len() - 1),
+                // Esc is No, which stops the turn; for a plan, Claude Code's keep planning.
+                Key::Esc => {
+                    send(out, vec![("a", Value::string("n"))]);
+                    return None;
+                }
                 k => digit(k).filter(|i| *i < opts.len()),
             };
-            match pick {
-                Some(i) => {
-                    out.push(m(
-                        "perm",
-                        vec![
-                            ("r", Value::string(request_id)),
-                            ("a", Value::string(answer(i))),
-                        ],
-                    ));
-                    None
-                }
-                None => Some(Dialog::Perm { sel, top }),
-            }
+            let Some(i) = pick else {
+                return perm(sel, top, None);
+            };
+            let answer: Vec<(&str, Value)> = match (plan, i, opts.len()) {
+                // Auto mode rides on a Yes, so a relay that does not know `m` still allows.
+                (true, 0, _) => vec![("a", Value::string("y")), ("m", Value::string("auto"))],
+                (true, 1, _) | (false, 0, _) => vec![("a", Value::string("y"))],
+                (true, _, _) => return perm(i, top, Some(String::new())),
+                (false, 1, 3) => vec![("a", Value::string("a"))],
+                _ => vec![("a", Value::string("n"))],
+            };
+            send(out, answer);
+            None
         }
         Dialog::Ask {
             q,
@@ -3252,7 +3272,14 @@ mod tests {
         ]);
         let mut ui = Ui::new();
         follow_prompts(&c, &mut ui);
-        assert_eq!(ui.dialog, Some(Dialog::Perm { sel: 0, top: 0 }));
+        assert_eq!(
+            ui.dialog,
+            Some(Dialog::Perm {
+                sel: 0,
+                top: 0,
+                typing: None
+            })
+        );
         for (k, want) in [
             (Key::Enter, "y"),
             (Key::Char('2'), "a"),
@@ -3261,7 +3288,16 @@ mod tests {
         ] {
             let mut out = Vec::new();
             assert_eq!(
-                dialog_key(&c, Dialog::Perm { sel: 0, top: 0 }, k, &mut out),
+                dialog_key(
+                    &c,
+                    Dialog::Perm {
+                        sel: 0,
+                        top: 0,
+                        typing: None
+                    },
+                    k,
+                    &mut out
+                ),
                 None
             );
             assert_eq!(
@@ -3272,8 +3308,21 @@ mod tests {
         }
         let mut out = Vec::new();
         assert_eq!(
-            dialog_key(&c, Dialog::Perm { sel: 0, top: 0 }, Key::Down, &mut out),
-            Some(Dialog::Perm { sel: 1, top: 0 })
+            dialog_key(
+                &c,
+                Dialog::Perm {
+                    sel: 0,
+                    top: 0,
+                    typing: None
+                },
+                Key::Down,
+                &mut out
+            ),
+            Some(Dialog::Perm {
+                sel: 1,
+                top: 0,
+                typing: None
+            })
         );
         assert!(out.is_empty());
         // Answered elsewhere: the dialog goes.
@@ -3284,6 +3333,79 @@ mod tests {
         );
         follow_prompts(&c, &mut ui);
         assert_eq!(ui.dialog, None);
+    }
+
+    #[test]
+    fn a_plans_options_are_claude_codes_and_its_third_takes_words_for_claude() {
+        let c = convo_with(&[
+            r##"{"t":"add","id":1,"k":"perm","r":"p1","n":"ExitPlanMode","a":"# Plan\n\n1. Do it."}"##,
+        ]);
+        let start = |sel| Dialog::Perm {
+            sel,
+            top: 0,
+            typing: None,
+        };
+        let key = |d: Dialog, k: Key| {
+            let mut out = Vec::new();
+            let d = dialog_key(&c, d, k, &mut out);
+            (d, out.iter().map(line).collect::<Vec<_>>())
+        };
+        // 1: auto mode, on a Yes; 2: a plain Yes; Esc: No, which stops the turn.
+        for (k, want) in [
+            (Key::Enter, r#"{"a":"y","m":"auto","r":"p1","t":"perm"}"#),
+            (Key::Char('2'), r#"{"a":"y","r":"p1","t":"perm"}"#),
+            (Key::Esc, r#"{"a":"n","r":"p1","t":"perm"}"#),
+        ] {
+            assert_eq!(key(start(0), k), (None, vec![want.to_string()]), "{k:?}");
+        }
+        // 3 opens the row for typing; what is typed goes as a No with it, the turn going on.
+        let (d, out) = key(start(0), Key::Char('3'));
+        assert!(out.is_empty());
+        assert_eq!(
+            d,
+            Some(Dialog::Perm {
+                sel: 2,
+                top: 0,
+                typing: Some(String::new())
+            })
+        );
+        let mut d = d.unwrap();
+        for ch in "use a b".chars() {
+            d = key(d, Key::Char(ch)).0.unwrap();
+        }
+        d = key(d, Key::Char('\x7f')).0.unwrap();
+        d = key(d, Key::Char('x')).0.unwrap();
+        // Esc there goes back to the options, nothing sent.
+        assert_eq!(
+            key(d.clone(), Key::Esc),
+            (
+                Some(Dialog::Perm {
+                    sel: 2,
+                    top: 0,
+                    typing: None
+                }),
+                vec![]
+            )
+        );
+        assert_eq!(
+            key(d, Key::Enter),
+            (
+                None,
+                vec![r#"{"a":"n","r":"p1","t":"perm","x":"use a x"}"#.to_string()]
+            )
+        );
+        // An empty Enter sends nothing.
+        let d = key(start(0), Key::Char('3')).0.unwrap();
+        assert_eq!(key(d, Key::Enter), (Some(start(2)), vec![]));
+        // PgDn scrolls the plan, held to its length.
+        assert_eq!(
+            key(start(0), Key::PageDown).0,
+            Some(Dialog::Perm {
+                sel: 0,
+                top: 3,
+                typing: None
+            })
+        );
     }
 
     #[test]

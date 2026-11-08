@@ -1165,9 +1165,13 @@ const SPIN: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
 /// A dialog the client has open over the conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
-    /// Claude's permission prompt, the cursor on option `sel`, and how far a plan in it is
-    /// scrolled.
-    Perm { sel: usize, top: usize },
+    /// Claude's permission prompt, the cursor on option `sel`, how far a plan in it is
+    /// scrolled, and what is being typed for Claude on a plan's "Tell Claude what to change".
+    Perm {
+        sel: usize,
+        top: usize,
+        typing: Option<String>,
+    },
     /// A question: the tab in view (a question, or the Submit tab after the last where there
     /// are several), the cursor, each question's answer so far, what is typed for "Type
     /// something.", and each multi-select's ticks. Answers and ticks are by question, and
@@ -2232,65 +2236,109 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     (out, cursor)
 }
 
-fn perm_dialog(e: &Entry, sel: usize, top: usize, w: usize, h: usize) -> Vec<Line> {
-    let Entry::Perm {
-        tool,
-        arg,
-        description,
-        always,
-        ..
-    } = e
+fn perm_dialog(e: &Entry, d: &Dialog, w: usize, h: usize) -> Vec<Line> {
+    let (
+        Entry::Perm {
+            tool,
+            arg,
+            description,
+            always,
+            ..
+        },
+        Dialog::Perm { sel, top, typing },
+    ) = (e, d)
     else {
         return Vec::new();
     };
-    let plan = tool == crate::reduce::PLAN_TOOL;
+    if tool == crate::reduce::PLAN_TOOL {
+        return plan_dialog(arg, *sel, *top, typing.as_deref(), w, h);
+    }
     let mut out = vec![rule(w, "─", fg(LAVENDER))];
-    if plan {
-        // Claude Code's words for it, the plan as markdown under them.
-        out.push(line(" Ready to code?", bold(LAVENDER)));
-        out.push(line(" Here is Claude's plan:", PLAIN));
-    } else {
-        out.push(line(format!(" {}", perm_title(tool)), bold(LAVENDER)));
-        if !description.is_empty() {
-            out.extend(wrapped(description, " ", " ", w, PLAIN));
-        }
+    out.push(line(format!(" {}", perm_title(tool)), bold(LAVENDER)));
+    if !description.is_empty() {
+        out.extend(wrapped(description, " ", " ", w, PLAIN));
     }
     out.push(rule(w, "╌", fg(LAVENDER)));
-    if plan {
-        let body: Vec<Line> = crate::markdown::render(arg, w.saturating_sub(3))
-            .into_iter()
-            .map(|l| {
-                let mut row: Line = vec![(" ".into(), PLAIN)];
-                row.extend(l);
-                row
-            })
-            .collect();
-        // The rows the rest of the dialog leaves (a rule, the question, the options, a gap
-        // and the hints), and three kept for the transcript above.
-        let rest = perm_options(always).len() + 5;
-        let room = h.saturating_sub(out.len() + rest + 3).max(3);
-        out.extend(scrolled(body, top, room));
-    } else {
-        out.extend(wrapped(arg, " ", " ", w, PLAIN));
-    }
+    out.extend(wrapped(arg, " ", " ", w, PLAIN));
     out.push(rule(w, "╌", fg(LAVENDER)));
     out.push(line(" Do you want to proceed?", PLAIN));
-    for (i, opt) in perm_options(always).iter().enumerate() {
+    out.extend(option_rows(&perm_options(always), *sel, None, w));
+    out.push(Vec::new());
+    out.push(line(" Esc to cancel", fg(GREY)));
+    out
+}
+
+/// A prompt's numbered options, the cursor's in lavender. `typed` is what is being typed on
+/// the last option, which takes the place of its label, as on a question's "Type something.".
+fn option_rows(opts: &[String], sel: usize, typed: Option<&str>, w: usize) -> Vec<Line> {
+    let mut out = Vec::new();
+    for (i, opt) in opts.iter().enumerate() {
         let n = i + 1;
         let (first, st) = if i == sel {
             (format!(" ❯ {n}. "), fg(LAVENDER))
         } else {
             (format!("   {n}. "), PLAIN)
         };
-        out.extend(wrapped(opt, &first, "      ", w, st));
-    }
-    out.push(Vec::new());
-    if plan {
-        out.extend(hints(&["Esc to cancel", "PgUp/PgDn to scroll"], " ", w));
-    } else {
-        out.push(line(" Esc to cancel", fg(GREY)));
+        let label = match typed {
+            Some(t) if i + 1 == opts.len() => format!("{t}▏"),
+            _ => opt.clone(),
+        };
+        out.extend(wrapped(&label, &first, "      ", w, st));
     }
     out
+}
+
+/// `ExitPlanMode`'s options, as Claude Code 2.1.311 words them where auto mode is on offer
+/// (driven 2026-11-08): auto mode, manual, or words for Claude to plan again with.
+pub const PLAN_OPTIONS: [&str; 3] = [
+    "Yes, and use auto mode",
+    "Yes, manually approve edits",
+    "Tell Claude what to change",
+];
+
+/// `ExitPlanMode`'s prompt, laid out as Claude Code 2.1.311 draws it (driven 2026-11-08):
+/// "Ready to code?", the plan as markdown between dashed rules, then its question and
+/// options under a rule of their own. A plan taller than the screen leaves room for scrolls.
+fn plan_dialog(
+    plan: &str,
+    sel: usize,
+    top: usize,
+    typing: Option<&str>,
+    w: usize,
+    h: usize,
+) -> Vec<Line> {
+    let mut head = vec![rule(w, "─", fg(LAVENDER))];
+    head.push(line(" Ready to code?", bold(LAVENDER)));
+    head.push(Vec::new());
+    head.push(line(" Here is Claude's plan:", PLAIN));
+    head.push(rule(w, "╌", fg(LAVENDER)));
+    let body: Vec<Line> = crate::markdown::render(plan, w.saturating_sub(3))
+        .into_iter()
+        .map(|l| {
+            let mut row: Line = vec![(" ".into(), PLAIN)];
+            row.extend(l);
+            row
+        })
+        .collect();
+    let mut foot = vec![rule(w, "╌", fg(LAVENDER))];
+    foot.push(rule(w, "─", fg(LAVENDER)));
+    foot.extend(wrapped(
+        "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+        " ",
+        " ",
+        w,
+        PLAIN,
+    ));
+    foot.push(Vec::new());
+    let opts: Vec<String> = PLAN_OPTIONS.iter().map(|o| o.to_string()).collect();
+    foot.extend(option_rows(&opts, sel, typing, w));
+    foot.push(Vec::new());
+    foot.extend(hints(&["Esc to cancel", "PgUp/PgDn to scroll"], " ", w));
+    // The plan takes the screen: it is what the prompt is there to be read for.
+    let room = h.saturating_sub(head.len() + foot.len()).max(3);
+    head.extend(scrolled(body, top, room));
+    head.extend(foot);
+    head
 }
 
 /// `room` rows of `body` from row `top` (held to the last screenful), with `↑ n more` and
@@ -2964,9 +3012,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
             ask_top = true;
             ask_dialog(questions, d, w, h.saturating_sub(3))
         }
-        (Some(Dialog::Perm { sel, top }), Some(e @ Entry::Perm { .. })) => {
-            perm_dialog(e, *sel, *top, w, h)
-        }
+        (Some(d @ Dialog::Perm { .. }), Some(e @ Entry::Perm { .. })) => perm_dialog(e, d, w, h),
         _ => {
             // The suggestion list over the prompt, as Claude Code puts it.
             let list = if c.viewing.is_some() {
@@ -3790,7 +3836,11 @@ mod tests {
             ],
         );
         let mut ui = Ui::new();
-        ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 });
+        ui.dialog = Some(Dialog::Perm {
+            sel: 0,
+            top: 0,
+            typing: None,
+        });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         let mut want = mockup("R3");
         // The transcript's line is the request's own description, as claude sent it.
@@ -3819,20 +3869,44 @@ mod tests {
             ],
         );
         let mut ui = Ui::new();
-        ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 });
+        ui.dialog = Some(Dialog::Perm {
+            sel: 0,
+            top: 0,
+            typing: None,
+        });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(got.len(), 24, "{got:#?}");
         let at = |t: &str| got.iter().position(|l| l.trim_end() == t);
         let head = at(" Ready to code?").expect("titled as Claude Code titles it");
-        assert_eq!(got[head + 1].trim_end(), " Here is Claude's plan:");
+        assert_eq!(got[head + 1].trim_end(), "");
+        assert_eq!(got[head + 2].trim_end(), " Here is Claude's plan:");
         assert!(at(" Fix the dialog").is_some(), "{got:#?}");
         assert!(at(" 1. Step 1.").is_some(), "{got:#?}");
         let more = got.iter().filter(|l| l.contains("↓ ")).count();
         assert_eq!(more, 1, "the rest is said to be below: {got:#?}");
-        assert!(at(" Do you want to proceed?").is_some());
-        assert!(got.iter().any(|l| l.contains("❯ 1. Yes")));
+        assert!(
+            at(" Claude has written up a plan and is").is_some(),
+            "{got:#?}"
+        );
+        let opts: Vec<&str> = got
+            .iter()
+            .map(|l| l.trim_end())
+            .filter(|l| l.contains(". Yes") || l.contains(". Tell"))
+            .collect();
+        assert_eq!(
+            opts,
+            [
+                " ❯ 1. Yes, and use auto mode",
+                "   2. Yes, manually approve edits",
+                "   3. Tell Claude what to change",
+            ]
+        );
         // Scrolled to the end: the last step shows, and what is above is counted.
-        ui.dialog = Some(Dialog::Perm { sel: 0, top: 99 });
+        ui.dialog = Some(Dialog::Perm {
+            sel: 0,
+            top: 99,
+            typing: None,
+        });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert_eq!(got.len(), 24, "{got:#?}");
         assert!(
@@ -3841,6 +3915,17 @@ mod tests {
         );
         assert!(got.iter().any(|l| l.contains("↑ ")), "{got:#?}");
         assert!(!got.iter().any(|l| l.contains("↓ ")), "{got:#?}");
+        // Typing on the third: what is typed in its place, with the cursor after it.
+        ui.dialog = Some(Dialog::Perm {
+            sel: 2,
+            top: 0,
+            typing: Some("smaller steps".into()),
+        });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert!(
+            got.iter().any(|l| l.trim_end() == " ❯ 3. smaller steps▏"),
+            "{got:#?}"
+        );
     }
 
     #[test]

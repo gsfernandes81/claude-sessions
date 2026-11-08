@@ -27,6 +27,9 @@ pub enum Msg {
     },
     /// `system/status`: `requesting`, `compacting`, or none (back to idle or streaming).
     Status(Option<String>),
+    /// `system/status` with no status and a `permissionMode`: the session's mode changed, as
+    /// when a plan is approved (2.1.311, measured 2026-11-08).
+    ModeChanged(String),
     /// Streamed text for the content block `index` of the message `message_id` being written
     /// (the stream event's `api_message_id`, the same id its `assistant` line carries).
     TextDelta {
@@ -397,7 +400,15 @@ pub fn classify(v: &Value) -> Msg {
                     .filter_map(|c| c.as_str().map(String::from))
                     .collect(),
             },
-            "status" => Msg::Status(v.get("status").and_then(Value::as_str).map(String::from)),
+            "status" => {
+                let status = v.get("status").and_then(Value::as_str).map(String::from);
+                match v.get("permissionMode").and_then(Value::as_str) {
+                    Some(mode) if status.is_none() && !mode.is_empty() => {
+                        Msg::ModeChanged(mode.to_string())
+                    }
+                    _ => Msg::Status(status),
+                }
+            }
             "session_title_changed" => Msg::TitleChanged(s(v, "title")),
             "compact_boundary" => {
                 let meta = v.get("compact_metadata");
@@ -1446,6 +1457,25 @@ pub fn allow_always(request_id: &str, input: Value, suggestions: &[Value]) -> Va
     )
 }
 
+/// Allow a tool call and switch the session to `mode`: Claude Code's "Yes, and use auto
+/// mode" on a plan. Claude says the switch in a `system/status` line (2.1.311, measured
+/// 2026-11-08: `"permissionMode":"auto"`, and `default` after a plain allow).
+pub fn allow_with_mode(request_id: &str, input: Value, mode: &str) -> Value {
+    let set = obj(vec![
+        ("type", Value::string("setMode")),
+        ("mode", Value::string(mode)),
+        ("destination", Value::string("session")),
+    ]);
+    answer(
+        request_id,
+        obj(vec![
+            ("behavior", Value::string("allow")),
+            ("updatedInput", input),
+            ("updatedPermissions", Value::Arr(vec![set])),
+        ]),
+    )
+}
+
 /// Deny a tool call; `message` is what claude is told. With `interrupt`, the turn stops
 /// there, as Claude Code's own No stops it: claude answers with `[Request interrupted by
 /// user for tool use]` and ends the turn (2.1.311, measured 2026-11-06). Without, as for
@@ -1633,6 +1663,12 @@ mod tests {
                 r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}"#
             ),
             Msg::Status(None)
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"status","status":null,"permissionMode":"auto","uuid":"6a74","session_id":"8b87"}"#
+            ),
+            Msg::ModeChanged("auto".into())
         );
         assert_eq!(
             read(

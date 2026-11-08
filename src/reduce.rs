@@ -928,6 +928,13 @@ impl Reducer {
                 };
                 self.set_meta(&mut out, meta);
             }
+            Msg::ModeChanged(permission_mode) => {
+                let meta = Meta {
+                    permission_mode,
+                    ..self.meta.clone()
+                };
+                self.set_meta(&mut out, meta);
+            }
             Msg::Status(status) => match status.as_deref() {
                 Some("compacting") => self.set_state(&mut out, "compacting"),
                 Some(_) => self.set_state(&mut out, "working"),
@@ -2698,6 +2705,23 @@ mod tests {
         );
         let (p, n) = preview("\u{1b}[31mred\u{1b}[0m\n\n");
         assert_eq!((p, n), (vec!["red".to_string()], 1));
+    }
+
+    #[test]
+    fn a_mode_claude_says_it_switched_to_is_the_sessions_mode() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-5-5","permissionMode":"plan"}"#,
+            ],
+        );
+        assert_eq!(r.meta().permission_mode, "plan");
+        feed_all(
+            &mut r,
+            &[r#"{"type":"system","subtype":"status","status":null,"permissionMode":"auto"}"#],
+        );
+        assert_eq!(r.meta().permission_mode, "auto");
     }
 
     #[test]

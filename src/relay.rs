@@ -941,7 +941,12 @@ impl Relay {
                 let interrupt = t == "perm" && typed.is_none();
                 let no = typed.unwrap_or_else(|| DENY.to_string());
                 let line = match (t, s(v, "a").as_deref()) {
-                    ("perm", Some("y")) => sdk::allow(&r, input),
+                    // A plan's Yes may name the mode to work on in, as Claude Code's "Yes, and
+                    // use auto mode" does; a plain Yes leaves plan mode for manual.
+                    ("perm", Some("y")) => match s(v, "m").filter(|m| !m.is_empty()) {
+                        Some(mode) => sdk::allow_with_mode(&r, input, &mode),
+                        None => sdk::allow(&r, input),
+                    },
                     ("perm", Some("a")) => {
                         sdk::allow_always(&r, input, c.reducer.waiting_suggestions(&r))
                     }
@@ -2374,6 +2379,14 @@ mod tests {
             to_claude(&fx),
             [
                 r#"{"response":{"request_id":"p1","response":{"behavior":"allow","updatedInput":{"command":"touch x"}},"subtype":"success"},"type":"control_response"}"#
+            ]
+        );
+        // A Yes that names a mode switches to it, as a plan's "Yes, and use auto mode" does.
+        let fx = client(&mut r, r#"{"t":"perm","r":"p1","a":"y","m":"auto"}"#);
+        assert_eq!(
+            to_claude(&fx),
+            [
+                r#"{"response":{"request_id":"p1","response":{"behavior":"allow","updatedInput":{"command":"touch x"},"updatedPermissions":[{"destination":"session","mode":"auto","type":"setMode"}]},"subtype":"success"},"type":"control_response"}"#
             ]
         );
         let fx = client(&mut r, r#"{"t":"perm","r":"p1","a":"n"}"#);
