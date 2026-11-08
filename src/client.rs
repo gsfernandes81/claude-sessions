@@ -16,7 +16,7 @@
 //! Drawing writes only the rows that changed. Nothing is written while nothing happens, save
 //! the spinner while claude works and the seconds while the link is down.
 
-use crate::convo::{self, Applied, Convo, Dialog, Entry, Focus, Link, Ui};
+use crate::convo::{self, Applied, Convo, Dialog, Entry, Field, Focus, Link, Ui};
 use crate::drafts::{self, Draft};
 use crate::harness::Harness;
 use crate::json::{self, Value};
@@ -2283,15 +2283,30 @@ fn edit(ui: &mut Ui, k: Key) {
             return;
         }
     }
+    ui.cursor = edit_line(&mut chars, at, k);
+    ui.input = chars.into_iter().collect();
+}
+
+/// A dialog's text field takes a key as the prompt does, on its one line.
+fn edit_field(f: &mut Field, k: Key) {
+    let mut chars: Vec<char> = f.text.chars().collect();
+    let at = f.cursor.min(chars.len());
+    f.cursor = edit_line(&mut chars, at, k);
+    f.text = chars.into_iter().collect();
+}
+
+/// Typing, moving and deleting in `chars` with the cursor at `at`; where the cursor goes.
+fn edit_line(chars: &mut Vec<char>, at: usize, k: Key) -> usize {
     match k {
         Key::Char('\x7f') | Key::Char('\x08') if at > 0 => {
             chars.remove(at - 1);
-            ui.cursor = at - 1;
+            at - 1
         }
         Key::Delete if at < chars.len() => {
             chars.remove(at);
+            at
         }
-        Key::Left => ui.cursor = at.saturating_sub(1),
+        Key::Left => at.saturating_sub(1),
         // A word at a time, as Claude Code's prompt: back to the start of a word, on to the
         // end of one, a word being letters, digits and `_`.
         Key::WordLeft => {
@@ -2302,7 +2317,7 @@ fn edit(ui: &mut Ui, k: Key) {
             while i > 0 && is_word(chars[i - 1]) {
                 i -= 1;
             }
-            ui.cursor = i;
+            i
         }
         Key::WordRight => {
             let mut i = at;
@@ -2312,22 +2327,21 @@ fn edit(ui: &mut Ui, k: Key) {
             while i < chars.len() && is_word(chars[i]) {
                 i += 1;
             }
-            ui.cursor = i;
+            i
         }
-        Key::Right => ui.cursor = (at + 1).min(chars.len()),
-        Key::Home | Key::Char('\x01') => ui.cursor = 0,
-        Key::End | Key::Char('\x05') => ui.cursor = chars.len(),
+        Key::Right => (at + 1).min(chars.len()),
+        Key::Home | Key::Char('\x01') => 0,
+        Key::End | Key::Char('\x05') => chars.len(),
         Key::Char('\x15') => {
             chars.drain(..at);
-            ui.cursor = 0;
+            0
         }
         Key::Char(ch) if !ch.is_control() => {
             chars.insert(at, ch);
-            ui.cursor = at + 1;
+            at + 1
         }
-        _ => {}
+        _ => at,
     }
-    ui.input = chars.into_iter().collect();
 }
 
 /// A key while a dialog is open; what it leaves open.
@@ -2366,19 +2380,18 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
             if let Some(mut t) = typing {
                 match k {
                     Key::Esc => return perm(sel, top, None),
-                    Key::Enter if t.trim().is_empty() => return perm(sel, top, None),
+                    Key::Enter if t.text.trim().is_empty() => return perm(sel, top, None),
                     Key::Enter => {
                         send(
                             out,
-                            vec![("a", Value::string("n")), ("x", Value::string(t.trim()))],
+                            vec![
+                                ("a", Value::string("n")),
+                                ("x", Value::string(t.text.trim())),
+                            ],
                         );
                         return None;
                     }
-                    Key::Char('\x7f') | Key::Char('\x08') => {
-                        t.pop();
-                    }
-                    Key::Char(ch) if !ch.is_control() => t.push(ch),
-                    _ => {}
+                    k => edit_field(&mut t, k),
                 }
                 return perm(sel, top, Some(t));
             }
@@ -2410,7 +2423,7 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 // Auto mode rides on a Yes, so a relay that does not know `m` still allows.
                 (true, 0, _) => vec![("a", Value::string("y")), ("m", Value::string("auto"))],
                 (true, 1, _) | (false, 0, _) => vec![("a", Value::string("y"))],
-                (true, _, _) => return perm(i, top, Some(String::new())),
+                (true, _, _) => return perm(i, top, Some(Field::default())),
                 (false, 1, 3) => vec![("a", Value::string("a"))],
                 _ => vec![("a", Value::string("n"))],
             };
@@ -2507,19 +2520,15 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 match k {
                     Key::Esc => return ask(q, sel, answers, None, ticked),
                     Key::Enter => {
-                        let given = !t.is_empty();
-                        answers[q] = given.then_some(t);
+                        let given = !t.text.is_empty();
+                        answers[q] = given.then_some(t.text);
                         // A multi-select keeps its tab: what is typed joins what is ticked.
                         if question.multi || !given {
                             return ask(q, sel, answers, None, ticked);
                         }
                         return advance(answers, ticked, out);
                     }
-                    Key::Char('\x7f') | Key::Char('\x08') => {
-                        t.pop();
-                    }
-                    Key::Char(ch) if !ch.is_control() => t.push(ch),
-                    _ => {}
+                    k => edit_field(&mut t, k),
                 }
                 return ask(q, sel, answers, Some(t), ticked);
             }
@@ -2547,7 +2556,7 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                     .clone()
                     .filter(|t| question.multi || !question.options.iter().any(|o| o.0 == *t))
                     .unwrap_or_default();
-                return ask(q, i, answers, Some(before), ticked);
+                return ask(q, i, answers, Some(before.into()), ticked);
             }
             if question.multi {
                 if i < own {
@@ -3581,7 +3590,7 @@ mod tests {
             Some(Dialog::Perm {
                 sel: 2,
                 top: 0,
-                typing: Some(String::new())
+                typing: Some(Field::default())
             })
         );
         let mut d = d.unwrap();
@@ -3590,6 +3599,33 @@ mod tests {
         }
         d = key(d, Key::Char('\x7f')).0.unwrap();
         d = key(d, Key::Char('x')).0.unwrap();
+        // The field moves and edits as the prompt does: Home, a word on, a character on,
+        // Delete, a word back, End and Left.
+        for k in [
+            Key::Home,
+            Key::WordRight,
+            Key::Right,
+            Key::Delete,
+            Key::Char('n'),
+            Key::WordLeft,
+            Key::Char('_'),
+        ] {
+            d = key(d, k).0.unwrap();
+        }
+        assert_eq!(
+            d,
+            Dialog::Perm {
+                sel: 2,
+                top: 0,
+                typing: Some(Field {
+                    text: "use _n x".into(),
+                    cursor: 5
+                })
+            }
+        );
+        for k in [Key::End, Key::Left, Key::Char('y')] {
+            d = key(d, k).0.unwrap();
+        }
         // Esc there goes back to the options, nothing sent.
         assert_eq!(
             key(d.clone(), Key::Esc),
@@ -3606,7 +3642,7 @@ mod tests {
             key(d, Key::Enter),
             (
                 None,
-                vec![r#"{"a":"n","r":"p1","t":"perm","x":"use a x"}"#.to_string()]
+                vec![r#"{"a":"n","r":"p1","t":"perm","x":"use _n yx"}"#.to_string()]
             )
         );
         // An empty Enter sends nothing.

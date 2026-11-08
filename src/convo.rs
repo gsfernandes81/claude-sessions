@@ -1164,6 +1164,38 @@ const SPIN: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
 
 // ── what the client holds beside the conversation ───────────────────────────
 
+/// A dialog's one-line text field: what is typed, and the cursor, in chars into it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Field {
+    pub text: String,
+    pub cursor: usize,
+}
+
+impl Field {
+    /// What is typed with `▏` where the cursor is.
+    pub fn shown(&self) -> String {
+        let at = self.cursor.min(self.text.chars().count());
+        let mut out: String = self.text.chars().take(at).collect();
+        out.push('▏');
+        out.extend(self.text.chars().skip(at));
+        out
+    }
+}
+
+/// A field holding `text`, the cursor after it.
+impl From<String> for Field {
+    fn from(text: String) -> Self {
+        let cursor = text.chars().count();
+        Field { text, cursor }
+    }
+}
+
+impl From<&str> for Field {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
 /// A dialog the client has open over the conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
@@ -1172,7 +1204,7 @@ pub enum Dialog {
     Perm {
         sel: usize,
         top: usize,
-        typing: Option<String>,
+        typing: Option<Field>,
     },
     /// A question: the tab in view (a question, or the Submit tab after the last where there
     /// are several), the cursor, each question's answer so far, what is typed for "Type
@@ -1182,7 +1214,7 @@ pub enum Dialog {
         q: usize,
         sel: usize,
         answers: Vec<Option<String>>,
-        typing: Option<String>,
+        typing: Option<Field>,
         ticked: Vec<Vec<bool>>,
     },
     /// `/model`: the cursor, and the list once the relay has sent it.
@@ -2264,7 +2296,7 @@ fn perm_dialog(e: &Entry, d: &Dialog, w: usize, h: usize) -> Vec<Line> {
         return Vec::new();
     };
     if tool == crate::reduce::PLAN_TOOL {
-        return plan_dialog(arg, *sel, *top, typing.as_deref(), w, h);
+        return plan_dialog(arg, *sel, *top, typing.as_ref(), w, h);
     }
     let mut out = vec![rule(w, "─", fg(LAVENDER))];
     out.push(line(format!(" {}", perm_title(tool)), bold(LAVENDER)));
@@ -2283,7 +2315,7 @@ fn perm_dialog(e: &Entry, d: &Dialog, w: usize, h: usize) -> Vec<Line> {
 
 /// A prompt's numbered options, the cursor's in lavender. `typed` is what is being typed on
 /// the last option, which takes the place of its label, as on a question's "Type something.".
-fn option_rows(opts: &[String], sel: usize, typed: Option<&str>, w: usize) -> Vec<Line> {
+fn option_rows(opts: &[String], sel: usize, typed: Option<&Field>, w: usize) -> Vec<Line> {
     let mut out = Vec::new();
     for (i, opt) in opts.iter().enumerate() {
         let n = i + 1;
@@ -2293,7 +2325,7 @@ fn option_rows(opts: &[String], sel: usize, typed: Option<&str>, w: usize) -> Ve
             (format!("   {n}. "), PLAIN)
         };
         let label = match typed {
-            Some(t) if i + 1 == opts.len() => format!("{t}▏"),
+            Some(t) if i + 1 == opts.len() => t.shown(),
             _ => opt.clone(),
         };
         out.extend(wrapped(&label, &first, "      ", w, st));
@@ -2316,7 +2348,7 @@ fn plan_dialog(
     plan: &str,
     sel: usize,
     top: usize,
-    typing: Option<&str>,
+    typing: Option<&Field>,
     w: usize,
     h: usize,
 ) -> Vec<Line> {
@@ -2591,7 +2623,7 @@ fn ask_dialog(questions: &[Question], d: &Dialog, w: usize, room: usize) -> Vec<
             };
             let typed_row = i == q.options.len();
             let label = match (typing, typed_row, &typed) {
-                (Some(t), true, _) if i == *sel => format!("{t}▏"),
+                (Some(t), true, _) if i == *sel => t.shown(),
                 (_, true, Some(t)) => t.clone(),
                 _ => label.clone(),
             };
@@ -3937,6 +3969,20 @@ mod tests {
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         assert!(
             got.iter().any(|l| l.trim_end() == " ❯ 3. smaller steps▏"),
+            "{got:#?}"
+        );
+        // Moved back into what is typed, the cursor is drawn there.
+        ui.dialog = Some(Dialog::Perm {
+            sel: 2,
+            top: 0,
+            typing: Some(Field {
+                text: "smaller steps".into(),
+                cursor: 7,
+            }),
+        });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert!(
+            got.iter().any(|l| l.trim_end() == " ❯ 3. smaller▏ steps"),
             "{got:#?}"
         );
     }

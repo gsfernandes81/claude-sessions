@@ -553,7 +553,10 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        a conversation and its id arriving, if the view leaves in that moment.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
      Ctrl-U; Ctrl or Alt with Left or Right a word at a time, back to a word's start and on to
-     its end, as Claude Code's prompt goes; the prompt soft-wraps at words, the space a row breaks on hanging at its end so
+     its end, as Claude Code's prompt goes — the same keys edit a dialog's text field, a
+     question's "Type something." and a plan's "Tell Claude what to change", on its one line,
+     its `▏` drawn at the cursor (before 2026-11-08 those only typed and took Backspace at the
+     end); the prompt soft-wraps at words, the space a row breaks on hanging at its end so
      no row starts with one, as editors and Claude Code do, and a prompt taller than half the
      screen shows half the screen's rows, scrolled to keep the cursor in them, `↑` or `↓`
      leading a row with more past it; `\` then Enter is a newline, as in Claude Code; Up and Down move between the prompt's rows, and off its top or bottom row step through what
