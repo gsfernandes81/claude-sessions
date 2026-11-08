@@ -6635,6 +6635,11 @@ mod tests {
         assert_eq!(key(mode(2), Key::Left).0, Some(mode(2)));
         assert_eq!(key(mode(2), Key::Esc), (None, String::new()));
         assert_eq!(key(mode(last), Key::Enter).1, r#"{"m":"auto","t":"mode"}"#);
+        assert_eq!(
+            key(mode(9), Key::Enter).1,
+            r#"{"m":"auto","t":"mode"}"#,
+            "a choice past the end is the last"
+        );
     }
 
     #[test]
