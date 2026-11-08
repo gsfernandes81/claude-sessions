@@ -1242,13 +1242,27 @@ fn a_local_claudes_record_is_named_as_other_containers_list_it_and_keeps_it_thro
 }
 
 #[test]
-fn another_local_claude_lists_a_named_one_and_reaches_it_by_that_name() {
-    let Some(mut rig) = Rig::start("localpeer", Arc::new(|_| Reply::Text("ok".into())), None)
-    else {
+fn a_message_between_two_local_slots_passes_through_the_relay_with_the_verified_sender() {
+    // claude-1 replies to what it is sent, to its `from`, as Claude Code tells it to.
+    let reply_to = |r: &Request| {
+        r.texts()
+            .iter()
+            .find(|t| t.contains("msg 1"))
+            .and_then(|t| attr(t, "from"))
+            .unwrap_or_default()
+    };
+    let replying = send_message(reply_to, "pong");
+    let script: Script = Arc::new(move |r: &Request| {
+        if r.mentions("msg 1") {
+            replying(r)
+        } else {
+            Reply::Text("ok".into())
+        }
+    });
+    let Some(mut rig) = Rig::start("twoslots", script, None) else {
         return;
     };
-    rig.named_near();
-    // A second claude in the same container, in no slot: it only lists and sends.
+    // A second claude, in slot claude-2 of the same container.
     let api = FakeApi::start(on_each_prompt());
     let mut other = claude_command(&real_claude().unwrap(), &rig.dir, &api.url, None)
         .stdin(Stdio::piped())
@@ -1263,9 +1277,35 @@ fn another_local_claude_lists_a_named_one_and_reaches_it_by_that_name() {
             let _ = self.0.wait();
         }
     }
+    let pid = other.id();
     let mut other_in = other.stdin.take().unwrap();
     let other_out = lines(other.stdout.take().unwrap());
     let _other = Kill(other);
+    let record = rig.dir.join(format!("cc/sessions/{pid}.json"));
+    let until = Instant::now() + WAIT;
+    while !fs::read_to_string(&record).is_ok_and(|t| t.contains("messagingSocketPath")) {
+        assert!(Instant::now() < until, "the second claude wrote no record");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    fs::write(
+        rig.dir.join("registry/claude-2.json"),
+        format!(
+            r#"{{"slot":"claude-2","state":"live","pid":{pid},"proc_start":{start},"title":"two",
+                "session_id":"s2","cwd":"{work}","needs_you":false,"busy":false,
+                "registered":true,"last_activity_ms":{at}}}"#,
+            start = start_time(pid),
+            work = rig.dir.join("work").display(),
+            at = now_ms(),
+        ),
+    )
+    .unwrap();
+    fs::write(rig.dir.join("zmx/claude-2"), format!("{pid} 0\n")).unwrap();
+    rig.named_near();
+    let until = Instant::now() + WAIT;
+    while !fs::read_to_string(&record).is_ok_and(|t| t.contains("near/claude-2 two")) {
+        assert!(Instant::now() < until, "the second claude was never named");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let mut ask = |text: &str| {
         let v = obj(vec![
             ("type", Value::string("user")),
@@ -1282,21 +1322,57 @@ fn another_local_claude_lists_a_named_one_and_reaches_it_by_that_name() {
         first(&other_out, WAIT, |v| str_of(v, &["type"]) == Some("result"))
             .unwrap_or_else(|| panic!("the second claude's turn for {text:?} never ended"));
     };
+
+    // claude-2 lists claude-1 by its name and sends to it: the agent, fronting claude-1's
+    // inbox, hands it to the hub as from claude-2.
     ask("list");
-    let listed = api
-        .wait_for(WAIT, |r| r.results().iter().any(|(n, _)| n == "ListAgents"))
-        .expect("the second claude listed");
-    let (_, text) = listed
+    let (_, text) = api
+        .requests()
+        .last()
+        .unwrap()
         .results()
         .into_iter()
         .find(|(n, _)| n == "ListAgents")
         .unwrap();
-    assert!(
-        text.lines().any(|l| l.contains(NEAR)),
-        "the slot's claude is listed by its name: {text}"
-    );
+    assert!(text.contains(NEAR), "{text}");
     ask(&format!("send to {NEAR}"));
+    let p = first(&rig.agent_out, WAIT, |v| {
+        v.get("peer")
+            .is_some_and(|p| str_of(p, &["to"]) == Some("near/claude-1"))
+    })
+    .unwrap_or_else(|| panic!("the local send never reached the agent\n{}", rig.story()));
+    let p = &p["peer"];
+    assert_eq!(
+        str_of(p, &["from"]),
+        Some("claude-2"),
+        "the slot at the socket's other end"
+    );
+
+    // The hub hands it back, and it reaches claude-1 from claude-2's name, never the name
+    // claude-2's Claude Code calls itself.
+    rig.tell(obj(vec![(
+        "deliver",
+        obj(vec![
+            ("to", Value::string("claude-1")),
+            ("from", Value::string("near/claude-2")),
+            ("frame", p["frame"].clone()),
+        ]),
+    )]));
     let seen = seen_by_model(&rig.api, "msg 1", WAIT)
-        .unwrap_or_else(|| panic!("the named claude never got the message\n{}", rig.story()));
-    assert!(seen.contains("msg 1"));
+        .unwrap_or_else(|| panic!("claude-1 never got it\n{}", rig.story()));
+    assert_eq!(
+        attr(&seen, "from-name").as_deref(),
+        Some("near/claude-2 two"),
+        "{seen}"
+    );
+
+    // Its reply, to claude-2's own address, comes back through the agent too.
+    let back = first(&rig.agent_out, WAIT, |v| {
+        v.get("peer").is_some_and(|p| {
+            str_of(p, &["to"]) == Some("near/claude-2")
+                && str_of(p, &["frame", "type"]) == Some("user")
+        })
+    })
+    .unwrap_or_else(|| panic!("the reply never reached the agent\n{}", rig.story()));
+    assert_eq!(str_of(&back["peer"], &["from"]), Some("claude-1"));
 }

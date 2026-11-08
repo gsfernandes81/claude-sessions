@@ -31,8 +31,10 @@ between containers (design § *Agent messaging*, 2026-11-06; it replaced agent m
 container's agent holds a stand-in socket and session record for every slot in the other
 containers, so `ListAgents` lists the fleet as `repo/slot` and the conversation's title
 (design § *A peer's name*, 2026-11-08) and `SendMessage` reaches it by that name; a local
-claude's own session record is given the same name. The
-hub's router passes frames between agents and keeps a message for an offloaded slot on disk.
+claude's own session record is given the same name, and its inbox is fronted by the relay
+(its socket moved aside, the relay listening at its path), so a local message passes through
+the hub too. The hub's router passes frames between agents and keeps a message for an
+offloaded slot on disk.
 Who sent a message is ours to say, never the sender's: the socket's peer pid names the slot,
 the ssh connection names the container, and `from-name` is rewritten to that address (and
 its title) on delivery. The relay rides an undocumented Claude Code protocol, so it checks the protocol

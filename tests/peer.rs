@@ -445,7 +445,20 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
             "b/claude-2 claude-2 put away"
         ]
     );
-    assert_eq!(names("b"), ["a/claude-1 claude-1 at work"]);
+    // b also stands in for its own offloaded slot, so its own sessions can message it and wake
+    // it; its own live one is fronted instead: its socket moved aside, the relay at its path.
+    assert_eq!(
+        names("b"),
+        [
+            "a/claude-1 claude-1 at work",
+            "b/claude-2 claude-2 put away"
+        ]
+    );
+    let until = Instant::now() + WAIT;
+    while !root.d("a").join(".real-in.sock").exists() {
+        assert!(Instant::now() < until, "a's live claude was never fronted");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // a/claude-1 writes to its stand-in for b/claude-1, claiming a name of its own.
     let a_sock = root.d("a").join("in.sock");
@@ -604,6 +617,15 @@ fn a_relay_switches_itself_off_for_a_claude_that_speaks_another_protocol() {
     root.route("a b");
     root.stand_in("a", "b/claude-1");
     let to_a1 = root.stand_in("b", "a/claude-1");
+    let moved = root.d("b").join(".real-in.sock");
+    let until = Instant::now() + WAIT;
+    while !moved.exists() {
+        assert!(
+            Instant::now() < until,
+            "calibration: b's claude was fronted"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     // b's claude now speaks protocol 2: b's stand-ins go and the router is told.
     root.claim_protocol("b", 2);
@@ -613,6 +635,24 @@ fn a_relay_switches_itself_off_for_a_claude_that_speaks_another_protocol() {
     while !root.stand_ins("b").is_empty() || to_a1.exists() {
         assert!(Instant::now() < until, "b's stand-ins stayed");
         std::thread::sleep(Duration::from_millis(100));
+    }
+    // And its claude's socket is put back, so b's own sessions reach it directly again.
+    while moved.exists() {
+        assert!(
+            Instant::now() < until,
+            "b's claude's socket was not put back"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    UnixStream::connect(root.d("b").join("in.sock")).unwrap();
+    b_in.set_nonblocking(true).unwrap();
+    let until = Instant::now() + WAIT;
+    while b_in.accept().is_err() {
+        assert!(
+            Instant::now() < until,
+            "in.sock reaches b's claude itself again"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
     // A message for b is bounced by its agent, and kept rather than lost.
     let a_sock = root.d("a").join("in.sock");

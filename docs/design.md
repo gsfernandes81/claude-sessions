@@ -1101,10 +1101,33 @@ conversation's own name: `infra/claude-4 tunnel cert renewal` (`peer::listed_nam
   a `/rename`, which writes a custom title into the transcript (2.1.311), so it would replace
   the owner's titles in the menu and in Claude Code's picker and come back into the address.
   Claude Code merges each update of its own into the record as it finds it, so the name stays
-  until Claude Code names the session itself, and is written again within ten seconds. The
-  session's own idea of its name is untouched, so a message one local session sends another
-  directly, with no relay between, still carries Claude Code's name for the sender in
-  `from-name`; a reply goes to its `from`, which is unaffected.
+  until Claude Code names the session itself, and is written again within ten seconds.
+- **A local message passes through the relay** (owner, 2026-11-08, so that its `from-name` is
+  the sender's listed name and not what the sender's Claude Code calls itself). The relay
+  fronts each live local claude's inbox (`peer::Fronted`): it renames the claude's listening
+  socket to `.real-<name>` beside it, which a listening Unix socket survives, and listens at
+  the old path itself. The record, and the session's idea of itself, still name that path, so
+  the session is not listed to itself: Claude Code leaves a session out of its own listing
+  only when the record's socket is textually its own, and a record pointing anywhere else
+  lists the session as its own peer (both measured against 2.1.311). Every other session
+  connecting to that path reaches the relay, which hands the message to the hub as it does one
+  for another container, from the slot at the socket's other end; the router now routes within
+  a container as between them; and the relay writes it into the moved socket with the sender's
+  path (fronted too) as `from` and its listed name as `from-name`. A reply comes back the same
+  way. The router also sends each container its own slots (`"own"`), so the relay stands in for
+  an offloaded local slot as for another container's, and a local message to one is kept and
+  wakes it.
+- **Putting it back.** When the relay stops, loses its lock or switches itself off, every
+  fronted socket goes back to its path, so local sessions reach each other directly again. A
+  relay killed outright cannot; the next one's sweep puts back each `.real-<name>` whose path
+  no longer answers, and until then those sessions are not listed (Claude Code lists only a
+  record whose socket answers). A claude that binds a new socket, or leaves, is let go at the
+  relay's next look.
+- **What it costs.** Local messaging now depends on the relay and the hub, as messaging
+  between containers does: with the hub down, the agents go, and their sockets are put back,
+  so local sessions fall back to Claude Code's own direct delivery, with its names. A claude in
+  no slot has no address, so what it sends a fronted session is dropped, as what it sends a
+  stand-in always was.
 - **From a peer.** A delivered message's `from-name` is the name the sender's stand-in here is
   listed by, so it reads as the listing does. It starts with the address the hub verified;
   the title after it is the sender's conversation's, which is the owner's or Claude Code's to
@@ -1144,7 +1167,7 @@ the agent wire (`proto.rs`):
 
 | | |
 |---|---|
-| `{"roster":[{repo,slot,title,busy,live}…],"you":repo}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent; `title` is the conversation's own name, empty while it has none; `you` is the container's own repo |
+| `{"roster":[{repo,slot,title,busy,live}…],"you":repo,"own":[…]}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent; `title` is the conversation's own name, empty while it has none; `you` is the container's own repo, and `own` its own slots |
 | `{"peer":{from,to,frame}}` | agent → hub: a frame local slot `from` wrote to the stand-in for `to` |
 | `{"deliver":{to,from,frame}}` | hub → agent: write `frame`, from `from`, into local slot `to` |
 | `{"bounce":{to,from,frame,why}}` | agent → hub: it could not be written yet (no claude or inbox, relay off) |
@@ -1230,7 +1253,8 @@ Left unset, Claude Code holds a message from a sender in another permission clas
 approval, and a headless slot has nowhere to approve it. Auto mode is in the `prompting`
 class, as is every slot by default, but a slot started in `bypassPermissions` is not.
 
-**Not carried:** pi slots (out of scope, owner 2026-11-06), a claude in no slot, and anything
+**Not carried:** pi slots (out of scope, owner 2026-11-06), a claude in no slot (not even to a
+session in its own container, whose inbox the relay fronts), and anything
 to the owner. Claude Code's GrowthBook flags can change its messaging without a version
 change: a risk the owner accepted.
 
@@ -1243,8 +1267,9 @@ account is used, and each test reads as the promise it checks:
 - a stand-in is listed, and a dead one is not;
 - a stand-in is listed by its address and title, and reached by that name in another case
   with hyphens for spaces;
-- a local claude's own record named so, kept through a turn, and another local claude listing
-  it and reaching it by that name;
+- a local claude's own record named so, and kept through a turn;
+- a message between two local slots handed to the hub from the sender's slot, reaching the
+  other from the sender's listed name, and its reply coming back through the relay too;
 - a renamed stand-in is refused by its old name, even by a session that sent to it under
   that name, and listed by its new name with the old one beside it, which then reaches it;
 - a send to a stand-in reaches the agent from the sender's slot, and nothing is carried from

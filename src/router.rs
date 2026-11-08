@@ -118,6 +118,24 @@ impl Fleet {
         self.up.get(repo).copied().unwrap_or(false) && self.slot(repo, slot).is_some_and(|s| s.live)
     }
 
+    /// `host`'s own slots, as its agent is told them beside the roster: it fronts the running
+    /// ones' inboxes and stands in for the rest, so a local message passes through the hub as
+    /// another container's does (`peer::Fronted`).
+    pub fn own_for(&self, host: &str) -> Vec<Entry> {
+        self.slots
+            .get(host)
+            .into_iter()
+            .flatten()
+            .map(|s| Entry {
+                repo: host.to_string(),
+                slot: s.slot.clone(),
+                title: s.title.clone(),
+                busy: s.live && s.busy,
+                live: s.live,
+            })
+            .collect()
+    }
+
     /// What `host`'s agent is to hold stand-ins for: every slot in every other container.
     pub fn roster_for(&self, host: &str) -> Vec<Entry> {
         self.slots
@@ -232,8 +250,10 @@ pub fn route(fleet: &Fleet, host: &str, peer: &Value, now: u64) -> Route {
     let Some((repo, slot)) = peer::split_addr(to) else {
         return Route::Drop(format!("{to:?} is not an address"));
     };
-    if repo == host {
-        return Route::Drop("its own container's sessions are reached without the hub".into());
+    // A local message passes through here too (its container's agent fronts every inbox), but
+    // a session is never listed to itself.
+    if repo == host && slot == from_slot {
+        return Route::Drop(format!("{to} sent to itself"));
     }
     if fleet.slot(repo, slot).is_none() {
         return Route::Drop(format!("no slot {to}"));
@@ -578,16 +598,19 @@ fn rosters(router: &Router) {
                 .map(Entry::to_value)
                 .collect(),
         );
-        if lock(&router.sent).get(&host) == Some(&entries) {
+        let own = Value::Arr(fleet.own_for(&host).iter().map(Entry::to_value).collect());
+        let mut msg = Value::obj();
+        msg.set("roster", entries);
+        // The container's own repo, which it cannot name itself: its local sessions are listed
+        // under it (`peer::front_locals`); and its own slots. An agent older than either reads
+        // only the roster.
+        msg.set("you", Value::string(&host));
+        msg.set("own", own);
+        if lock(&router.sent).get(&host) == Some(&msg) {
             continue;
         }
-        let mut msg = Value::obj();
-        msg.set("roster", entries.clone());
-        // The container's own repo, which it cannot name itself: its local sessions are listed
-        // under it (`peer::local_name`). An agent older than that reads only the roster.
-        msg.set("you", Value::string(&host));
         if conn.tell(&msg).is_ok() {
-            lock(&router.sent).insert(host, entries);
+            lock(&router.sent).insert(host, msg);
         }
     }
 }
@@ -989,6 +1012,35 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_between_two_slots_of_one_container_goes_through_the_hub_like_any_other() {
+        let mut f = fleet();
+        f.slots.get_mut("a").unwrap().push(slot("claude-2", true));
+        match route(&f, "a", &peer_msg("claude-1", "a/claude-2", "user"), 5) {
+            Route::Deliver(repo, item) => {
+                assert_eq!(repo, "a", "back to its own container");
+                assert_eq!(item.from, "a/claude-1");
+            }
+            other => panic!("{other:?}"),
+        }
+        // An offloaded one's message is kept, to wake it, as another container's is.
+        assert!(matches!(
+            route(&f, "b", &peer_msg("claude-1", "b/claude-2", "user"), 5),
+            Route::Keep(_)
+        ));
+        // And its agent is told its own slots beside the roster, which leaves them out.
+        let own: Vec<(String, bool)> = f
+            .own_for("b")
+            .into_iter()
+            .map(|e| (e.addr(), e.live))
+            .collect();
+        assert_eq!(
+            own,
+            [("b/claude-1".into(), true), ("b/claude-2".into(), false)]
+        );
+        assert!(f.roster_for("b").iter().all(|e| e.repo != "b"));
+    }
+
+    #[test]
     fn a_frame_goes_to_a_live_slot_now_and_waits_for_one_that_is_not() {
         let f = fleet();
         match route(&f, "a", &peer_msg("claude-1", "b/claude-1", "user"), 5) {
@@ -1042,7 +1094,7 @@ mod tests {
             (
                 "a",
                 peer_msg("claude-1", "a/claude-1", "user"),
-                "its own container",
+                "sent to itself",
             ),
             ("a", peer_msg("claude-1", "b", "user"), "is not an address"),
             (

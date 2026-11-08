@@ -182,6 +182,14 @@ pub fn serve() -> io::Result<()> {
         };
         if let Some(roster) = msg.get("roster").and_then(Value::as_arr) {
             let entries = roster.iter().filter_map(peer::Entry::from_value).collect();
+            // This container's own slots, from a router that sends them.
+            let own = msg
+                .get("own")
+                .and_then(Value::as_arr)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(peer::Entry::from_value)
+                .collect();
             // From a router older than the field, none: local sessions keep Claude Code's names.
             let you = msg
                 .get("you")
@@ -193,7 +201,7 @@ pub fn serve() -> io::Result<()> {
                     let out = agent.out.clone();
                     peer::Relay::start(Arc::new(move |v| out.send(&v)))
                 })
-                .set_roster(entries, you);
+                .set_roster(entries, you, own);
             continue;
         }
         if let Some(slot) = msg

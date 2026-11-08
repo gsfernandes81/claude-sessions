@@ -13,9 +13,13 @@
 //! a `pidDomain` of our own. Claude Code takes a record from a foreign pid domain as present
 //! without a pid check, as long as its socket answers. A local claude then lists
 //! `repo/slot` and its title ([`listed_name`]), and what it sends there reaches the agent,
-//! which hands it to the hub. A
-//! message from the hub is written into the local slot's own socket, with `from` naming the
-//! sender's stand-in here, so a reply comes back the same way.
+//! which hands it to the hub. A message from the hub is written into the local slot's own
+//! socket, with `from` naming the sender's stand-in here, so a reply comes back the same way.
+//!
+//! **This container's own sessions go the same way.** The relay fronts each live local
+//! claude's inbox ([`Fronted`]): its socket moved aside, the relay listening at its path. So
+//! what one local session sends another reaches the relay too, goes through the hub, and
+//! arrives with the sender's listed name, as from another container.
 //!
 //! **One process both delivers and listens.** A receiving claude reads the delivering pid
 //! from the socket (`SO_PEERCRED`) and replies only to a socket that same pid listens on.
@@ -581,12 +585,78 @@ impl Drop for StandIn {
     }
 }
 
+/// Where a fronted claude's own socket is moved: beside its path, as `.real-<name>`, so a
+/// relay that starts after one that died can put it back ([`Relay::sweep`]).
+pub fn moved_path(sock: &Path) -> PathBuf {
+    let name = sock
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    sock.with_file_name(format!(".real-{name}"))
+}
+
+/// A live local claude whose inbox the relay fronts (owner, 2026-11-08), so that what another
+/// local session sends it passes through the relay as what another container sends does, and
+/// arrives with the verified sender's name.
+///
+/// **Its socket is moved, not its record changed.** Claude Code leaves a session out of its own
+/// listing only when the record's socket is textually its own (2.1.311), so a record pointing
+/// elsewhere lists the session as its own peer. Instead its listening socket is renamed to
+/// [`moved_path`] (a listening Unix socket keeps working under a new name) and the relay binds
+/// its own at the old path: the record, and the session's idea of itself, still name that path;
+/// everyone else connecting to it reaches the relay; the relay writes into the moved socket.
+/// Measured 2026-11-08: the session neither lists itself nor notices, and takes what is written
+/// to the moved socket.
+struct Fronted {
+    pid: u32,
+    /// The session's socket path, where the relay listens.
+    path: PathBuf,
+    /// Where its own socket now is, and what is written to.
+    real: PathBuf,
+    /// The relay's socket's inode, to know the path is still the relay's.
+    ino: u64,
+    /// The name it is listed by: what `from-name` says on what it sends.
+    name: String,
+    stop: Arc<AtomicBool>,
+}
+
+impl Fronted {
+    fn ours(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&self.path).is_ok_and(|m| m.ino() == self.ino)
+    }
+}
+
+impl Drop for Fronted {
+    /// Put the session's own socket back, so it is reached directly again; or, when its path
+    /// is no longer the relay's (the session left, or bound a new socket), drop the moved one.
+    fn drop(&mut self) {
+        let ours = self.ours();
+        self.stop.store(true, Ordering::SeqCst);
+        if ours {
+            // Wake its accept, so its thread sees the stop and ends.
+            let _ = UnixStream::connect(&self.path);
+            let _ = fs::remove_file(&self.path);
+            if let Err(e) = fs::rename(&self.real, &self.path) {
+                log(&format!("peer: putting back {}: {e}", self.path.display()));
+            }
+        } else {
+            let _ = fs::remove_file(&self.real);
+        }
+    }
+}
+
 struct State {
     lock: Option<SlotLock>,
     roster: Vec<Entry>,
+    /// This container's own slots that are not running, as the hub sees them: stood in for as
+    /// another container's are, so a local session can message one and wake it.
+    own: Vec<Entry>,
     /// This container's repo, as the hub names it: what its local sessions are listed under.
     repo: Option<String>,
     stand_ins: HashMap<String, StandIn>,
+    /// Live local claudes, by slot.
+    fronted: HashMap<String, Fronted>,
     off: Option<String>,
 }
 
@@ -610,8 +680,10 @@ impl Relay {
             state: Mutex::new(State {
                 lock: None,
                 roster: Vec::new(),
+                own: Vec::new(),
                 repo: None,
                 stand_ins: HashMap::new(),
+                fronted: HashMap::new(),
                 off: None,
             }),
         });
@@ -646,8 +718,10 @@ impl Relay {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Remove stand-ins an earlier agent left: records in our pid domain, and their sockets.
+    /// Remove stand-ins an earlier agent left: records in our pid domain, and their sockets;
+    /// and put back the sockets of the claudes it fronted, which it could not if it was killed.
     fn sweep(&self) {
+        restore_moved(&self.socks);
         let Ok(entries) = fs::read_dir(&self.sessions) else {
             return;
         };
@@ -682,19 +756,22 @@ impl Relay {
     pub fn stop(&self) {
         let mut st = self.lock();
         st.stand_ins.clear();
+        st.fronted.clear();
         st.roster.clear();
+        st.own.clear();
         st.lock = None;
     }
 
-    /// The hub's roster: every slot in the other containers; and this container's own repo,
-    /// when the hub says it.
-    pub fn set_roster(self: &Arc<Self>, roster: Vec<Entry>, repo: Option<String>) {
+    /// The hub's roster: every slot in the other containers; this container's own repo, when
+    /// the hub says it; and its own slots, of which those not running are stood in for.
+    pub fn set_roster(self: &Arc<Self>, roster: Vec<Entry>, repo: Option<String>, own: Vec<Entry>) {
         {
             let mut st = self.lock();
             st.roster = roster;
             if repo.is_some() {
                 st.repo = repo;
             }
+            st.own = own;
         }
         self.apply();
     }
@@ -725,10 +802,20 @@ impl Relay {
         }
         if st.lock.is_none() || st.off.is_some() {
             st.stand_ins.clear();
+            st.fronted.clear();
             return;
         }
-        let wanted: HashMap<String, Entry> =
-            st.roster.iter().map(|e| (e.addr(), e.clone())).collect();
+        // A live local slot is fronted, not stood in for: its claude's own record lists it.
+        let running: Vec<String> = local_claudes().into_iter().map(|(s, _)| s).collect();
+        let own = st.own.iter().filter(|e| {
+            st.repo.as_deref() == Some(e.repo.as_str()) && !e.live && !running.contains(&e.slot)
+        });
+        let wanted: HashMap<String, Entry> = st
+            .roster
+            .iter()
+            .chain(own)
+            .map(|e| (e.addr(), e.clone()))
+            .collect();
         st.stand_ins.retain(|addr, _| wanted.contains_key(addr));
         for (addr, e) in wanted {
             let changed = st.stand_ins.get(&addr).map(|s| s.entry != e);
@@ -764,13 +851,15 @@ impl Relay {
         let repo = st.repo.clone();
         drop(st);
         if let Some(repo) = repo {
-            self.name_locals(&repo);
+            self.front_locals(&repo);
         }
     }
 
-    /// Give each local claude's record its name, as another container lists it: its
-    /// `repo/slot` and title (`name_local`).
-    fn name_locals(&self, repo: &str) {
+    /// Each live local claude: its record given its name, as another container lists it (its
+    /// `repo/slot` and title, `name_local`), and its inbox fronted ([`Fronted`]). A claude that
+    /// has gone, or bound a new socket, is let go first.
+    fn front_locals(self: &Arc<Self>, repo: &str) {
+        let mut wanted: HashMap<String, (u32, String, PathBuf)> = HashMap::new();
         for r in running_claudes() {
             let Some(pid) = r.pid else { continue };
             let (title, named) = r.row_titles();
@@ -781,11 +870,91 @@ impl Relay {
             match name_local(&self.sessions, pid, &name, crate::clock::now()) {
                 Ok(true) => log(&format!("peer: {} is listed here as {name:?}", r.slot)),
                 Ok(false) => {}
-                // No record yet: a claude just starting, named at the next look.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                // No record yet: a claude just starting, named and fronted at the next look.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => log(&format!("peer: naming {}: {e}", r.slot)),
             }
+            if let Some(inbox) = inbox_of(&self.sessions, pid) {
+                wanted.insert(r.slot, (pid, name, inbox.socket));
+            }
         }
+        let mut st = self.lock();
+        if st.lock.is_none() || st.off.is_some() {
+            return;
+        }
+        st.fronted.retain(|slot, f| {
+            wanted
+                .get(slot)
+                .is_some_and(|(pid, _, path)| *pid == f.pid && *path == f.path && f.ours())
+        });
+        for (slot, (pid, name, path)) in wanted {
+            if let Some(f) = st.fronted.get_mut(&slot) {
+                f.name = name;
+                continue;
+            }
+            // A path already fronted is the relay's own socket now, never to be moved again
+            // (two slots naming one claude, as only a test arranges).
+            if st.fronted.values().any(|f| f.path == path) {
+                continue;
+            }
+            match self.front(repo, &slot, pid, &path, name) {
+                Ok(f) => {
+                    log(&format!("peer: {slot}'s inbox is fronted"));
+                    st.fronted.insert(slot, f);
+                }
+                Err(e) => log(&format!("peer: fronting {slot}: {e}")),
+            }
+        }
+    }
+
+    /// Move `path`, a local claude's listening socket, aside and listen there in its place.
+    fn front(
+        self: &Arc<Self>,
+        repo: &str,
+        slot: &str,
+        pid: u32,
+        path: &Path,
+        name: String,
+    ) -> io::Result<Fronted> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if !fs::symlink_metadata(path)?.file_type().is_socket() {
+            return Err(io::Error::other(format!("{} is no socket", path.display())));
+        }
+        let real = moved_path(path);
+        let _ = fs::remove_file(&real);
+        fs::rename(path, &real)?;
+        let listener = match UnixListener::bind(path) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = fs::rename(&real, path);
+                return Err(e);
+            }
+        };
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        let ino = fs::symlink_metadata(path)?.ino();
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay = self.clone();
+        let addr = format!("{repo}/{slot}");
+        let halt = stop.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if halt.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(conn) = conn else { continue };
+                let relay = relay.clone();
+                let addr = addr.clone();
+                std::thread::spawn(move || relay.take(conn, &addr));
+            }
+        });
+        Ok(Fronted {
+            pid,
+            path: path.to_path_buf(),
+            real,
+            ino,
+            name,
+            stop,
+        })
     }
 
     fn write_record(&self, s: &StandIn) -> io::Result<()> {
@@ -932,7 +1101,7 @@ impl Relay {
                 "{to}'s claude does not speak peer protocol {PROTOCOL}"
             )));
         }
-        let (stand_in, from_name) = {
+        let (stand_in, from_name, socket) = {
             let mut st = self.lock();
             if st.lock.is_none() {
                 return Err(Later("another agent holds this container's relay".into()));
@@ -940,21 +1109,39 @@ impl Relay {
             if let Some(why) = &st.off {
                 return Err(Later(format!("the relay is off: {why}")));
             }
-            if !st.stand_ins.contains_key(from_addr) {
-                // A sender the roster has not reached yet: it needs a stand-in to reply to.
-                let (repo, slot) = split_addr(from_addr).unwrap_or_default();
-                let e = Entry {
-                    repo: repo.into(),
-                    slot: slot.into(),
-                    title: String::new(),
-                    busy: true,
-                    live: true,
-                };
-                let s = self.open(&e).map_err(|e| Later(format!("stand-in: {e}")))?;
-                st.stand_ins.insert(from_addr.to_string(), s);
+            // A fronted claude is written to where its socket was moved: its path is the
+            // relay's own.
+            let socket = match st.fronted.values().find(|f| f.pid == pid) {
+                Some(f) => f.real.clone(),
+                None => inbox.socket.clone(),
+            };
+            // A sender in this container replies to its own path, which the relay fronts.
+            let (repo, slot) = split_addr(from_addr).unwrap_or_default();
+            if st.repo.as_deref() == Some(repo) {
+                if let Some(f) = st.fronted.get(slot) {
+                    (f.path.clone(), f.name.clone(), socket)
+                } else {
+                    return Err(Later(format!(
+                        "{from_addr}'s inbox is not fronted here yet"
+                    )));
+                }
+            } else {
+                if !st.stand_ins.contains_key(from_addr) {
+                    // A sender the roster has not reached yet: it needs a stand-in to reply to.
+                    let (repo, slot) = split_addr(from_addr).unwrap_or_default();
+                    let e = Entry {
+                        repo: repo.into(),
+                        slot: slot.into(),
+                        title: String::new(),
+                        busy: true,
+                        live: true,
+                    };
+                    let s = self.open(&e).map_err(|e| Later(format!("stand-in: {e}")))?;
+                    st.stand_ins.insert(from_addr.to_string(), s);
+                }
+                let s = &st.stand_ins[from_addr];
+                (s.sock.clone(), s.entry.listed(), socket)
             }
-            let s = &st.stand_ins[from_addr];
-            (s.sock.clone(), s.entry.listed())
         };
         let out = rewrite(frame, &stand_in, &from_name)
             .ok_or_else(|| Never("not a message Claude Code would take".into()))?;
@@ -964,11 +1151,36 @@ impl Relay {
             return Err(Never("over Claude Code's line cap".into()));
         }
         let mut s =
-            UnixStream::connect(&inbox.socket).map_err(|e| Later(format!("{to}'s inbox: {e}")))?;
+            UnixStream::connect(&socket).map_err(|e| Later(format!("{to}'s inbox: {e}")))?;
         let _ = s.set_write_timeout(Some(WRITE_WAIT));
         s.write_all(line.as_bytes())
             .and_then(|()| s.shutdown(std::net::Shutdown::Write))
             .map_err(|e| Later(format!("{to}'s inbox: {e}")))
+    }
+}
+
+/// Put back each claude socket a relay moved aside and could not restore (it was killed): a
+/// `.real-<name>` whose path no longer answers goes back to its path. One whose path answers
+/// is stale (the claude bound another socket since) and goes.
+fn restore_moved(socks: &Path) {
+    let Ok(entries) = fs::read_dir(socks) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(orig) = name.strip_prefix(".real-") else {
+            continue;
+        };
+        let (real, path) = (e.path(), socks.join(orig));
+        if UnixStream::connect(&path).is_ok() {
+            let _ = fs::remove_file(&real);
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+        match fs::rename(&real, &path) {
+            Ok(()) => log(&format!("peer: put back {}", path.display())),
+            Err(e) => log(&format!("peer: putting back {}: {e}", path.display())),
+        }
     }
 }
 
@@ -1312,6 +1524,82 @@ mod tests {
         // Counted in characters, as Claude Code counts them.
         let wide = listed_name("a/claude-1", &"é".repeat(100));
         assert_eq!(wide.chars().count(), MAX_LISTED);
+    }
+
+    /// Whether `listener`, a stand-in claude's own socket, takes a connection within a second.
+    fn answers(listener: &UnixListener) -> bool {
+        listener.set_nonblocking(true).unwrap();
+        for _ in 0..100 {
+            if listener.accept().is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_fronted_inbox_is_moved_aside_reached_there_and_put_back() {
+        let dir = std::env::temp_dir().join(format!("cs-front-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("123.sock");
+        let claude = UnixListener::bind(&path).unwrap();
+        let relay = Arc::new(Relay {
+            tell: Arc::new(|_| {}),
+            sessions: dir.join("sessions"),
+            socks: dir.clone(),
+            state: Mutex::new(State {
+                lock: None,
+                roster: Vec::new(),
+                own: Vec::new(),
+                repo: None,
+                stand_ins: HashMap::new(),
+                fronted: HashMap::new(),
+                off: None,
+            }),
+        });
+        UnixStream::connect(&path).unwrap();
+        assert!(
+            answers(&claude),
+            "calibration: the claude's own socket answers"
+        );
+
+        let f = relay
+            .front("near", "claude-1", 7, &path, "near/claude-1 t".into())
+            .unwrap();
+        assert!(f.ours());
+        assert_eq!(f.real, dir.join(".real-123.sock"));
+        // Its path is the relay's now; its own socket answers where it was moved.
+        UnixStream::connect(&path).unwrap();
+        assert!(
+            !answers(&claude),
+            "a connection to its path reaches the relay"
+        );
+        UnixStream::connect(&f.real).unwrap();
+        assert!(answers(&claude), "the moved socket is still the claude's");
+
+        drop(f);
+        assert!(!dir.join(".real-123.sock").exists());
+        UnixStream::connect(&path).unwrap();
+        assert!(
+            answers(&claude),
+            "put back, its path reaches it directly again"
+        );
+
+        // A relay killed while fronting leaves the claude's socket aside and a dead one at its
+        // path; the next relay's sweep puts it back.
+        fs::rename(&path, moved_path(&path)).unwrap();
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(
+            UnixStream::connect(&path).is_err(),
+            "calibration: nothing answers"
+        );
+        restore_moved(&dir);
+        UnixStream::connect(&path).unwrap();
+        assert!(answers(&claude));
+        assert!(!moved_path(&path).exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
