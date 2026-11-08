@@ -67,6 +67,7 @@ pub(crate) fn home_header() -> Header {
     Header {
         host: menu::host(),
         memory: statusline::pool(),
+        swap: statusline::pool_swap(),
         load: statusline::host_load(),
     }
 }
@@ -162,6 +163,7 @@ impl Hub {
                     .entry(name.clone())
                     .or_insert_with(|| Place::new(&name));
                 place.header.memory = None;
+                place.header.swap = None;
                 place.reach = Reach::Down(why);
             }
         }
@@ -818,6 +820,7 @@ mod tests {
         Header {
             host: "hub".into(),
             memory: None,
+            swap: None,
             load: None,
         }
     }

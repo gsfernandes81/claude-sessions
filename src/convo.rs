@@ -1608,7 +1608,8 @@ pub(crate) fn rule(w: usize, glyph: &str, st: St) -> Line {
 /// The ssh sessions' status line (`statusline.rs`), its figures in its words: a figure past
 /// its first threshold yellow and past its second red, as there; the words say it all
 /// without them. After the conversation's `container/slot` where that fits (R1 at 80), else
-/// as an ssh session prints it, else its figures alone, so a phone keeps the load in view.
+/// as an ssh session prints it, else its figures alone, else its figures squeezed —
+/// `RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0.7` — so a phone keeps all three in view.
 fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     use crate::statusline::Level;
     let paint = |lvl: Level| match lvl {
@@ -1616,20 +1617,28 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
         Level::Warn => fg(YELLOW),
         Level::Calm => fg(GREY),
     };
-    let (ram, rl) = f.ram();
-    let (load, ll) = f.load();
-    let figures = width(&ram) + 2 + width(&load);
+    let (mut ram, rl) = f.ram();
+    let (mut swap, sl) = f.swap();
+    let (mut load, ll) = f.load();
+    let figures = |r: &str, s: &str, l: &str| width(r) + 2 + width(s) + 2 + width(l);
     let room = w.saturating_sub(3);
-    let (before, after) = if width(place) + 3 + figures <= room {
+    let whole = figures(&ram, &swap, &load);
+    let (before, after) = if width(place) + 3 + whole <= room {
         (format!("{place} · "), String::new())
-    } else if figures + 2 + width(f.place()) <= room {
+    } else if whole + 2 + width(f.place()) <= room {
         (String::new(), format!(", {}", f.place()))
     } else {
+        if whole > room {
+            let squeeze = |t: &str| t.replacen(": ", " ", 1).replace("G / ", "/");
+            (ram, swap, load) = (squeeze(&ram), squeeze(&swap), squeeze(&load));
+        }
         (String::new(), String::new())
     };
     let parts = [
         (format!("  {before}"), fg(GREY)),
         (ram, paint(rl)),
+        (", ".into(), fg(GREY)),
+        (swap, paint(sl)),
         (", ".into(), fg(GREY)),
         (load, paint(ll)),
         (after, fg(GREY)),
@@ -1907,10 +1916,11 @@ fn reconnecting_line(
     if let Some(f) = load {
         let room = w.saturating_sub(width(down) + 3);
         let figures = status_line(place, f, room);
-        let (ram, _) = f.ram();
-        let (load, _) = f.load();
-        let whole = width(&plain(&figures)) >= 2 + width(&ram) + 2 + width(&load)
-            && !plain(&figures).ends_with('…');
+        let drawn = plain(&figures);
+        let whole = [f.ram().0, f.swap().0, f.load().0]
+            .iter()
+            .all(|t| drawn.contains(t.as_str()))
+            && !drawn.ends_with('…');
         if whole {
             let mut l = figures;
             l.push((" · ".into(), fg(GREY)));
@@ -3227,6 +3237,7 @@ mod tests {
         crate::statusline::Figures {
             used: Some(g(used_g)),
             total: Some(g(total_g)),
+            swap: Some((g(0.1), g(4.0))),
             load: Some(load),
             cores: Some(4),
             place: "claude-sessions".into(),
@@ -3696,11 +3707,17 @@ mod tests {
         // R1 at 80, in mockups-80.md.
         assert_eq!(
             at(80),
-            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7"
+            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7"
         );
-        // Where that does not fit, the ssh session's own line, then its figures alone.
-        assert_eq!(at(52), "  RAM: 0.9G / 2.0G, Load: 0.7, claude-sessions");
-        assert_eq!(at(40), "  RAM: 0.9G / 2.0G, Load: 0.7");
+        // Where that does not fit, the ssh session's own line, then its figures alone, then
+        // squeezed, all three still there at a phone's 40.
+        assert_eq!(
+            at(70),
+            "  RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7, claude-sessions"
+        );
+        assert_eq!(at(52), "  RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7");
+        assert_eq!(at(40), "  RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0.7");
+        assert_eq!(at(39), "  RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0…");
         // statusline.rs's levels: RAM past 70% and load past 0.7 a core are yellow, past 85%
         // and 1.0 a core red.
         let hot = status_line("x/y", &figures(1.8, 2.0, 300), 40);
@@ -4397,16 +4414,18 @@ mod tests {
         };
         assert_eq!(
             at(80),
-            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
+            "  RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
         );
         assert_eq!(
-            at(70),
-            "  RAM: 0.9G / 2.0G, Load: 0.7, claude-sessions · ⠋ Reconnecting… (8s)"
+            at(110),
+            "  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
         );
         assert_eq!(
-            at(60),
-            "  RAM: 0.9G / 2.0G, Load: 0.7 · ⠋ Reconnecting… (8s)"
+            at(95),
+            "  RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7, claude-sessions · ⠋ Reconnecting… (8s)"
         );
+        // Squeezed is not whole: the link's state takes the line.
+        assert_eq!(at(60), "  ⠋ Reconnecting… (8s)");
         assert_eq!(at(40), "  ⠋ Reconnecting… (8s)");
         assert_eq!(
             plain(&reconnecting_line("x/y", None, down, 80)),

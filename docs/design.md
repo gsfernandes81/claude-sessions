@@ -574,9 +574,12 @@ quiet for ten minutes, detached and not kept alive, is offloaded. `src/activity.
 
 ## The status line
 
-`claude-sessions statusline` prints `RAM: 1.9G / 3.0G, Load: 2.3, or3-dev` (owner,
-2026-10-06; 36 columns, inside the 40 a phone shows) for Claude Code's status line, and the
-menu draws the same line at the foot of the door (below). **Its figures are every
+`claude-sessions statusline` prints `RAM: 1.9G / 3.0G, Swap: 0.2G / 4.0G, Load: 2.3, or3-dev`
+(owner, 2026-10-06; swap split out beside RAM on 2026-11-08: "Split RAM into RAM and SWAP for
+the statusline in claude remote and in each claude session") for Claude Code's status line,
+and the menu draws the same figures at the foot of the door (below), squeezed to
+`RAM 1.9/3.0G, Swap 0.2/4.0G, Load 2.3` with the place left off where they do not fit, as the
+remote view's status line is. **Its figures are every
 container's** (owner, 2026-10-27: "total ram and total cpu in all sessions"; "all sessions =
 every container the hub reaches"; "CPU = same load average (sum of every container if
 possible, host total otherwise)"):
@@ -589,6 +592,15 @@ possible, host total otherwise)"):
   answering container's figures added up. **For a session's line to show the pool, infra
   mounts the pool read-only into each dev container and sets `CLAUDE_SESSIONS_POOL` there**,
   as it does in the hub; until it does, a session's line shows its own container's figure.
+- **Swap is read from where RAM is**, and said beside it, never added to it (`memory.current`
+  does not count swap): the cgroup's `memory.swap.current` against its `memory.swap.max`,
+  capped at the host's `SwapTotal` since a cgroup can swap no more than the host has — or,
+  with no memory limit, the host's `SwapTotal` less `SwapFree`. No swap at all is
+  `Swap: none`. An agent sends its container's swap in its header beside its memory, only
+  where it has a memory limit (absent from an older agent: unknown); the door's figure for
+  the remote view is the pool's, else those added up. Containers whose swap ceiling is
+  `max` each say the host's whole swap, so that sum can overstate it, as a sum of memory
+  ceilings can overstate the host's RAM.
 - **Load is the one-minute load average, counted once per machine.** `/proc/loadavg` is not
   namespaced: every container on one host reads the same host-wide figure, so a sum over
   containers would count that host once per container. Each reading carries the kernel's
@@ -600,7 +612,7 @@ possible, host total otherwise)"):
 - The last part names where the line is read: the container's hostname in a session, the
   hub's at the door. Anything unreadable is a `?`.
 
-**RAM turns yellow at 70% and red at 85%; load at 0.7 and 1.0 per logical core**
+**RAM and swap turn yellow at 70% and red at 85%; load at 0.7 and 1.0 per logical core**
 (`/sys/devices/system/cpu/online`) — the machines', against all their cores, because the load
 average counts the whole machine too. The figures carry the meaning, colour is emphasis on
 top, and `NO_COLOR` turns it off. Yellow here is the owner's choice for this line

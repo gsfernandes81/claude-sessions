@@ -98,6 +98,7 @@ impl Place {
             header: Header {
                 host: name.to_string(),
                 memory: None,
+                swap: None,
                 load: None,
             },
             workspace: "/workspace".to_string(),
@@ -536,6 +537,7 @@ impl Menu {
         crate::statusline::door(
             self.home.load.clone(),
             self.home.memory,
+            self.home.swap,
             answering,
             &self.home.host,
         )
@@ -1116,6 +1118,7 @@ mod tests {
         Header {
             host: "infra-dev".into(),
             memory: None,
+            swap: None,
             load: None,
         }
     }

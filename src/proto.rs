@@ -166,6 +166,12 @@ pub fn header_to(h: &Header) -> Value {
             arr([Value::num(used as f64), Value::num(limit as f64)]),
         );
     }
+    if let Some((used, total)) = h.swap {
+        o.set(
+            "swap",
+            arr([Value::num(used as f64), Value::num(total as f64)]),
+        );
+    }
     if let Some(l) = &h.load {
         let mut load = obj(vec![
             ("centi", Value::num(l.centi as f64)),
@@ -180,13 +186,15 @@ pub fn header_to(h: &Header) -> Value {
 }
 
 pub fn header_from(v: &Value) -> Header {
-    let memory = v
-        .get("memory")
-        .and_then(Value::as_arr)
-        .and_then(|m| match m {
+    let pair = |key: &str| {
+        v.get(key).and_then(Value::as_arr).and_then(|m| match m {
             [used, limit] => Some((used.as_u64()?, limit.as_u64()?)),
             _ => None,
-        });
+        })
+    };
+    let memory = pair("memory");
+    // An agent older than the swap figure sends none: unknown, never zero.
+    let swap = pair("swap");
     // An agent older than the load line sends none, and its machine's load is then unknown —
     // not zero, which would be a guess.
     let load = v.get("load").and_then(|l| {
@@ -199,6 +207,7 @@ pub fn header_from(v: &Value) -> Header {
     Header {
         host: s(v, "host").unwrap_or_default(),
         memory,
+        swap,
         load,
     }
 }
@@ -510,6 +519,7 @@ mod tests {
         let header = Header {
             host: "infra-dev".into(),
             memory: Some((812 << 20, 1 << 30)),
+            swap: Some((5 << 20, 4 << 30)),
             load: Some(HostLoad {
                 centi: 231,
                 cores: Some(4),
@@ -525,6 +535,7 @@ mod tests {
         let bare = Header {
             host: "x".into(),
             memory: None,
+            swap: None,
             load: None,
         };
         assert_eq!(
@@ -537,6 +548,8 @@ mod tests {
         // is on is no reading: either is unknown, never zero.
         let old = json::parse(r#"{"host":"x","memory":[1,2]}"#).unwrap();
         assert_eq!(header_from(&old).load, None);
+        assert_eq!(header_from(&old).swap, None);
+        assert_eq!(header_from(&old).memory, Some((1, 2)), "calibration");
         let nameless = json::parse(r#"{"host":"x","load":{"centi":50,"boot":""}}"#).unwrap();
         assert_eq!(header_from(&nameless).load, None);
         // Calibration: the same with its machine named is read.

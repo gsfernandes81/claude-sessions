@@ -76,6 +76,23 @@ pub fn read_at(dir: &str) -> Memory {
     }
 }
 
+/// Swap charged to a cgroup v2 directory and its swap ceiling: `memory.swap.current`, and
+/// `memory.swap.max` (`None` where it says `max`, or cannot be read). Swap is not in
+/// `memory.current`, so it is said beside the working set, never added to it.
+pub fn swap_at(dir: &str) -> (Option<u64>, Option<u64>) {
+    let max = match fs::read_to_string(format!("{dir}/memory.swap.max")) {
+        Ok(s) if s.trim() == "max" => None,
+        Ok(s) => s.trim().parse().ok(),
+        Err(_) => None,
+    };
+    (read_u64(&format!("{dir}/memory.swap.current")), max)
+}
+
+/// [`swap_at`] for this container's own cgroup.
+pub fn swap() -> (Option<u64>, Option<u64>) {
+    swap_at(&cgroup())
+}
+
 /// One `key value` line of a cgroup v2 stat file. The key must match whole: `memory.stat`
 /// also has `inactive_file` beside `active_file`, and `memory.events` has `oom_group_kill`
 /// beside `oom_kill`.

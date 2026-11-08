@@ -114,6 +114,9 @@ fn header() -> Header {
     Header {
         host: menu::host(),
         memory: m.limit.zip(m.used()).map(|(limit, used)| (used, limit)),
+        // Beside the memory only: a container with no limit would say the host's swap, which
+        // the door would then add once per container.
+        swap: m.limit.and_then(|_| crate::statusline::own_swap()),
         load: crate::statusline::host_load(),
     }
 }

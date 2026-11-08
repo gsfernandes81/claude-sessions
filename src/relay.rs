@@ -1941,6 +1941,7 @@ mod tests {
                 header: Header {
                     host: host.into(),
                     memory: None,
+                    swap: None,
                     load: None,
                 },
                 workspace: "/workspace".into(),

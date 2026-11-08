@@ -25,7 +25,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 2 — Nothing open
@@ -39,7 +39,7 @@ infra-dev · nothing open · 812M of 1.0G
   s   a shell instead
 ────────────────────────────────────────────────────────────────────────────────
 n new   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 3 — retired 2026-10-27
@@ -110,7 +110,7 @@ infra-dev · 6 open · 1.0G of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
 detached · it is still running
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 1.0G / 1.0G, Load: 2.3, infra-dev
+RAM: 1.0G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 7 — The keys, on ?
@@ -134,7 +134,7 @@ Archived   ended, still resumable; Enter
 !          a prompt is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 8 — The hint line as the terminal narrows
@@ -201,7 +201,7 @@ infra-dev · 2 open · 812M of 1.0G
   smartd on one                                                              63d
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 10 — The first frame, while the list is read
@@ -212,7 +212,7 @@ infra-dev · 812M of 1.0G
 ⠋ reading sessions
 ────────────────────────────────────────────────────────────────────────────────
 n new   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ### Mockup 11 — Offloading a session with `c`, the spinner turning
@@ -233,7 +233,7 @@ infra-dev · 6 open · 812M of 1.0G
 ────────────────────────────────────────────────────────────────────────────────
 ⠋ offloading session
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM: 0.8G / 1.0G, Swap: 0.1G / 4.0G, Load: 2.3, infra-dev
 ```
 
 ## The hub (2026-10-26)
@@ -257,7 +257,7 @@ dev · 4 containers · 1.9G of 3.0G
   ds-dev                                                           not answering
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM: 1.9G / 3.0G, Swap: 0.1G / 4.0G, Load: 2.3, dev
 ```
 
 ### Mockup 13 — One container, from the home
@@ -277,7 +277,7 @@ infra-dev · 6 open · 812M of 1.0G
 ── Archived · 7 · Enter shows ──────────────────────────────────────────────────
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi   Esc back
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM: 1.9G / 3.0G, Swap: 0.1G / 4.0G, Load: 2.3, dev
 ```
 
 ### Mockup 14 — A container not answering
@@ -292,7 +292,7 @@ ds-dev · not answering
   Esc back to every container
 ────────────────────────────────────────────────────────────────────────────────
 ? keys   s shell   Esc back
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM: 1.9G / 3.0G, Swap: 0.1G / 4.0G, Load: 2.3, dev
 ```
 
 ### Mockup 15 — The keys, at the home
@@ -314,7 +314,7 @@ Containers every one the hub reaches,
 !          a session is waiting for you
 ────────────────────────────────────────────────────────────────────────────────
 Enter open   n new   c close   ? keys   s shell   p new pi
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM: 1.9G / 3.0G, Swap: 0.1G / 4.0G, Load: 2.3, dev
 ```
 
 ## The remote view at 80 columns (2026-11-01)
@@ -345,7 +345,7 @@ Approved with the 40-column set in [`mockups.md`](mockups.md), § *The remote vi
 ───────────────────────────────────────────────────────────────── fix the door ─
 ❯ now run clippy
 ────────────────────────────────────────────────────────────────────────────────
-  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Load: 0.7
+  claude-sessions/claude-3 · RAM: 0.9G / 2.0G, Swap: 0.1G / 4.0G, Load: 0.7
   ⏵⏵ auto mode on (/mode to change)
 ```
 

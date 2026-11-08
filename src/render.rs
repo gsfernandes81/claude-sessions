@@ -800,7 +800,7 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
 /// figures and the levels are emphasis — nothing is colour-only. Cut at the edge, never
 /// wrapped: one line, whatever the width.
 fn load_line(view: &View, w: usize) -> Option<Line> {
-    let figures = view.load.as_ref().map(figures_line);
+    let figures = view.load.as_ref().map(|f| figures_line(f, w));
     let line = match (&view.reconnecting, figures) {
         // The phone's link is down: after the figures where both fit, else in their place.
         (Some(down), Some(mut l)) if l.width + 3 + width(down) <= w => {
@@ -819,19 +819,32 @@ fn load_line(view: &View, w: usize) -> Option<Line> {
     Some(cut)
 }
 
-fn figures_line(f: &crate::statusline::Figures) -> Line {
+/// RAM, swap and load, then where they are read where that fits whole. Where the three do
+/// not fit they are squeezed, `RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3`, so a phone keeps all
+/// three (owner, 2026-11-08), as the remote view's status line does.
+fn figures_line(f: &crate::statusline::Figures, w: usize) -> Line {
     let style = |level| match level {
         Level::Calm => DIM,
         Level::Warn => BOLD,
         Level::High => RED,
     };
-    let (ram, ram_level) = f.ram();
-    let (load, load_level) = f.load();
+    let (mut ram, ram_level) = f.ram();
+    let (mut swap, swap_level) = f.swap();
+    let (mut load, load_level) = f.load();
+    if width(&ram) + 2 + width(&swap) + 2 + width(&load) > w {
+        let squeeze = |t: &str| t.replacen(": ", " ", 1).replace("G / ", "/");
+        (ram, swap, load) = (squeeze(&ram), squeeze(&swap), squeeze(&load));
+    }
     let mut line = Line::default();
     line.push(&ram, style(ram_level))
         .push(", ", DIM)
-        .push(&load, style(load_level))
-        .push(&format!(", {}", f.place()), DIM);
+        .push(&swap, style(swap_level))
+        .push(", ", DIM)
+        .push(&load, style(load_level));
+    let place = format!(", {}", f.place());
+    if line.width + width(&place) <= w {
+        line.push(&place, DIM);
+    }
     line
 }
 
@@ -1250,6 +1263,7 @@ mod tests {
             header: Header {
                 host: "infra-dev".to_string(),
                 memory: Some((used_mib * MIB, 1024 * MIB)),
+                swap: None,
                 load: None,
             },
             home: false,
@@ -1275,6 +1289,7 @@ mod tests {
         Figures {
             used: Some(used_mib * MIB),
             total: Some(total_mib * MIB),
+            swap: Some((100 * MIB, 4096 * MIB)),
             load: Some(230),
             cores: Some(4),
             place: place.to_string(),
@@ -1428,6 +1443,7 @@ mod tests {
             header: Header {
                 host: "dev".to_string(),
                 memory: Some((1946 * MIB, 3072 * MIB)),
+                swap: None,
                 load: None,
             },
             home: true,
@@ -1448,6 +1464,7 @@ mod tests {
             header: Header {
                 host: "ds-dev".to_string(),
                 memory: None,
+                swap: None,
                 load: None,
             },
             back: true,
@@ -1731,7 +1748,7 @@ mod tests {
     fn last_hint_line(frame: &Frame) -> Option<usize> {
         let got = lines(frame);
         let load = got.iter().rposition(|l| !l.is_empty())?;
-        if !got[load].starts_with("RAM: ") {
+        if !got[load].starts_with("RAM") {
             return None;
         }
         let i = load.checked_sub(1)?;
@@ -1836,7 +1853,7 @@ mod tests {
         assert_eq!(p[3], "⠋ reading sessions");
         assert_eq!(p[22], "n new   ? keys   s shell   p new pi");
         assert_eq!(
-            p[23], "RAM: 0.8G / 1.0G, Load: 2.3, infra-dev",
+            p[23], "RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3",
             "the load line, at once"
         );
         // Calibration: the same empty list, read, says nothing is open.
@@ -2746,9 +2763,9 @@ mod tests {
         let keys = render(&mockup_7(40)).unwrap().ansi();
         assert!(keys.contains("\x1b[2K\r\n\x1b[2K\r\n\x1b[2K"));
         // The load line is the bottom line: 812M of 1.0G is past 70%, so its RAM is bold; the
-        // calm load and the place are dim.
+        // calm swap and load are dim.
         assert!(
-            keys.ends_with("\x1b[1mRAM: 0.8G / 1.0G\x1b[0m\x1b[2m, Load: 2.3, infra-dev\x1b[0m"),
+            keys.ends_with("\x1b[1mRAM 0.8/1.0G\x1b[0m\x1b[2m, Swap 0.1/4.0G, Load 2.3\x1b[0m"),
             "the load line is the bottom line: {keys:?}"
         );
     }

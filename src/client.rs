@@ -668,6 +668,7 @@ impl App {
         ui.load = Some(crate::statusline::door(
             self.hub.load.clone(),
             self.hub.memory,
+            self.hub.swap,
             answering,
             &place,
         ));
@@ -2682,6 +2683,7 @@ impl App {
         let hub = Header {
             host: name.to_string(),
             memory: None,
+            swap: None,
             load: None,
         };
         let mut app = App {
@@ -3057,6 +3059,7 @@ mod tests {
         let hub = Header {
             host: "zero".into(),
             memory: None,
+            swap: None,
             load: None,
         };
         let mut place = Place::new("claude-sessions");
@@ -3093,6 +3096,7 @@ mod tests {
         let hub = Header {
             host: "zero".into(),
             memory: Some((1 << 30, 3 << 30)),
+            swap: Some((1 << 29, 2 << 30)),
             load: None,
         };
         let draw = |w: u16, down: Option<&str>| {
@@ -3102,10 +3106,13 @@ mod tests {
             let f = crate::render::render(&m.view()).unwrap();
             f.plain().lines().last().unwrap_or("").to_string()
         };
-        assert_eq!(draw(80, None), "RAM: 1.0G / 3.0G, Load: ?, zero");
+        assert_eq!(
+            draw(80, None),
+            "RAM: 1.0G / 3.0G, Swap: 0.5G / 2.0G, Load: ?, zero"
+        );
         assert_eq!(
             draw(80, Some("⠋ Reconnecting… (8s)")),
-            "RAM: 1.0G / 3.0G, Load: ?, zero · ⠋ Reconnecting… (8s)"
+            "RAM: 1.0G / 3.0G, Swap: 0.5G / 2.0G, Load: ?, zero · ⠋ Reconnecting… (8s)"
         );
         assert_eq!(
             draw(40, Some("⠋ Reconnecting… (8s)")),
@@ -3118,6 +3125,7 @@ mod tests {
         let hub = Header {
             host: "zero".into(),
             memory: None,
+            swap: None,
             load: None,
         };
         let mut m = Menu::hub(40, 24, hub, Vec::new(), Vec::new());

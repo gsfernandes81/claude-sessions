@@ -157,6 +157,9 @@ pub struct Header {
     pub host: String,
     /// Bytes used and the ceiling, from the cgroup. `None` when there is no ceiling to show.
     pub memory: Option<(u64, u64)>,
+    /// Swap used and its total, said beside `memory` for the status line (2026-11-08). `None`
+    /// from an agent too old to send it, or where it cannot be read.
+    pub swap: Option<(u64, u64)>,
     /// The load of the machine the container runs on, for the load line's total (2026-10-27).
     /// `None` from an agent too old to send it, or where it cannot be read.
     pub load: Option<HostLoad>,

@@ -57,7 +57,12 @@ claude code puts it approximately. You have creative freedom" — so every scree
 ends with `RAM: 1.9G / 3.0G, Load: 2.3, dev` under its hints: the status line's text, every
 container's figures (`docs/design.md` § *The status line*), named for where it is read — the
 hub at the door, the container where there is only one. Every such screen below was redrawn
-for it, from the renderer, at both widths; the dialogs, which have no footer, have none. Dim
+for it, from the renderer, at both widths; the dialogs, which have no footer, have none.
+**On 2026-11-08 the owner split swap out of RAM** ("Split RAM into RAM and SWAP for the
+statusline in claude remote and in each claude session"; and of the home, "I hope the home
+screen statusline accounting works correctly too?"): the line is `RAM: 1.9G / 3.0G, Swap: 0.1G
+/ 4.0G, Load: 2.3, dev` where it fits, as at 80, and squeezed to `RAM 1.9/3.0G, Swap
+0.1/4.0G, Load 2.3`, the place left off, where it does not, as at 40. Dim
 as structure, a figure past its first threshold bold and past its second red: not yellow,
 which beside amber would read as *waiting for you*. It is the one line an idle menu rewrites,
 and only when it reads differently. **On 2026-10-30 the owner added pi** (design
@@ -125,7 +130,7 @@ mark again, with its title, from 2026-10-26.
 |---|---|---|
 | the `!` before a session waiting for you, and its title — or a container's name, at the home | amber, the mark bold | the only row that is a *request*, and the only amber anywhere |
 | a key you can press — the hint line, the keys screen | blue | actionable, not alarming |
-| the load line, under the hints | dim; a figure past 70% of RAM or 0.7 load a core bold, past 85% or 1.0 red | structure until it is a worry; red is Claude Code's own for the same line |
+| the load line, under the hints | dim; a figure past 70% of RAM or swap or 0.7 load a core bold, past 85% or 1.0 red | structure until it is a worry; red is Claude Code's own for the same line |
 | every other group heading | rule dim, name bold | a divider the eye can find, and a glyph, so a monochrome terminal keeps it |
 | the Archived heading under the cursor | reverse video, like a row | the one heading the cursor can rest on |
 | an unread title | foreground, bold | news, not a problem |
@@ -168,7 +173,7 @@ mount guards on one                   2d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 2 — Nothing open
@@ -182,7 +187,7 @@ infra-dev · nothing open · 812M of 1.0G
   s   a shell instead
 ────────────────────────────────────────
 n new   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 3 — retired 2026-10-27
@@ -259,7 +264,7 @@ mount guards on one                   2d
 detached · it is still running
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 1.0G / 1.0G, Load: 2.3, infra-dev
+RAM 1.0/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 7 — The keys, on ?
@@ -284,7 +289,7 @@ Archived   ended, still resumable; Enter
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 8 — The hint line as the terminal narrows
@@ -352,7 +357,7 @@ smartd on one                        63d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 10 — The first frame, while the list is read
@@ -363,7 +368,7 @@ infra-dev · 812M of 1.0G
 ⠋ reading sessions
 ────────────────────────────────────────
 n new   ? keys   s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 11 — Offloading a session with `c`, the spinner turning
@@ -385,7 +390,7 @@ mount guards on one                   2d
 ⠋ offloading session
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 0.8G / 1.0G, Load: 2.3, infra-dev
+RAM 0.8/1.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ## The hub: every container, and one at a time (2026-10-26)
@@ -433,7 +438,7 @@ ds-dev                     not answering
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 13 — One container, from the home
@@ -454,7 +459,7 @@ mount guards on one                   2d
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi   Esc back
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 14 — A container not answering
@@ -470,7 +475,7 @@ ds-dev · not answering
   Esc back to every container
 ────────────────────────────────────────
 ? keys   s shell   Esc back
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup 15 — The keys, at the home
@@ -493,7 +498,7 @@ Containers every one the hub reaches,
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
 s shell   p new pi
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ## The remote view: Claude Code drawn on the phone (2026-11-01)
@@ -533,7 +538,10 @@ The owner's calls, each made in a comment on the page:
   statusline matching … what's currently used by the normal ssh sessions, ie: ram and load"):
   `statusline.rs`'s figures and words, from the hub's and the containers' snapshots, yellow and
   red past its thresholds. After `container/slot` where it fits, as R1 at 80 has it; else as an
-  ssh session prints it, `RAM: …, Load: …, host`; else its figures alone, as at 40.
+  ssh session prints it, `RAM: …, Swap: …, Load: …, host`; else its figures alone; else
+  squeezed, `RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0.7`, as at 40, so a phone keeps all three
+  (owner, 2026-11-08: "Split RAM into RAM and SWAP for the statusline in claude remote and in
+  each claude session"; the door's load line, the home here, says the same).
 - **When the link is down, the footer says `⠋ Reconnecting… (8s)`**, the spinner turning: after
   the status line where both fit, the figures whole, and in its place where they do not, as at
   40 (owner, 2026-11-01: "near the statusline or replacing the statusline depending on the
@@ -600,7 +608,7 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ───────────────────────── fix the door ─
 ❯ now run clippy
 ────────────────────────────────────────
-  RAM: 0.9G / 2.0G, Load: 0.7
+  RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0.7
   ⏵⏵ auto mode on (/mode to change)
 ```
 
@@ -628,7 +636,7 @@ R1 and R4b are also drawn at 80 columns, in [`mockups-80.md`](mockups-80.md).
 ───────────────────────── fix the door ─
 ❯
 ────────────────────────────────────────
-  RAM: 1.2G / 2.0G, Load: 0.7
+  RAM 1.2/2.0G, Swap 0.1/4.0G, Load 0.7
   ⏵⏵ auto mode on      5h 12% · 7d 72%
 ```
 
@@ -799,7 +807,7 @@ takes the effort out (owner, 2026-11-07: `/effort` marks the session's own, as `
 ───────────────────────── fix the door ─
 ❯
 ────────────────────────────────────────
-  RAM: 0.9G / 2.0G, Load: 0.7
+  RAM 0.9/2.0G, Swap 0.1/4.0G, Load 0.7
   ⏵⏵ auto mode on (/mode to change)
 ```
 
@@ -846,7 +854,7 @@ dd-dev                       2 offloaded
 ds-dev                     not answering
 ────────────────────────────────────────
 Enter open   n new   c close   ? keys
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup R10 — Enter on a terminal session
@@ -866,7 +874,7 @@ mount guards on one                   2d
 ────────────────────────────────────────
 Runs in a terminal: attach it from
 ssh dev, or end it there to open here
-RAM: 1.9G / 3.0G, Load: 2.3, dev
+RAM 1.9/3.0G, Swap 0.1/4.0G, Load 2.3
 ```
 
 ### Mockup R11 — /mode

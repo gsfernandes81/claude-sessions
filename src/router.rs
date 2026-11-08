@@ -1111,6 +1111,7 @@ mod tests {
             header: crate::ui::Header {
                 host: "a".into(),
                 memory: None,
+                swap: None,
                 load: None,
             },
             workspace: String::new(),
@@ -1159,6 +1160,7 @@ mod tests {
             header: crate::ui::Header {
                 host: "a".into(),
                 memory: None,
+                swap: None,
                 load: None,
             },
             workspace: String::new(),

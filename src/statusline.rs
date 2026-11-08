@@ -1,7 +1,7 @@
-//! The load line: `RAM: 1.9G / 3.0G, Load: 2.3, or3-dev` (owner, 2026-10-06; 36 columns,
-//! inside the 40 a phone shows). Claude Code draws it under its prompt, so memory is in view
-//! while you work, and the menu draws the same line at the foot of the door (owner,
-//! 2026-10-27), roughly where Claude Code puts it.
+//! The load line: `RAM: 1.9G / 3.0G, Swap: 0.2G / 4.0G, Load: 2.3, or3-dev` (owner,
+//! 2026-10-06; swap split out of RAM on 2026-11-08). Claude Code draws it under its prompt, so
+//! memory is in view while you work, and the menu draws the same figures at the foot of the
+//! door (owner, 2026-10-27), roughly where Claude Code puts it.
 //!
 //! **The figures are every container's, wherever the line is read** (owner, 2026-10-27:
 //! "total ram and total cpu in all sessions"). RAM is the dev containers' shared pool where it
@@ -9,7 +9,10 @@
 //! container: the working set, page cache the kernel reclaims first set aside — `mem.rs`).
 //! Where it is not, a session's line falls back to its own container's limit, or the host's
 //! total and available memory where there is no limit, and the door to the sum of what each
-//! container's agent said. Load is the one-minute load average, **counted once per machine**:
+//! container's agent said. Swap is read from the same place as RAM — the cgroup's
+//! `memory.swap.current` against its `memory.swap.max`, capped at the host's `SwapTotal`, or
+//! the host's `SwapTotal` less `SwapFree` — and `Swap: none` where there is no swap. Load is
+//! the one-minute load average, **counted once per machine**:
 //! `/proc/loadavg` is not namespaced, so every container on one host reads the same host-wide
 //! figure, and adding them would count that host once per container. The kernel's `boot_id`
 //! says which machine a reading is from ([`total_load`]). The last part names where the line is
@@ -17,8 +20,8 @@
 //! be read is a `?`, never a guess. ASCII only: this lands in whatever font the terminal has
 //! (CLAUDE.md, on glyphs).
 //!
-//! **Colour** (owner, 2026-10-06): yellow, then red, as RAM passes 70% and 85% of its total
-//! and as the load passes 0.7 and 1.0 per logical core — the machines', because the load
+//! **Colour** (owner, 2026-10-06): yellow, then red, as RAM or swap passes 70% and 85% of its
+//! total and as the load passes 0.7 and 1.0 per logical core — the machines', because the load
 //! average counts the whole machine too. The numbers carry the meaning; colour is emphasis on
 //! top, and `NO_COLOR` turns it off. The menu draws the same levels in its own vocabulary
 //! (`render.rs`), since its amber is reserved for *waiting for you*.
@@ -59,6 +62,8 @@ fn level(value: f64, warn: f64, high: f64) -> Level {
 pub struct Figures {
     pub used: Option<u64>,
     pub total: Option<u64>,
+    /// Swap used and its total, read from where RAM is. `None` where it cannot be read.
+    pub swap: Option<(u64, u64)>,
     /// The load average, in hundredths, as [`HostLoad`] carries it.
     pub load: Option<u64>,
     pub cores: Option<usize>,
@@ -75,6 +80,18 @@ impl Figures {
                 level(u as f64 / t as f64, 0.70, 0.85),
             ),
             _ => ("RAM: ?".to_string(), Level::Calm),
+        }
+    }
+
+    /// `Swap: 0.2G / 4.0G`, at RAM's thresholds; `Swap: none` where there is none to use.
+    pub fn swap(&self) -> (String, Level) {
+        match self.swap {
+            Some((u, t)) if t > 0 => (
+                format!("Swap: {} / {}", gib(u), gib(t)),
+                level(u as f64 / t as f64, 0.70, 0.85),
+            ),
+            Some((0, 0)) => ("Swap: none".to_string(), Level::Calm),
+            _ => ("Swap: ?".to_string(), Level::Calm),
         }
     }
 
@@ -108,8 +125,9 @@ impl Figures {
             _ => text,
         };
         format!(
-            "{}, {}, {}",
+            "{}, {}, {}, {}",
             paint(self.ram()),
+            paint(self.swap()),
             paint(self.load()),
             self.place()
         )
@@ -142,16 +160,30 @@ pub fn total_load<'a>(
     (!seen.is_empty()).then_some((load, cores))
 }
 
-/// The door's figures: the pool's memory where the hub can read it, else every container's
-/// working set and ceiling added up — those that said; and the load of every machine, the
-/// hub's own reading first, since it is the freshest (a container's arrives with its rows).
+/// The door's figures: the pool's memory and swap where the hub can read it, else every
+/// container's working set and ceiling, and swap, added up — those that said; and the load of
+/// every machine, the hub's own reading first, since it is the freshest (a container's arrives
+/// with its rows).
 pub fn door<'a>(
     own: Option<HostLoad>,
     pool: Option<(u64, u64)>,
+    pool_swap: Option<(u64, u64)>,
     containers: impl IntoIterator<Item = &'a crate::ui::Header>,
     place: &str,
 ) -> Figures {
     let containers: Vec<&crate::ui::Header> = containers.into_iter().collect();
+    let sum = |said: Vec<(u64, u64)>| {
+        (!said.is_empty()).then(|| {
+            (
+                said.iter().map(|m| m.0).sum(),
+                said.iter().map(|m| m.1).sum(),
+            )
+        })
+    };
+    let swap = match pool {
+        Some(_) => pool_swap,
+        None => sum(containers.iter().filter_map(|h| h.swap).collect()),
+    };
     let (used, total) = match pool {
         Some((used, total)) => (Some(used), Some(total)),
         None => {
@@ -173,6 +205,7 @@ pub fn door<'a>(
     Figures {
         used,
         total,
+        swap,
         load: total_load.map(|t| t.0),
         cores: total_load.and_then(|t| t.1),
         place: place.to_string(),
@@ -212,6 +245,32 @@ fn host_memory(meminfo: &str) -> Option<(u64, u64)> {
     Some((kb("MemTotal")? * 1024, kb("MemAvailable")? * 1024))
 }
 
+/// `SwapTotal` and `SwapFree` from `/proc/meminfo`, in bytes.
+fn host_swap(meminfo: &str) -> Option<(u64, u64)> {
+    let kb = |key: &str| {
+        meminfo.lines().find_map(|l| {
+            let v = l.strip_prefix(key)?.strip_prefix(':')?;
+            v.split_whitespace().next()?.parse::<u64>().ok()
+        })
+    };
+    Some((kb("SwapTotal")? * 1024, kb("SwapFree")? * 1024))
+}
+
+/// A cgroup's swap, used and total, from [`crate::mem::swap_at`]'s reading: its ceiling, or the
+/// host's `SwapTotal` where that is smaller or there is no ceiling, since a cgroup can swap no
+/// more than the host has. `None` where the use or every total is unreadable.
+fn cgroup_swap(
+    (current, max): (Option<u64>, Option<u64>),
+    meminfo: Option<&str>,
+) -> Option<(u64, u64)> {
+    let host = meminfo.and_then(host_swap).map(|h| h.0);
+    let total = match (max, host) {
+        (Some(m), Some(h)) => m.min(h),
+        (m, h) => m.or(h)?,
+    };
+    Some((current?, total))
+}
+
 /// The one-minute load average from `/proc/loadavg`, in hundredths.
 fn loadavg_centi(text: &str) -> Option<u64> {
     let l: f64 = text.split_whitespace().next()?.parse().ok()?;
@@ -239,6 +298,28 @@ fn host_load_at(root: &Path) -> Option<HostLoad> {
 /// has a ceiling.
 pub fn pool() -> Option<(u64, u64)> {
     pool_at(&std::env::var("CLAUDE_SESSIONS_POOL").ok()?)
+}
+
+/// The pool's swap, read as [`pool`] reads its memory, against the host's swap where the pool
+/// has no swap ceiling of its own.
+pub fn pool_swap() -> Option<(u64, u64)> {
+    let dir = std::env::var("CLAUDE_SESSIONS_POOL").ok()?;
+    if dir.is_empty() {
+        return None;
+    }
+    cgroup_swap(
+        crate::mem::swap_at(&dir),
+        std::fs::read_to_string("/proc/meminfo").ok().as_deref(),
+    )
+}
+
+/// This container's swap against its ceiling, said where its memory is (a container with a
+/// memory limit), for the agent's header.
+pub fn own_swap() -> Option<(u64, u64)> {
+    cgroup_swap(
+        crate::mem::swap(),
+        std::fs::read_to_string("/proc/meminfo").ok().as_deref(),
+    )
 }
 
 /// [`pool`] from the cgroup directory `dir`; an empty one is no pool.
@@ -269,6 +350,26 @@ fn memory(
     }
 }
 
+/// What a session's line shows for swap, from where its RAM comes ([`memory`]): the pool's
+/// (`pool`, read only where the pool's memory is), else this container's where it has a
+/// limit, else the host's.
+fn swap(
+    pool: Option<Option<(u64, u64)>>,
+    own: &crate::mem::Memory,
+    own_swap: (Option<u64>, Option<u64>),
+    meminfo: Option<&str>,
+) -> Option<(u64, u64)> {
+    if let Some(pool) = pool {
+        return pool;
+    }
+    match own.limit {
+        Some(_) => cgroup_swap(own_swap, meminfo),
+        None => meminfo
+            .and_then(host_swap)
+            .map(|(total, free)| (total.saturating_sub(free), total)),
+    }
+}
+
 /// Read, and say the line. Claude Code writes its session as JSON on stdin, straight after
 /// starting this; it is drained so the writer never meets a closed pipe, but never waited on —
 /// not at a terminal, and not past a moment's quiet on a pipe whose writer stays open (a
@@ -283,15 +384,21 @@ pub fn run() {
             }
         }
     }
-    let (used, total) = memory(
-        pool(),
-        &crate::mem::read(),
-        std::fs::read_to_string("/proc/meminfo").ok().as_deref(),
+    let pool_memory = pool();
+    let own = crate::mem::read();
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+    let (used, total) = memory(pool_memory, &own, meminfo.as_deref());
+    let swap = swap(
+        pool_memory.map(|_| pool_swap()),
+        &own,
+        crate::mem::swap(),
+        meminfo.as_deref(),
     );
     let load = host_load();
     let figures = Figures {
         used,
         total,
+        swap,
         load: load.as_ref().map(|l| l.centi),
         cores: load.and_then(|l| l.cores),
         place: std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -319,6 +426,7 @@ mod tests {
         Figures {
             used,
             total,
+            swap: Some((G / 2, 4 * G)),
             load: load.map(|l| (l * 100.0).round() as u64),
             cores,
             place: place.to_string(),
@@ -329,7 +437,7 @@ mod tests {
     fn it_reads_as_the_owner_asked() {
         assert_eq!(
             figures(Some(G), Some(3 * G), Some(2.31), Some(4), "or3-dev").line(true),
-            "RAM: 1.0G / 3.0G, Load: 2.3, or3-dev"
+            "RAM: 1.0G / 3.0G, Swap: 0.5G / 4.0G, Load: 2.3, or3-dev"
         );
     }
 
@@ -361,7 +469,7 @@ mod tests {
         // No colour asked for: plain whatever the figures.
         assert_eq!(
             figures(Some(99 * G), Some(100 * G), Some(9.0), Some(1), "h").line(false),
-            "RAM: 99.0G / 100.0G, Load: 9.0, h"
+            "RAM: 99.0G / 100.0G, Swap: 0.5G / 4.0G, Load: 9.0, h"
         );
     }
 
@@ -369,12 +477,94 @@ mod tests {
     fn what_cannot_be_read_is_a_question_mark() {
         assert_eq!(
             figures(None, Some(G), None, None, "").line(true),
-            "RAM: ?, Load: ?, ?"
+            "RAM: ?, Swap: 0.5G / 4.0G, Load: ?, ?"
         );
         assert_eq!(
             figures(Some(G / 2), Some(G), Some(0.0), None, "").line(true),
-            "RAM: 0.5G / 1.0G, Load: 0.0, ?"
+            "RAM: 0.5G / 1.0G, Swap: 0.5G / 4.0G, Load: 0.0, ?"
         );
+    }
+
+    #[test]
+    fn swap_is_said_beside_ram_at_the_same_thresholds() {
+        let with = |swap| Figures {
+            swap,
+            ..figures(Some(G), Some(100 * G), Some(0.1), Some(4), "h")
+        };
+        assert_eq!(
+            with(Some((G / 4, 4 * G))).line(true),
+            "RAM: 1.0G / 100.0G, Swap: 0.2G / 4.0G, Load: 0.1, h"
+        );
+        assert!(!with(Some((69, 100))).line(true).contains('\x1b'));
+        assert!(
+            with(Some((70, 100)))
+                .line(true)
+                .contains(&format!("{YELLOW}Swap: "))
+        );
+        assert!(
+            with(Some((85, 100)))
+                .line(true)
+                .contains(&format!("{RED}Swap: "))
+        );
+        // No swap on the machine is said as such; unreadable is a question mark.
+        assert_eq!(with(Some((0, 0))).swap().0, "Swap: none");
+        assert_eq!(with(None).swap().0, "Swap: ?");
+        assert_eq!(with(Some((5, 0))).swap().0, "Swap: ?");
+    }
+
+    #[test]
+    fn a_cgroups_swap_is_capped_at_the_hosts() {
+        let mi = "SwapTotal: 4 kB\nSwapFree: 3 kB\n";
+        assert_eq!(host_swap(mi), Some((4096, 3072)));
+        assert_eq!(host_swap("SwapTotal: 4 kB\n"), None);
+        // A ceiling above the host's swap is the host's; below it, the ceiling.
+        assert_eq!(
+            cgroup_swap((Some(10), Some(1 << 20)), Some(mi)),
+            Some((10, 4096))
+        );
+        assert_eq!(
+            cgroup_swap((Some(10), Some(100)), Some(mi)),
+            Some((10, 100))
+        );
+        // No ceiling: the host's; neither, or no use read: unknown.
+        assert_eq!(cgroup_swap((Some(10), None), Some(mi)), Some((10, 4096)));
+        assert_eq!(cgroup_swap((Some(10), Some(100)), None), Some((10, 100)));
+        assert_eq!(cgroup_swap((Some(10), None), None), None);
+        assert_eq!(cgroup_swap((None, Some(100)), Some(mi)), None);
+    }
+
+    #[test]
+    fn a_cgroups_swap_files_are_read() {
+        let t = Tree::new("swap");
+        t.put("memory.swap.current", "4644864\n")
+            .put("memory.swap.max", "max\n");
+        assert_eq!(crate::mem::swap_at(&t.dir()), (Some(4644864), None));
+        t.put("memory.swap.max", "4294967296\n");
+        assert_eq!(
+            crate::mem::swap_at(&t.dir()),
+            (Some(4644864), Some(4294967296))
+        );
+        assert_eq!(crate::mem::swap_at("/nonexistent-cs"), (None, None));
+    }
+
+    #[test]
+    fn swap_is_the_pools_else_the_containers_else_the_hosts() {
+        let own = |limit| crate::mem::Memory {
+            limit,
+            current: Some(300),
+            reclaimable: None,
+        };
+        let mi = "SwapTotal: 4 kB\nSwapFree: 3 kB\n";
+        let cg = (Some(7), Some(100));
+        // The pool's memory read: its swap, even unknown, never the container's.
+        assert_eq!(
+            swap(Some(Some((1, 2))), &own(Some(9)), cg, Some(mi)),
+            Some((1, 2))
+        );
+        assert_eq!(swap(Some(None), &own(Some(9)), cg, Some(mi)), None);
+        assert_eq!(swap(None, &own(Some(9)), cg, Some(mi)), Some((7, 100)));
+        assert_eq!(swap(None, &own(None), cg, Some(mi)), Some((1024, 4096)));
+        assert_eq!(swap(None, &own(None), cg, None), None);
     }
 
     #[test]
@@ -408,12 +598,12 @@ mod tests {
         // A zero total is no figure, not a division; zero cores is no yardstick.
         assert_eq!(
             figures(Some(G), Some(0), Some(9.0), Some(0), "h").line(true),
-            "RAM: ?, Load: 9.0, h"
+            "RAM: ?, Swap: 0.5G / 4.0G, Load: 9.0, h"
         );
         // Without colour a warning is as plain as an alarm.
         assert_eq!(
             figures(Some(70 * G), Some(100 * G), Some(2.8), Some(4), "h").line(false),
-            "RAM: 70.0G / 100.0G, Load: 2.8, h"
+            "RAM: 70.0G / 100.0G, Swap: 0.5G / 4.0G, Load: 2.8, h"
         );
     }
 
@@ -538,6 +728,7 @@ mod tests {
         Header {
             host: "c".to_string(),
             memory,
+            swap: memory.map(|_| (G / 4, 2 * G)),
             load,
         }
     }
@@ -552,17 +743,24 @@ mod tests {
         let f = door(
             Some(on("pi", 250, Some(4))),
             Some((2 * G, 3 * G)),
+            Some((G / 2, 4 * G)),
             [&a, &b, &old],
             "dev",
         );
-        assert_eq!(f.line(false), "RAM: 2.0G / 3.0G, Load: 2.5, dev");
+        assert_eq!(
+            f.line(false),
+            "RAM: 2.0G / 3.0G, Swap: 0.5G / 4.0G, Load: 2.5, dev"
+        );
         // No pool: what each container said, added up; a container too old to say is left out.
-        let f = door(None, None, [&a, &b, &old], "dev");
-        assert_eq!(f.line(false), "RAM: 1.5G / 3.0G, Load: 2.0, dev");
+        let f = door(None, None, None, [&a, &b, &old], "dev");
+        assert_eq!(
+            f.line(false),
+            "RAM: 1.5G / 3.0G, Swap: 0.5G / 4.0G, Load: 2.0, dev"
+        );
         // Nothing said and nothing read: question marks, not zeros.
         assert_eq!(
-            door(None, None, [&old], "dev").line(false),
-            "RAM: ?, Load: ?, dev"
+            door(None, None, None, [&old], "dev").line(false),
+            "RAM: ?, Swap: ?, Load: ?, dev"
         );
     }
 }
