@@ -3328,6 +3328,7 @@ mod tests {
         // Backspace after one takes it whole, and the paste.
         edit(&mut ui, Key::Char('\x7f'));
         assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
+        assert_eq!(ui.cursor, ui.input.chars().count(), "where it began");
         assert_eq!(ui.pastes.len(), 1);
         edit(&mut ui, Key::Char('\x7f'));
         assert_eq!(ui.input, "look: ");
@@ -6714,5 +6715,67 @@ mod tests {
         let mut ui = Ui::new();
         submit(&mut c, &mut ui, "/tasks", &None);
         assert!(matches!(ui.dialog, Some(Dialog::Tasks(v)) if v.notices_at == 2));
+    }
+
+    #[test]
+    fn a_paste_of_800_characters_goes_in_as_itself_and_one_more_stands_in() {
+        let mut ui = Ui::new();
+        paste(&mut ui, &"x".repeat(800), 32, Instant::now());
+        assert!(ui.pastes.is_empty());
+        let mut ui = Ui::new();
+        paste(&mut ui, &"x".repeat(801), 32, Instant::now());
+        assert_eq!(ui.input, "[Pasted text #1]");
+    }
+
+    #[test]
+    fn pasting_again_expands_a_paste_of_up_to_a_hundred_thousand_characters() {
+        let now = Instant::now();
+        let mut ui = Ui::new();
+        let most = "x".repeat(PASTE_EXPANDS);
+        paste(&mut ui, &most, 32, now);
+        paste(&mut ui, &most, 32, now);
+        assert_eq!(ui.input.chars().count(), PASTE_EXPANDS, "expanded");
+        let mut ui = Ui::new();
+        let more = "x".repeat(PASTE_EXPANDS + 1);
+        paste(&mut ui, &more, 32, now);
+        assert_eq!(ui.paste_hint, None, "no hint for what will not expand");
+        paste(&mut ui, &more, 32, now);
+        assert_eq!(ui.input, "[Pasted text #1][Pasted text #2]");
+    }
+
+    #[test]
+    fn the_line_editor_deletes_and_moves_within_the_line_and_types_no_control_keys() {
+        let key = |text: &str, at: usize, k: Key| {
+            let mut chars: Vec<char> = text.chars().collect();
+            let at = edit_line(&mut chars, at, k);
+            (chars.into_iter().collect::<String>(), at)
+        };
+        let back = Key::Char('\x7f');
+        assert_eq!(key("hello", 3, back), ("helo".into(), 2));
+        assert_eq!(key("hello", 0, back), ("hello".into(), 0), "nothing before");
+        assert_eq!(key("hello", 3, Key::Delete), ("helo".into(), 3));
+        assert_eq!(
+            key("hello", 5, Key::Delete),
+            ("hello".into(), 5),
+            "nothing after"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x15')),
+            ("llo".into(), 0),
+            "Ctrl+U"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x01')),
+            ("hello".into(), 0),
+            "Ctrl+A"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x05')),
+            ("hello".into(), 5),
+            "Ctrl+E"
+        );
+        assert_eq!(key("hello", 2, Key::Char('\x02')), ("hello".into(), 2));
+        assert_eq!(key("hello", 5, Key::Right), ("hello".into(), 5));
+        assert_eq!(key("hello", 0, Key::Left), ("hello".into(), 0));
     }
 }
