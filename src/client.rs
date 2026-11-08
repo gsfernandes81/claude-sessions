@@ -1982,7 +1982,12 @@ fn copied(text: &str) -> String {
 /// A key in the prompt: typing, moving and deleting.
 /// The terminal's columns and rows, or the narrow mockups' when it cannot say.
 fn size() -> (usize, usize) {
-    term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize))
+    screen(term::size())
+}
+
+/// A size the terminal said, or the narrow mockups' 40×24 when it said none.
+fn screen(said: Option<(u16, u16)>) -> (usize, usize) {
+    said.map_or((40, 24), |(w, h)| (w as usize, h as usize))
 }
 
 /// `\` then Enter is a newline, as in Claude Code: the backslash before the cursor gives way
@@ -3135,6 +3140,11 @@ mod tests {
             moved: true,
         };
         assert_eq!(selected_text(&rows, sel((0, 2), (0, 10))), "the quick");
+        assert_eq!(
+            selected_text(&rows, sel((0, 2), (0, 3))),
+            "th",
+            "both ends in it, and no more"
+        );
         // Backwards is the same; across rows, each row from its start; trailing spaces go.
         assert_eq!(
             selected_text(&rows, sel((3, 9), (0, 12))),
@@ -6672,5 +6682,37 @@ mod tests {
         }
         assert_eq!(d, perm(0, 30), "held to its lines");
         assert_eq!(key(&plan, perm(0, 99), Key::PageUp).0, Some(perm(0, 20)));
+    }
+
+    #[test]
+    fn the_screen_is_what_the_terminal_says_or_the_narrow_mockups_when_it_cannot() {
+        assert_eq!(screen(Some((80, 30))), (80, 30));
+        assert_eq!(screen(None), (40, 24));
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_across_wrapped_rows_and_never_land_past_a_wrap() {
+        let at = |input: &str, cursor: usize, up: bool, room: usize| {
+            let mut ui = Ui::new();
+            ui.input = input.into();
+            ui.cursor = cursor;
+            assert!(row_step(&mut ui, up, room));
+            ui.cursor
+        };
+        assert_eq!(at("abcdefghijklmno", 12, true, 10), 2, "the same column");
+        assert_eq!(at("abcdefghijklmno", 2, false, 10), 12);
+        // Wrapped at the space: Up stops on it, not on the next row's first letter.
+        assert_eq!(at("aaa bbbbbb", 9, true, 6), 3);
+        // A last row shorter than the column: its end.
+        assert_eq!(at("abcdef\nxyz", 5, false, 6), 10);
+    }
+
+    #[test]
+    fn the_tasks_view_from_slash_tasks_counts_only_notices_since_it_opened() {
+        let mut c = convo_with(&[]);
+        c.notices = 2;
+        let mut ui = Ui::new();
+        submit(&mut c, &mut ui, "/tasks", &None);
+        assert!(matches!(ui.dialog, Some(Dialog::Tasks(v)) if v.notices_at == 2));
     }
 }

@@ -94,4 +94,10 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # client.rs: the second Left's window compared with `<` or `<=` (timing only); the
+    # terminal's size read live, over `screen`, which is tested; and a selection's empty span
+    # on a row, which draws and copies the same as none.
+    'src/client\.rs:.*: replace < with <= in App::conv_key$',
+    'src/client\.rs:.*: replace size -> ',
+    'src/client\.rs:.*: replace < with <= in Selection::cols$',
 ]
