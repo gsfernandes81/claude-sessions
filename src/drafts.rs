@@ -228,6 +228,17 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_is_kept_for_thirty_days() {
+        const DAY: u64 = 24 * 3600 * 1000;
+        let f = scratch("days");
+        save(&f, "dev", "s1", Some(&draft("kept")), 1_000);
+        save(&f, "dev", "s2", Some(&draft("later")), 1_000 + 29 * DAY);
+        assert!(load(&f, "dev", "s1").is_some(), "29 days on");
+        save(&f, "dev", "s3", Some(&draft("later")), 1_000 + 31 * DAY);
+        assert_eq!(load(&f, "dev", "s1"), None, "31 days on");
+    }
+
+    #[test]
     fn past_the_cap_the_oldest_go_first() {
         let f = scratch("cap");
         let big = "x".repeat(MOST_BYTES / 3);
