@@ -2850,6 +2850,16 @@ impl App {
 
     fn paint(&mut self, term: &mut RawTerminal, now: Instant) -> io::Result<()> {
         let (w, h) = term::size().unwrap_or((40, 24));
+        let out = self.paint_bytes(w, h, now);
+        if !out.is_empty() {
+            term.write_all(out.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// What painting a `w`×`h` screen writes: the clipboard's escape if one is due, the rows
+    /// that differ from what was drawn, and the cursor.
+    fn paint_bytes(&mut self, w: u16, h: u16, now: Instant) -> String {
         let (rows, cursor) = self.frame(w, h, now);
         let mut out = String::new();
         if let Some(t) = self.clip.take() {
@@ -2868,10 +2878,7 @@ impl App {
             Some((r, c)) => out.push_str(&format!("\x1b[{};{}H\x1b[?25h", r + 1, c + 1)),
             None => out.push_str("\x1b[?25l"),
         }
-        if !out.is_empty() {
-            term.write_all(out.as_bytes())?;
-        }
-        Ok(())
+        out
     }
 
     /// How long something sent may go unanswered before the link is thought dead: longer while
@@ -4509,8 +4516,50 @@ mod tests {
         assert_eq!(base64(b"hi"), "aGk=");
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"abc"), "YWJj");
-        assert_eq!(took(Duration::from_secs(41)), "41s");
-        assert_eq!(took(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(base64(b"h"), "aA==");
+        assert_eq!(base64(b"\xff\xfe\xfd"), "//79");
+        assert_eq!(base64(b""), "");
+        assert_eq!(copy_seq("hi"), "\x1b]52;c;aGk=\x07", "the clipboard escape");
+    }
+
+    #[test]
+    fn a_turn_took_seconds_then_minutes_and_seconds_then_hours_and_minutes() {
+        for (s, want) in [
+            (0, "0s"),
+            (41, "41s"),
+            (59, "59s"),
+            (60, "1m 0s"),
+            (125, "2m 5s"),
+            (3599, "59m 59s"),
+            (3600, "1h 0m"),
+            (3725, "1h 2m"),
+            (90061, "25h 1m"),
+        ] {
+            assert_eq!(took(Duration::from_secs(s)), want);
+        }
+    }
+
+    #[test]
+    fn a_styled_run_is_its_sgr_and_reset_and_a_plain_one_is_only_its_text() {
+        let all = convo::St {
+            fg: Some(0x11_2233),
+            bg: Some(0x44_5566),
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+        };
+        assert_eq!(sgr(&all), "\x1b[1;3;4;9;38;2;17;34;51;48;2;68;85;102m");
+        assert_eq!(sgr(&convo::PLAIN), "");
+        let bold = convo::St {
+            bold: true,
+            ..convo::PLAIN
+        };
+        assert_eq!(
+            ansi(&vec![("a".into(), convo::PLAIN), ("b".into(), bold)]),
+            "\x1b[2Ka\x1b[1mb\x1b[0m",
+            "the row cleared first"
+        );
     }
 
     fn pasted(app: &mut App, text: &str) {
@@ -5638,12 +5687,14 @@ mod tests {
     #[test]
     fn the_suggestion_list_has_the_arrows_tab_esc_and_enter_while_it_shows() {
         let mut app = app_in(&[]);
+        app.history = vec!["sent before".into()];
         let now = Instant::now();
         type_in_only(&mut app, "/");
         let list = convo::suggestions(ui_of(&app));
         assert!(list.len() > 2);
         app.key(Key::Up, now);
         assert_eq!(ui_of(&app).suggest, 0, "nothing above the first");
+        assert_eq!(ui_of(&app).input, "/", "the list's, not what was sent");
         app.key(Key::Down, now);
         assert_eq!(ui_of(&app).suggest, 1);
         for _ in 0..list.len() + 2 {
@@ -5804,5 +5855,98 @@ mod tests {
             assert_eq!(v.open.as_deref(), open);
             assert_eq!(v.notices_at, 3, "{keys:?}");
         }
+    }
+
+    #[test]
+    fn a_side_answer_scrolls_a_line_or_ten_at_a_time_and_not_above_its_top() {
+        let mut app = app_in(&[]);
+        type_in(&mut app, "/btw what?");
+        let now = Instant::now();
+        let top = |app: &App| match dialog(app) {
+            Some(Dialog::Btw { top, .. }) => *top,
+            d => panic!("{d:?}"),
+        };
+        for (k, want) in [
+            (Key::PageDown, 10),
+            (Key::Down, 11),
+            (Key::WheelDown, 12),
+            (Key::Up, 11),
+            (Key::PageUp, 1),
+            (Key::WheelUp, 0),
+            (Key::Up, 0),
+        ] {
+            app.key(k, now);
+            assert_eq!(top(&app), want, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn the_copy_picker_moves_and_esc_closes_it_copying_nothing() {
+        let mut app = app_in(&[
+            r#"{"t":"add","id":1,"k":"user","x":"two"}"#,
+            r#"{"t":"add","id":2,"k":"text","x":"Run:\n\n```sh\nmake test\n```\n\nthen look."}"#,
+        ]);
+        type_in(&mut app, "/copy");
+        let now = Instant::now();
+        let sel = |app: &App| match dialog(app) {
+            Some(Dialog::Copy { sel, .. }) => *sel,
+            d => panic!("{d:?}"),
+        };
+        app.key(Key::Down, now);
+        assert_eq!(sel(&app), 1);
+        app.key(Key::Down, now);
+        assert_eq!(sel(&app), 1, "not past the last");
+        app.key(Key::Up, now);
+        assert_eq!(sel(&app), 0);
+        app.key(Key::Esc, now);
+        assert!(dialog(&app).is_none());
+        assert_eq!(app.clip, None);
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_prompt_and_on_an_empty_one_leaves_as_ctrl_d_does() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "half");
+        app.key(Key::Char('\x03'), Instant::now());
+        assert_eq!((ui_of(&app).input.as_str(), ui_of(&app).cursor), ("", 0));
+        app.key(Key::Char('\x03'), Instant::now());
+        assert!(matches!(app.screen, Screen::Home));
+        let mut app = app_in(&[]);
+        app.key(Key::Char('\x04'), Instant::now());
+        assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn painting_writes_only_the_rows_that_changed_then_the_cursor() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello"}"#]);
+        let now = Instant::now();
+        let first = app.paint_bytes(40, 24, now);
+        for r in 1..=24 {
+            assert!(first.contains(&format!("\x1b[{r};1H")), "row {r} drawn");
+        }
+        assert!(first.ends_with("\x1b[?25h"), "the prompt's cursor shown");
+        let again = app.paint_bytes(40, 24, now);
+        assert!(!again.contains(";1H\x1b[2K"), "nothing redrawn: {again:?}");
+        type_in_only(&mut app, "x");
+        let typed = app.paint_bytes(40, 24, now);
+        assert_eq!(
+            typed.matches(";1H").count(),
+            1,
+            "the prompt's row: {typed:?}"
+        );
+        assert!(typed.contains("❯ x"), "{typed:?}");
+        // A copy rides on the next frame, once; the home hides the cursor.
+        app.clip = Some("hi".into());
+        assert!(
+            app.paint_bytes(40, 24, now)
+                .starts_with("\x1b]52;c;aGk=\x07")
+        );
+        assert!(!app.paint_bytes(40, 24, now).contains("\x1b]52"));
+        app.home(None);
+        assert!(app.paint_bytes(40, 24, now).ends_with("\x1b[?25l"));
+        // A screen of another height is drawn whole.
+        let mut app = app_in(&[]);
+        app.paint_bytes(40, 24, now);
+        assert_eq!(app.paint_bytes(40, 20, now).matches(";1H").count(), 20);
     }
 }
