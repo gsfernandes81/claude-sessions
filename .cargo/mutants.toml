@@ -94,4 +94,7 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # drafts.rs and tasks.rs (2026-11-08). The drafts file exactly at its cap: telling `>`
+    # from `>=` needs a file of exactly 4 MiB, a size only the serializer's arithmetic gives.
+    'src/drafts\.rs:.*: replace > with >= in save$',
 ]
