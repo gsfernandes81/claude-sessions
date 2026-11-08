@@ -4813,15 +4813,29 @@ mod tests {
         rx
     }
 
+    /// Set once a mark never came back: nothing is being sent, and every test waiting on one
+    /// gives up at once rather than each waiting out its own time.
+    static NOTHING_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     /// What the client sent since last asked, a line each: everything `cat` echoed before a
     /// mark sent after it, on the link's own epoch.
     fn sent(app: &mut App, rx: &Receiver<Heard>) -> Vec<String> {
+        use std::sync::atomic::Ordering;
         let awaiting = app.awaiting;
         app.send(App::msg("mark", vec![]));
         app.awaiting = awaiting;
         let mut out = Vec::new();
         loop {
-            match rx.recv_timeout(Duration::from_secs(20)) {
+            let wait = if NOTHING_SENT.load(Ordering::Relaxed) {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(10)
+            };
+            let got = rx.recv_timeout(wait);
+            if got.is_err() {
+                NOTHING_SENT.store(true, Ordering::Relaxed);
+            }
+            match got {
                 Ok(Heard::Line(e, v)) => {
                     assert_eq!(e, app.epoch, "heard on the link's own epoch");
                     let l = json::to_line(&v);
