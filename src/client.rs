@@ -6487,4 +6487,83 @@ mod tests {
             "{d:?}"
         );
     }
+
+    #[test]
+    fn the_clients_slash_commands_say_what_they_take_and_send_what_they_mean() {
+        let mut c = convo_with(&[
+            r#"{"t":"meta","sid":"s","m":"claude-opus-5-5","pm":"default","ti":"","e":"high","cwd":"","ver":""}"#,
+        ]);
+        let mut ui = Ui::new();
+        let mut run = |text: &str, models: &Option<Vec<(String, String)>>| {
+            ui.status = None;
+            ui.dialog = None;
+            let got = match submit(&mut c, &mut ui, text, models) {
+                Submit::Send(v) => v.iter().map(line).collect::<Vec<_>>().join(" "),
+                Submit::Copy(t) => format!("copy {t}"),
+                Submit::Home => "home".into(),
+                Submit::Nothing => String::new(),
+            };
+            (got, ui.status.clone(), ui.dialog.clone())
+        };
+        let said = |s: &str| Some(s.to_string());
+        assert_eq!(run("", &None), (String::new(), None, None));
+        // `/effort` bare: the picker on the session's own; `auto` and `default` take it out.
+        assert_eq!(
+            run("/effort", &None),
+            (String::new(), None, Some(Dialog::Effort { sel: 3 }))
+        );
+        for e in ["auto", "default"] {
+            assert_eq!(
+                run(&format!("/effort {e}"), &None).0,
+                r#"{"e":null,"t":"effort"}"#
+            );
+        }
+        assert_eq!(
+            run("/rename", &None),
+            (String::new(), said("/rename takes the new title"), None)
+        );
+        for q in ["/exit", "/quit"] {
+            assert_eq!(run(q, &None).0, r#"{"t":"exit"}"#);
+        }
+        for rc in ["/rc", "/remote-control"] {
+            assert_eq!(
+                run(rc, &None),
+                (r#"{"t":"rc"}"#.into(), said("Remote Control…"), None)
+            );
+        }
+        assert!(matches!(run("/bashes", &None).2, Some(Dialog::Tasks(_))));
+        assert_eq!(
+            run("/btw", &None),
+            (String::new(), said("/btw takes a question"), None)
+        );
+        // `/model` with the list already here: the picker on the model in use, nothing sent.
+        let list = Some(vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ]);
+        let (sent, _, d) = run("/model", &list);
+        assert_eq!(sent, "");
+        assert!(matches!(d, Some(Dialog::Model { list: Some(_), .. })));
+        // `/copy`: how many back, 1 the latest; not 0, not a word, not more than there are.
+        for bad in ["/copy 0", "/copy two"] {
+            assert_eq!(
+                run(bad, &None).1,
+                said("/copy takes how many responses back, 1 the latest")
+            );
+        }
+        c.apply(
+            &parse(r#"{"t":"add","id":1,"k":"text","x":"hello"}"#).unwrap(),
+            Instant::now(),
+        );
+        let mut ui2 = Ui::new();
+        assert!(matches!(
+            submit(&mut c, &mut ui2, "/copy 2", &None),
+            Submit::Nothing
+        ));
+        assert_eq!(ui2.status, said("Only 1 responses to copy from"));
+        assert!(
+            matches!(submit(&mut c, &mut ui2, "/copy 1", &None), Submit::Copy(t) if t == "hello")
+        );
+        assert_eq!(ui2.status, said("Copied 5 characters to the clipboard"));
+    }
 }
