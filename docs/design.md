@@ -628,6 +628,9 @@ kept current**: the hub reads its own figures — the pool and its machine's loa
 seconds (`CLAUDE_SESSIONS_LOAD_MS` for tests), a container's arrive with its rows, and the
 line is rewritten only when its text changes. That is the one thing an idle menu writes
 (until 2026-10-27 an idle menu wrote nothing at all; the owner dropped that rule for this).
+**Infra's smoke test matches its shape**, the fields in their order (`RAM`, `Swap`, `Load`,
+the host; infra, 2026-11-08, after 0.18.5's swap broke its pattern): a change to the fields,
+their order or their punctuation is said in the release notes' *For infra* section.
 
 `hooks-config` installs it as `statusLine` in the same drop-in as the hooks, with
 `refreshInterval: 60` — RAM and load move without any Claude Code event, and otherwise it
