@@ -407,7 +407,9 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    - **The link** is `ssh -T -C -o BatchMode=yes <name> claude-sessions relay`
      (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
      backoff from 1 to 30 seconds, doubling once per failed dial (an ssh the client cut is
-     not counted again when it ends); dead too when something sent has no answer in 5
+     not counted again when it ends), or at once on any key — moving on the home, Enter on a
+     session, typing — which starts the backoff again from 1 (owner, 2026-11-08); a dial
+     under way is left to its answer, so keys do not stack up ssh's; dead too when something sent has no answer in 5
      seconds (30 for a new link's hello),
      and a key after 2 minutes of silence sends a `ping` first. So the relay answers every
      message at once, with `pong` when it has nothing else to say yet: a side question takes

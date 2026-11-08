@@ -14,7 +14,8 @@
 //!   line or two it is on, and a fresh reading the load line, if it reads differently.
 //! - **A container's agent sends its rows only when they change**, or when the minute turns
 //!   for the ages, and the loop wakes on nothing else but a key, a resize, a reconnect due to a
-//!   container that is not answering — which changes nothing on screen unless it answers — and
+//!   container that is not answering — which changes nothing on screen unless it answers, and
+//!   which a key brings forward to at once — and
 //!   the load line's reading, every [`load_every`].
 //! - **The hub's own figures are read on that tick**: the pool's memory, which the home's
 //!   header shows too, and the load of the machine the hub is on. A container's arrive with
@@ -199,6 +200,16 @@ impl Hub {
             let conn = (self.connect)(&name, self.events.clone(), term::wake);
             self.conns.insert(name, conn);
         }
+    }
+
+    /// The owner pressed a key: every container that is not answering is asked again now,
+    /// not when its wait is up. One already being asked is left to its answer.
+    fn retry_now(&mut self) {
+        let now = Instant::now();
+        for at in self.retry.values_mut() {
+            *at = now;
+        }
+        self.reconnect_due();
     }
 
     fn next_retry(&self) -> Option<Duration> {
@@ -428,6 +439,8 @@ fn drive(
             Input::Woken => {}
             Input::Keys(keys) => {
                 menu.set_home(home_header());
+                // Someone is there: a container that is down is not left to its wait.
+                hub.retry_now();
                 for key in keys {
                     if key == Key::Resize {
                         if let Some((w, h)) = term.size() {
@@ -881,6 +894,19 @@ mod tests {
         hub.apply(Event::Snapshot("a".into(), snapshot(vec![])));
         assert_eq!(hub.next_retry(), None);
         assert!(hub.answering("a").is_some());
+    }
+
+    #[test]
+    fn a_key_asks_a_container_that_is_down_again_at_once() {
+        let (mut hub, _, _) = offline(&["a", "b"]);
+        hub.apply(Event::Down("a".into(), "no route".into()));
+        assert!(hub.answering("a").is_none());
+        hub.retry_now();
+        assert_eq!(hub.next_retry(), None, "no wait left");
+        assert!(hub.answering("a").is_some(), "asked again");
+        // Nothing is down: a key asks nothing.
+        hub.retry_now();
+        assert_eq!(hub.next_retry(), None);
     }
 
     #[test]

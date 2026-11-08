@@ -102,7 +102,8 @@ list, interleaved by when each was last active without reordering any container'
 (`hub::merge`), and shows one container's at a time.
 
 **A container that does not answer** is drawn as such (mockup 14) and asked again every 15
-seconds. Not shown as `connecting` meanwhile: a retry that fails must change nothing on the
+seconds, or at once when the owner presses a key — someone at the menu is not left to the wait
+(owner, 2026-11-08); one already being asked is left to its answer. Not shown as `connecting` meanwhile: a retry that fails must change nothing on the
 screen, or a dead container would make an idle hub talk four times a minute; the hub test holds
 that through two retries. `s` on it still tries `ssh -t <c>`, which may answer where the agent
 did not. **Which containers** is `CLAUDE_SESSIONS_HOSTS`, else `local` — this machine, with the agent a child process and no ssh,

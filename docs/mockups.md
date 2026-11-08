@@ -414,7 +414,7 @@ deeper"):
 
 `n` and `s` at the home act in the container of the row under the cursor; `c` on a container's
 own row says what `c` is for. A container that does not answer (mockup 14) is asked
-again every 15 seconds, which changes nothing on the screen until it answers — the idle hub
+again every 15 seconds, or at once on a key, which changes nothing on the screen until it answers — the idle hub
 still writes nothing but its load line.
 
 ### Mockup 12 — Every container and its loaded sessions, the hub's home

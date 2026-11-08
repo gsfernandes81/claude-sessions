@@ -2,11 +2,12 @@
 //! WSL (`docs/remote-view.md`; mockups R1 to R10).
 //!
 //! **One ssh, kept up.** `ssh -T -C <name> claude-sessions relay`, run again with backoff from
-//! 1 to 30 seconds whenever it ends. While it is down the screen stays, scrollback included,
-//! typing still works, and an Enter is refused and kept, the footer saying so in words (R8). A
-//! link is also taken for dead when something sent gets no answer within five seconds, and a
-//! key after two minutes of silence first sends a ping. Back up, it says hello and, with a
-//! conversation open, where it got to, so only what it lacks is sent again.
+//! 1 to 30 seconds whenever it ends, or at once on a key, which starts the backoff again.
+//! While it is down the screen stays, scrollback included, typing still works, and an Enter
+//! is refused and kept, the footer saying so in words (R8). A link is also taken for dead when
+//! something sent gets no answer within five seconds, and a key after two minutes of silence
+//! first sends a ping. Back up, it says hello and, with a conversation open, where it got to,
+//! so only what it lacks is sent again.
 //!
 //! **The home is the hub's menu**, drawn by the same code from the same snapshots, with R9's
 //! hint line. A session a terminal drives is listed dim, as `term: `, and Enter on it says why
@@ -801,6 +802,7 @@ impl App {
         if self.up() && now.duration_since(self.last_heard) > QUIET_PROBE {
             self.send(App::msg("ping", vec![]));
         }
+        self.redial_now(now);
         // A drag over the conversation selects, and letting go copies, as in Claude Code: its
         // fullscreen mode holds the mouse, so the terminal's own selection cannot.
         let conv = matches!(self.screen, Screen::Conv { .. });
@@ -872,6 +874,16 @@ impl App {
         match &mut self.screen {
             Screen::Home => self.home_key(k),
             Screen::Conv { .. } => self.conv_key(k, now),
+        }
+    }
+
+    /// The owner pressed a key while the link is down and waiting out its backoff: dial now,
+    /// and start the backoff again from a second, since someone is there to see it. A dial
+    /// under way is left to its answer, so keys do not stack up ssh's.
+    fn redial_now(&mut self, now: Instant) {
+        if self.wire.is_none() && self.retry_at.is_some() {
+            self.retry_at = Some(now);
+            self.backoff = Duration::from_secs(1);
         }
     }
 
@@ -3946,6 +3958,32 @@ mod tests {
             now + Duration::from_millis(60),
         );
         assert_eq!((app.retry_at, app.backoff), (retry, backoff));
+    }
+
+    #[test]
+    fn a_key_while_the_link_is_down_redials_at_once_and_from_the_first_backoff() {
+        let mut app = App::new("dev", 80, 24, 3);
+        let now = Instant::now();
+        for _ in 0..5 {
+            app.link_down(now);
+        }
+        assert_eq!(app.retry_at, Some(now + Duration::from_secs(16)));
+        let later = now + Duration::from_secs(1);
+        app.key(Key::Down, later);
+        assert_eq!(app.retry_at, Some(later), "due now");
+        assert_eq!(app.backoff, Duration::from_secs(1));
+        // Enter on the home, trying to open what is under the cursor, does the same.
+        app.link_down(later);
+        app.key(Key::Enter, later + Duration::from_millis(10));
+        assert_eq!(app.retry_at, Some(later + Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn a_key_leaves_a_dial_under_way_alone() {
+        let mut app = App::new("dev", 80, 24, 3);
+        // Dialling: no retry is set, and a key must not set one.
+        app.key(Key::Down, Instant::now());
+        assert_eq!(app.retry_at, None);
     }
 
     #[test]
