@@ -6544,6 +6544,10 @@ mod tests {
         let (sent, _, d) = run("/model", &list);
         assert_eq!(sent, "");
         assert!(matches!(d, Some(Dialog::Model { list: Some(_), .. })));
+        assert_eq!(
+            run("/model sonnet", &list),
+            (r#"{"m":"sonnet","t":"model"}"#.into(), None, None)
+        );
         // `/copy`: how many back, 1 the latest; not 0, not a word, not more than there are.
         for bad in ["/copy 0", "/copy two"] {
             assert_eq!(
