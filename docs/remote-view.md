@@ -115,6 +115,7 @@ these lines, and its tests hold the exact shapes):
 |---|---|---|
 | start | `control_request` `initialize` | commands (skills included), models with each one's `supportedEffortLevels`, account, output style: about 38 KB |
 | permission | claude sends `can_use_tool`: tool name, input, description, suggestions | `control_response` `{behavior:"allow", updatedInput}` or `{behavior:"deny", message}`. A read-only command such as `echo` is allowed without asking. |
+| plan | `can_use_tool` with tool `ExitPlanMode`, `input.plan` the plan as markdown | as a permission. The view's dialog is Claude Code's "Ready to code?" with the whole plan drawn as markdown, scrolled with PgUp/PgDn or the wheel when it is taller than the screen leaves room for; until 2026-11-08 it showed only the plan's first line. |
 | question | `can_use_tool` with tool `AskUserQuestion`, `input.questions[]` | allow, with `updatedInput` = the input plus `answers: {question: label}` |
 | model | `set_model {model}` | `{model: <resolved id>}`, plus a `user` line `<local-command-stdout>Set model to …`. It switches the session only: a headless claude saves no default, which its interactive `/model` does, so the holder does that (*Decisions*). |
 | effort | `apply_flag_settings {settings:{effortLevel}}`; `null` resets | success. There is no effort request of its own; Claude Code's own `/effort` sends exactly this to a remote session. |

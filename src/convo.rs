@@ -1165,8 +1165,9 @@ const SPIN: [&str; 6] = ["·", "✢", "✳", "✶", "✻", "✽"];
 /// A dialog the client has open over the conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Dialog {
-    /// Claude's permission prompt, the cursor on option `sel`.
-    Perm { sel: usize },
+    /// Claude's permission prompt, the cursor on option `sel`, and how far a plan in it is
+    /// scrolled.
+    Perm { sel: usize, top: usize },
     /// A question: which one, the cursor, the answers so far, what is typed for "Type
     /// something.", and the multi-select ticks.
     Ask {
@@ -2229,7 +2230,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     (out, cursor)
 }
 
-fn perm_dialog(e: &Entry, sel: usize, w: usize) -> Vec<Line> {
+fn perm_dialog(e: &Entry, sel: usize, top: usize, w: usize, h: usize) -> Vec<Line> {
     let Entry::Perm {
         tool,
         arg,
@@ -2240,13 +2241,36 @@ fn perm_dialog(e: &Entry, sel: usize, w: usize) -> Vec<Line> {
     else {
         return Vec::new();
     };
+    let plan = tool == crate::reduce::PLAN_TOOL;
     let mut out = vec![rule(w, "─", fg(LAVENDER))];
-    out.push(line(format!(" {}", perm_title(tool)), bold(LAVENDER)));
-    if !description.is_empty() {
-        out.extend(wrapped(description, " ", " ", w, PLAIN));
+    if plan {
+        // Claude Code's words for it, the plan as markdown under them.
+        out.push(line(" Ready to code?", bold(LAVENDER)));
+        out.push(line(" Here is Claude's plan:", PLAIN));
+    } else {
+        out.push(line(format!(" {}", perm_title(tool)), bold(LAVENDER)));
+        if !description.is_empty() {
+            out.extend(wrapped(description, " ", " ", w, PLAIN));
+        }
     }
     out.push(rule(w, "╌", fg(LAVENDER)));
-    out.extend(wrapped(arg, " ", " ", w, PLAIN));
+    if plan {
+        let body: Vec<Line> = crate::markdown::render(arg, w.saturating_sub(3))
+            .into_iter()
+            .map(|l| {
+                let mut row: Line = vec![(" ".into(), PLAIN)];
+                row.extend(l);
+                row
+            })
+            .collect();
+        // The rows the rest of the dialog leaves (a rule, the question, the options, a gap
+        // and the hints), and three kept for the transcript above.
+        let rest = perm_options(always).len() + 5;
+        let room = h.saturating_sub(out.len() + rest + 3).max(3);
+        out.extend(scrolled(body, top, room));
+    } else {
+        out.extend(wrapped(arg, " ", " ", w, PLAIN));
+    }
     out.push(rule(w, "╌", fg(LAVENDER)));
     out.push(line(" Do you want to proceed?", PLAIN));
     for (i, opt) in perm_options(always).iter().enumerate() {
@@ -2259,7 +2283,34 @@ fn perm_dialog(e: &Entry, sel: usize, w: usize) -> Vec<Line> {
         out.extend(wrapped(opt, &first, "      ", w, st));
     }
     out.push(Vec::new());
-    out.push(line(" Esc to cancel", fg(GREY)));
+    if plan {
+        out.extend(hints(&["Esc to cancel", "PgUp/PgDn to scroll"], " ", w));
+    } else {
+        out.push(line(" Esc to cancel", fg(GREY)));
+    }
+    out
+}
+
+/// `room` rows of `body` from row `top` (held to the last screenful), with `↑ n more` and
+/// `↓ n more` in place of a row where there is more above or below.
+fn scrolled(body: Vec<Line>, top: usize, room: usize) -> Vec<Line> {
+    if body.len() <= room {
+        return body;
+    }
+    let top = top.min(body.len().saturating_sub(room - 1));
+    let mut out = Vec::new();
+    if top > 0 {
+        out.push(line(format!(" ↑ {top} more"), fg(GREY)));
+    }
+    let mut shown = room - usize::from(top > 0);
+    if body.len() > top + shown {
+        shown -= 1;
+    }
+    let below = body.len().saturating_sub(top + shown);
+    out.extend(body.into_iter().skip(top).take(shown));
+    if below > 0 {
+        out.push(line(format!(" ↓ {below} more"), fg(GREY)));
+    }
     out
 }
 
@@ -2747,7 +2798,9 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
                 None => Vec::new(),
             }
         }
-        (Some(Dialog::Perm { sel }), Some(e @ Entry::Perm { .. })) => perm_dialog(e, *sel, w),
+        (Some(Dialog::Perm { sel, top }), Some(e @ Entry::Perm { .. })) => {
+            perm_dialog(e, *sel, *top, w, h)
+        }
         _ => {
             // The suggestion list over the prompt, as Claude Code puts it.
             let list = if c.viewing.is_some() {
@@ -3561,7 +3614,7 @@ mod tests {
             ],
         );
         let mut ui = Ui::new();
-        ui.dialog = Some(Dialog::Perm { sel: 0 });
+        ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 });
         let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
         let mut want = mockup("R3");
         // The transcript's line is the request's own description, as claude sent it.
@@ -3572,6 +3625,46 @@ mod tests {
             *l = "● Create empty file named x".into();
         }
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn exit_plan_mode_shows_the_plan_and_scrolls_it() {
+        let steps: String = (1..=30).map(|n| format!("{n}. Step {n}.\\n")).collect();
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "plan"),
+                r#"{"t":"add","id":1,"k":"user","x":"plan it"}"#,
+                &format!(
+                    r##"{{"t":"add","id":2,"k":"perm","r":"p1","n":"ExitPlanMode","a":"# Fix the dialog\n\n{steps}"}}"##
+                ),
+                r#"{"t":"st","s":"waiting"}"#,
+            ],
+        );
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert_eq!(got.len(), 24, "{got:#?}");
+        let at = |t: &str| got.iter().position(|l| l.trim_end() == t);
+        let head = at(" Ready to code?").expect("titled as Claude Code titles it");
+        assert_eq!(got[head + 1].trim_end(), " Here is Claude's plan:");
+        assert!(at(" Fix the dialog").is_some(), "{got:#?}");
+        assert!(at(" 1. Step 1.").is_some(), "{got:#?}");
+        let more = got.iter().filter(|l| l.contains("↓ ")).count();
+        assert_eq!(more, 1, "the rest is said to be below: {got:#?}");
+        assert!(at(" Do you want to proceed?").is_some());
+        assert!(got.iter().any(|l| l.contains("❯ 1. Yes")));
+        // Scrolled to the end: the last step shows, and what is above is counted.
+        ui.dialog = Some(Dialog::Perm { sel: 0, top: 99 });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert_eq!(got.len(), 24, "{got:#?}");
+        assert!(
+            got.iter().any(|l| l.trim_end() == " 30. Step 30."),
+            "{got:#?}"
+        );
+        assert!(got.iter().any(|l| l.contains("↑ ")), "{got:#?}");
+        assert!(!got.iter().any(|l| l.contains("↓ ")), "{got:#?}");
     }
 
     #[test]

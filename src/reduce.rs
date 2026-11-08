@@ -1115,7 +1115,7 @@ impl Reducer {
                 description,
                 suggestions,
             } => {
-                let arg = tool_arg(&tool, &input);
+                let arg = perm_arg(&tool, &input);
                 let always = always_label(&suggestions).unwrap_or_default();
                 let id = self.add(
                     &mut out,
@@ -1514,6 +1514,18 @@ fn tool_arg(name: &str, input: &Value) -> String {
     // A command's first line, as Claude Code draws a multi-line one.
     cut(found.unwrap_or("").lines().next().unwrap_or(""))
 }
+
+/// What a permission prompt shows of the call: `tool_arg`'s line, or for `ExitPlanMode` the
+/// whole plan, which the dialog draws as markdown as Claude Code does.
+fn perm_arg(name: &str, input: &Value) -> String {
+    match input.get("plan").and_then(Value::as_str) {
+        Some(plan) if name == PLAN_TOOL => plan.trim().to_string(),
+        _ => tool_arg(name, input),
+    }
+}
+
+/// Claude's tool for leaving plan mode, whose prompt carries the plan.
+pub const PLAN_TOOL: &str = "ExitPlanMode";
 
 /// Remove the terminal escapes a local command's output may carry (claude colours `/model`'s
 /// answer, say): the view draws its own styles.
@@ -2686,6 +2698,21 @@ mod tests {
         );
         let (p, n) = preview("\u{1b}[31mred\u{1b}[0m\n\n");
         assert_eq!((p, n), (vec!["red".to_string()], 1));
+    }
+
+    #[test]
+    fn exit_plan_modes_prompt_carries_the_whole_plan() {
+        let plan = format!("# Plan\\n\\n1. {}\\n2. Test it.\\n", "x".repeat(300));
+        let req = format!(
+            r#"{{"type":"control_request","request_id":"p1","request":{{"subtype":"can_use_tool","tool_name":"ExitPlanMode","input":{{"plan":"{plan}"}}}}}}"#
+        );
+        let mut r = Reducer::new();
+        let out = r.feed(&parse(&req).unwrap());
+        let want = format!(r##""a":"# Plan\n\n1. {}\n2. Test it.""##, "x".repeat(300));
+        assert!(wire(&out.ops)[0].contains(&want), "{:?}", wire(&out.ops));
+        // The call's own line in the transcript stays a line.
+        let input = parse(&format!(r#"{{"plan":"{plan}"}}"#)).unwrap();
+        assert_eq!(tool_arg(PLAN_TOOL, &input), "# Plan");
     }
 
     #[test]

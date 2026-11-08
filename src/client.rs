@@ -1631,7 +1631,7 @@ fn workflow_key(
 fn follow_prompts(c: &Convo, ui: &mut Ui) {
     let waiting = c.waiting();
     match (&ui.dialog, waiting) {
-        (None, Some(Entry::Perm { .. })) => ui.dialog = Some(Dialog::Perm { sel: 0 }),
+        (None, Some(Entry::Perm { .. })) => ui.dialog = Some(Dialog::Perm { sel: 0, top: 0 }),
         (None, Some(Entry::Ask { questions, .. })) => {
             ui.dialog = Some(Dialog::Ask {
                 q: 0,
@@ -2129,14 +2129,19 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
         _ => None,
     };
     match d {
-        Dialog::Perm { sel } => {
+        Dialog::Perm { sel, top } => {
             let Some(Entry::Perm {
-                request_id, always, ..
+                request_id,
+                always,
+                arg,
+                ..
             }) = c.waiting()
             else {
                 return None;
             };
             let opts = convo::perm_options(always);
+            // A plan scrolls; held to its line count here, and to the screen when drawn.
+            let most = arg.lines().count();
             let answer = |i: usize| -> &'static str {
                 match (i, opts.len()) {
                     (0, _) => "y",
@@ -2148,11 +2153,27 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 Key::Up => {
                     return Some(Dialog::Perm {
                         sel: sel.saturating_sub(1),
+                        top,
                     });
                 }
                 Key::Down => {
                     return Some(Dialog::Perm {
                         sel: (sel + 1).min(opts.len() - 1),
+                        top,
+                    });
+                }
+                Key::PageUp | Key::WheelUp => {
+                    let step = if k == Key::PageUp { 10 } else { 1 };
+                    return Some(Dialog::Perm {
+                        sel,
+                        top: top.min(most).saturating_sub(step),
+                    });
+                }
+                Key::PageDown | Key::WheelDown => {
+                    let step = if k == Key::PageDown { 10 } else { 1 };
+                    return Some(Dialog::Perm {
+                        sel,
+                        top: (top + step).min(most),
                     });
                 }
                 Key::Enter => Some(sel),
@@ -2170,7 +2191,7 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                     ));
                     None
                 }
-                None => Some(Dialog::Perm { sel }),
+                None => Some(Dialog::Perm { sel, top }),
             }
         }
         Dialog::Ask {
@@ -3230,7 +3251,7 @@ mod tests {
         ]);
         let mut ui = Ui::new();
         follow_prompts(&c, &mut ui);
-        assert_eq!(ui.dialog, Some(Dialog::Perm { sel: 0 }));
+        assert_eq!(ui.dialog, Some(Dialog::Perm { sel: 0, top: 0 }));
         for (k, want) in [
             (Key::Enter, "y"),
             (Key::Char('2'), "a"),
@@ -3238,7 +3259,10 @@ mod tests {
             (Key::Esc, "n"),
         ] {
             let mut out = Vec::new();
-            assert_eq!(dialog_key(&c, Dialog::Perm { sel: 0 }, k, &mut out), None);
+            assert_eq!(
+                dialog_key(&c, Dialog::Perm { sel: 0, top: 0 }, k, &mut out),
+                None
+            );
             assert_eq!(
                 line(&out[0]),
                 format!(r#"{{"a":"{want}","r":"p1","t":"perm"}}"#),
@@ -3247,8 +3271,8 @@ mod tests {
         }
         let mut out = Vec::new();
         assert_eq!(
-            dialog_key(&c, Dialog::Perm { sel: 0 }, Key::Down, &mut out),
-            Some(Dialog::Perm { sel: 1 })
+            dialog_key(&c, Dialog::Perm { sel: 0, top: 0 }, Key::Down, &mut out),
+            Some(Dialog::Perm { sel: 1, top: 0 })
         );
         assert!(out.is_empty());
         // Answered elsewhere: the dialog goes.
