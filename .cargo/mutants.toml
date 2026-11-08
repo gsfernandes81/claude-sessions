@@ -94,13 +94,15 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # client.rs: the second Left's window compared with `<` or `<=` (timing only); a
-    # selection's empty span on a row, which draws and copies the same as none; base64's
-    # bytes packed with `|`, whose bits do not overlap; `date` failing, which no test can make
-    # it do; and what runs only against the real terminal and ssh, over the parts that are
-    # tested: the size read live (`screen`), `paint` writing `paint_bytes`, `dial` opening ssh
-    # (`dial_over`), and `run`'s loop (`keys`, `take`, `due`, `hosts_changed`).
+    # client.rs: the second Left's window and two minutes' quiet compared with or without
+    # their bounds (timing only); a selection's empty span on a row, which draws and copies the
+    # same as none; base64's bytes packed with `|`, whose bits do not overlap; `date` failing,
+    # which no test can make it do; and what runs only against the real terminal and ssh, over
+    # the parts that are tested: the size read live (`screen`), `paint` writing `paint_bytes`,
+    # `dial` opening ssh (`dial_over`), and `run`'s loop (`keys`, `take`, `due`,
+    # `hosts_changed`).
     'src/client\.rs:.*: replace < with <= in App::conv_key$',
+    'src/client\.rs:.*: replace > with >= in App::key$',
     'src/client\.rs:.*: replace < with <= in Selection::cols$',
     'src/client\.rs:.*: replace \| with \^ in base64$',
     'src/client\.rs:.*: replace match guard o\.status\.success\(\) with true in clock_time$',
