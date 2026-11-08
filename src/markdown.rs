@@ -384,12 +384,10 @@ fn code_line(raw: &str, st: St, w: usize, out: &mut Vec<Line>) {
         used += cw(c);
     }
     for r in rows {
+        // The indent is left unstyled; an empty run draws nothing, so none is kept.
         let lead = r.len() - r.trim_start().len();
-        let mut l: Line = Vec::new();
-        if lead > 0 {
-            l.push((r[..lead].to_string(), PLAIN));
-        }
-        l.push((r[lead..].to_string(), st));
+        let mut l: Line = vec![(r[..lead].to_string(), PLAIN), (r[lead..].to_string(), st)];
+        l.retain(|(t, _)| !t.is_empty());
         out.push(l);
     }
 }
@@ -427,18 +425,15 @@ fn list(
                     let n = lines[i];
                     if n.trim().is_empty() {
                         // A blank line continues the item only if what follows is indented.
-                        let next = lines[i + 1..].iter().find(|x| !x.trim().is_empty());
+                        let next = lines[i..].iter().find(|x| !x.trim().is_empty());
                         match next {
                             Some(x) if indent_of(x) >= it.content => {
                                 items.last_mut().expect("an item").0.push(String::new());
                                 i += 1;
                                 continue;
                             }
-                            _ => {
-                                gap = true;
-                                i += 1;
-                                break;
-                            }
+                            // The list's loop takes the blank line, and marks the gap.
+                            _ => break,
                         }
                     }
                     if indent_of(n) >= it.content {
@@ -584,7 +579,9 @@ fn table(header: &[String], align: &[Align], rows: &[Vec<String>], w: usize, out
                 .max(MIN_COL)
         })
         .collect();
-    let room = w.saturating_sub(1 + 3 * k).max(k * MIN_COL);
+    // No floor is needed: when this is short of `MIN_COL` a column, the columns' own floor makes
+    // the box wider than `w`, and the table is drawn as lines.
+    let room = w.saturating_sub(1 + 3 * k);
     let (sum_least, sum_ideal) = (least.iter().sum::<usize>(), ideal.iter().sum::<usize>());
     let mut hard = false;
     let widths: Vec<usize> = if sum_ideal <= room {
@@ -718,13 +715,11 @@ fn plain_of(spans: &[(String, St)]) -> String {
     spans.iter().map(|(t, _)| t.as_str()).collect()
 }
 
+/// A run, unless it is empty. Neighbouring runs of one style are left apart: what draws them,
+/// `wrap_spans` and `hard_wrap`, joins them as it goes.
 fn push(out: &mut Vec<(String, St)>, text: &str, st: St) {
-    if text.is_empty() {
-        return;
-    }
-    match out.last_mut() {
-        Some((t, s)) if *s == st => t.push_str(text),
-        _ => out.push((text.to_string(), st)),
+    if !text.is_empty() {
+        out.push((text.to_string(), st));
     }
 }
 
@@ -871,10 +866,8 @@ fn closer(s: &str, from: usize, delim: &str) -> Option<usize> {
         if ok {
             return Some(k);
         }
+        // Never past the end: a doubled `*` has another after it, and any other delimiter fits.
         at = k + delim.len().max(if doubled { 2 } else { 1 });
-        if at > s.len() {
-            return None;
-        }
     }
     None
 }
@@ -910,11 +903,11 @@ pub fn wrap_spans(spans: &[(String, St)], w: usize) -> Vec<Line> {
                     words.push(Vec::new());
                     space_st.push(*st);
                 } else {
-                    let word = words.last_mut().expect("a word");
-                    match word.last_mut() {
-                        Some((x, s)) if s == st => x.push(ch),
-                        _ => word.push((ch.to_string(), *st)),
-                    }
+                    // A piece per character: `append` joins a style's run as the line is built.
+                    words
+                        .last_mut()
+                        .expect("a word")
+                        .push((ch.to_string(), *st));
                 }
             }
         }
@@ -1090,6 +1083,13 @@ mod tests {
         assert!(h2.bold && !h2.italic && !h2.underline);
         assert_eq!(text("Title\n=====\nbody", 40), ["Title", "", "body"]);
         assert_eq!(text("#hashtag", 40), ["#hashtag"]);
+        assert_eq!(
+            text("# C#", 40),
+            ["C#"],
+            "a closing run is set off by a space"
+        );
+        assert_eq!(text("Title\n---\nbody", 40), ["Title", "", "body"]);
+        assert!(style_of("Title\n---\nbody", 40, "Title").bold);
     }
 
     #[test]
@@ -1205,5 +1205,269 @@ mod tests {
         assert_eq!(text("```\nlet x", 40), ["let x"]);
         assert_eq!(text("some **bold", 40), ["some **bold"]);
         assert_eq!(text("| a | b |\n|---|", 40), ["| a | b |", "|---|"]);
+    }
+    #[test]
+    fn a_block_may_be_indented_three_spaces_but_not_four() {
+        assert_eq!(text("   # T", 40), ["T"]);
+        assert_eq!(text("    # T", 40), ["# T"]);
+        assert_eq!(text("   ***", 40), ["---"]);
+        assert_eq!(text("    ***", 40), ["***"]);
+        assert_eq!(text("Title\n   ===", 40), ["Title"]);
+        assert_eq!(text("Title\n    ===", 40), ["Title", "==="]);
+        assert_eq!(text("   ```\n# code\n   ```", 40), ["# code"]);
+        assert_eq!(text("    ```\n# code", 40), ["```", "code"]);
+        assert_eq!(text("   > q", 40), ["▎ q"]);
+        assert_eq!(text("    > q", 40), ["> q"]);
+    }
+
+    #[test]
+    fn a_rule_is_three_or_more_of_one_mark_spaced_or_not() {
+        for md in ["***", "___", "* * *", "- - -"] {
+            assert_eq!(text(md, 40), ["---"], "{md:?}");
+        }
+        assert_eq!(text("__", 40), ["__"], "two are not enough");
+        assert_eq!(text("-*-", 40), ["-*-"], "mixed marks are text");
+        assert_eq!(
+            text("text\n***", 40),
+            ["text", "---"],
+            "a rule ends a paragraph"
+        );
+    }
+
+    #[test]
+    fn an_item_is_numbered_by_up_to_nine_digits_and_either_delimiter() {
+        // An item hangs its wrapped text under its first word; a paragraph does not.
+        assert_eq!(
+            text("123456789. aaa bbb", 16),
+            ["123456789. aaa", "           bbb"]
+        );
+        assert_eq!(text("1234567890. aaa bbb", 16), ["1234567890. aaa", "bbb"]);
+        assert_eq!(text("1) first\n2) second", 40), ["1. first", "2. second"]);
+    }
+
+    #[test]
+    fn an_empty_item_holds_what_is_indented_under_its_text_and_no_less() {
+        assert_eq!(text("-\n  foo", 40), ["- foo"]);
+        assert_eq!(text("1.\n   foo", 40), ["1. foo"]);
+        // Indented less than where the text would start: a sibling, not a child.
+        assert!(
+            text("-\n - y", 40).contains(&"- y".to_string()),
+            "{:?}",
+            text("-\n - y", 40)
+        );
+    }
+
+    #[test]
+    fn a_line_that_starts_nothing_carries_on_the_item_above() {
+        assert_eq!(text("- a\nb", 40), ["- a", "  b"]);
+    }
+
+    #[test]
+    fn an_item_indented_less_than_the_text_above_is_its_sibling() {
+        assert_eq!(text("- a\n - b", 40), ["- a", "- b"]);
+        assert_eq!(
+            text("- a\n  - b", 40),
+            ["- a", "  - b"],
+            "calibration: under the text"
+        );
+        assert_eq!(
+            text("  - a\n- b", 40),
+            ["- a", "- b"],
+            "or less indented than the first"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_carries_an_item_on_only_into_indented_text() {
+        assert_eq!(text("- a\n\n  b", 40), ["- a", "", "  b"]);
+        assert_eq!(text("- a\n\nb", 40), ["- a", "", "b"]);
+    }
+
+    #[test]
+    fn a_fence_is_closed_only_by_its_own_mark_at_least_as_long_with_nothing_after() {
+        let md = "```\n~~~\n```x\n````\nafter";
+        assert_eq!(text(md, 40), ["~~~", "```x", "after"]);
+        assert_eq!(style_of(md, 40, "after").fg, None, "the block ended");
+    }
+
+    #[test]
+    fn nested_numbers_are_letters_then_roman_up_to_the_last_roman_numeral() {
+        assert_eq!(
+            text("1. a\n   1. b\n\n      3998. c\n      3999. d", 40),
+            [
+                "1. a",
+                "   a. b",
+                "",
+                "      mmmcmxcviii. c",
+                "      mmmcmxcix. d"
+            ]
+        );
+        assert_eq!(
+            text("1. a\n   1. b\n\n      3999. c\n      4000. d", 40),
+            ["1. a", "   a. b", "", "      3999. c", "      4000. d"],
+            "a list that runs past 3999 keeps its digits"
+        );
+        assert_eq!(
+            text("1. a\n\n   0. b\n   1. c", 40),
+            ["1. a", "", "   0. b", "   1. c"],
+            "there is no letter for nought"
+        );
+        assert_eq!(
+            text(
+                "1. a\n   1. b\n\n      3998. c\n\n      3999. d\n\n      4000. e",
+                40
+            )[3..],
+            ["      3998. c", "", "      3999. d", "", "      4000. e"],
+            "items a blank line apart are one list, numbered as one"
+        );
+    }
+
+    #[test]
+    fn a_table_cell_may_hold_an_escaped_pipe_or_one_in_code() {
+        assert_eq!(
+            text("| a \\| b | c |\n|---|---|\n| x | y |", 40)[1],
+            "│ a | b │  c  │"
+        );
+        assert_eq!(
+            text("| `a|b` | c |\n|---|---|\n| x | y |", 40)[1],
+            "│ a|b │  c  │"
+        );
+        assert_eq!(
+            text("| C:\\Users | c |\n|---|---|\n| x | y |", 40)[1],
+            "│ C:\\Users │  c  │",
+            "a backslash before anything else is kept"
+        );
+    }
+
+    #[test]
+    fn a_delimiter_row_is_dashes_and_colons_and_nothing_else() {
+        for md in ["| a | b |\n| -x- | --- |", "| a | b |\n| : | --- |"] {
+            assert_eq!(text(md, 40), md.lines().collect::<Vec<_>>(), "{md:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_never_draws_wider_than_it_is_given() {
+        let tables = [
+            "| abc |\n|---|\n| x |",
+            "| a | b |\n|---|---|\n| one two | x |",
+            "| abcdefghijkl | mnopqrstuvwx |\n|---|---|\n| a | b |",
+            "| aa | b |\n|---|---|\n| one two three four five six seven | x |",
+            "| h |\n|---|\n| aaaa bbbb cccc dddd |",
+        ];
+        for md in tables {
+            for w in 1..=60 {
+                for l in render(md, w) {
+                    assert!(width(&plain(&l)) <= w, "{md:?} at {w}: {l:?}");
+                }
+            }
+        }
+        // Calibration: the narrowest box that fits is drawn as one, a cell narrower is not.
+        assert_eq!(text("| abc |\n|---|\n| x |", 7)[0], "┌─────┐");
+        assert_eq!(text("| abc |\n|---|\n| x |", 6), ["abc:", "x"]);
+    }
+
+    #[test]
+    fn a_wrapped_table_fills_its_room_and_a_column_that_fits_keeps_its_width() {
+        let got = text(
+            "| aa | b |\n|---|---|\n| one two three four five six seven | x |",
+            30,
+        );
+        assert_eq!(got[0], "┌──────────────────────┬─────┐", "{got:#?}");
+        assert_eq!(got[3], "│ one two three four   │ x   │");
+    }
+
+    #[test]
+    fn words_too_long_for_a_table_are_broken_at_the_column_width() {
+        let got = text("| abcdefghijkl | mnopqrstuvwx |\n|---|---|\n| a | b |", 20);
+        assert_eq!(
+            got[..3],
+            [
+                "┌────────┬────────┐",
+                "│ abcdef │ mnopqr │",
+                "│ ghijkl │ stuvwx │"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_of_up_to_four_lines_stays_boxed_and_a_taller_one_does_not() {
+        let four = text("| h |\n|---|\n| aaaa bbbb cccc dddd |", 8);
+        assert_eq!(four.len(), 8, "{four:#?}");
+        assert_eq!(four[0], "┌──────┐");
+        assert_eq!(
+            text("| h |\n|---|\n| aaaa bbbb cccc dddd eeee |", 8),
+            ["h: aaaa", "bbbb", "cccc", "dddd", "eeee"]
+        );
+    }
+
+    #[test]
+    fn a_short_cell_is_centred_on_a_tall_one_with_the_odd_line_below() {
+        let two = text("| a | b |\n|---|---|\n| x | aaa bbb |", 14);
+        assert_eq!(two[3..5], ["│ x   │ aaa  │", "│     │ bbb  │"]);
+        let four = text("| a | b |\n|---|---|\n| x | aaa bbb ccc ddd |", 14);
+        assert_eq!(four[4], "│ x   │ bbb  │", "{four:#?}");
+    }
+
+    #[test]
+    fn a_table_drawn_as_lines_keeps_a_value_with_no_header_and_a_header_with_no_value() {
+        assert_eq!(
+            text("| | Key |\n|---|---|\n| v1 | k1 |", 8),
+            ["v1", "Key: k1"]
+        );
+        assert_eq!(text("| A | B |\n|---|---|\n| | k1 |", 6), ["A:", "B: k1"]);
+    }
+
+    #[test]
+    fn a_backslash_escapes_punctuation_and_is_kept_before_anything_else() {
+        assert_eq!(text("x\\", 40), ["x\\"]);
+        assert_eq!(text("C:\\Users", 40), ["C:\\Users"]);
+    }
+
+    #[test]
+    fn a_code_span_loses_one_space_each_side_only_when_it_has_both() {
+        assert_eq!(text("x`  `y", 40), ["x  y"], "nothing but spaces");
+        assert_eq!(text("x` a `y", 40), ["xay"]);
+        assert_eq!(text("x` ab`y", 40), ["x aby"]);
+    }
+
+    #[test]
+    fn inline_marks_work_anywhere_on_a_line_and_after_each_other() {
+        let md = "`a` b and `c` d";
+        assert_eq!(text(md, 40), ["a b and c d"]);
+        assert_eq!(style_of(md, 40, "c").fg, Some(LAVENDER));
+        assert_eq!(
+            text("see [a](u) and [b](v) end", 40),
+            ["see a (u) and b (v) end"]
+        );
+        assert_eq!(text("xy **b** z", 40), ["xy b z"]);
+        assert!(style_of("xy **b** z", 40, "b").bold);
+        assert!(style_of("__bold__ x", 40, "bold").bold);
+        assert_eq!(text("`unclosed tick", 40), ["`unclosed tick"]);
+    }
+
+    #[test]
+    fn emphasis_closes_after_text_and_not_on_half_of_a_double_mark() {
+        assert_eq!(text("a **** b", 40), ["a **** b"], "empty is not emphasis");
+        assert_eq!(text("**a **b", 40), ["**a **b"], "a closer follows text");
+        assert_eq!(text("*a *b*", 40), ["a *b"]);
+        assert_eq!(text("**a **b**", 40), ["a **b"]);
+        assert!(style_of("**a **b**", 40, "a **b").bold);
+        let md = "*x **y** z*";
+        assert_eq!(text(md, 40), ["x y z"]);
+        let y = style_of(md, 40, "y");
+        assert!(y.bold && y.italic, "{y:?}");
+        assert!(style_of(md, 40, "z").italic);
+    }
+
+    #[test]
+    fn a_style_that_changes_inside_a_word_is_kept() {
+        assert!(style_of("plain**bold**", 40, "bold").bold);
+        assert!(!style_of("plain**bold**", 40, "plain").bold);
+    }
+
+    #[test]
+    fn a_word_longer_than_a_line_is_broken_at_the_width() {
+        assert_eq!(text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
     }
 }
