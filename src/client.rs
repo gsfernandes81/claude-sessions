@@ -5718,12 +5718,16 @@ mod tests {
             convo::suggestions(ui_of(&app)).is_empty(),
             "and the list goes"
         );
-        // Esc puts the list away, and only that.
+        // Esc puts the list away, and only that; typing on brings it back, from its top.
         let mut app = app_in(&[]);
         type_in_only(&mut app, "/");
+        app.key(Key::Down, now);
         app.key(Key::Esc, now);
         assert!(ui_of(&app).suggest_off);
         assert_eq!(ui_of(&app).input, "/");
+        type_in_only(&mut app, "m");
+        assert!(!ui_of(&app).suggest_off);
+        assert_eq!(ui_of(&app).suggest, 0);
         // A choice past the end of a list that shrank under it is the last.
         let mut app = app_in(&[]);
         type_in_only(&mut app, "/");
@@ -6135,5 +6139,137 @@ mod tests {
             app.key(Key::PageUp, now);
         }
         assert_eq!(ui_of(&app).scroll, most);
+    }
+
+    #[test]
+    fn enter_while_the_link_is_down_keeps_the_prompt_and_says_it_was_not_sent() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("earlier", now);
+        }
+        app.link_down(now);
+        type_in(&mut app, "hello");
+        assert_eq!(ui_of(&app).input, "hello", "back in the prompt");
+        assert!(matches!(
+            ui_of(&app).link,
+            Link::Down { not_sent: true, .. }
+        ));
+        let pending = |app: &App| {
+            conv_of(app)
+                .pending
+                .iter()
+                .map(|p| p.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pending(&app), ["earlier"], "nothing new on its way");
+        set_ui(&mut app, |ui| ui.input.clear());
+        type_in(&mut app, "/rename door");
+        assert_eq!(pending(&app), ["earlier"], "a command was never on its way");
+    }
+
+    #[test]
+    fn the_client_wakes_for_the_soonest_thing_that_changes_the_screen_and_else_sleeps() {
+        let now = Instant::now();
+        let greeted = || {
+            let mut app = App::new("dev", 40, 24, 1);
+            app.greeted = true;
+            app
+        };
+        assert_eq!(greeted().next_wake(now), None, "nothing to wait for");
+        let spin = Some(SPIN_EVERY);
+        // The home's spinners: connecting, reconnecting, an action under way.
+        assert_eq!(App::new("dev", 40, 24, 1).next_wake(now), spin);
+        let mut app = greeted();
+        app.down_since = Some(now);
+        assert_eq!(app.next_wake(now), spin);
+        let mut app = greeted();
+        app.working = Some((now, 0, "offloading session".into()));
+        assert_eq!(app.next_wake(now), spin);
+        // A retry due, an answer due, a draft to save: each when it is due.
+        let mut app = greeted();
+        app.retry_at = Some(now + Duration::from_secs(4));
+        assert_eq!(app.next_wake(now), Some(Duration::from_secs(4)));
+        let mut app = greeted();
+        app.awaiting = Some(now);
+        assert_eq!(app.next_wake(now), Some(ACK_WAIT));
+        let mut app = greeted();
+        app.dirty = Some(now);
+        assert_eq!(app.next_wake(now), Some(DRAFT_QUIET));
+        // The soonest of several.
+        let mut app = greeted();
+        app.retry_at = Some(now + Duration::from_secs(4));
+        app.awaiting = Some(now - Duration::from_secs(3));
+        assert_eq!(app.next_wake(now), Some(Duration::from_secs(2)));
+        // A conversation: idle, nothing; working, its spinner, but not behind a dialog.
+        let app = app_in(&[]);
+        assert_eq!(app.next_wake(now), None);
+        for st in ["working", "compacting"] {
+            let mut app = app_in(&[&format!(r#"{{"t":"st","s":"{st}"}}"#)]);
+            assert_eq!(app.next_wake(now), spin, "{st}");
+            set_ui(&mut app, |ui| ui.dialog = Some(Dialog::Effort { sel: 0 }));
+            assert_eq!(app.next_wake(now), None, "{st} behind a dialog");
+        }
+        // A prompt on its way, and a link down, turn too.
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("on its way", now);
+        }
+        assert_eq!(app.next_wake(now), spin);
+        let mut app = app_in(&[]);
+        app.link_down(now);
+        app.retry_at = None;
+        assert_eq!(app.next_wake(now), spin);
+        // An open shell's output: at once the first time, then when it is due again.
+        let mut app = app_in(&[TASKS]);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[0]);
+        set_ui(&mut app, |ui| ui.dialog = Some(Dialog::Tasks(v)));
+        assert_eq!(app.next_wake(now), Some(Duration::ZERO));
+        app.output_for = Some(("b1".into(), now + OUTPUT_EVERY));
+        assert_eq!(app.next_wake(now), Some(OUTPUT_EVERY));
+    }
+
+    #[test]
+    fn an_answer_may_take_longer_while_a_conversation_opens() {
+        let mut app = App::new("dev", 40, 24, 1);
+        assert_eq!(app.ack_wait(), ACK_WAIT);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        assert_eq!(app.ack_wait(), OPEN_WAIT);
+    }
+
+    #[test]
+    fn the_links_end_takes_it_down_saying_why_and_an_old_links_end_is_ignored() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.gone(app.epoch - 1, "an old link".into(), now);
+        assert!(app.up(), "an earlier link's end is not this one's");
+        app.gone(app.epoch, "Connection reset by peer".into(), now);
+        assert!(!app.up());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("Connection reset by peer")
+        );
+        // In a conversation it is said there; ssh saying nothing says nothing.
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.gone(app.epoch, "Connection reset by peer".into(), now);
+        assert_eq!(
+            ui_of(&app).status.as_deref(),
+            Some("Connection reset by peer")
+        );
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        set_ui(&mut app, |ui| ui.status = Some("as it was".into()));
+        app.gone(app.epoch, String::new(), now);
+        assert!(!app.up());
+        assert_eq!(ui_of(&app).status.as_deref(), Some("as it was"));
     }
 }
