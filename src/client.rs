@@ -207,6 +207,8 @@ struct App {
     dirty: Option<Instant>,
     /// The conversation whose kept draft was looked for, so it is looked for once.
     restored: Option<(String, String)>,
+    /// The containers the menu was last built for (`hosts_changed`).
+    menu_hosts: Vec<String>,
     /// Something was typed in this conversation before its id came: what is in the prompt is
     /// newer than any draft kept, which is not put back over it.
     touched: bool,
@@ -2335,24 +2337,20 @@ fn edit_line(chars: &mut Vec<char>, at: usize, k: Key) -> usize {
         // A word at a time, as Claude Code's prompt: back to the start of a word, on to the
         // end of one, a word being letters, digits and `_`.
         Key::WordLeft => {
-            let mut i = at;
-            while i > 0 && !is_word(chars[i - 1]) {
-                i -= 1;
-            }
-            while i > 0 && is_word(chars[i - 1]) {
-                i -= 1;
-            }
-            i
+            let before = &chars[..at];
+            let gap = before.iter().rev().take_while(|c| !is_word(**c)).count();
+            let word = before[..at - gap]
+                .iter()
+                .rev()
+                .take_while(|c| is_word(**c))
+                .count();
+            at - gap - word
         }
         Key::WordRight => {
-            let mut i = at;
-            while i < chars.len() && !is_word(chars[i]) {
-                i += 1;
-            }
-            while i < chars.len() && is_word(chars[i]) {
-                i += 1;
-            }
-            i
+            let after = &chars[at..];
+            let gap = after.iter().take_while(|c| !is_word(**c)).count();
+            let word = after[gap..].iter().take_while(|c| is_word(**c)).count();
+            at + gap + word
         }
         Key::Right => (at + 1).min(chars.len()),
         Key::Home | Key::Char('\x01') => 0,
@@ -2860,10 +2858,7 @@ impl App {
     fn paint(&mut self, term: &mut RawTerminal, now: Instant) -> io::Result<()> {
         let (w, h) = term::size().unwrap_or((40, 24));
         let out = self.paint_bytes(w, h, now);
-        if !out.is_empty() {
-            term.write_all(out.as_bytes())?;
-        }
-        Ok(())
+        term.write_all(out.as_bytes())
     }
 
     /// What painting a `w`×`h` screen writes: the clipboard's escape if one is due, the rows
@@ -2957,6 +2952,49 @@ impl App {
     }
 }
 
+impl App {
+    /// The containers the relay names changed since the menu was last built for them.
+    fn hosts_changed(&mut self) -> bool {
+        if self.hosts == self.menu_hosts {
+            return false;
+        }
+        self.menu_hosts = self.hosts.clone();
+        true
+    }
+
+    /// Keys from the terminal. A resize is the screen's, drawn again whole; whether there was
+    /// one, so the screen is cleared first.
+    fn keys(&mut self, keys: Vec<Key>, now: Instant) -> bool {
+        let mut resized = false;
+        for k in keys {
+            if k == Key::Resize {
+                self.drawn.clear();
+                resized = true;
+                continue;
+            }
+            self.key(k, now);
+        }
+        resized
+    }
+
+    /// What the link's reader said: a line from the link in use, or a link's end.
+    fn take(&mut self, h: Heard, now: Instant) {
+        match h {
+            Heard::Line(e, v) if e == self.epoch => self.heard(v, now),
+            Heard::Gone(e, why) => self.gone(e, why, now),
+            _ => {}
+        }
+    }
+
+    /// The link taken for dead if an answer is overdue; whether a dial is due.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.awaiting.is_some_and(|a| now >= a + self.ack_wait()) {
+            self.link_down(now);
+        }
+        self.retry_at.is_some_and(|r| now >= r)
+    }
+}
+
 /// `claude-remote <ssh name>`.
 /// Mockup 10's spinner and word, before the relay's hello.
 fn connecting(frame: usize) -> Busy {
@@ -3017,6 +3055,7 @@ impl App {
             seen: None,
             dirty: None,
             restored: None,
+            menu_hosts: Vec::new(),
             touched: false,
         };
         app.menu.remote = true;
@@ -3036,11 +3075,9 @@ pub fn run(name: &str) -> Result<(), String> {
     term.write_all(b"\x1b[2J\x1b[?2004h\x1b[?1002h")
         .map_err(|e| e.to_string())?;
     app.dial(Instant::now(), &tx);
-    let mut hosts_seen: Vec<String> = Vec::new();
     loop {
         let now = Instant::now();
-        if app.hosts != hosts_seen {
-            hosts_seen = app.hosts.clone();
+        if app.hosts_changed() {
             let (w, h) = term::size().unwrap_or((40, 24));
             app.rebuild_menu(w, h);
         }
@@ -3058,29 +3095,17 @@ pub fn run(name: &str) -> Result<(), String> {
         let now = Instant::now();
         match input {
             Ok(Input::Keys(keys)) => {
-                for k in keys {
-                    if k == Key::Resize {
-                        app.drawn.clear();
-                        let _ = term.write_all(b"\x1b[2J");
-                        continue;
-                    }
-                    app.key(k, now);
+                if app.keys(keys, now) {
+                    let _ = term.write_all(b"\x1b[2J");
                 }
             }
             Ok(Input::Timeout) | Ok(Input::Woken) => {}
             Err(_) => break,
         }
         while let Ok(h) = rx.try_recv() {
-            match h {
-                Heard::Line(e, v) if e == app.epoch => app.heard(v, now),
-                Heard::Gone(e, why) => app.gone(e, why, now),
-                _ => {}
-            }
+            app.take(h, now);
         }
-        if app.awaiting.is_some_and(|a| now >= a + app.ack_wait()) {
-            app.link_down(now);
-        }
-        if app.retry_at.is_some_and(|r| now >= r) {
+        if app.due(now) {
             app.dial(now, &tx);
         }
     }
@@ -6905,5 +6930,70 @@ mod tests {
             has(&rows, &format!("{} offloading session", spinner(2))),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn the_menu_is_built_again_only_when_the_containers_change() {
+        let mut app = App::new("dev", 40, 24, 1);
+        assert!(!app.hosts_changed(), "none yet, none built for");
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a"]}"#);
+        assert!(app.hosts_changed());
+        assert!(!app.hosts_changed(), "built for them");
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.hosts_changed());
+    }
+
+    #[test]
+    fn a_resize_redraws_the_whole_screen_and_is_no_key() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        app.paint_bytes(40, 24, now);
+        assert!(!app.keys(vec![Key::Char('a'), Key::Char('b')], now));
+        assert_eq!(ui_of(&app).input, "ab");
+        app.paint_bytes(40, 24, now);
+        assert!(app.keys(vec![Key::Resize, Key::Char('c')], now));
+        assert_eq!(ui_of(&app).input, "abc");
+        assert_eq!(app.paint_bytes(40, 24, now).matches(";1H").count(), 24);
+    }
+
+    #[test]
+    fn only_the_link_in_use_is_heard_and_a_links_end_is_taken() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.take(
+            Heard::Line(
+                app.epoch - 1,
+                parse(r#"{"t":"hi","v":1,"hosts":["old"]}"#).unwrap(),
+            ),
+            now,
+        );
+        assert!(app.hosts.is_empty(), "an earlier link's");
+        app.take(
+            Heard::Line(
+                app.epoch,
+                parse(r#"{"t":"hi","v":1,"hosts":["a"]}"#).unwrap(),
+            ),
+            now,
+        );
+        assert_eq!(app.hosts, ["a"]);
+        app.take(Heard::Gone(app.epoch, String::new()), now);
+        assert!(!app.up());
+    }
+
+    #[test]
+    fn an_answer_overdue_takes_the_link_down_and_a_retry_falls_due_on_time() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        let now = Instant::now();
+        app.awaiting = Some(now);
+        assert!(!app.due(now + Duration::from_secs(1)));
+        assert!(app.up(), "still within its five seconds");
+        assert!(!app.due(now + ACK_WAIT), "down, its retry a second off");
+        assert!(!app.up());
+        assert!(app.due(now + ACK_WAIT + Duration::from_secs(1)));
     }
 }
