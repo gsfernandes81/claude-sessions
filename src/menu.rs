@@ -677,6 +677,25 @@ impl Menu {
         }
     }
 
+    /// Claude Remote's arrows on its two homes (owner, 2026-11-08), as the key they stand for:
+    /// Right goes in as `Enter` does, into a container or a session or the Archived group, and
+    /// Left comes out, shutting that group or leaving a container for every container as `Esc`
+    /// does. `None` where there is nowhere to go: Left on the home of every container, where
+    /// `Esc` quits, does nothing. The door's menu does not take them.
+    pub fn arrow(&self, key: Key) -> Option<Key> {
+        if self.ask.is_some() || self.screen != Screen::List || self.rows.is_empty() {
+            return None;
+        }
+        let fold = self.on(|r| r.key == RowKey::ArchiveFold);
+        match key {
+            Key::Right if fold && self.archive_open => None,
+            Key::Right => Some(Key::Enter),
+            Key::Left if fold && self.archive_open => Some(Key::Enter),
+            Key::Left if self.back() => Some(Key::Esc),
+            _ => None,
+        }
+    }
+
     /// Whether the row under the cursor is one `pred` picks.
     fn on(&self, pred: impl Fn(&Row) -> bool) -> bool {
         self.rows.get(self.cursor).is_some_and(pred)
@@ -1670,6 +1689,61 @@ mod tests {
             .map(|r| (r.title.as_str(), r.remote))
             .collect();
         assert_eq!(remote, [("held", true), ("term", false)]);
+    }
+
+    /// What an arrow does on the phone's homes: `arrow` first, as the client's home does.
+    fn arrow(m: &mut Menu, k: Key) -> Action {
+        let k = m.arrow(k).unwrap_or(k);
+        m.key(k)
+    }
+
+    #[test]
+    fn on_the_phones_homes_right_goes_in_and_left_comes_out() {
+        let mut old = in_("infra-dev", "old");
+        old.closed = true;
+        old.key = RowKey::Conversation {
+            id: "old".into(),
+            cwd: "/workspace".into(),
+            harness: crate::harness::Harness::Claude,
+        };
+        let mut m = hub_menu(vec![in_("infra-dev", "a"), old]);
+        // Calibration: the menu alone, as the door has it, takes neither.
+        assert_eq!(m.key(Key::Right), Action::None);
+        assert_eq!(m.key(Key::Left), Action::None);
+        assert!(m.view().home, "still every container");
+        // Left on the home of every container does nothing, where Esc would quit.
+        assert_eq!(arrow(&mut m, Key::Left), Action::None);
+        assert_eq!(
+            m.key(Key::Esc),
+            Action::Quit,
+            "calibration: Esc there quits"
+        );
+        // Right on a session opens it, as Enter does.
+        m.key(Key::Down);
+        assert_eq!(arrow(&mut m, Key::Right), Action::Open(1));
+        // Right on a container goes into it.
+        m.key(Key::Up);
+        assert_eq!(arrow(&mut m, Key::Right), Action::Redraw);
+        assert!(m.view().back, "into infra-dev");
+        assert_eq!(names(&m), ["a", "Archived"]);
+        // Right opens the Archived group, and again stays put; Left shuts it.
+        m.key(Key::End);
+        arrow(&mut m, Key::Right);
+        assert_eq!(names(&m), ["a", "Archived", "old"]);
+        assert_eq!(arrow(&mut m, Key::Right), Action::None);
+        assert_eq!(names(&m), ["a", "Archived", "old"]);
+        arrow(&mut m, Key::Left);
+        assert_eq!(names(&m), ["a", "Archived"]);
+        // Left then leaves the container, the cursor back on it, so Right goes straight in.
+        assert_eq!(arrow(&mut m, Key::Left), Action::Redraw);
+        assert!(m.view().home && !m.view().back);
+        assert_eq!(m.rows()[m.view().cursor].title, "infra-dev");
+        arrow(&mut m, Key::Right);
+        assert!(m.view().back);
+        // The keys screen takes neither.
+        m.key(Key::Char('?'));
+        assert_eq!(arrow(&mut m, Key::Left), Action::None);
+        assert_eq!(arrow(&mut m, Key::Right), Action::None);
     }
 
     #[test]

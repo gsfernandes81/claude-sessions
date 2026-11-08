@@ -403,7 +403,11 @@ the owner had already spoken (above). Two items need the owner, and both are moc
    drawing are `src/convo.rs`, tested as text against R1 to R8 at 40 columns.
    - **The home is the hub's own menu** (`Menu::hub`) fed the relay's snapshots, with R9's
      hint line (`View::remote`). A running session no holder drives is dim and `term: `, and
-     Enter on it puts R10's words where the hint line was.
+     Enter on it puts R10's words where the hint line was. **Right goes in and Left comes
+     out** (owner, 2026-11-08), on the phone's two homes only (`Menu::arrow`): Right as Enter
+     into a container, a session or the Archived group, Left shutting that group or leaving a
+     container for every container as Esc does. Left on the home of every container does
+     nothing, where Esc quits; the door's menu takes neither, and the hint lines are R9's.
    - **The link** is `ssh -T -C -o BatchMode=yes <name> claude-sessions relay`
      (`CLAUDE_REMOTE_SSH` and `CLAUDE_REMOTE_RELAY` override both halves), redialled with
      backoff from 1 to 30 seconds, doubling once per failed dial (an ssh the client cut is

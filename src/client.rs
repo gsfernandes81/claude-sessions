@@ -892,6 +892,9 @@ impl App {
             self.quit = true;
             return;
         }
+        // Right goes in and Left comes out, on the phone's homes only (owner, 2026-11-08).
+        // Where there is nowhere to go, the menu has the arrow itself, which does nothing.
+        let k = self.menu.arrow(k).unwrap_or(k);
         let action = self.menu.key(k);
         match action {
             Action::Quit => self.quit = true,

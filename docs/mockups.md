@@ -549,6 +549,8 @@ The owner's calls, each made in a comment on the page:
     Enter on one says why, in place of the hint line, until the next key (R10).
   - Everything else opens on Enter. Offloaded and archived sessions resume in remote mode.
   - `n` starts a new remote-mode session. The keys are `Enter open   n new   c close   ? keys`.
+  - Right goes in as Enter does, and Left comes out as Esc does, but not out of the client
+    from the home of every container (owner, 2026-11-08). The hint line does not list them.
   - **`c` puts a session away as at the door** (owner, 2026-11-01: "get the offloading commands
     etc working … and remove non working commands from being presented"): offloads a loaded one,
     archives an offloaded one, the row's spinner turning meanwhile (mockup 11). A shell (`s`) and
