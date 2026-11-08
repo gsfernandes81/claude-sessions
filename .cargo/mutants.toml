@@ -94,11 +94,10 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # drafts.rs and tasks.rs (2026-11-08). The drafts file exactly at its cap: telling `>`
-    # from `>=` needs a file of exactly 4 MiB, a size only the serializer's arithmetic gives.
-    'src/drafts\.rs:.*: replace > with >= in save$',
-    # The strip's counts at the one width where they meet the name: the mutant is the fix
-    # for an off-by-one there (the counts are kept and the line cut a cell short), reported
-    # to the owner rather than pinned; drop this when it is fixed.
-    'src/tasks\.rs:.*: replace > with >= in overflows$',
+    # client.rs: the second Left's window compared with `<` or `<=` (timing only); the
+    # terminal's size read live, over `screen`, which is tested; and a selection's empty span
+    # on a row, which draws and copies the same as none.
+    'src/client\.rs:.*: replace < with <= in App::conv_key$',
+    'src/client\.rs:.*: replace size -> ',
+    'src/client\.rs:.*: replace < with <= in Selection::cols$',
 ]
