@@ -1048,7 +1048,8 @@ another.
 
 **The stand-ins (`src/peer.rs`).** For each claude slot in every other container, running or
 offloaded, the container's agent holds a stand-in: a socket `<16 hex>.sock` beside Claude
-Code's own, and a record naming it as `repo/slot`, with a `pidDomain` of
+Code's own, and a record naming it by its address and title (below, *A peer's name*), with a
+`pidDomain` of
 `claude-sessions:<repo>` and a made-up pid above any real one. A live slot's record says `busy`
 or `idle`; an offloaded one's says nothing, since Claude Code shows `status` only when it is one
 of its own four (`busy`, `shell`, `idle`, `waiting`, read from 2.1.311) and drops any other.
@@ -1058,12 +1059,39 @@ a foreign pid domain as present without a pid check, as long as its socket answe
 claude therefore lists the whole fleet and messages it by name, with no skill or command of
 ours.
 
+**A peer's name** (owner, 2026-11-08: "the user defined name or what they're working on").
+A stand-in is listed, and messaged, as its `repo/slot` and then the words of its
+conversation's own name: `infra/claude-4 tunnel cert renewal` (`peer::listed_name`).
+- **Which title.** The custom title, else the generated one; never the first prompt, which
+  gives way to the generated title within a turn or two and would change the name with it. A
+  row says which it has (`named`, sent only when set, so a row from an older agent reads as
+  untitled), and the router puts a title in the roster only from a named row. Until then the
+  slot is listed as its `repo/slot`.
+- **What Claude Code takes** (2.1.311, read from its bundle and held by
+  `tests/claude_peer.rs`). It matches a name ignoring case, a run of spaces as one `-`, so
+  `infra/claude-4-Tunnel-cert-renewal` reaches the same session. It refuses a name with `@`
+  and reads one ending `[<hex>]` as a name and a ref, and a wrapper attribute cannot hold
+  `"<>` or a line break, so the title keeps letters, digits and `-_.,'+&#()!?` and anything
+  else is a space; `/` too, so the address ends at the first space. A receiver cuts a
+  `from-name` past 64 characters and then rejects the message as re-serialised differently,
+  so the whole name is cut at a word to 64.
+- **Renamed.** The stand-in, its socket and its `[ref]` stay; only the record's name
+  changes. Claude Code then refuses the old name, even from a session that sent to it under
+  that name ("No agent named … is reachable. Use ListAgents"), so the record keeps the names
+  it had as `formerNames`, which `ListAgents` shows for ten minutes beside the new one ("says
+  it was … until … ago"), and every session is told to list again when a name is not found.
+- **From a peer.** A delivered message's `from-name` is the name the sender's stand-in here is
+  listed by, so it reads as the listing does. It starts with the address the hub verified;
+  the title after it is the sender's conversation's, which is the owner's or Claude Code's to
+  say. A sender the roster has not reached yet is named by its address alone.
+
 - **Who sent it is ours to say.** A frame written to a stand-in is attributed to the slot
   whose claude is at the other end of the socket (`SO_PEERCRED`, then this container's
   registry). A claude in no slot has no address, and what it sends is dropped.
 - **Delivery.** A frame from the hub is written into the local slot's inbox, named by its
   claude's record. `from`, and the wrapper's `from=`, are set to the sender's stand-in here,
-  and `from-name` to the address the hub verified, whatever the sender wrote. A receiver
+  and `from-name` to the name its stand-in is listed by, which starts with the address the
+  hub verified, whatever the sender wrote. A receiver
   replies only to a socket owned by the pid that delivered the message, so the agent that
   delivers is the one holding the stand-ins, and a reply comes back the same way. Receipts,
   idle notices and the other control frames travel the same path.
@@ -1091,7 +1119,7 @@ the agent wire (`proto.rs`):
 
 | | |
 |---|---|
-| `{"roster":[{repo,slot,title,busy,live}…]}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent |
+| `{"roster":[{repo,slot,title,busy,live}…]}` | hub → agent: every slot in the other containers, sent when it changes and to every new agent; `title` is the conversation's own name, empty while it has none |
 | `{"peer":{from,to,frame}}` | agent → hub: a frame local slot `from` wrote to the stand-in for `to` |
 | `{"deliver":{to,from,frame}}` | hub → agent: write `frame`, from `from`, into local slot `to` |
 | `{"bounce":{to,from,frame,why}}` | agent → hub: it could not be written yet (no claude or inbox, relay off) |
@@ -1151,7 +1179,9 @@ the agent wire (`proto.rs`):
   (owner, 2026-11-06).
 
 **What every session is told** (owner and infra, 2026-11-07). The facts an agent needs before
-it messages a peer: other containers' sessions are listed as `repo/slot`; a peer with no status
+it messages a peer: other containers' sessions are listed as `repo/slot` and their title, and
+reached by that whole name, which changes with the title, so list again when it is not found; a
+peer with no status
 is offloaded; a message wakes one where there is room, at about `mem::SESSION_COST` of that
 container's RAM and CPU on the shared host; so prefer a live peer and send one message, not
 several; and a `hub/router` notice is not a peer. Four lines, in `peer::context`.
@@ -1186,6 +1216,10 @@ model is sent and answers with scripted tool calls. So no request leaves the mac
 account is used, and each test reads as the promise it checks:
 - the record names an inbox in protocol 1, and `peer-check` agrees;
 - a stand-in is listed, and a dead one is not;
+- a stand-in is listed by its address and title, and reached by that name in another case
+  with hyphens for spaces;
+- a renamed stand-in is refused by its old name, even by a session that sent to it under
+  that name, and listed by its new name with the old one beside it, which then reaches it;
 - a send to a stand-in reaches the agent from the sender's slot, and nothing is carried from
   a claude in no slot;
 - a delivered message reaches the model from the verified sender;
@@ -1202,7 +1236,10 @@ changed, and names the broken behaviour when something did.
 
 `tests/peer.rs` proves the rest end to end, with the real binary as the router and as two
 containers' agents over a stand-in ssh:
-- stand-ins for the other container's slots, and none for a container's own;
+- stand-ins for the other container's slots, listed by address and title, and none for a
+  container's own;
+- a slot renamed in one container listed by its new name in the other, through the same
+  stand-in, with the name it had kept;
 - a message delivered with its verified sender, and the sender's own claim of a name
   discarded;
 - the reply coming back;

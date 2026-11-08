@@ -313,27 +313,41 @@ impl SlotRecord {
     /// [`Self::display_title`], with titles read from the transcript since the hook last
     /// recorded them (`transcript::titles_cached`) taking the place of the recorded ones.
     pub fn display_title_with(&self, read: &crate::transcript::Titles) -> String {
+        self.own_title_with(read)
+            .or_else(|| self.first_prompt.clone())
+            .unwrap_or_else(|| "(no title yet)".into())
+    }
+
+    /// The conversation's own name, if it has one yet: the custom title, else the generated
+    /// one. Not the first prompt, which stands in for a title only until one is generated.
+    pub fn own_title_with(&self, read: &crate::transcript::Titles) -> Option<String> {
         read.custom
             .clone()
             .or_else(|| self.title.clone())
             .or_else(|| read.ai.clone())
             .or_else(|| self.ai_title.clone())
-            .or_else(|| self.first_prompt.clone())
-            .unwrap_or_else(|| "(no title yet)".into())
     }
 
     /// The title its row shows, with titles read from its transcript (a `/rename` fires no
     /// hook), as the menu draws it and messages name it.
     pub fn row_title(&self) -> String {
-        self.display_title_with(
-            &self
-                .conversation_path()
-                .map(|p| match self.harness {
-                    Harness::Claude => crate::transcript::titles_cached(&p),
-                    Harness::Pi => crate::pisession::titles_cached(&p),
-                })
-                .unwrap_or_default(),
-        )
+        self.row_titles().0
+    }
+
+    /// [`Self::row_title`], and whether it is the conversation's own name
+    /// ([`Self::own_title_with`]) rather than its first prompt or nothing yet.
+    pub fn row_titles(&self) -> (String, bool) {
+        let read = self
+            .conversation_path()
+            .map(|p| match self.harness {
+                Harness::Claude => crate::transcript::titles_cached(&p),
+                Harness::Pi => crate::pisession::titles_cached(&p),
+            })
+            .unwrap_or_default();
+        match self.own_title_with(&read) {
+            Some(t) => (t, true),
+            None => (self.display_title_with(&read), false),
+        }
     }
 
     /// How much longer a keep-alive holds this slot, if one does: only while it runs.

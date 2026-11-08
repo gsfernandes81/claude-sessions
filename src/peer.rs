@@ -12,7 +12,8 @@
 //! agent holds a stand-in: a socket under the same `cc-socks/` and a record naming it, with
 //! a `pidDomain` of our own. Claude Code takes a record from a foreign pid domain as present
 //! without a pid check, as long as its socket answers. A local claude then lists
-//! `repo/slot`, and what it sends there reaches the agent, which hands it to the hub. A
+//! `repo/slot` and its title ([`listed_name`]), and what it sends there reaches the agent,
+//! which hands it to the hub. A
 //! message from the hub is written into the local slot's own socket, with `from` naming the
 //! sender's stand-in here, so a reply comes back the same way.
 //!
@@ -22,8 +23,9 @@
 //!
 //! **Who sent it is ours to say, never the sender's.** The sending slot is found from the
 //! connecting pid, among the slots this container's registry says are live. The hub adds the
-//! container, from which agent told it. On delivery, `from-name` is set to that `repo/slot`,
-//! whatever the sender wrote.
+//! container, from which agent told it. On delivery, `from-name` is set to the name the
+//! sender's stand-in is listed by — that `repo/slot`, then its title — whatever the sender
+//! wrote.
 //!
 //! **It switches itself off rather than half-work.** It speaks peer protocol 1. When a local
 //! claude's record says otherwise, every stand-in goes, it tells the hub once, and a delivery
@@ -130,6 +132,11 @@ impl Entry {
         format!("{}/{}", self.repo, self.slot)
     }
 
+    /// The name it is listed and messaged by: [`listed_name`].
+    pub fn listed(&self) -> String {
+        listed_name(&self.addr(), &self.title)
+    }
+
     pub fn to_value(&self) -> Value {
         let mut v = Value::obj();
         v.set("repo", Value::string(&self.repo));
@@ -163,23 +170,94 @@ pub fn is_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
 }
 
+/// The longest name a peer is listed by. Claude Code cuts a `from-name` longer than this, and
+/// a receiver that re-serialises a wrapper and finds it cut rejects the message (2.1.311).
+pub const MAX_LISTED: usize = 64;
+
+/// The name a peer is listed by in `ListAgents` and messaged by with `SendMessage`: its
+/// `repo/slot`, then the words of its title (owner, 2026-11-08), so an agent sees what each
+/// peer is working on: `infra/claude-4 tunnel cert renewal`. Claude Code matches a name
+/// ignoring case and taking a run of spaces as one `-`.
+///
+/// The title keeps letters, digits and `-_.,'+&#()!?`; anything else is a space, so the name
+/// has no `@` (which Claude Code refuses), no `/` (which would blur where the slot ends), no
+/// `[` (a name ending `[<hex>]` reads as a name and a ref), and nothing a wrapper attribute
+/// cannot hold (`"<>`, line breaks). It is cut at a word to fit [`MAX_LISTED`]. A slot with
+/// no title, or none of it left, is listed as its `repo/slot`.
+pub fn listed_name(addr: &str, title: &str) -> String {
+    let words: String = title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "-_.,'+&#()!?".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let room = MAX_LISTED.saturating_sub(addr.chars().count() + 1);
+    let mut kept = String::new();
+    for w in words.split_whitespace() {
+        let n = kept.chars().count();
+        let want = n + usize::from(n > 0) + w.chars().count();
+        if want > room {
+            // One word longer than the room is cut, rather than leaving no title at all.
+            if n == 0 {
+                kept = w.chars().take(room).collect();
+            }
+            break;
+        }
+        if n > 0 {
+            kept.push(' ');
+        }
+        kept.push_str(w);
+    }
+    if kept.is_empty() {
+        addr.to_string()
+    } else {
+        format!("{addr} {kept}")
+    }
+}
+
 /// `repo/slot`, both names.
 pub fn split_addr(addr: &str) -> Option<(&str, &str)> {
     let (repo, slot) = addr.split_once('/')?;
     (is_name(repo) && is_name(slot)).then_some((repo, slot))
 }
 
+/// How many earlier names a record keeps: Claude Code reads three.
+const FORMER_NAMES: usize = 3;
+
+/// A stand-in's name over time: since when it has had the one it has, and the ones it had
+/// before, newest first, each with when it stopped being that.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Naming {
+    pub since: u64,
+    pub former: Vec<(String, u64)>,
+}
+
+impl Naming {
+    /// The name went from `old` to `new` at `now`: `old` is remembered, and a name it has come
+    /// back to is not listed as a former one.
+    pub fn renamed(&mut self, old: String, new: &str, now: u64) {
+        self.former.retain(|(n, _)| n != new && *n != old);
+        self.former.insert(0, (old, now));
+        self.former.truncate(FORMER_NAMES);
+        self.since = now;
+    }
+}
+
 /// The record Claude Code reads for a stand-in: the fields a 2.1.311 record carries that its
-/// listing reads, with our pid domain.
-pub fn record(e: &Entry, sock: &Path, now_ms: u64) -> Value {
+/// listing reads, with our pid domain. Its name is [`Entry::listed`]; the names it had are
+/// `formerNames`, which `ListAgents` shows for ten minutes as "says it was … until … ago", so
+/// an agent holding an old listing sees where its peer went.
+pub fn record(e: &Entry, sock: &Path, now_ms: u64, naming: &Naming) -> Value {
     let addr = e.addr();
     let mut v = Value::obj();
     let n = |x: u64| Value::num(x as f64);
     v.set("pid", n(stand_in_pid(&addr)));
-    v.set(
-        "sessionId",
-        Value::string(format!("00000000-0000-4000-8000-{:012x}", fnv(&addr) >> 16)),
-    );
+    let session = format!("00000000-0000-4000-8000-{:012x}", fnv(&addr) >> 16);
+    v.set("sessionId", Value::string(&session));
     v.set("cwd", Value::string(format!("/{}", e.repo)));
     v.set("startedAt", n(now_ms));
     v.set("procStart", Value::string("1"));
@@ -201,9 +279,34 @@ pub fn record(e: &Entry, sock: &Path, now_ms: u64) -> Value {
         "messagingSocketPath",
         Value::string(sock.display().to_string()),
     );
-    v.set("name", Value::string(&addr));
+    v.set("name", Value::string(e.listed()));
     v.set("nameSource", Value::string("user"));
-    v.set("nameSince", n(now_ms));
+    v.set(
+        "nameSince",
+        n(if naming.since == 0 {
+            now_ms
+        } else {
+            naming.since
+        }),
+    );
+    if !naming.former.is_empty() {
+        v.set(
+            "formerNames",
+            Value::Arr(
+                naming
+                    .former
+                    .iter()
+                    .map(|(name, until)| {
+                        let mut f = Value::obj();
+                        f.set("name", Value::string(name));
+                        f.set("until", n(*until));
+                        f.set("sessionId", Value::string(&session));
+                        f
+                    })
+                    .collect(),
+            ),
+        );
+    }
     // Claude Code shows `status` only when it is one of its own (busy, shell, idle, waiting),
     // so an offloaded slot has none rather than one that says idle. The `peers` skill tells
     // agents that a peer listed with no status is offloaded.
@@ -293,9 +396,10 @@ impl Wrapper {
 }
 
 /// `frame` as it is to reach a local claude: `from` naming the sender's stand-in here, and,
-/// on a message, the wrapper's `from` the same and `from-name` the verified address. `None`
-/// when it is neither a message in canonical form nor a control frame.
-pub fn rewrite(frame: &Value, stand_in: &Path, from_addr: &str) -> Option<Value> {
+/// on a message, the wrapper's `from` the same and `from-name` the name that stand-in is
+/// listed by, which starts with the verified address. `None` when it is neither a message in
+/// canonical form nor a control frame.
+pub fn rewrite(frame: &Value, stand_in: &Path, from_name: &str) -> Option<Value> {
     let from = format!("uds:{}", stand_in.display());
     let mut out = frame.clone();
     match frame.get("type").and_then(Value::as_str)? {
@@ -303,7 +407,7 @@ pub fn rewrite(frame: &Value, stand_in: &Path, from_addr: &str) -> Option<Value>
             let content = frame.get("message")?.get("content")?.as_str()?;
             let mut w = Wrapper::parse(content)?;
             w.from = Some(from.clone());
-            w.from_name = Some(from_addr.to_string());
+            w.from_name = Some(from_name.to_string());
             let mut message = frame.get("message")?.clone();
             message.set("content", Value::string(w.render()));
             out.set("message", message);
@@ -402,6 +506,7 @@ pub type Tell = Arc<dyn Fn(Value) + Send + Sync>;
 
 struct StandIn {
     entry: Entry,
+    naming: Naming,
     sock: PathBuf,
     record: PathBuf,
     stop: Arc<AtomicBool>,
@@ -569,6 +674,10 @@ impl Relay {
                 }
                 Some(true) => {
                     if let Some(s) = st.stand_ins.get_mut(&addr) {
+                        let (old, new) = (s.entry.listed(), e.listed());
+                        if old != new {
+                            s.naming.renamed(old, &new, crate::clock::now());
+                        }
                         s.entry = e;
                         if let Err(err) = self.write_record(s) {
                             log(&format!("peer: record for {addr}: {err}"));
@@ -586,7 +695,7 @@ impl Relay {
     }
 
     fn write_record(&self, s: &StandIn) -> io::Result<()> {
-        let v = record(&s.entry, &s.sock, crate::clock::now());
+        let v = record(&s.entry, &s.sock, crate::clock::now(), &s.naming);
         put(&s.record, json::to_line(&v).as_bytes())
     }
 
@@ -608,6 +717,10 @@ impl Relay {
         let stop = Arc::new(AtomicBool::new(false));
         let s = StandIn {
             entry: e.clone(),
+            naming: Naming {
+                since: crate::clock::now(),
+                former: Vec::new(),
+            },
             record: self.sessions.join(format!("{}.json", stand_in_pid(&addr))),
             sock,
             stop: stop.clone(),
@@ -725,7 +838,7 @@ impl Relay {
                 "{to}'s claude does not speak peer protocol {PROTOCOL}"
             )));
         }
-        let stand_in = {
+        let (stand_in, from_name) = {
             let mut st = self.lock();
             if st.lock.is_none() {
                 return Err(Later("another agent holds this container's relay".into()));
@@ -746,9 +859,10 @@ impl Relay {
                 let s = self.open(&e).map_err(|e| Later(format!("stand-in: {e}")))?;
                 st.stand_ins.insert(from_addr.to_string(), s);
             }
-            st.stand_ins[from_addr].sock.clone()
+            let s = &st.stand_ins[from_addr];
+            (s.sock.clone(), s.entry.listed())
         };
-        let out = rewrite(frame, &stand_in, from_addr)
+        let out = rewrite(frame, &stand_in, &from_name)
             .ok_or_else(|| Never("not a message Claude Code would take".into()))?;
         let mut line = json::to_line(&out);
         line.push('\n');
@@ -781,8 +895,9 @@ pub enum Undelivered {
 pub fn context() -> String {
     let cost = crate::fmt::human(crate::mem::SESSION_COST);
     format!(
-        "Sessions in other containers are listed by ListAgents as repo/slot, and SendMessage \
-         reaches them as it does local ones.\n\
+        "Sessions in other containers are listed by ListAgents as repo/slot and then the title \
+         of what each is working on; SendMessage reaches one by that whole name, as listed, \
+         which changes when its title does, so list again if a name is not found.\n\
          A peer listed with no status (neither busy nor idle) is offloaded. A message to it is \
          kept, and wakes it if its container has room: about {cost} of that container's RAM, \
          and CPU on the host every container shares, until it is offloaded again.\n\
@@ -1062,6 +1177,97 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_is_listed_by_its_address_and_the_words_of_its_title() {
+        assert_eq!(
+            listed_name("infra/claude-4", "Tunnel cert renewal"),
+            "infra/claude-4 Tunnel cert renewal"
+        );
+        assert_eq!(listed_name("infra/claude-4", ""), "infra/claude-4");
+        // Nothing Claude Code refuses or reads otherwise: no `@`, no `/`, no trailing ref, no
+        // quote or angle bracket a wrapper attribute cannot hold, no line break.
+        assert_eq!(
+            listed_name(
+                "or3/claude-2",
+                "mail a@b \"fix\" <x>/y\nz [abc123]\u{1b}[2J"
+            ),
+            "or3/claude-2 mail a b fix x y z abc123 2J"
+        );
+        assert_eq!(listed_name("or3/claude-2", " @@ / "), "or3/claude-2");
+        assert_eq!(
+            listed_name("or3/claude-2", "owner's (2nd) try, #4 + done!"),
+            "or3/claude-2 owner's (2nd) try, #4 + done!"
+        );
+        assert_eq!(
+            listed_name("or3/claude-2", "réparer l'éditeur"),
+            "or3/claude-2 réparer l'éditeur",
+            "letters are letters in any script"
+        );
+        // Cut at a word to fit; a single word too long for the room is cut within it.
+        let long = listed_name(
+            "infra/claude-14",
+            "the remote view keeps its mode line through a turn and more besides",
+        );
+        assert_eq!(
+            long,
+            "infra/claude-14 the remote view keeps its mode line through a"
+        );
+        assert!(long.chars().count() <= MAX_LISTED);
+        let word = listed_name("infra/claude-14", &"x".repeat(100));
+        assert_eq!(word.chars().count(), MAX_LISTED);
+        assert!(word.starts_with("infra/claude-14 xxx"));
+        // Counted in characters, as Claude Code counts them.
+        let wide = listed_name("a/claude-1", &"é".repeat(100));
+        assert_eq!(wide.chars().count(), MAX_LISTED);
+    }
+
+    #[test]
+    fn a_renamed_stand_in_lists_the_names_it_had() {
+        let e = Entry {
+            repo: "or3".into(),
+            slot: "claude-2".into(),
+            title: "new name".into(),
+            busy: false,
+            live: true,
+        };
+        let sock = Path::new("/tmp/cc-socks/ab.sock");
+        let fresh = record(&e, sock, 9, &Naming::default());
+        assert_eq!(fresh.get("formerNames"), None, "calibration: none yet");
+        assert_eq!(at(&fresh, &["nameSince"]).as_u64(), Some(9));
+
+        let mut n = Naming {
+            since: 1,
+            former: Vec::new(),
+        };
+        n.renamed("or3/claude-2".into(), "or3/claude-2 first", 5);
+        n.renamed("or3/claude-2 first".into(), "or3/claude-2 new name", 7);
+        let v = record(&e, sock, 9, &n);
+        assert_eq!(at(&v, &["name"]).as_str(), Some("or3/claude-2 new name"));
+        assert_eq!(at(&v, &["nameSince"]).as_u64(), Some(7));
+        let former = v.get("formerNames").and_then(Value::as_arr).unwrap();
+        assert_eq!(
+            at(&former[0], &["name"]).as_str(),
+            Some("or3/claude-2 first")
+        );
+        assert_eq!(at(&former[0], &["until"]).as_u64(), Some(7));
+        assert_eq!(
+            at(&former[0], &["sessionId"]).as_str(),
+            at(&v, &["sessionId"]).as_str(),
+            "the same session, so Claude Code may take the old name as this one's"
+        );
+        assert_eq!(at(&former[1], &["name"]).as_str(), Some("or3/claude-2"));
+
+        // Back to a name it had: that one is current, not former; and three at most.
+        n.renamed("or3/claude-2 new name".into(), "or3/claude-2 first", 8);
+        let names: Vec<&str> = n.former.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["or3/claude-2 new name", "or3/claude-2"]);
+        for i in 0..5 {
+            n.renamed(format!("n{i}"), &format!("n{}", i + 1), 10 + i);
+        }
+        assert_eq!(n.former.len(), 3);
+        assert_eq!(n.former[0].0, "n4");
+    }
+
+    #[test]
     fn a_stand_in_has_a_name_claude_code_takes_as_a_reply_address() {
         let p = stand_in_path(Path::new("/tmp/cc-socks"), "infra/claude-14");
         let name = p.file_name().unwrap().to_str().unwrap();
@@ -1095,8 +1301,8 @@ mod tests {
             live: true,
         };
         let sock = Path::new("/tmp/cc-socks/ab.sock");
-        let v = record(&e, sock, 1_794_000_000_000);
-        assert_eq!(at(&v, &["name"]).as_str(), Some("or3/claude-2"));
+        let v = record(&e, sock, 1_794_000_000_000, &Naming::default());
+        assert_eq!(at(&v, &["name"]).as_str(), Some("or3/claude-2 t"));
         assert_eq!(at(&v, &["pidDomain"]).as_str(), Some("claude-sessions:or3"));
         assert_eq!(
             at(&v, &["messagingSocketPath"]).as_str(),
@@ -1115,6 +1321,7 @@ mod tests {
             },
             sock,
             0,
+            &Naming::default(),
         );
         assert_eq!(at(&busy, &["status"]).as_str(), Some("busy"));
         let offloaded = record(
@@ -1124,6 +1331,7 @@ mod tests {
             },
             sock,
             0,
+            &Naming::default(),
         );
         assert_eq!(
             offloaded.get("status"),
@@ -1176,6 +1384,8 @@ mod tests {
             .unwrap();
         for said in [
             "repo/slot",
+            "title",
+            "list again",
             "no status",
             "offloaded",
             "250M",

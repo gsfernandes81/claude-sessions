@@ -29,11 +29,12 @@ reads the registry and `zmx list`, never guesses, and opens what the owner picks
 Sessions message each other with **Claude Code's own messaging**, which the hub carries
 between containers (design § *Agent messaging*, 2026-11-06; it replaced agent mail). Each
 container's agent holds a stand-in socket and session record for every slot in the other
-containers, so `ListAgents` lists the fleet as `repo/slot` and `SendMessage` reaches it. The
+containers, so `ListAgents` lists the fleet as `repo/slot` and the conversation's title
+(design § *A peer's name*, 2026-11-08) and `SendMessage` reaches it by that name. The
 hub's router passes frames between agents and keeps a message for an offloaded slot on disk.
 Who sent a message is ours to say, never the sender's: the socket's peer pid names the slot,
-the ssh connection names the container, and `from-name` is rewritten to that address on
-delivery. The relay rides an undocumented Claude Code protocol, so it checks the protocol
+the ssh connection names the container, and `from-name` is rewritten to that address (and
+its title) on delivery. The relay rides an undocumented Claude Code protocol, so it checks the protocol
 and switches itself off on a mismatch, and `peer-check` lets infra check a Claude Code pin.
 
 ## The rules that have teeth

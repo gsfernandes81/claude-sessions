@@ -131,6 +131,10 @@ pub fn row_to(r: &Row) -> Value {
     if r.remote {
         v.set("remote", Value::Bool(true));
     }
+    // Likewise: an older reader ignores it, and a row from an older agent reads as unnamed.
+    if r.named {
+        v.set("named", Value::Bool(true));
+    }
     v
 }
 
@@ -150,6 +154,7 @@ pub fn row_from(v: &Value, host: &str) -> Option<Row> {
         at: v.get("at").and_then(Value::as_u64).unwrap_or(0),
         nested: false,
         remote: b(v, "remote"),
+        named: b(v, "named"),
     })
 }
 
@@ -449,6 +454,7 @@ mod tests {
             at: 1_759_000_000_123,
             nested: false,
             remote: false,
+            named: false,
         }
     }
 
@@ -491,6 +497,11 @@ mod tests {
             "as older releases wrote it"
         );
         r.remote = true;
+        assert_eq!(row_from(&wire(&row_to(&r)), "infra-dev").unwrap(), r);
+        // So does whether its title is its own name, and a row without the mark, as an agent
+        // older than it sends every row, reads as unnamed.
+        assert!(row_to(&r).get("named").is_none());
+        r.named = true;
         assert_eq!(row_from(&wire(&row_to(&r)), "infra-dev").unwrap(), r);
     }
 

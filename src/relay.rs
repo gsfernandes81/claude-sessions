@@ -1930,6 +1930,7 @@ mod tests {
             at: 1,
             nested: false,
             remote: true,
+            named: false,
         }
     }
 

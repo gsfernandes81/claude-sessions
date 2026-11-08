@@ -65,6 +65,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
     pub slot: String,
+    /// Its conversation's own name, custom or generated, or empty while it has none: what
+    /// its peer address carries (`peer::listed_name`). Never the first prompt, which gives
+    /// way to the generated title within a turn or two and would change the address with it.
     pub title: String,
     pub busy: bool,
     pub live: bool,
@@ -83,7 +86,11 @@ pub fn slots_of(snap: &Snapshot) -> Vec<Slot> {
             let wanted = claude && !r.archived && (!r.closed || r.offloaded);
             (wanted && peer::is_name(name)).then(|| Slot {
                 slot: name.clone(),
-                title: r.title.clone(),
+                title: if r.named {
+                    r.title.clone()
+                } else {
+                    String::new()
+                },
                 busy: r.busy,
                 live: !(r.offloaded || r.closed),
             })
@@ -1092,6 +1099,7 @@ mod tests {
                 at: 0,
                 nested: false,
                 remote: false,
+                named: false,
             };
             f(&mut r);
             r
@@ -1123,6 +1131,42 @@ mod tests {
             got,
             vec![("claude-1".into(), true), ("claude-2".into(), false)]
         );
+    }
+
+    #[test]
+    fn a_slots_address_carries_its_own_name_and_never_its_first_prompt() {
+        let row = |slot: &str, title: &str, named: bool| Row {
+            host: "a".into(),
+            key: RowKey::Slot(slot.into()),
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: false,
+            archived: false,
+            title: title.into(),
+            age: String::new(),
+            at: 0,
+            nested: false,
+            remote: false,
+            named,
+        };
+        let snap = Snapshot {
+            header: crate::ui::Header {
+                host: "a".into(),
+                memory: None,
+                load: None,
+            },
+            workspace: String::new(),
+            rows: vec![
+                row("claude-1", "tunnel cert renewal", true),
+                row("claude-2", "can you look at why the tunnel", false),
+                row("claude-3", "(no title yet)", false),
+            ],
+        };
+        let titles: Vec<String> = slots_of(&snap).into_iter().map(|s| s.title).collect();
+        assert_eq!(titles, ["tunnel cert renewal", "", ""]);
     }
 
     #[test]

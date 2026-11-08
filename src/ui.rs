@@ -112,6 +112,10 @@ pub struct Row {
     /// it. A running slot without it is a terminal's, which the phone lists dimmed as
     /// `term: ` (mockup R9). The menu draws nothing for it.
     pub remote: bool,
+    /// `title` is the session's own name, custom or generated, not its first prompt, so the
+    /// router may put it in the session's peer address (`peer::listed_name`). Sent only when
+    /// set.
+    pub named: bool,
 }
 
 impl Row {

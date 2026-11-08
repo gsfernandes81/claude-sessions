@@ -68,6 +68,18 @@ fn frame(from_sock: &Path, name: &str, body: &str) -> String {
     )
 }
 
+/// The name a stand-in's record lists it by: its own `name`, not one of its `formerNames`,
+/// which sort before it. A former name holds no `]`, so the list ends at the first.
+fn record_name(text: &str) -> Option<String> {
+    match text.find("\"formerNames\":[") {
+        Some(i) => {
+            let end = i + text[i..].find(']')?;
+            field(&format!("{}{}", &text[..i], &text[end + 1..]), "name")
+        }
+        None => field(text, "name"),
+    }
+}
+
 /// A field of a JSON line, read crudely: `"key":"value"`, the value unescaped of `\"`.
 fn field(line: &str, key: &str) -> Option<String> {
     let at = line.find(&format!("\"{key}\":\""))? + key.len() + 4;
@@ -323,11 +335,16 @@ exit 2"#,
         out
     }
 
-    /// The stand-in socket `host`'s agent holds for `addr`, once its record is there.
+    /// The stand-in socket `host`'s agent holds for `addr`, once its record is there: the
+    /// record listed as `addr`, or as `addr` and a title.
     fn stand_in(&self, host: &str, addr: &str) -> PathBuf {
         let until = Instant::now() + WAIT;
         loop {
-            if let Some(p) = self.stand_ins(host).into_iter().find(|(a, _)| a == addr) {
+            if let Some(p) = self
+                .stand_ins(host)
+                .into_iter()
+                .find(|(a, _)| is_listed_as(a, addr))
+            {
                 return p.1;
             }
             assert!(
@@ -351,7 +368,7 @@ exit 2"#,
                 continue;
             }
             if let (Some(name), Some(sock)) =
-                (field(&text, "name"), field(&text, "messagingSocketPath"))
+                (record_name(&text), field(&text, "messagingSocketPath"))
             {
                 out.push((name, PathBuf::from(sock)));
             }
@@ -359,6 +376,11 @@ exit 2"#,
         out.sort();
         out
     }
+}
+
+/// Whether a stand-in's name is `addr`'s: the address alone, or followed by a title.
+fn is_listed_as(name: &str, addr: &str) -> bool {
+    name == addr || name.starts_with(&format!("{addr} "))
 }
 
 /// Write `line` to `sock`, as a claude's `SendMessage` does.
@@ -415,8 +437,15 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     root.stand_in("a", "b/claude-2");
     root.stand_in("b", "a/claude-1");
     let names = |h: &str| -> Vec<String> { root.stand_ins(h).into_iter().map(|p| p.0).collect() };
-    assert_eq!(names("a"), ["b/claude-1", "b/claude-2"]);
-    assert_eq!(names("b"), ["a/claude-1"]);
+    // Each listed by its address and its title, the owner's name for it in each registry.
+    assert_eq!(
+        names("a"),
+        [
+            "b/claude-1 claude-1 at work",
+            "b/claude-2 claude-2 put away"
+        ]
+    );
+    assert_eq!(names("b"), ["a/claude-1 claude-1 at work"]);
 
     // a/claude-1 writes to its stand-in for b/claude-1, claiming a name of its own.
     let a_sock = root.d("a").join("in.sock");
@@ -424,8 +453,8 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     let got = delivered(&b_in, &mut root);
     let content = field(&got, "content").expect("a message");
     assert!(
-        content.contains("from-name=\"a/claude-1\""),
-        "the verified address, never the claim: {content}"
+        content.contains("from-name=\"a/claude-1 claude-1 at work\""),
+        "the verified address and its title, never the claim: {content}"
     );
     assert!(!content.contains("the owner"));
     assert!(content.ends_with("\nhello from a\n</cross-session-message>"));
@@ -444,7 +473,10 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
     send(&back, &frame(&b_sock, "whoever", "pong"));
     let got = delivered(&a_in, &mut root);
     let content = field(&got, "content").unwrap();
-    assert!(content.contains("from-name=\"b/claude-1\""), "{content}");
+    assert!(
+        content.contains("from-name=\"b/claude-1 claude-1 at work\""),
+        "{content}"
+    );
     assert!(content.ends_with("\npong\n</cross-session-message>"));
     assert_eq!(
         field(&got, "from").unwrap(),
@@ -477,8 +509,58 @@ fn a_message_crosses_containers_with_its_verified_sender_and_the_reply_comes_bac
         content.ends_with("\nfor later\n</cross-session-message>"),
         "{content}"
     );
-    assert!(content.contains("from-name=\"a/claude-1\""));
+    // A new router may hand it on before a has told it the sender's title, and the address
+    // alone is what is known then.
+    assert!(content.contains("from-name=\"a/claude-1"), "{content}");
     root.logs("a/claude-1 to b/claude-2: message handed on (was waiting)");
+}
+
+#[test]
+fn a_slot_renamed_in_one_container_is_listed_by_its_new_name_in_the_other() {
+    let mut root = Root::new("rename");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.live("b", "claude-1");
+    let _a_in = root.inbox("a", 1);
+    let _b_in = root.inbox("b", 1);
+    root.route("a b");
+    let before = root.stand_in("a", "b/claude-1");
+    let names =
+        |root: &Root| -> Vec<String> { root.stand_ins("a").into_iter().map(|p| p.0).collect() };
+    assert_eq!(names(&root), ["b/claude-1 claude-1 at work"], "calibration");
+
+    // The owner renames it: its registry record's title, as the hook would write it.
+    let rec = root.d("b").join("registry/claude-1.json");
+    let text = fs::read_to_string(&rec).unwrap();
+    fs::write(
+        &rec,
+        text.replace("claude-1 at work", "tunnel cert renewal"),
+    )
+    .unwrap();
+    let until = Instant::now() + WAIT;
+    while names(&root) != ["b/claude-1 tunnel cert renewal"] {
+        assert!(
+            Instant::now() < until,
+            "a's stand-in was never renamed: {:?}\n{}",
+            names(&root),
+            root.story()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The same stand-in, so a session that already sent to it reaches it still, and its
+    // record says the name it had.
+    assert_eq!(root.stand_in("a", "b/claude-1"), before);
+    let record = fs::read_dir(root.d("a").join("cc/sessions"))
+        .unwrap()
+        .flatten()
+        .map(|e| fs::read_to_string(e.path()).unwrap_or_default())
+        .find(|t| t.contains("tunnel cert renewal"))
+        .unwrap();
+    assert!(
+        record.contains(r#""formerNames":[{"name":"b/claude-1 claude-1 at work","#),
+        "{record}"
+    );
 }
 
 #[test]
@@ -539,7 +621,7 @@ fn a_message_to_an_offloaded_slot_asks_to_wake_it_and_tells_the_sender_why_not()
             .unwrap()
             .flatten()
             .map(|e| fs::read_to_string(e.path()).unwrap_or_default())
-            .find(|t| field(t, "name").as_deref() == Some(name))
+            .find(|t| record_name(t).is_some_and(|n| is_listed_as(&n, name)))
             .unwrap()
     };
     assert!(

@@ -346,6 +346,7 @@ impl Menu {
             at: 0,
             nested: false,
             remote: false,
+            named: false,
         });
         if self.archive_open {
             out.extend(archived);
@@ -396,6 +397,7 @@ impl Menu {
             at: 0,
             nested: false,
             remote: false,
+            named: false,
         }
     }
 
@@ -810,6 +812,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
             at: c.last_ms,
             nested: false,
             remote: false,
+            named: false,
         };
         dated.push((c.last_ms, row));
     }
@@ -845,6 +848,7 @@ fn socket_rows(recs: &[SlotRecord], sessions: &[zmx::Session], clock: Millis) ->
             at: since,
             nested: false,
             remote: false,
+            named: false,
         });
     }
     rows
@@ -865,6 +869,7 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
                 .and_then(|p| crate::transcript::interrupted_at_cached(&p)),
         )
         .is_some();
+    let (title, named) = r.row_titles();
     Row {
         host: String::new(),
         key: RowKey::Slot(r.slot.clone()),
@@ -882,13 +887,14 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         // What Claude Code's own session selector shows (`transcript.rs`), not the live
         // sessions file's `name`, which showed Claude's replies on the boxes (0.3.1). Read
         // from the transcript as well as the record: a `/rename` fires no hook.
-        title: r.row_title(),
+        title,
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
         // Said by the record, or by the holder's socket where an older release rewrote it.
         remote: r.driver == crate::registry::Driver::Holder
             || (alive || r.pid.is_none()) && crate::holder::paths(&r.slot).sock.exists(),
+        named,
     }
 }
 
@@ -1102,6 +1108,7 @@ mod tests {
             at: 0,
             nested: false,
             remote: false,
+            named: false,
         }
     }
 

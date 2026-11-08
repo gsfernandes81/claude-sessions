@@ -364,14 +364,54 @@ exit 2"#,
             inbox,
             _turn: turn,
         };
+        // No title, so the stand-in is listed as FAR alone; the tests of titles give one.
         let mut far = Value::obj();
         far.set("repo", Value::string("far"));
         far.set("slot", Value::string("claude-3"));
-        far.set("title", Value::string("far away"));
         far.set("live", Value::Bool(true));
         rig.tell(obj(vec![("roster", Value::Arr(vec![far]))]));
         rig.stand_in();
         Some(rig)
+    }
+
+    /// A prompt, as [`Self::prompt`], and back once its turn has ended: a prompt typed during
+    /// a turn is queued into it in another form.
+    fn turn(&mut self, text: &str) {
+        self.prompt(text);
+        first(&self.claude_out, WAIT, |v| {
+            str_of(v, &["type"]) == Some("result")
+        })
+        .unwrap_or_else(|| panic!("the turn for {text:?} never ended\n{}", self.story()));
+    }
+
+    /// The hub retitles [`FAR`]; back once its record is listed as `listed`.
+    fn retitle(&mut self, title: &str, listed: &str) {
+        let mut far = Value::obj();
+        far.set("repo", Value::string("far"));
+        far.set("slot", Value::string("claude-3"));
+        far.set("title", Value::string(title));
+        far.set("live", Value::Bool(true));
+        self.tell(obj(vec![("roster", Value::Arr(vec![far]))]));
+        let until = Instant::now() + WAIT;
+        while self.record_name().as_deref() != Some(listed) {
+            assert!(
+                Instant::now() < until,
+                "the stand-in was never listed as {listed:?}; it is {:?}",
+                self.record_name()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The name [`FAR`]'s stand-in record is listed by.
+    fn record_name(&self) -> Option<String> {
+        fs::read_dir(self.dir.join("cc/sessions"))
+            .ok()?
+            .flatten()
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .filter_map(|t| json::parse(&t).ok())
+            .filter_map(|v| str_of(&v, &["name"]).map(str::to_string))
+            .find(|n| n == FAR || n.starts_with(&format!("{FAR} ")))
     }
 
     fn tell(&mut self, v: Value) {
@@ -409,7 +449,9 @@ exit 2"#,
                 else {
                     continue;
                 };
-                if str_of(&v, &["name"]) == Some(FAR) {
+                if str_of(&v, &["name"])
+                    .is_some_and(|n| n == FAR || n.starts_with(&format!("{FAR} ")))
+                {
                     return str_of(&v, &["messagingSocketPath"]).unwrap().to_string();
                 }
             }
@@ -980,4 +1022,135 @@ fn the_shipped_settings_tell_a_session_about_offloaded_peers_at_start_and_after_
                 rig.story()
             )
         });
+}
+
+/// The model's part in the tests of titled names: on each prompt saying `send to <name>`, one
+/// `SendMessage` to that name, then `ListAgents` on a prompt saying `list`, and nothing else.
+fn on_each_prompt() -> Script {
+    Arc::new(|r: &Request| {
+        // An earlier prompt comes back with a line break after it.
+        let texts: Vec<String> = r.texts().iter().map(|t| t.trim().to_string()).collect();
+        let asks: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.starts_with("send to ") || t.as_str() == "list")
+            .collect();
+        let answered = r
+            .results()
+            .iter()
+            .filter(|(n, _)| n == "SendMessage" || n == "ListAgents")
+            .count();
+        let Some(ask) = asks.get(answered) else {
+            return Reply::Text("done".into());
+        };
+        if ask.as_str() == "list" {
+            return Reply::Tool {
+                name: "ListAgents".into(),
+                input: Value::obj(),
+            };
+        }
+        let loaded = r.results().iter().any(|(n, _)| n == "ToolSearch");
+        if !(r.tools().iter().any(|t| t == "SendMessage") || loaded) {
+            let mut input = Value::obj();
+            input.set("query", Value::string("select:SendMessage"));
+            input.set("max_results", Value::num(1));
+            return Reply::Tool {
+                name: "ToolSearch".into(),
+                input,
+            };
+        }
+        let mut input = Value::obj();
+        input.set("to", Value::string(ask.trim_start_matches("send to ")));
+        input.set("message", Value::string(format!("msg {answered}")));
+        input.set("summary", Value::string("test"));
+        Reply::Tool {
+            name: "SendMessage".into(),
+            input,
+        }
+    })
+}
+
+/// The text of the `n`th result (from 0) of `tool` the model was given.
+fn nth_result(rig: &Rig, tool: &str, n: usize) -> String {
+    let req = rig
+        .api
+        .wait_for(WAIT, |r| {
+            r.results().iter().filter(|(t, _)| t == tool).count() > n
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the model was never given {tool} result {n}\n{}",
+                rig.story()
+            )
+        });
+    req.results()
+        .into_iter()
+        .filter(|(t, _)| t == tool)
+        .nth(n)
+        .unwrap()
+        .1
+}
+
+#[test]
+fn a_peer_is_listed_by_its_address_and_title_and_reached_by_that_name_in_any_case() {
+    let Some(mut rig) = Rig::start("titled", on_each_prompt(), None) else {
+        return;
+    };
+    rig.retitle("Tunnel cert renewal", "far/claude-3 Tunnel cert renewal");
+    rig.turn("list");
+    let text = nth_result(&rig, "ListAgents", 0);
+    let row = text
+        .lines()
+        .find(|l| l.contains("far/claude-3 Tunnel cert renewal"))
+        .unwrap_or_else(|| panic!("listed by its address and title: {text}"));
+    assert!(row_fields(row).iter().any(|f| f == "idle"), "{row}");
+    // Claude Code matches a name ignoring case, a run of spaces as one hyphen.
+    rig.turn("send to FAR/claude-3-tunnel-CERT-renewal");
+    let p = rig
+        .sent(|p| str_of(p, &["frame", "type"]) == Some("user"))
+        .unwrap_or_else(|| panic!("the send never reached the stand-in\n{}", rig.story()));
+    assert_eq!(str_of(&p, &["from"]), Some(SLOT));
+    let content = str_of(&p["frame"], &["message", "content"]).unwrap();
+    assert_eq!(body(content), Some("msg 1"), "{content}");
+}
+
+#[test]
+fn a_renamed_peer_is_not_reached_by_its_old_name_but_found_again_by_listing() {
+    let Some(mut rig) = Rig::start("renamed", on_each_prompt(), None) else {
+        return;
+    };
+    rig.retitle("first name", "far/claude-3 first name");
+    rig.turn("send to far/claude-3 first name");
+    rig.sent(|p| str_of(p, &["frame", "type"]) == Some("user"))
+        .unwrap_or_else(|| panic!("calibration: the first send\n{}", rig.story()));
+    rig.retitle("second name", "far/claude-3 second name");
+
+    // Not even by the session that sent to it under that name: Claude Code holds no pin to it
+    // (2.1.311). It is told so, and to list again, and nothing is carried.
+    rig.turn("send to far/claude-3 first name");
+    let refused = nth_result(&rig, "SendMessage", 1);
+    assert!(
+        refused.contains("No agent named") && refused.contains("ListAgents"),
+        "{refused}"
+    );
+    assert!(
+        first(&rig.agent_out, QUIET, |v| v.get("peer").is_some()).is_none(),
+        "an old name reaches nobody"
+    );
+
+    // The listing shows the new name, and beside it the one it had.
+    rig.turn("list");
+    let text = nth_result(&rig, "ListAgents", 0);
+    let row = text
+        .lines()
+        .find(|l| l.contains("far/claude-3 second name"))
+        .unwrap_or_else(|| panic!("listed by its new name: {text}"));
+    assert!(
+        row.contains("says it was far/claude-3 first name"),
+        "the name it had is shown beside it: {row}"
+    );
+    rig.turn("send to far/claude-3 second name");
+    rig.sent(|p| {
+        str_of(p, &["frame", "message", "content"]).is_some_and(|c| body(c) == Some("msg 3"))
+    })
+    .unwrap_or_else(|| panic!("the new name reaches it\n{}", rig.story()));
 }
