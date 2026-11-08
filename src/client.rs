@@ -6848,4 +6848,62 @@ mod tests {
         let now = clock_time();
         assert!(now.contains(':') && !now.starts_with('0'), "{now:?}");
     }
+
+    fn plain_frame(app: &mut App, now: Instant) -> Vec<String> {
+        let (rows, _) = app.frame(40, 24, now);
+        rows.iter()
+            .map(|r| {
+                // The row's text, its escapes taken out.
+                let mut out = String::new();
+                let mut esc = false;
+                for ch in r.chars() {
+                    match ch {
+                        '\x1b' => esc = true,
+                        c if esc && c.is_ascii_alphabetic() => esc = false,
+                        _ if esc => {}
+                        c => out.push(c),
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_homes_spinners_turn_with_time_saying_what_they_wait_for() {
+        let t0 = Instant::now();
+        let spinner = |frame: usize| crate::ui::SPINNER[frame % crate::ui::SPINNER.len()];
+        // Before the hello: connecting, a frame each SPIN_EVERY since the client started.
+        let mut app = App::new("dev", 40, 24, 1);
+        app.started = t0;
+        let has = |rows: &[String], s: &str| rows.iter().any(|r| r.contains(s));
+        let rows = plain_frame(&mut app, t0 + SPIN_EVERY * 3);
+        assert!(
+            has(&rows, &format!("{} connecting", spinner(3))),
+            "{rows:?}"
+        );
+        // The link down after it: reconnecting, with the seconds.
+        app.greeted = true;
+        app.menu.set_busy(None);
+        app.down_since = Some(t0);
+        let rows = plain_frame(&mut app, t0 + Duration::from_secs(8));
+        let frame = (8000 / SPIN_EVERY.as_millis()) as usize;
+        assert!(
+            has(&rows, &format!("{} Reconnecting… (8s)", spinner(frame))),
+            "{rows:?}"
+        );
+        // Not before the hello: then it is still connecting.
+        let mut app = App::new("dev", 40, 24, 1);
+        app.down_since = Some(t0);
+        assert!(!has(&plain_frame(&mut app, t0), "Reconnecting"));
+        // An action under way: its words, turning from when it began.
+        let rows = vec![row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut app = home_with(&rows);
+        app.working = Some((t0, 1, "offloading session".into()));
+        let rows = plain_frame(&mut app, t0 + SPIN_EVERY * 2);
+        assert!(
+            has(&rows, &format!("{} offloading session", spinner(2))),
+            "{rows:?}"
+        );
+    }
 }
