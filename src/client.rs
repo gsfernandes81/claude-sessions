@@ -1693,12 +1693,12 @@ fn tasks_key(
     Some(Dialog::Tasks(v))
 }
 
-/// What Claude Code calls a task's details: `Shell details`, `Monitor details`.
+/// What Claude Code calls a task's details: `Shell details`, `Monitor details`. A workflow's
+/// are its browser, which says nothing on closing (`workflow_key`).
 fn kind_word(t: &convo::Task) -> &'static str {
     match t.kind.as_str() {
         "shell" => "Shell",
         "monitor" => "Monitor",
-        "workflow" => "Workflow",
         _ => "Agent",
     }
 }
@@ -6357,5 +6357,134 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_workflows_save_form_edits_its_name_sends_it_and_once_saved_enter_closes_it() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.save = Some(tasks::Save {
+            name: "two-readers".into(),
+            ..tasks::Save::default()
+        });
+        let mut out = Vec::new();
+        let step = |v: tasks::View, k: Key, out: &mut Vec<Value>| match tasks_key(
+            c, v, k, out, &mut None, &mut None,
+        ) {
+            Some(Dialog::Tasks(v)) => v,
+            d => panic!("{d:?}"),
+        };
+        for k in [
+            Key::Char('\x7f'),
+            Key::Char('\x08'),
+            Key::Char('s'),
+            Key::Char('!'),
+            Key::Char('\x01'),
+        ] {
+            v = step(v, k, &mut out);
+        }
+        assert_eq!(v.save.as_ref().unwrap().name, "two-reades!");
+        v = step(v, Key::Enter, &mut out);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"wf1","n":"two-reades!","sc":"project","t":"wsave"}"#]
+        );
+        v.save.as_mut().unwrap().said = Some(Ok("/w/two-reades!.js".into()));
+        let mut out = Vec::new();
+        v = step(v, Key::Enter, &mut out);
+        assert!(out.is_empty(), "saved: Enter does not save it again");
+        assert!(v.save.is_none(), "but closes the form");
+    }
+
+    #[test]
+    fn the_browsers_phases_move_with_up_and_down_and_stop_at_either_end() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["one","two","three"],"ag":[]}"#).unwrap(),
+        ));
+        let phase = |v: &mut tasks::View, k: Key| {
+            let Some(Dialog::Tasks(next)) =
+                tasks_key(c, v.clone(), k, &mut Vec::new(), &mut None, &mut None)
+            else {
+                panic!()
+            };
+            *v = next;
+            v.phase
+        };
+        assert_eq!(phase(&mut v, Key::Up), 0);
+        assert_eq!(phase(&mut v, Key::Down), 1);
+        assert_eq!(phase(&mut v, Key::Down), 2);
+        assert_eq!(phase(&mut v, Key::Down), 2);
+        assert_eq!(phase(&mut v, Key::Up), 1);
+    }
+
+    #[test]
+    fn the_browsers_agents_move_within_their_list_and_one_agents_pane_goes_back_to_it() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["read"],"ag":[{"l":"a","ph":1},{"l":"b","ph":1},{"l":"c","ph":1}]}"#)
+                .unwrap(),
+        ));
+        let key = |v: &mut tasks::View, k: Key| {
+            let Some(Dialog::Tasks(next)) =
+                tasks_key(c, v.clone(), k, &mut Vec::new(), &mut None, &mut None)
+            else {
+                panic!()
+            };
+            *v = next;
+            (v.pane, v.agent)
+        };
+        use tasks::Pane::{Agent, Agents};
+        assert_eq!(key(&mut v, Key::Right), (Agents, 0));
+        assert_eq!(key(&mut v, Key::Up), (Agents, 0));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 1));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 2));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 2));
+        assert_eq!(key(&mut v, Key::Up), (Agents, 1));
+        for back in [Key::Esc, Key::Left, Key::Enter] {
+            assert_eq!(key(&mut v, Key::Enter), (Agent, 1));
+            assert_eq!(key(&mut v, back), (Agents, 1), "{back:?}");
+        }
+    }
+
+    #[test]
+    fn s_saves_only_a_workflow_that_can_be_saved() {
+        let app = app_in(&[SHELL_AND_AGENT]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, c.tasks.iter().find(|t| t.id == "wf1").unwrap());
+        let d = tasks_key(c, v, Key::Char('s'), &mut Vec::new(), &mut None, &mut None);
+        assert!(matches!(d, Some(Dialog::Tasks(v)) if v.save.is_none()));
+    }
+
+    #[test]
+    fn x_stops_only_a_running_workflow_and_enter_opens_no_pane_on_an_empty_list() {
+        let app = app_in(&[
+            r#"{"t":"tasks","l":[{"i":"wf1","k":"workflow","d":"Two agents","c":"two","st":"completed"}]}"#,
+        ]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[0]);
+        let mut out = Vec::new();
+        let d = tasks_key(c, v, Key::Char('x'), &mut out, &mut None, &mut None);
+        assert!(out.is_empty(), "already ended");
+        let Some(Dialog::Tasks(v)) = d else { panic!() };
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Right, &mut out, &mut None, &mut None)
+        else {
+            panic!()
+        };
+        let d = tasks_key(c, v, Key::Enter, &mut out, &mut None, &mut None);
+        assert!(
+            matches!(&d, Some(Dialog::Tasks(v)) if v.pane == tasks::Pane::Agents),
+            "{d:?}"
+        );
     }
 }
