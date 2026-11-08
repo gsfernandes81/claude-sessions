@@ -2501,12 +2501,11 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 })
             };
             let tab = match (&typing, k) {
-                (None, Key::Left | Key::BackTab) if several => Some(q.saturating_sub(1)),
-                (None, Key::Right | Key::Char('\t')) if several => {
-                    Some((q + 1).min(questions.len()))
-                }
+                (None, Key::Left | Key::BackTab) => Some(q.saturating_sub(1)),
+                (None, Key::Right | Key::Char('\t')) => Some((q + 1).min(questions.len())),
                 _ => None,
-            };
+            }
+            .filter(|_| several);
             if let Some(to) = tab {
                 let sel = if to == q { sel } else { 0 };
                 return ask(to, sel, answers, None, ticked);
@@ -2584,8 +2583,9 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 return ask(q, i, answers, Some(before.into()), ticked);
             }
             if question.multi {
-                if i < own {
-                    ticked[q][i] = !ticked[q][i];
+                // One of its own options ticked or not; the row after them goes on.
+                if let Some(t) = ticked[q].get_mut(i) {
+                    *t = !*t;
                     return ask(q, i, answers, None, ticked);
                 }
                 return advance(answers, ticked, out);
@@ -6777,5 +6777,58 @@ mod tests {
         assert_eq!(key("hello", 2, Key::Char('\x02')), ("hello".into(), 2));
         assert_eq!(key("hello", 5, Key::Right), ("hello".into(), 5));
         assert_eq!(key("hello", 0, Key::Left), ("hello".into(), 0));
+    }
+
+    #[test]
+    fn an_answer_typed_comes_back_to_be_edited_and_a_multi_select_keeps_its_tab() {
+        let c = convo_with(&[
+            r#"{"t":"add","id":1,"k":"ask","r":"q1","q":[{"q":"Colour?","h":"C","m":false,"o":[["Red",""],["Blue",""]]},{"q":"Sizes?","h":"S","m":true,"o":[["S",""],["M",""]]}]}"#,
+        ]);
+        let mut ui = Ui::new();
+        follow_prompts(&c, &mut ui);
+        let start = ui.dialog.clone().unwrap();
+        let keys = |d: Dialog, keys: &[Key]| {
+            let mut d = Some(d);
+            let mut out = Vec::new();
+            for k in keys {
+                d = dialog_key(&c, d.expect("open"), *k, &mut out);
+            }
+            (d, out.len())
+        };
+        let typing = |d: &Option<Dialog>| match d {
+            Some(Dialog::Ask { typing, q, sel, .. }) => {
+                (*q, *sel, typing.as_ref().map(|f| f.text.clone()))
+            }
+            d => panic!("{d:?}"),
+        };
+        let typed = |s: &str| s.chars().map(Key::Char).collect::<Vec<_>>();
+        // Typed, moved on, and back: the row for typing has it again.
+        let mut ks = vec![Key::Char('3')];
+        ks.extend(typed("teal"));
+        ks.extend([Key::Enter, Key::Left, Key::Char('3')]);
+        assert_eq!(
+            typing(&keys(start.clone(), &ks).0),
+            (0, 2, Some("teal".into()))
+        );
+        // A label chosen is not brought back as typing.
+        let (d, _) = keys(start.clone(), &[Key::Char('1'), Key::Left, Key::Char('3')]);
+        assert_eq!(typing(&d), (0, 2, Some(String::new())));
+        // Nothing typed: Enter stays on the question, unanswered.
+        let (d, _) = keys(start.clone(), &[Key::Char('3'), Key::Enter]);
+        assert_eq!(typing(&d), (0, 2, None));
+        // A multi-select keeps its tab once something is typed, so more can be ticked.
+        let mut ks = vec![Key::Right, Key::Char('3')];
+        ks.extend(typed("XL"));
+        ks.push(Key::Enter);
+        assert_eq!(typing(&keys(start.clone(), &ks).0), (1, 2, None));
+        // Left on the first tab goes nowhere and keeps the row chosen.
+        let (d, _) = keys(start.clone(), &[Key::Down, Key::Left]);
+        assert_eq!(typing(&d), (0, 1, None));
+        // Down stops on the last row, "Chat about this", after Red, Blue and typing.
+        let mut d = Some(start);
+        for _ in 0..9 {
+            d = keys(d.unwrap(), &[Key::Down]).0;
+        }
+        assert_eq!(typing(&d), (0, 3, None));
     }
 }
