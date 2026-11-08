@@ -82,8 +82,15 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
         std::env::var("CLAUDE_REMOTE_RELAY").unwrap_or_else(|_| "claude-sessions relay".into());
     let mut cmd = Command::new(ssh);
     cmd.args(["-T", "-C", "-o", "BatchMode=yes", "--", name])
-        .arg(relay)
-        .stdin(Stdio::piped())
+        .arg(relay);
+    link(cmd, epoch, tx, term::wake)
+}
+
+/// The link over `cmd`: what it prints, a JSON value a line, comes to `tx` as `Heard::Line`,
+/// and its end as `Heard::Gone`, with the last thing it said on stderr, `wake` called after each
+/// so the terminal's wait takes them.
+fn link(mut cmd: Command, epoch: u64, tx: &Sender<Heard>, wake: fn()) -> io::Result<Wire> {
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -95,9 +102,7 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
         let said = said.clone();
         std::thread::spawn(move || {
             for l in BufReader::new(err).lines().map_while(Result::ok) {
-                if !l.trim().is_empty() {
-                    *said.lock().unwrap_or_else(|p| p.into_inner()) = l.trim().to_string();
-                }
+                last_word(&mut said.lock().unwrap_or_else(|p| p.into_inner()), &l);
             }
         });
     }
@@ -108,15 +113,23 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
                 if tx.send(Heard::Line(epoch, v)).is_err() {
                     return;
                 }
-                term::wake();
+                wake();
             }
         }
         std::thread::sleep(Duration::from_millis(50));
         let why = said.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let _ = tx.send(Heard::Gone(epoch, why));
-        term::wake();
+        wake();
     });
     Ok(Wire { child, stdin })
+}
+
+/// A line of ssh's stderr: what it said last, the blank lines it ends with skipped, is why the
+/// link went.
+fn last_word(said: &mut String, line: &str) {
+    if !line.trim().is_empty() {
+        *said = line.trim().to_string();
+    }
 }
 
 enum Screen {
@@ -200,9 +213,10 @@ struct App {
 }
 
 impl App {
-    fn send(&mut self, v: Value) -> bool {
+    /// A message to the relay; the first of any not yet answered starts the wait for one.
+    fn send(&mut self, v: Value) {
         let Some(w) = self.wire.as_mut() else {
-            return false;
+            return;
         };
         let ok = writeln!(w.stdin, "{}", json::to_line(&v))
             .and_then(|()| w.stdin.flush())
@@ -210,7 +224,6 @@ impl App {
         if ok && self.awaiting.is_none() {
             self.awaiting = Some(Instant::now());
         }
-        ok
     }
 
     fn msg(t: &str, rest: Vec<(&str, Value)>) -> Value {
@@ -261,10 +274,16 @@ impl App {
     }
 
     fn dial(&mut self, now: Instant, tx: &Sender<Heard>) {
+        let name = self.name.clone();
+        self.dial_over(now, |epoch| connect(&name, epoch, tx));
+    }
+
+    /// A new link, opened by `open` for its epoch, and what it is told first.
+    fn dial_over(&mut self, now: Instant, open: impl FnOnce(u64) -> io::Result<Wire>) {
         self.retry_at = None;
         self.epoch += 1;
         self.hello_due = true;
-        match connect(&self.name, self.epoch, tx) {
+        match open(self.epoch) {
             Ok(w) => {
                 self.wire = Some(w);
                 self.last_heard = now;
@@ -4696,5 +4715,485 @@ mod tests {
             drafts::load(&file, "h", "s1").map(|d| d.text),
             Some("half".into())
         );
+    }
+
+    /// A link to `cat` in the relay's place: everything the client sends comes back, in order.
+    fn cat_relay(app: &mut App) -> Receiver<Heard> {
+        let (tx, rx) = mpsc::channel();
+        app.dial_over(Instant::now(), |e| link(Command::new("cat"), e, &tx, || {}));
+        rx
+    }
+
+    /// What the client sent since last asked, a line each: everything `cat` echoed before a
+    /// mark sent after it, on the link's own epoch.
+    fn sent(app: &mut App, rx: &Receiver<Heard>) -> Vec<String> {
+        let awaiting = app.awaiting;
+        app.send(App::msg("mark", vec![]));
+        app.awaiting = awaiting;
+        let mut out = Vec::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(20)) {
+                Ok(Heard::Line(e, v)) => {
+                    assert_eq!(e, app.epoch, "heard on the link's own epoch");
+                    let l = json::to_line(&v);
+                    if l == r#"{"t":"mark"}"# {
+                        return out;
+                    }
+                    out.push(l);
+                }
+                Ok(Heard::Gone(..)) => {}
+                Err(e) => panic!("the mark never came back: {e} (after {out:?})"),
+            }
+        }
+    }
+
+    const HI: &str = r#"{"t":"hi","v":1}"#;
+
+    #[test]
+    fn what_is_sent_goes_down_the_link_a_line_each_and_the_first_unanswered_is_timed() {
+        let mut app = App::new("dev", 40, 24, 1);
+        // No link: nothing goes, and nothing waits for an answer.
+        app.send(App::msg("ping", vec![]));
+        assert_eq!(app.awaiting, None);
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI], "a new link says hello");
+        assert!(app.awaiting.is_some(), "an answer is now due");
+        // A second before the first is answered: the wait still runs from the first.
+        let first = Instant::now() - Duration::from_secs(3);
+        app.awaiting = Some(first);
+        app.send(App::msg("ping", vec![]));
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"ping"}"#]);
+        assert_eq!(app.awaiting, Some(first));
+    }
+
+    #[test]
+    fn each_dial_is_a_new_epoch_and_one_that_fails_waits_out_the_backoff() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        assert_eq!((app.epoch, app.hello_due), (1, true));
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(app.epoch, 2, "what the old link still says is not heard");
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        // ssh that will not start: down, a retry due after the backoff, from its first second.
+        let mut app = App::new("dev", 40, 24, 1);
+        let now = Instant::now();
+        app.dial_over(now, |_| Err(io::Error::other("no ssh")));
+        assert!(!app.up());
+        assert_eq!(app.down_since, Some(now));
+        assert_eq!(app.retry_at, Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_new_link_opens_again_what_was_opening_and_catches_up_what_was_open() {
+        // An existing conversation opening: asked for again on the new link.
+        let open = r#"{"c":"claude-sessions","k":{"slot":"claude-3"},"t":"open"}"#;
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", parse(open).unwrap());
+        let first = sent(&mut app, &rx);
+        assert_eq!(first.len(), 1, "{first:?}");
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI.to_string(), first[0].clone()]);
+        assert!(matches!(app.screen, Screen::Conv { opening: true, .. }));
+        // A new one: not started twice, but home, where it is listed if it started.
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        app.held.push(App::msg("say", vec![]));
+        sent(&mut app, &rx);
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        assert!(matches!(app.screen, Screen::Home));
+        assert!(app.open_msg.is_none() && app.held.is_empty());
+        assert!(app.menu.view().status.unwrap().contains("listed if it did"));
+        // Open, on a slot: where it got to, and the agent in view.
+        let mut app = app_in(&[AGENTS]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            c.slot = "claude-3".into();
+            c.run = "r9".into();
+            c.n = 5;
+            let t = c.tasks[0].clone();
+            view_agent(c, ui, &t);
+        }
+        let rx = cat_relay(&mut app);
+        let (w, r) = size();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [
+                HI.to_string(),
+                format!(r#"{{"c":"h","n":5,"r":{r},"run":"r9","s":"claude-3","t":"re","w":{w}}}"#),
+                r#"{"i":"ag1","t":"fg"}"#.to_string(),
+            ]
+        );
+        // Open but its slot not yet said, or opened with no agent in view: no more than it has.
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.slot.clear();
+        }
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI]);
+    }
+
+    #[test]
+    fn the_reason_a_link_went_is_the_last_thing_ssh_said_not_a_blank_line() {
+        let mut said = String::new();
+        for l in ["  Permission denied (publickey).  ", "", "   "] {
+            last_word(&mut said, l);
+        }
+        assert_eq!(said, "Permission denied (publickey).");
+        last_word(&mut said, "Connection closed by 10.0.0.1");
+        assert_eq!(said, "Connection closed by 10.0.0.1");
+    }
+
+    fn conv_of(app: &App) -> &Convo {
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!("not in a conversation")
+        };
+        c
+    }
+
+    fn hear(app: &mut App, line: &str) {
+        app.heard(parse(line).unwrap(), Instant::now());
+    }
+
+    #[test]
+    fn the_relays_hello_lists_its_containers_and_ends_connecting_once() {
+        let mut app = App::new("dev", 40, 24, 1);
+        app.menu.set_busy(Some(connecting(0)));
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.greeted);
+        assert_eq!(app.hosts, ["a", "b"]);
+        assert!(app.menu.view().busy.is_none(), "connected: no more spinner");
+        // A new link's hello leaves an action's spinner turning: its answer is still to come.
+        app.menu.set_busy(Some(connecting(3)));
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.menu.view().busy.is_some());
+    }
+
+    #[test]
+    fn the_home_is_the_hubs_header_and_each_containers_snapshot_or_why_it_is_down() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        hear(
+            &mut app,
+            r#"{"t":"hub","h":{"host":"zero","memory":[1,2]}}"#,
+        );
+        assert_eq!(app.hub.host, "zero");
+        assert_eq!(app.menu.view().header.host, "zero");
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let rows = [row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", &rows));
+        app.heard(snap, Instant::now());
+        let listed = |app: &App| {
+            app.menu
+                .all_rows()
+                .iter()
+                .any(|r| r.title == "immich upgrade")
+        };
+        assert!(listed(&app), "{:?}", app.menu.all_rows());
+        assert_eq!(app.places["claude-sessions"].reach, Reach::Up);
+        hear(
+            &mut app,
+            r#"{"t":"down","c":"claude-sessions","x":"no route"}"#,
+        );
+        assert_eq!(
+            app.places["claude-sessions"].reach,
+            Reach::Down("no route".into())
+        );
+        assert!(!listed(&app), "a container down lists nothing");
+    }
+
+    #[test]
+    fn a_home_actions_answer_stops_its_spinner_and_says_how_it_went() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        app.working = Some((Instant::now(), 0, "offloading session".into()));
+        app.menu.set_busy(Some(connecting(1)));
+        hear(&mut app, r#"{"t":"did","x":"offloaded claude-3"}"#);
+        assert!(app.working.is_none());
+        assert!(app.menu.view().busy.is_none());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("offloaded claude-3")
+        );
+        hear(&mut app, r#"{"t":"did","x":""}"#);
+        assert_eq!(app.menu.view().status, None, "nothing said: nothing shown");
+    }
+
+    #[test]
+    fn once_open_the_conversation_takes_its_slot_and_what_was_typed_meanwhile_goes() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        sent(&mut app, &rx);
+        type_in(&mut app, "hello");
+        assert_eq!(
+            sent(&mut app, &rx),
+            Vec::<String>::new(),
+            "held while it opens"
+        );
+        hear(&mut app, r#"{"t":"open","s":"claude-3","run":"r1"}"#);
+        let Screen::Conv { c, ui, opening } = &app.screen else {
+            panic!()
+        };
+        assert!(!opening);
+        assert_eq!((c.slot.as_str(), c.run.as_str()), ("claude-3", "r1"));
+        assert_eq!(ui.status, None, "no longer Opening…");
+        assert!(app.open_msg.is_none());
+        let uuid = c.pending[0].uuid.clone();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [
+                r#"{"t":"models"}"#.to_string(),
+                format!(r#"{{"t":"say","u":"{uuid}","x":"hello"}}"#),
+            ],
+            "the command list asked for, then what was held"
+        );
+        // With the command list in hand, it is not asked for again.
+        app.catalog = vec![convo::Command {
+            name: "review".into(),
+            about: String::new(),
+            hint: String::new(),
+        }];
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"open","s":"claude-4","run":"r2"}"#);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_reset_starts_the_transcript_again_and_keeps_what_is_on_its_way() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"text","x":"hello"}"#]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("on its way", Instant::now());
+        }
+        hear(&mut app, r#"{"t":"reset"}"#);
+        let c = conv_of(&app);
+        assert!(
+            !c.entries.contains(&Entry::Text("hello".into())),
+            "{:?}",
+            c.entries
+        );
+        assert_eq!(c.pending.len(), 1);
+        assert_eq!((c.host.as_str(), c.slot.as_str()), ("h", "claude-3"));
+    }
+
+    #[test]
+    fn the_model_list_fills_the_picker_and_the_command_list_the_suggestions() {
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            c.meta.chosen = "sonnet".into();
+            ui.dialog = Some(Dialog::Model { sel: 0, list: None });
+        }
+        hear(
+            &mut app,
+            r#"{"t":"models","m":[{"v":"default","d":"Opus"},{"v":"sonnet","d":"Sonnet"}],"c":[["review","Review &lt;pr&gt; &amp; more",""],["","nameless",""]]}"#,
+        );
+        let list = vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ];
+        assert_eq!(app.models.as_ref(), Some(&list));
+        assert_eq!(
+            dialog(&app),
+            Some(&Dialog::Model {
+                sel: 1,
+                list: Some(list)
+            }),
+            "on the model in use"
+        );
+        let review = convo::Command {
+            name: "review".into(),
+            about: "Review <pr> & more".into(),
+            hint: String::new(),
+        };
+        assert_eq!(
+            app.catalog,
+            std::slice::from_ref(&review),
+            "a command with no name is none"
+        );
+        assert_eq!(ui_of(&app).catalog, [review]);
+    }
+
+    #[test]
+    fn remote_control_on_is_said_with_its_link_copied_and_off_is_said_too() {
+        let mut app = app_in(&[]);
+        hear(
+            &mut app,
+            r#"{"t":"rc","on":true,"x":"https://claude.ai/x"}"#,
+        );
+        assert_eq!(
+            conv_of(&app).entries.last(),
+            Some(&Entry::Note(
+                "Remote Control active · https://claude.ai/x".into()
+            ))
+        );
+        assert_eq!(app.clip.as_deref(), Some("https://claude.ai/x"));
+        assert_eq!(
+            ui_of(&app).status.as_deref(),
+            Some("Copied 19 characters to the clipboard")
+        );
+        hear(&mut app, r#"{"t":"rc","on":false}"#);
+        assert_eq!(
+            conv_of(&app).entries.last(),
+            Some(&Entry::Note("Remote Control disconnected.".into()))
+        );
+        assert_eq!(ui_of(&app).status, None);
+    }
+
+    #[test]
+    fn a_workflows_browser_and_its_save_form_take_the_relays_answers_for_them() {
+        let mut app = app_in(&[AGENTS]);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[1]);
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Tasks(v));
+        }
+        let view = |app: &App| match dialog(app) {
+            Some(Dialog::Tasks(v)) => v.clone(),
+            d => panic!("{d:?}"),
+        };
+        hear(&mut app, r#"{"t":"wf","i":"other","p":[]}"#);
+        assert!(view(&app).wf.is_none(), "another workflow's");
+        hear(&mut app, r#"{"t":"wf","i":"wf1","p":[]}"#);
+        assert!(view(&app).wf.is_some());
+        if let Some(Dialog::Tasks(v)) = app_dialog_mut(&mut app) {
+            v.save = Some(tasks::Save::default());
+        }
+        hear(
+            &mut app,
+            r#"{"t":"wsaved","x":"/w/.claude/workflows/two.js"}"#,
+        );
+        assert_eq!(
+            view(&app).save.unwrap().said,
+            Some(Ok("/w/.claude/workflows/two.js".into()))
+        );
+        hear(&mut app, r#"{"t":"wsaved","e":"read-only"}"#);
+        assert_eq!(view(&app).save.unwrap().said, Some(Err("read-only".into())));
+    }
+
+    fn app_dialog_mut(app: &mut App) -> Option<&mut Dialog> {
+        match &mut app.screen {
+            Screen::Conv { ui, .. } => ui.dialog.as_mut(),
+            Screen::Home => None,
+        }
+    }
+
+    #[test]
+    fn a_pong_is_only_the_link_alive_and_touches_nothing_in_the_conversation() {
+        let mut app = app_in(&[TASKS]);
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Perm {
+                sel: 1,
+                top: 0,
+                typing: None,
+            });
+        }
+        app.awaiting = Some(Instant::now());
+        for t in ["pong", "full"] {
+            hear(&mut app, &format!(r#"{{"t":"{t}"}}"#));
+            assert!(app.awaiting.is_none(), "answered");
+            assert!(dialog(&app).is_some(), "{t}: as it was");
+        }
+    }
+
+    #[test]
+    fn a_conversation_that_ends_goes_home_saying_so_and_an_error_is_said_in_place() {
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"err","x":"no such command"}"#);
+        assert_eq!(ui_of(&app).status.as_deref(), Some("no such command"));
+        hear(&mut app, r#"{"t":"end"}"#);
+        assert!(matches!(app.screen, Screen::Home));
+        assert_eq!(app.menu.view().status.as_deref(), Some("claude-3 ended"));
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"end","x":"claude-3 was offloaded"}"#);
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("claude-3 was offloaded")
+        );
+    }
+
+    #[test]
+    fn a_model_list_without_commands_keeps_the_ones_it_has() {
+        let mut app = app_in(&[]);
+        let review = convo::Command {
+            name: "review".into(),
+            about: String::new(),
+            hint: String::new(),
+        };
+        app.catalog = vec![review.clone()];
+        hear(
+            &mut app,
+            r#"{"t":"models","m":[{"v":"default","d":"Opus"}]}"#,
+        );
+        assert_eq!(app.catalog, [review]);
+    }
+
+    #[test]
+    fn remote_control_on_with_no_link_copies_nothing() {
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"rc","on":true}"#);
+        assert_eq!(app.clip, None);
+        assert_eq!(ui_of(&app).status, None);
+    }
+
+    #[test]
+    fn the_agent_in_view_counts_from_its_own_start_and_its_ops_add_to_what_it_has() {
+        let t0 = crate::clock::now() - 60_000;
+        let tasks = format!(
+            r#"{{"t":"tasks","l":[{{"i":"ag0","k":"agent","d":"quick","st":"running","t0":{}}},{{"i":"ag1","k":"agent","d":"slow reader","st":"running","t0":{t0}}}]}}"#,
+            t0 + 55_000
+        );
+        let mut app = app_in(&[&tasks]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            let t = c.tasks[1].clone();
+            view_agent(c, ui, &t);
+        }
+        hear(
+            &mut app,
+            r#"{"t":"fgo","i":"ag1","reset":true,"o":[{"t":"add","id":1,"k":"user","x":"Read it."},{"t":"st","s":"working"}]}"#,
+        );
+        hear(
+            &mut app,
+            r#"{"t":"fgo","i":"ag1","o":[{"t":"add","id":2,"k":"text","x":"Reading."}]}"#,
+        );
+        let a = &conv_of(&app).viewing.as_ref().unwrap().1;
+        assert_eq!(
+            a.entries,
+            [
+                Entry::Prompt("Read it.".into()),
+                Entry::Text("Reading.".into())
+            ]
+        );
+        let since = a.working_since.expect("it is working");
+        assert!(
+            since + Duration::from_secs(30) < Instant::now(),
+            "its spinner counts from a minute ago"
+        );
+    }
+
+    #[test]
+    fn at_the_bottom_the_view_follows_what_arrives() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"count"}"#]);
+        for id in 2..40 {
+            hear(
+                &mut app,
+                &format!(r#"{{"t":"add","id":{id},"k":"text","x":"line {id}"}}"#),
+            );
+            assert_eq!(ui_of(&app).scroll, 0);
+        }
     }
 }
