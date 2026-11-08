@@ -5949,4 +5949,191 @@ mod tests {
         app.paint_bytes(40, 24, now);
         assert_eq!(app.paint_bytes(40, 20, now).matches(";1H").count(), 20);
     }
+
+    fn set_ui(app: &mut App, f: impl FnOnce(&mut Ui)) {
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            f(ui);
+        }
+    }
+
+    #[test]
+    fn esc_goes_back_to_the_bottom_first_then_interrupts_what_is_under_way() {
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let long = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let now = Instant::now();
+        for (state, pending, scroll, want) in [
+            ("working", false, 5, vec![]),
+            ("working", false, 0, vec![r#"{"t":"esc"}"#]),
+            ("idle", true, 0, vec![r#"{"t":"esc"}"#]),
+            ("idle", false, 0, vec![]),
+        ] {
+            let st = format!(r#"{{"t":"st","s":"{state}"}}"#);
+            let mut app = app_in(&[&long, &st]);
+            if pending {
+                if let Screen::Conv { c, .. } = &mut app.screen {
+                    c.sent("waiting", now);
+                }
+            }
+            set_ui(&mut app, |ui| ui.scroll = scroll);
+            let rx = cat_relay(&mut app);
+            sent(&mut app, &rx);
+            app.key(Key::Esc, now);
+            assert_eq!(ui_of(&app).scroll, 0, "{state} {scroll}");
+            assert_eq!(
+                sent(&mut app, &rx),
+                want,
+                "{state} pending {pending} {scroll}"
+            );
+            assert!(matches!(app.screen, Screen::Conv { .. }));
+        }
+    }
+
+    #[test]
+    fn in_an_agents_view_esc_interrupts_it_unless_scrolled_back_or_ended() {
+        let now = Instant::now();
+        let view = |app: &mut App| {
+            if let Screen::Conv { c, ui, .. } = &mut app.screen {
+                let t = c.tasks.iter().find(|t| t.id == "ag1").unwrap().clone();
+                view_agent(c, ui, &t);
+            }
+        };
+        let mut app = app_in(&[AGENTS]);
+        view(&mut app);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        set_ui(&mut app, |ui| ui.scroll = 3);
+        app.key(Key::Esc, now);
+        assert_eq!(ui_of(&app).scroll, 0, "back to the bottom");
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        app.key(Key::Esc, now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"ag1","t":"tesc"}"#]);
+        // Ended, though something else still runs: Esc leaves its view.
+        let mut app = app_in(&[
+            r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"},{"i":"ag1","k":"agent","d":"slow reader","st":"stopped"}]}"#,
+        ]);
+        view(&mut app);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.key(Key::Esc, now);
+        assert_eq!(viewing(&app), None);
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"fg"}"#]);
+    }
+
+    #[test]
+    fn in_an_agents_view_the_prompt_keeps_what_was_typed_and_end_only_scrolls() {
+        let mut app = app_in(&[AGENTS]);
+        set_ui(&mut app, |ui| {
+            ui.input = "half a prompt".into();
+            ui.cursor = 4;
+        });
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            let t = c.tasks[0].clone();
+            view_agent(c, ui, &t);
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        for k in [
+            Key::Left,
+            Key::Right,
+            Key::Home,
+            Key::Delete,
+            Key::End,
+            Key::Up,
+            Key::Enter,
+        ] {
+            app.key(k, now);
+            assert_eq!(
+                (ui_of(&app).input.as_str(), ui_of(&app).cursor),
+                ("half a prompt", 4),
+                "{k:?}"
+            );
+        }
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        set_ui(&mut app, |ui| ui.scroll = 4);
+        app.key(Key::End, now);
+        assert_eq!(ui_of(&app).scroll, 0);
+        assert_eq!(ui_of(&app).cursor, 4);
+    }
+
+    #[test]
+    fn end_goes_to_the_bottom_when_scrolled_back_and_else_to_the_end_of_the_prompt() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "abc");
+        set_ui(&mut app, |ui| {
+            ui.cursor = 1;
+            ui.scroll = 4;
+        });
+        app.key(Key::End, Instant::now());
+        assert_eq!((ui_of(&app).scroll, ui_of(&app).cursor), (0, 1));
+        app.key(Key::End, Instant::now());
+        assert_eq!(ui_of(&app).cursor, 3);
+    }
+
+    #[test]
+    fn enter_after_a_backslash_is_a_newline_and_an_empty_enter_is_not_history() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        type_in(&mut app, "one\\");
+        assert_eq!(ui_of(&app).input, "one\n");
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        let mut app = app_in(&[]);
+        app.key(Key::Enter, Instant::now());
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_sent_with_a_paste_in_it_is_shown_as_it_was_typed() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        type_in_only(&mut app, "see ");
+        pasted(&mut app, "a\nb\nc\nd");
+        app.key(Key::Enter, Instant::now());
+        let c = conv_of(&app);
+        assert_eq!(c.display("see a\nb\nc\nd"), "see [Pasted text #1 +3 lines]");
+        assert_eq!(app.history, ["see a\nb\nc\nd"]);
+    }
+
+    #[test]
+    fn down_with_text_in_the_prompt_stays_in_it_and_up_climbs_its_rows() {
+        let mut app = app_in(&[TASKS]);
+        type_in_only(&mut app, "a");
+        type_in(&mut app, "\\");
+        type_in_only(&mut app, "bb");
+        app.key(Key::Down, Instant::now());
+        assert_eq!(ui_of(&app).focus, Focus::Prompt, "no pill while typing");
+        app.key(Key::Up, Instant::now());
+        assert_eq!(ui_of(&app).cursor, 1, "up a row, to the end of `a`");
+    }
+
+    #[test]
+    fn page_up_scrolls_ten_lines_and_the_wheel_its_own_step_never_past_the_top() {
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let long = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let mut app = app_in(&[&long]);
+        app.wheel = 3;
+        let now = Instant::now();
+        let scroll = |app: &mut App, k: Key| {
+            app.key(k, now);
+            ui_of(app).scroll
+        };
+        assert_eq!(scroll(&mut app, Key::PageUp), 10);
+        assert_eq!(scroll(&mut app, Key::WheelUp), 13);
+        assert_eq!(scroll(&mut app, Key::WheelDown), 10);
+        assert_eq!(scroll(&mut app, Key::PageDown), 0);
+        assert_eq!(scroll(&mut app, Key::WheelDown), 0);
+        let most = top(&app);
+        for _ in 0..20 {
+            app.key(Key::PageUp, now);
+        }
+        assert_eq!(ui_of(&app).scroll, most);
+    }
 }
