@@ -17,6 +17,7 @@
 //! the spinner while claude works and the seconds while the link is down.
 
 use crate::convo::{self, Applied, Convo, Dialog, Entry, Focus, Link, Ui};
+use crate::drafts::{self, Draft};
 use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::menu::{Action, Menu, Place, Reach};
@@ -26,6 +27,7 @@ use crate::term::{self, Input, RawTerminal};
 use crate::ui::{Busy, Header, Key, Row, RowKey};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -56,6 +58,9 @@ const LEFT_HINT: &str = "Left again to disconnect";
 /// arrives as a byte rather than stopping the terminal.
 const CTRL_X: char = '\x18';
 const CTRL_S: char = '\x13';
+/// How long typing must pause before the unsent prompt is saved (`drafts.rs`): soon enough
+/// that Termux killed in the background loses little, seldom enough to write little.
+const DRAFT_QUIET: Duration = Duration::from_secs(1);
 /// R10's words, in place of the hint line until the next key.
 const TERMINAL_ONLY: &str =
     "Runs in a terminal: attach it from ssh dev, or end it there to open here";
@@ -180,6 +185,18 @@ struct App {
     /// A selection dragged over the conversation, in screen cells: where the button went
     /// down, where it is now, and whether it has moved. Highlighted, and copied on release.
     select: Option<Selection>,
+    /// Where unsent prompts are kept (`drafts.rs`); none in a test that does not ask.
+    drafts: Option<PathBuf>,
+    /// The open conversation's draft as last saved or found, by container and id.
+    kept: Option<(String, String, Draft)>,
+    /// As last seen, and since when it has differed from what is kept, unsaved.
+    seen: Option<(String, String, Draft)>,
+    dirty: Option<Instant>,
+    /// The conversation whose kept draft was looked for, so it is looked for once.
+    restored: Option<(String, String)>,
+    /// Something was typed in this conversation before its id came: what is in the prompt is
+    /// newer than any draft kept, which is not put back over it.
+    touched: bool,
 }
 
 impl App {
@@ -779,16 +796,147 @@ impl App {
     }
 
     fn home(&mut self, status: Option<String>) {
+        // What was typed and not sent is kept for the next time it is opened, here or after
+        // an offload, and Up's place in what was sent is the conversation's, not the next's.
+        self.save_draft();
+        self.history_at = None;
+        self.draft = None;
         self.screen = Screen::Home;
         self.menu.set_status(status);
         self.drawn.clear();
     }
 
+    // ── the unsent prompt ────────────────────────────────────────────────────
+
+    /// The open conversation's container, id and draft as it now stands: the prompt with its
+    /// pastes collapsed, or, while Up shows what was sent, what Up took away. None until its
+    /// id is known.
+    fn current_draft(&self) -> Option<(String, String, Draft)> {
+        let Screen::Conv {
+            c,
+            ui,
+            opening: false,
+        } = &self.screen
+        else {
+            return None;
+        };
+        if c.meta.session_id.is_empty() {
+            return None;
+        }
+        let (text, cursor) = match self.history_at {
+            Some(_) => {
+                let t = self.draft.clone().unwrap_or_default();
+                let n = t.chars().count();
+                (t, n)
+            }
+            None => (ui.input.clone(), ui.cursor),
+        };
+        // Only the pastes still standing in it: Ctrl+C clears the prompt and not them.
+        let pastes = ui
+            .pastes
+            .iter()
+            .filter(|(n, t)| text.contains(&paste_label(*n, t.matches('\n').count())))
+            .cloned()
+            .collect();
+        Some((
+            c.host.clone(),
+            c.meta.session_id.clone(),
+            Draft {
+                text,
+                cursor,
+                pastes,
+            },
+        ))
+    }
+
+    /// After every key and every line from the relay: the kept draft put back once the
+    /// conversation's id is known, if nothing was typed first; a change saved once typing
+    /// pauses, and at once when the prompt empties, as sending does.
+    fn note_draft(&mut self, now: Instant) {
+        let Some(file) = self.drafts.clone() else {
+            return;
+        };
+        if let Screen::Conv {
+            c,
+            ui,
+            opening: false,
+        } = &mut self.screen
+        {
+            let sid = c.meta.session_id.clone();
+            if sid.is_empty() {
+                self.touched |= !ui.input.is_empty();
+            } else if self.restored.as_ref() != Some(&(c.host.clone(), sid.clone())) {
+                self.restored = Some((c.host.clone(), sid.clone()));
+                let mut kept = Draft::default();
+                if !self.touched && ui.input.is_empty() && self.history_at.is_none() {
+                    if let Some(d) = drafts::load(&file, &c.host, &sid) {
+                        ui.input = d.text.clone();
+                        ui.cursor = d.cursor;
+                        ui.pastes = d.pastes.clone();
+                        ui.last_paste = None;
+                        kept = d;
+                    }
+                }
+                self.kept = Some((c.host.clone(), sid, kept));
+            }
+        }
+        let Some(cur) = self.current_draft() else {
+            return;
+        };
+        if self.seen.as_ref() != Some(&cur) {
+            let emptied = cur.2.text.trim().is_empty()
+                && self
+                    .kept
+                    .as_ref()
+                    .is_some_and(|k| !k.2.text.trim().is_empty());
+            self.seen = Some(cur);
+            self.dirty = Some(now);
+            if emptied {
+                self.save_draft();
+                return;
+            }
+        }
+        if self.dirty.is_some_and(|d| now >= d + DRAFT_QUIET) {
+            self.save_draft();
+        }
+    }
+
+    /// A conversation opening: nothing of the last one's draft carries over.
+    fn new_draft(&mut self) {
+        self.kept = None;
+        self.seen = None;
+        self.dirty = None;
+        self.restored = None;
+        self.touched = false;
+    }
+
+    /// Save the open conversation's draft now, if it differs from what is kept.
+    fn save_draft(&mut self) {
+        self.dirty = None;
+        let (Some(file), Some(cur)) = (self.drafts.clone(), self.current_draft()) else {
+            return;
+        };
+        let same_key = self
+            .kept
+            .as_ref()
+            .is_some_and(|k| k.0 == cur.0 && k.1 == cur.1);
+        if self.kept.as_ref() == Some(&cur) || (!same_key && cur.2.text.trim().is_empty()) {
+            return;
+        }
+        if drafts::save(&file, &cur.0, &cur.1, Some(&cur.2), crate::clock::now()) {
+            self.kept = Some(cur);
+        }
+    }
+
     // ── keys ─────────────────────────────────────────────────────────────────
 
-    /// A first Left on an empty prompt that waited out `LEFT_AGAIN`: its hint goes.
+    /// A first Left on an empty prompt that waited out `LEFT_AGAIN`: its hint goes. And
+    /// `paste again to expand`, after its eight seconds.
     fn expire_left(&mut self, now: Instant) {
         if let Screen::Conv { ui, .. } = &mut self.screen {
+            if ui.paste_hint.is_some_and(|at| now >= at + PASTE_HINT_FOR) {
+                ui.paste_hint = None;
+            }
             if ui.left.is_some_and(|at| now >= at + LEFT_AGAIN) {
                 ui.left = None;
                 if ui.status.as_deref() == Some(LEFT_HINT) {
@@ -860,7 +1008,7 @@ impl App {
                         // A prompt that takes nothing takes no paste either.
                     } else {
                         let rows = term::size().map_or(24, |(_, h)| h as usize);
-                        paste(ui, &text, rows);
+                        paste(ui, &text, rows, now);
                     }
                 }
                 return;
@@ -965,6 +1113,7 @@ impl App {
         self.send(msg.clone());
         self.open_msg = Some(msg);
         self.held.clear();
+        self.new_draft();
         let mut ui = Ui::new();
         ui.status = Some("Opening…".into());
         ui.catalog = self.catalog.clone();
@@ -1246,10 +1395,13 @@ impl App {
                             c.collapsed(&text, &typed);
                         }
                         ui.pastes.clear();
+                        ui.last_paste = None;
+                        ui.paste_hint = None;
                         ui.cursor = 0;
                         ui.scroll = 0;
                         if !text.trim().is_empty() {
                             self.history.push(text.clone());
+                            self.touched = true;
                         }
                         self.history_at = None;
                         self.draft = None;
@@ -2029,15 +2181,33 @@ fn paste_label(id: u32, breaks: usize) -> String {
     }
 }
 
-/// A paste into the prompt, as Claude Code takes one: as itself when short, its tabs four
-/// spaces; past [`PASTE_CHARS`] or [`PASTE_BREAKS`], as a numbered stand-in.
-fn paste(ui: &mut Ui, text: &str, rows: usize) {
-    let text = text.replace('\t', "    ");
+/// How long `paste again to expand` stays: Claude Code 2.1.311's eight seconds.
+const PASTE_HINT_FOR: Duration = Duration::from_secs(8);
+/// The longest paste that pasting again expands, and that gets the hint: Claude Code's 100,000.
+const PASTE_EXPANDS: usize = 100_000;
+
+/// A paste into the prompt, as Claude Code takes one: as itself when short, its line ends
+/// `\n` and its tabs four spaces; past [`PASTE_CHARS`] or [`PASTE_BREAKS`], as a numbered
+/// stand-in, with `paste again to expand` for eight seconds. The same text pasted again,
+/// while the last stand-in is the newest in the prompt, puts that paste there whole in its
+/// place, the cursor after it, as 2.1.311 does (its paste handler, read 2026-11-08).
+fn paste(ui: &mut Ui, text: &str, rows: usize, now: Instant) {
+    let text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ");
+    if expand_again(ui, &text) {
+        return;
+    }
     let breaks = text.matches('\n').count();
     let most = PASTE_BREAKS.min(rows.saturating_sub(10));
     let insert = if text.chars().count() > PASTE_CHARS || breaks > most {
         let id = ui.pastes.iter().map(|(n, _)| *n).max().unwrap_or(0) + 1;
         ui.pastes.push((id, text.clone()));
+        ui.last_paste = Some(id);
+        if text.chars().count() <= PASTE_EXPANDS {
+            ui.paste_hint = Some(now);
+        }
         paste_label(id, breaks)
     } else {
         text
@@ -2048,6 +2218,36 @@ fn paste(ui: &mut Ui, text: &str, rows: usize) {
     chars.splice(at..at, insert.chars());
     ui.input = chars.into_iter().collect();
     ui.cursor = at + n;
+}
+
+/// The second of two identical pastes: the first's stand-in, if it is the newest stand-in in
+/// the prompt, replaced by its text. Whether it was.
+fn expand_again(ui: &mut Ui, text: &str) -> bool {
+    let Some(id) = ui.last_paste else {
+        return false;
+    };
+    let Some(i) = ui.pastes.iter().position(|(n, t)| *n == id && t == text) else {
+        return false;
+    };
+    // Claude Code expands the stand-in with the highest number, and only if it is this one.
+    let newest = ui
+        .pastes
+        .iter()
+        .filter(|(n, t)| ui.input.contains(&paste_label(*n, t.matches('\n').count())))
+        .map(|(n, _)| *n)
+        .max();
+    if newest != Some(id) || text.chars().count() > PASTE_EXPANDS {
+        return false;
+    }
+    let label = paste_label(id, text.matches('\n').count());
+    let Some(byte) = ui.input.find(&label) else {
+        return false;
+    };
+    ui.input.replace_range(byte..byte + label.len(), text);
+    ui.cursor = ui.input[..byte].chars().count() + text.chars().count();
+    ui.pastes.remove(i);
+    ui.paste_hint = None;
+    true
 }
 
 /// The prompt as sent: every stand-in still in it replaced by its paste.
@@ -2691,6 +2891,9 @@ impl App {
             if let Some(at) = ui.left {
                 soon(at + LEFT_AGAIN);
             }
+            if let Some(at) = ui.paste_hint {
+                soon(at + PASTE_HINT_FOR);
+            }
         }
         if matches!(self.screen, Screen::Home)
             && (!self.greeted || self.down_since.is_some() || self.working.is_some())
@@ -2699,6 +2902,9 @@ impl App {
         }
         if let Some(a) = self.awaiting {
             soon(a + self.ack_wait());
+        }
+        if let Some(d) = self.dirty {
+            soon(d + DRAFT_QUIET);
         }
         if self.output_wanted().is_some() {
             soon(self.output_for.as_ref().map_or(now, |(_, at)| *at));
@@ -2762,6 +2968,12 @@ impl App {
             select: None,
             held: Vec::new(),
             open_msg: None,
+            drafts: None,
+            kept: None,
+            seen: None,
+            dirty: None,
+            restored: None,
+            touched: false,
         };
         app.menu.remote = true;
         app
@@ -2772,6 +2984,7 @@ pub fn run(name: &str) -> Result<(), String> {
     let (w, h) = term::size().ok_or("not a terminal")?;
     let (tx, rx): (Sender<Heard>, Receiver<Heard>) = mpsc::channel();
     let mut app = App::new(name, w, h, wheel_step(|k| std::env::var(k).ok()));
+    app.drafts = drafts::path(|k| std::env::var(k).ok());
     let mut term = RawTerminal::enter().map_err(|e| format!("cannot set up the terminal: {e}"))?;
     // And bracketed paste, so a paste arrives as one (`Key::PasteStart`), as in Claude Code.
     // And motion while a button is held (`?1002`), for a selection dragged over the
@@ -2790,6 +3003,7 @@ pub fn run(name: &str) -> Result<(), String> {
         app.want_older();
         app.want_output(now);
         app.expire_left(now);
+        app.note_draft(now);
         if app.paint(&mut term, now).is_err() {
             break;
         }
@@ -2826,6 +3040,7 @@ pub fn run(name: &str) -> Result<(), String> {
             app.dial(now, &tx);
         }
     }
+    app.save_draft();
     if let Some(mut w) = app.wire.take() {
         let _ = w.child.kill();
         let _ = w.child.wait();
@@ -3041,23 +3256,23 @@ mod tests {
     fn a_paste_goes_in_as_itself_or_as_claude_codes_stand_in() {
         let mut ui = Ui::new();
         // Two line breaks or fewer, as typed: Claude Code's three-line paste stays inline.
-        paste(&mut ui, "first\nsecond\nthird", 32);
+        paste(&mut ui, "first\nsecond\nthird", 32, Instant::now());
         assert_eq!(ui.input, "first\nsecond\nthird");
         assert!(ui.pastes.is_empty());
         // Three breaks, or past 800 characters, a stand-in at the cursor.
         let mut ui = Ui::new();
         ui.input = "look: ".into();
         ui.cursor = 6;
-        paste(&mut ui, "a\nb\nc\nd", 32);
+        paste(&mut ui, "a\nb\nc\nd", 32, Instant::now());
         assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
-        paste(&mut ui, &"x".repeat(801), 32);
+        paste(&mut ui, &"x".repeat(801), 32, Instant::now());
         assert_eq!(ui.input, "look: [Pasted text #1 +3 lines][Pasted text #2]");
         // On a short screen fewer breaks are too many: one at 11 rows, none at 10.
         let mut short = Ui::new();
-        paste(&mut short, "a\nb", 11);
+        paste(&mut short, "a\nb", 11, Instant::now());
         assert_eq!(short.input, "a\nb");
         let mut shorter = Ui::new();
-        paste(&mut shorter, "a\nb", 10);
+        paste(&mut shorter, "a\nb", 10, Instant::now());
         assert_eq!(shorter.input, "[Pasted text #1 +1 lines]");
         // Sent, each is itself again.
         assert_eq!(
@@ -3074,7 +3289,7 @@ mod tests {
         assert_eq!(ui.input, "look:", "then a character at a time");
         // Tabs are four spaces, as Claude Code pastes them.
         let mut ui = Ui::new();
-        paste(&mut ui, "a\tb", 32);
+        paste(&mut ui, "a\tb", 32, Instant::now());
         assert_eq!(ui.input, "a    b");
     }
 
@@ -4241,5 +4456,209 @@ mod tests {
         assert_eq!(base64(b"abc"), "YWJj");
         assert_eq!(took(Duration::from_secs(41)), "41s");
         assert_eq!(took(Duration::from_secs(125)), "2m 5s");
+    }
+
+    fn pasted(app: &mut App, text: &str) {
+        app.key(Key::PasteStart, Instant::now());
+        for ch in text.chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        app.key(Key::PasteEnd, Instant::now());
+    }
+
+    #[test]
+    fn the_same_paste_again_puts_the_newest_stand_in_there_whole_as_claude_code_does() {
+        // Claude Code 2.1.311 in a pty (2026-11-08): `[Pasted text #1 +3 lines] after`, the
+        // same four lines pasted again, and the prompt read them whole in its place, the
+        // cursor after them; `paste again to expand` stood in the mode line's place until.
+        let t0 = Instant::now();
+        let mut ui = Ui::new();
+        let four = "line one\nline two\nline three\nline four";
+        paste(&mut ui, four, 30, t0);
+        for ch in " after".chars() {
+            edit(&mut ui, Key::Char(ch));
+        }
+        assert_eq!(ui.input, "[Pasted text #1 +3 lines] after");
+        assert_eq!(ui.paste_hint, Some(t0));
+        paste(&mut ui, four, 30, t0);
+        assert_eq!(ui.input, format!("{four} after"));
+        assert_eq!(ui.cursor, four.chars().count());
+        assert!(ui.pastes.is_empty() && ui.paste_hint.is_none());
+        // Pasted a third time it is a paste like any other.
+        paste(&mut ui, four, 30, t0);
+        assert_eq!(ui.input, format!("{four}[Pasted text #1 +3 lines] after"));
+
+        // Line ends and tabs as Claude Code reads them, so `\r\n` matches `\n`.
+        let mut ui = Ui::new();
+        paste(&mut ui, "a\r\nb\r\nc\r\nd", 30, t0);
+        paste(&mut ui, "a\nb\nc\nd", 30, t0);
+        assert_eq!(ui.input, "a\nb\nc\nd");
+
+        // Only the newest: a second, different paste since means the first stays.
+        let mut ui = Ui::new();
+        paste(&mut ui, four, 30, t0);
+        paste(&mut ui, "w\nx\ny\nz", 30, t0);
+        paste(&mut ui, four, 30, t0);
+        assert_eq!(
+            ui.input,
+            "[Pasted text #1 +3 lines][Pasted text #2 +3 lines][Pasted text #3 +3 lines]"
+        );
+        // Nor once its stand-in is deleted.
+        let mut ui = Ui::new();
+        paste(&mut ui, four, 30, t0);
+        edit(&mut ui, Key::Char('\x7f'));
+        paste(&mut ui, four, 30, t0);
+        assert_eq!(ui.input, "[Pasted text #1 +3 lines]");
+    }
+
+    #[test]
+    fn paste_again_to_expand_is_in_the_mode_lines_place_for_eight_seconds() {
+        let mut app = app_in(&[
+            r#"{"t":"meta","sid":"s","m":"claude-opus-5-5","pm":"default","ti":"","e":"","cwd":"","ver":""}"#,
+        ]);
+        let foot = |app: &App| match &app.screen {
+            Screen::Conv { c, ui, .. } => {
+                let lines = convo::draw(c, ui, 40, 24, Instant::now()).lines;
+                lines[lines.len() - 1]
+                    .iter()
+                    .map(|(t, _)| t.as_str())
+                    .collect::<String>()
+            }
+            _ => panic!("left"),
+        };
+        assert!(foot(&app).contains("manual mode on"), "{}", foot(&app));
+        pasted(&mut app, "a\nb\nc\nd");
+        assert!(
+            foot(&app).starts_with("  paste again to expand "),
+            "{}",
+            foot(&app)
+        );
+        let t0 = ui_of(&app).paste_hint.unwrap();
+        // Typing keeps it, as Claude Code's timer does.
+        app.key(Key::Char('x'), Instant::now());
+        app.expire_left(t0 + Duration::from_millis(7999));
+        assert!(foot(&app).contains("paste again"));
+        assert_eq!(app.next_wake(t0).map(|d| d <= PASTE_HINT_FOR), Some(true));
+        app.expire_left(t0 + PASTE_HINT_FOR);
+        assert!(foot(&app).contains("manual mode on"));
+    }
+
+    fn scratch_drafts(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "claude-remote-client-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        d.join("drafts.json")
+    }
+
+    fn meta(sid: &str) -> String {
+        format!(
+            r#"{{"t":"meta","sid":"{sid}","m":"claude-opus-5-5","pm":"default","ti":"","e":"","cwd":"","ver":""}}"#
+        )
+    }
+
+    /// The conversation `ops` opened again on `app`, as `open_conv` and the relay's answer do.
+    fn reopen(app: &mut App, ops: &[&str]) {
+        app.new_draft();
+        app.screen = Screen::Conv {
+            c: Box::new(convo_with(ops)),
+            ui: Box::new(Ui::new()),
+            opening: false,
+        };
+        app.note_draft(Instant::now());
+    }
+
+    #[test]
+    fn an_unsent_prompt_and_its_pastes_come_back_when_the_conversation_is_opened_again() {
+        let file = scratch_drafts("back");
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        app.note_draft(Instant::now());
+        for ch in "look: ".chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        pasted(&mut app, "a\nb\nc\nd");
+        app.note_draft(Instant::now());
+        app.key(Key::Char(DETACH), Instant::now());
+        assert!(matches!(app.screen, Screen::Home));
+
+        // Opened again — the slot offloaded and resumed meanwhile, its id the same.
+        reopen(&mut app, &[&meta("s1")]);
+        let ui = ui_of(&app);
+        assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
+        assert_eq!(ui.cursor, ui.input.chars().count());
+        assert_eq!(ui.pastes, vec![(1, "a\nb\nc\nd".to_string())]);
+        // An emptied prompt is no draft, kept at once: sending empties it so too (a test's
+        // client has no link, so its Enter is held, R8).
+        app.key(Key::Char('\x03'), Instant::now());
+        app.note_draft(Instant::now());
+        assert_eq!(drafts::load(&file, "h", "s1"), None);
+    }
+
+    #[test]
+    fn a_draft_waits_for_its_own_conversation_and_never_over_what_was_typed() {
+        let file = scratch_drafts("own");
+        drafts::save(
+            &file,
+            "h",
+            "s1",
+            Some(&Draft {
+                text: "kept".into(),
+                cursor: 4,
+                pastes: Vec::new(),
+            }),
+            crate::clock::now(),
+        );
+        let mut app = App::new("dev", 40, 24, 1);
+        app.drafts = Some(file.clone());
+        // The slot's name reused by another conversation: nothing comes back.
+        reopen(&mut app, &[&meta("s2")]);
+        assert_eq!(ui_of(&app).input, "");
+        // Its id not yet come, the owner types; when it comes, what was typed stays, and it
+        // is what is kept from then on.
+        reopen(&mut app, &[]);
+        for ch in "new".chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+        app.note_draft(Instant::now());
+        app.heard(parse(&meta("s1")).unwrap(), Instant::now());
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "new");
+        app.home(None);
+        assert_eq!(
+            drafts::load(&file, "h", "s1").map(|d| d.text),
+            Some("new".into())
+        );
+    }
+
+    #[test]
+    fn a_draft_is_saved_once_typing_pauses_and_up_in_what_was_sent_is_not_it() {
+        let file = scratch_drafts("pause");
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        let t0 = Instant::now();
+        app.note_draft(t0);
+        app.history = vec!["sent before".into()];
+        for ch in "half".chars() {
+            app.key(Key::Char(ch), t0);
+        }
+        app.note_draft(t0);
+        assert_eq!(drafts::load(&file, "h", "s1"), None, "still typing");
+        assert_eq!(app.next_wake(t0).map(|d| d <= DRAFT_QUIET), Some(true));
+        app.note_draft(t0 + DRAFT_QUIET);
+        assert_eq!(
+            drafts::load(&file, "h", "s1").map(|d| d.text),
+            Some("half".into())
+        );
+        // Up shows what was sent; the draft is still what Up took away.
+        app.key(Key::Up, t0);
+        assert_eq!(ui_of(&app).input, "sent before");
+        app.note_draft(t0 + DRAFT_QUIET * 3);
+        app.home(None);
+        assert_eq!(
+            drafts::load(&file, "h", "s1").map(|d| d.text),
+            Some("half".into())
+        );
     }
 }

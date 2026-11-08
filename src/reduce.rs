@@ -864,6 +864,17 @@ impl Reducer {
             self.set_meta(&mut out, meta);
             return out;
         }
+        // A SessionStart hook's lines carry the conversation's id the moment claude starts,
+        // where `system/init` waits for a turn: a conversation resumed and not yet prompted
+        // has an id the view can keep the owner's unsent prompt by (`drafts.rs`).
+        if sdk::session_start(v).is_some_and(|sid| sid != self.meta.session_id) {
+            let meta = Meta {
+                session_id: sdk::session_start(v).unwrap_or_default(),
+                ..self.meta.clone()
+            };
+            self.set_meta(&mut out, meta);
+            return out;
+        }
         let msg = sdk::classify(v);
         let quiet = matches!(
             msg,
@@ -2791,6 +2802,27 @@ mod tests {
             (r.meta().chosen.as_str(), r.meta().effort.as_str()),
             ("opus", "high")
         );
+    }
+
+    #[test]
+    fn a_session_start_hook_names_the_conversation_before_any_turn() {
+        // 2.1.311 headless, started with `--session-id` and sent only `initialize` (2026-11-08):
+        // the SessionStart hook's lines came, with the id, and no `system/init`.
+        let mut r = Reducer::new();
+        let started = r#"{"type":"system","subtype":"hook_started","hook_id":"h1","hook_name":"SessionStart:resume","hook_event":"SessionStart","uuid":"u1","session_id":"3f0e4a52"}"#;
+        let answered = r#"{"type":"system","subtype":"hook_response","hook_id":"h1","hook_name":"SessionStart:resume","hook_event":"SessionStart","output":"","exit_code":0,"outcome":"success","uuid":"u2","session_id":"3f0e4a52"}"#;
+        let out = feed_all(&mut r, &[started, answered]);
+        assert_eq!(
+            wire(&out.ops),
+            [r#"{"cwd":"","e":"","m":"","pm":"","sid":"3f0e4a52","t":"meta","ti":"","ver":""}"#],
+            "once, from the first line"
+        );
+        // Another event's hook says nothing of it, and `/clear`'s SessionStart moves it on.
+        let other = r#"{"type":"system","subtype":"hook_started","hook_name":"UserPromptSubmit","hook_event":"UserPromptSubmit","session_id":"elsewhere"}"#;
+        assert!(feed_all(&mut r, &[other]).ops.is_empty());
+        let cleared = r#"{"type":"system","subtype":"hook_started","hook_name":"SessionStart:clear","hook_event":"SessionStart","session_id":"9b1c"}"#;
+        feed_all(&mut r, &[cleared]);
+        assert_eq!(r.meta().session_id, "9b1c");
     }
 
     #[test]

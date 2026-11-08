@@ -380,6 +380,18 @@ fn s(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// The conversation a SessionStart hook's line names (`system/hook_started` or
+/// `hook_response`, `hook_event` `SessionStart`), which claude writes as it starts, before
+/// any turn: `SessionStart:startup`, `:resume`, `:clear` or `:compact`.
+pub fn session_start(v: &Value) -> Option<String> {
+    let sub = v.get("subtype").and_then(Value::as_str)?;
+    let ok = v.get("type").and_then(Value::as_str) == Some("system")
+        && matches!(sub, "hook_started" | "hook_response")
+        && v.get("hook_event").and_then(Value::as_str) == Some("SessionStart");
+    let sid = v.get("session_id").and_then(Value::as_str)?;
+    (ok && !sid.is_empty()).then(|| sid.to_string())
+}
+
 /// Read one line from claude.
 pub fn classify(v: &Value) -> Msg {
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");

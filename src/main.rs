@@ -46,6 +46,7 @@ mod bind;
 mod client;
 mod clock;
 mod convo;
+mod drafts;
 mod events;
 mod fmt;
 mod harness;

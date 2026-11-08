@@ -523,6 +523,34 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        transcript draws a prompt sent with a stand-in as it stood in the prompt — waiting, and
        once claude has it — while claude gets the paste whole (owner, 2026-11-03). That is the
        sending view's memory only: another device, or the view restarted, draws it whole.
+     - **The same paste again expands it**, as 2.1.311 does (its paste handler, read and
+       driven in a pty on 2026-11-08; the owner chose this over a Ctrl+O of the phone's own,
+       which stays the transcript's). After a paste goes in as a stand-in,
+       `paste again to expand` stands in the mode line's place for eight seconds; the same
+       text pasted again (line ends read as `\n`, tabs as four spaces), while that stand-in
+       is the newest in the prompt, puts the paste there whole in its place, the cursor after
+       it, as ordinary text to edit. There is no way back to the stand-in, as in Claude Code.
+       A paste over 100,000 characters neither expands nor gets the hint. Sending puts the
+       hint away.
+     - **What is typed and not sent is kept** (owner, 2026-11-08): leaving a conversation, by
+       Ctrl+\\, `/home` or its end, or quitting the client, and once typing pauses for a
+       second, the prompt — its pastes collapsed, each paste's text beside it, and the cursor —
+       is saved on the device the client runs on (`drafts.rs`:
+       `$CLAUDE_REMOTE_DRAFTS`, else `$XDG_STATE_HOME/claude-remote/drafts.json`, else under
+       `~/.local/state`), and put back when that conversation is opened again, whether it ran
+       on meanwhile, was offloaded and resumed, or archived. It is keyed by container and
+       conversation id, never by slot, since a slot's name is reused. The id comes in the
+       meta op, which the relay fills from the SessionStart hook's lines as claude starts
+       (`sdk::session_start`), since `system/init` waits for a turn: a conversation resumed
+       and not yet prompted would otherwise have none. A relay from before this sends it only
+       with a turn, so there the draft comes back once the conversation is next prompted.
+       It is put back only into an empty prompt, and not at all if anything was typed before
+       the id came. While Up shows what was sent, the draft is what Up took away. An emptied
+       prompt — sent, or cleared with Ctrl+C — drops it at once. Drafts unsaved for 30 days
+       go, and past 4 MB the oldest; the file is written whole under a lock that waits at most
+       half a second, re-read first so two clients on one device keep each other's, and one
+       that cannot be read is no draft. Not kept: what is typed in the moment between opening
+       a conversation and its id arriving, if the view leaves in that moment.
    - **Keys and commands.** Typing, Left, Right, Home, End, Delete, Backspace, Ctrl-A, Ctrl-E,
      Ctrl-U; Ctrl or Alt with Left or Right a word at a time, back to a word's start and on to
      its end, as Claude Code's prompt goes; the prompt soft-wraps at words, the space a row breaks on hanging at its end so

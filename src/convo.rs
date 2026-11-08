@@ -1123,6 +1123,8 @@ pub fn mode_line(mode: &str) -> Option<(String, u32)> {
 /// What the mode line says after a mode other than manual, where Claude Code says
 /// `(shift+tab to cycle)`.
 pub const MODE_HINT: &str = " (/mode to change)";
+/// What Claude Code 2.1.311 says for eight seconds after a paste goes in as a stand-in.
+pub const PASTE_HINT: &str = "paste again to expand";
 
 /// Claude Code's grey for `manual mode on`, a shade off its secondary text's.
 const MANUAL_GREY: u32 = 0x94_9494;
@@ -1299,6 +1301,12 @@ pub struct Ui {
     /// Pastes standing in the prompt as `[Pasted text #N +L lines]`, by number, as Claude
     /// Code's are: put back whole when the prompt is sent.
     pub pastes: Vec<(u32, String)>,
+    /// The newest paste that went in as a stand-in: the same text pasted again while its
+    /// stand-in is the newest in the prompt puts it there whole, as Claude Code 2.1.311 does.
+    pub last_paste: Option<u32>,
+    /// Since when `paste again to expand` has stood in the mode line's place: Claude Code's
+    /// hint, for eight seconds after a paste goes in as a stand-in.
+    pub paste_hint: Option<std::time::Instant>,
     /// claude's slash commands with what each does, for the suggestion list (`suggestions`).
     pub catalog: Vec<Command>,
     /// The suggestion list's selected entry, and whether Esc put the list away until the
@@ -1327,6 +1335,8 @@ impl Ui {
             chord: false,
             left: None,
             pastes: Vec::new(),
+            last_paste: None,
+            paste_hint: None,
             catalog: Vec::new(),
             suggest: 0,
             suggest_off: false,
@@ -2160,6 +2170,9 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             ),
             fg(GREY),
         ));
+    } else if ui.paste_hint.is_some() && agent.is_none() {
+        // Claude Code's hint after a paste went in as a stand-in, in its mode line's place.
+        foot.push((format!("  {PASTE_HINT}"), fg(GREY)));
     } else if let Some((m, colour)) = mode_line(&c.meta.mode) {
         // The hint goes too when the usage would not fit beside it.
         let crowded = usage.as_ref().is_some_and(|u| {
