@@ -144,6 +144,9 @@ mod tests {
         let own = line(&["claude-sessions", "sh", "claude", "claude-sessions", "zmx"]);
         assert_eq!(place(&own, false), placed(Binding::Own, Some(12), 11));
         assert_eq!(place(&own, true).binding, Binding::Nested, "in a subagent");
+        // `sh` exec'd the hook, so the holder's claude is its parent.
+        let exec = line(&["claude-sessions", "claude", "claude-sessions", "zmx"]);
+        assert_eq!(place(&exec, false), placed(Binding::Own, Some(11), 10));
         // A `claude -p` from a tool call of the remote slot's claude.
         let nested = line(&[
             "claude-sessions",
