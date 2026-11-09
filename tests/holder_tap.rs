@@ -132,6 +132,33 @@ fn a_tap_carries_lines_both_ways_stamps_the_slot_and_an_answer_clears_its_mark()
     assert!(status.success(), "{status}");
     assert_ne!(record_field(&root, "last_attach_ms").as_deref(), Some("0"));
 
+    // A record an older release rewrote says nothing of the holder; its socket answering
+    // still makes the running slot the remote view's to open.
+    let pid = holder.id().to_string();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let start = stat[stat.rfind(')').unwrap() + 2..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .to_string();
+    std::fs::write(
+        root.join("registry/claude-7.json"),
+        format!(r#"{{"slot":"claude-7","state":"live","pid":{pid},"proc_start":{start}}}"#),
+    )
+    .unwrap();
+    let mut open = Command::new(BIN);
+    open.args(["remote", "open", "claude-7"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    env(&mut open);
+    let opened = open.output().unwrap();
+    let first = String::from_utf8_lossy(&opened.stdout);
+    assert_eq!(
+        first.lines().next(),
+        Some(r#"{"slot":"claude-7"}"#),
+        "{first}"
+    );
+
     holder.kill().unwrap();
     holder.wait().unwrap();
     let _ = std::fs::remove_dir_all(&root);
