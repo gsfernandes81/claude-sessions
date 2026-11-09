@@ -1859,12 +1859,97 @@ pub(crate) mod tests {
         held.sort();
         assert_eq!(held, ["a/claude-5", "b/claude-1", "b/claude-2"]);
         assert!(fx.relay.lock().fronted.contains_key("claude-3"));
+        // A second claude here is fronted too.
+        let _second = fx.claude("claude-4", 4_000_003);
+        fx.relay.apply();
+        assert!(fx.relay.lock().fronted.contains_key("claude-4"));
+        assert!(fx.relay.lock().fronted.contains_key("claude-3"));
         // A record somebody removed is written again at the next look.
         let record = fx.relay.lock().stand_ins["b/claude-1"].record.clone();
         assert!(record.exists(), "calibration");
         fs::remove_file(&record).unwrap();
         fx.relay.apply();
         assert!(record.exists());
+    }
+
+    #[test]
+    fn a_stand_in_follows_its_slot_renamed_and_goes_when_the_slot_leaves_the_roster() {
+        let fx = Fx::new("rename");
+        let mut e = entry("b/claude-1", true);
+        e.title = "first".into();
+        let set = |e: &Entry| {
+            fx.relay
+                .set_roster(vec![e.clone()], Some("a".into()), Vec::new())
+        };
+        set(&e);
+        let (record, sock) = {
+            let st = fx.relay.lock();
+            let s = &st.stand_ins["b/claude-1"];
+            (s.record.clone(), s.sock.clone())
+        };
+        let read = || json::parse(&fs::read_to_string(&record).unwrap()).unwrap();
+        let former = |v: &Value| -> Vec<String> {
+            v.get("formerNames")
+                .and_then(Value::as_arr)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        };
+        // Busy now: the record says so, under the same name, with no former one.
+        e.busy = true;
+        set(&e);
+        let v = read();
+        assert_eq!(at(&v, &["status"]).as_str(), Some("busy"));
+        assert!(former(&v).is_empty(), "{v:?}");
+        // Renamed: the new name, the old one beside it.
+        e.title = "second".into();
+        set(&e);
+        let v = read();
+        assert_eq!(at(&v, &["name"]).as_str(), Some("b/claude-1 second"));
+        assert_eq!(former(&v), ["b/claude-1 first"]);
+        // Gone from the roster: its record and its socket go.
+        fx.relay
+            .set_roster(Vec::new(), Some("a".into()), Vec::new());
+        assert!(!record.exists() && !sock.exists());
+    }
+
+    #[test]
+    fn the_relay_switches_off_while_a_local_claude_speaks_another_protocol_and_back_on() {
+        let fx = Fx::new("off");
+        let _inbox = fx.claude("claude-3", 4_000_031);
+        let roster = || vec![entry("b/claude-1", true)];
+        fx.relay.set_roster(roster(), Some("a".into()), Vec::new());
+        assert_eq!(fx.relay.lock().stand_ins.len(), 1, "calibration");
+        let record = fx.dir.join("sessions/4000031.json");
+        let speaks = |p: u32| {
+            let sock = fx.dir.join("socks/4000031.sock");
+            fs::write(
+                &record,
+                format!(
+                    r#"{{"pid":4000031,"messagingSocketPath":"{}","peerProtocol":{p}}}"#,
+                    sock.display()
+                ),
+            )
+            .unwrap();
+        };
+        speaks(2);
+        fx.relay.apply();
+        fx.relay.apply();
+        {
+            let st = fx.relay.lock();
+            assert!(st.stand_ins.is_empty() && st.fronted.is_empty());
+        }
+        let told = std::mem::take(&mut *fx.told.lock().unwrap());
+        assert_eq!(told.len(), 1, "the hub is told once: {told:?}");
+        assert_eq!(
+            at(&told[0], &["relay", "off"]).as_str(),
+            Some("claude-3's claude speaks peer protocol 2, not 1")
+        );
+        speaks(1);
+        fx.relay.apply();
+        assert_eq!(fx.relay.lock().stand_ins.len(), 1, "on again");
+        assert!(fx.told.lock().unwrap().is_empty());
     }
 
     #[test]
