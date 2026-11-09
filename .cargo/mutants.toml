@@ -69,7 +69,7 @@ exclude_re = [
     # that are equal only where the result is the same or at widths the menu refuses.
     'src/launch\.rs:.*: replace match guard procinfo::is_alive\(pid, start\) with true in (offload|close)$',
     'src/lockfile\.rs:.*<impl Drop for SlotLock>::drop with \(\)$',
-    'src/mem\.rs:.*: replace match guard s\.trim\(\) == "max" with false in read_at$',
+    'src/mem\.rs:.*: replace match guard s\.trim\(\) == "max" with false in (read_at|swap_at)$',
     'src/menu\.rs:.*: replace && with \|\| in Menu::container_row$',
     'src/run\.rs:.*: replace != with == in drive$',
     'src/render\.rs:.*: replace < with <= in (Line::pad|scroll_to)$',
@@ -83,15 +83,23 @@ exclude_re = [
     'src/transcript\.rs:.*: replace \+ with \* in whole_lines$',
     'src/store\.rs:12\d:\d+: replace && with \|\| in in_workspace$',
     # Thin wrappers that read the live machine, over functions tested on their own:
-    # `marks_in`/`set_in`, `oom_kill_in`, `teardown_listed`, `orphans`/`kill_tree`,
+    # `marks_in`/`set_in`, `oom_kill_in` and `swap_at`, `teardown_listed`, `orphans`/`kill_tree`,
     # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts, `snapshot_of` (whose
     # `/proc` readers these are); and the agent's own log.
     'src/archive\.rs:.*: replace (dir|marks|set) -> ',
-    'src/mem\.rs:.*: replace oom_kills -> ',
+    'src/mem\.rs:.*: replace (oom_kills|swap) -> ',
     'src/offload\.rs:.*: replace (teardown_zmx -> |sweep_orphans with)',
     'src/zmx\.rs:.*: replace (socket_dir|Watch::sessions) -> ',
     'src/run\.rs:.*<impl Console for RawTerminal>::size',
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # The same for pi's store (main.rs and its modules, 2026-11-09): the live layout and the
+    # two readers over it, `conversation_path_in` and `in_workspace_in`, are tested on their
+    # own; the live one would read the owner's real `~/.pi`.
+    'src/pisession\.rs:.*: replace (conversation_path|in_workspace) -> ',
+    # Equivalent where the tests run as root, as a cloud sandbox's do: there 0 is this
+    # process's uid. `the_uid_is_this_processs_own` catches it for any other user, `dev` in
+    # the dev container among them.
+    'src/zmx\.rs:.*: replace uid -> Option<u32> with Some\(0\)$',
 ]
