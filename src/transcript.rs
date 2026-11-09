@@ -625,6 +625,11 @@ mod tests {
         f.write_all(filler.repeat(TAIL as usize / filler.len() + 10).as_bytes())
             .unwrap();
         assert_eq!(titles_cached(&path).custom.as_deref(), Some("second"));
+        // And asked again and again with nothing added, as an idle slot is every two seconds:
+        // still, once the reads have caught up with the end and after.
+        for _ in 0..3 {
+            assert_eq!(titles_cached(&path).custom.as_deref(), Some("second"));
+        }
 
         // A file that shrank is another file: read afresh, nothing carried over.
         std::fs::write(&path, named("x")).unwrap();

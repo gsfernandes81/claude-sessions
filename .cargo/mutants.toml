@@ -76,12 +76,10 @@ exclude_re = [
     'src/render\.rs:.*: replace > with >= in wrap$',
     'src/render\.rs:.*: replace \+ with [-*] in heading$',
     'src/render\.rs:.*: replace \+ with \* in row$',
-    # Caches whose miss only costs a read: an unchanged transcript read again, a size or a
-    # modification time alone (an append moves both), a newline's offset kept or not.
-    'src/transcript\.rs:.*: replace match guard upto == len with false in titles_cached$',
-    'src/transcript\.rs:.*: replace < with <= in titles_cached$',
+    # A cache's newline offset kept one byte short costs only a read again (`whole_lines`); and
+    # `titles_cached_by`'s `upto < len` is reached only past the arm that takes `upto == len`.
+    'src/transcript\.rs:.*: replace < with <= in titles_cached_by$',
     'src/transcript\.rs:.*: replace \+ with \* in whole_lines$',
-    'src/store\.rs:12\d:\d+: replace && with \|\| in in_workspace$',
     # Thin wrappers that read the live machine, over functions tested on their own:
     # `marks_in`/`set_in`, `oom_kill_in`, `teardown_listed`, `orphans`/`kill_tree`,
     # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts, `snapshot_of` (whose

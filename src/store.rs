@@ -640,6 +640,45 @@ mod tests {
     }
 
     #[test]
+    fn a_file_that_grew_is_read_again_though_its_time_did_not_move() {
+        // A clock coarser than two appends, or a copy that kept its time: the size alone says
+        // it changed.
+        let d = Dir::new("grew");
+        let first = entry("user", "/workspace", "2026-10-01T00:00:00.000Z", "first");
+        let p = d.write("/workspace", "a", std::slice::from_ref(&first));
+        assert_eq!(in_workspace(&d.0, "/workspace")[0].title, "first");
+        let before = std::fs::metadata(&p).unwrap().modified().unwrap();
+        let named = r#"{"type":"custom-title","customTitle":"renamed","sessionId":"a"}"#;
+        std::fs::write(&p, format!("{first}\n{named}\n")).unwrap();
+        File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert_eq!(in_workspace(&d.0, "/workspace")[0].title, "renamed");
+    }
+
+    #[test]
+    fn the_newest_copy_of_a_conversation_wins_whichever_is_found_first() {
+        let copy = |cwd: &str, last_ms| Conversation {
+            id: "m".into(),
+            harness: crate::harness::Harness::Claude,
+            cwd: cwd.into(),
+            path: PathBuf::from(format!("{cwd}/m.jsonl")),
+            title: "m".into(),
+            last_ms,
+        };
+        let (old, new) = (copy("/workspace", 1), copy("/workspace/y", 2));
+        for found in [
+            vec![old.clone(), new.clone()],
+            vec![new.clone(), old.clone()],
+        ] {
+            assert_eq!(newest_per_id(found), std::slice::from_ref(&new));
+        }
+    }
+
+    #[test]
     fn within_means_the_workspace_or_under_it() {
         assert!(within("/workspace", "/workspace"));
         assert!(within("/workspace/a/b", "/workspace/"));
