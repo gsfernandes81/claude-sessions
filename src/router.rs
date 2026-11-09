@@ -762,19 +762,23 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
         };
         let addr = format!("{host}/{slot}");
         lock(&router.waking).remove(&addr);
-        let ok = w.get("ok").and_then(Value::as_bool) == Some(true);
-        let why = w.get("why").and_then(Value::as_str).unwrap_or("?");
-        say(&if ok {
-            format!("woke {addr} for its waiting messages")
-        } else {
-            format!("did not wake {addr}: {why}")
-        });
+        say(&woke_line(&addr, w));
         let text = wake_notice(&addr, w);
         let senders = lock(&router.queue).senders_for(&addr);
         for sender in senders {
             notify(router, &sender, &text);
         }
         wake_next(router);
+    }
+}
+
+/// The log's line for an agent's answer `w` to a wake of `addr`.
+fn woke_line(addr: &str, w: &Value) -> String {
+    if w.get("ok").and_then(Value::as_bool) == Some(true) {
+        format!("woke {addr} for its waiting messages")
+    } else {
+        let why = w.get("why").and_then(Value::as_str).unwrap_or("?");
+        format!("did not wake {addr}: {why}")
     }
 }
 
@@ -1380,6 +1384,15 @@ mod tests {
         assert!(
             other.contains("could not be woken (claude-5 is gone)"),
             "{other}"
+        );
+        // And the log says which it was.
+        assert_eq!(
+            woke_line("infra/claude-5", &answer(r#""ok":true"#)),
+            "woke infra/claude-5 for its waiting messages"
+        );
+        assert_eq!(
+            woke_line("infra/claude-5", &answer(r#""ok":false,"why":"no-room""#)),
+            "did not wake infra/claude-5: no-room"
         );
         let down = down_notice("infra/claude-5");
         assert!(
