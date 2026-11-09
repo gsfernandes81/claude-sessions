@@ -457,10 +457,15 @@ impl Router {
 /// Where waiting messages are kept: `HUB_QUEUE`, else `$HOME/queue`. A persisted volume, since
 /// every deploy recreates the hub.
 pub fn queue_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("HUB_QUEUE").filter(|d| !d.is_empty()) {
+    queue_dir_from(|k| std::env::var_os(k))
+}
+
+/// [`queue_dir`] from `env`. An empty variable is an unset one.
+fn queue_dir_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(d) = env("HUB_QUEUE").filter(|d| !d.is_empty()) {
         return PathBuf::from(d);
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/".into());
+    let home = env("HOME").unwrap_or_else(|| "/".into());
     PathBuf::from(home).join("queue")
 }
 
@@ -1061,11 +1066,11 @@ mod tests {
             route(&f, "a", &peer_msg("claude-1", "c/claude-1", "user"), 0),
             Route::Keep(_)
         ));
-        // A control frame is about now.
-        assert!(matches!(
+        // A control frame is about now, and the log says which it was.
+        assert_eq!(
             route(&f, "a", &peer_msg("claude-1", "b/claude-2", "control"), 0),
-            Route::Drop(_)
-        ));
+            Route::Drop("b/claude-2 is not live, and a peer_message_status is about now".into())
+        );
         assert!(matches!(
             route(&f, "a", &peer_msg("claude-1", "b/claude-1", "control"), 0),
             Route::Deliver(..)
@@ -1113,6 +1118,29 @@ mod tests {
                 other => panic!("{p:?} from {host}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_frame_up_to_claude_codes_line_cap_is_carried_and_one_past_it_is_not() {
+        let f = fleet();
+        let sized = |len: usize| {
+            let mut frame = json::parse(r#"{"type":"user","message":{"content":""}}"#).unwrap();
+            let bare = json::to_line(&frame).len();
+            let mut m = Value::obj();
+            m.set("content", Value::string("x".repeat(len - bare)));
+            frame.set("message", m);
+            assert_eq!(json::to_line(&frame).len(), len, "calibration");
+            let mut p = Value::obj();
+            p.set("from", Value::string("claude-1"));
+            p.set("to", Value::string("b/claude-1"));
+            p.set("frame", frame);
+            route(&f, "a", &p, 0)
+        };
+        assert!(matches!(sized(peer::MAX_LINE), Route::Deliver(..)));
+        assert_eq!(
+            sized(peer::MAX_LINE + 1),
+            Route::Drop("over Claude Code's line cap".into())
+        );
     }
 
     #[test]
@@ -1175,6 +1203,8 @@ mod tests {
                 }),
                 row(RowKey::Slot("claude-3".into()), |r| r.closed = true),
                 row(RowKey::Slot("claude-4".into()), |r| r.archived = true),
+                // Offloaded and not yet marked closed, as an offload in progress reads.
+                row(RowKey::Slot("claude-5".into()), |r| r.offloaded = true),
                 row(RowKey::Slot("pi-1".into()), |_| {}),
                 row(RowKey::Socket("other".into()), |_| {}),
             ],
@@ -1185,7 +1215,50 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![("claude-1".into(), true), ("claude-2".into(), false)]
+            vec![
+                ("claude-1".into(), true),
+                ("claude-2".into(), false),
+                ("claude-5".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slot_is_called_busy_only_while_it_runs_in_a_container_that_answers() {
+        // Every slot's last row said busy: one since offloaded, and one in a container that has
+        // stopped answering, are listed with no status, so not busy.
+        let mut f = Fleet::default();
+        let busy = |name: &str, live: bool| Slot {
+            busy: true,
+            ..slot(name, live)
+        };
+        f.slots.insert(
+            "a".into(),
+            vec![busy("claude-1", true), busy("claude-2", false)],
+        );
+        f.slots.insert("c".into(), vec![busy("claude-1", true)]);
+        f.up.insert("a".into(), true);
+        f.up.insert("c".into(), false);
+        let said = |entries: Vec<Entry>| -> Vec<(String, bool, bool)> {
+            entries
+                .into_iter()
+                .map(|e| (e.addr(), e.live, e.busy))
+                .collect()
+        };
+        assert_eq!(
+            said(f.roster_for("b")),
+            [
+                ("a/claude-1".into(), true, true),
+                ("a/claude-2".into(), false, false),
+                ("c/claude-1".into(), false, false),
+            ]
+        );
+        assert_eq!(
+            said(f.own_for("a")),
+            [
+                ("a/claude-1".into(), true, true),
+                ("a/claude-2".into(), false, false),
+            ]
         );
     }
 
@@ -1291,6 +1364,11 @@ mod tests {
         let w = peer::Wrapper::parse(content).expect("canonical, or no claude would take it");
         assert_eq!(w.from_name.as_deref(), Some(HUB_ADDR));
         assert_eq!(w.body, "hello");
+        // Like Claude Code's own, the wrapper names the sender's socket as the frame does.
+        assert_eq!(
+            w.from.as_deref(),
+            item.frame.get("from").and_then(Value::as_str)
+        );
         // What the receiving agent writes into the inbox passes the same test.
         let out = peer::rewrite(&item.frame, Path::new("/s/ab.sock"), HUB_ADDR).unwrap();
         assert!(out.get("from").is_some());
@@ -1315,6 +1393,11 @@ mod tests {
             reclaimable: Some(0),
         };
         assert_eq!(host_room(Some(4096 * mb), Some(pool(1024 * mb))), Ok(()));
+        assert_eq!(
+            host_room(Some(4096 * mb), Some(pool(4096 * mb - want))),
+            Ok(()),
+            "exactly enough in the pool too"
+        );
         let why = host_room(Some(4096 * mb), Some(pool(3700 * mb))).unwrap_err();
         assert!(why.contains("pool has 396M free"), "{why}");
         let text = host_notice("b/claude-2", &why);
@@ -1322,6 +1405,21 @@ mod tests {
             text.contains("b/claude-2 is offloaded, and it was not woken: the containers' pool")
         );
         assert!(text.contains("kept"));
+    }
+
+    #[test]
+    fn the_queue_is_kept_where_the_hub_says_else_in_its_home() {
+        let q = |pairs: &[(&str, &str)]| queue_dir_from(peer::tests::env(pairs));
+        assert_eq!(
+            q(&[("HUB_QUEUE", "/data/q"), ("HOME", "/h")]),
+            PathBuf::from("/data/q")
+        );
+        assert_eq!(
+            q(&[("HUB_QUEUE", ""), ("HOME", "/h")]),
+            PathBuf::from("/h/queue"),
+            "an empty variable is an unset one"
+        );
+        assert_eq!(q(&[]), PathBuf::from("/queue"));
     }
 
     #[test]
@@ -1398,6 +1496,21 @@ mod tests {
         assert_eq!(q.len(), 1);
         let (q2, _) = Queue::open(&dir).unwrap();
         assert_eq!(q2.len(), 1, "taken means gone from disk too");
+        // One kept after a restart is kept beside those from before it, never over one.
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let (mut q, _) = Queue::open(&dir).unwrap();
+            q.push(item("b/claude-2", 1)).unwrap();
+            q.push(item("b/claude-2", 2)).unwrap();
+        }
+        Queue::open(&dir)
+            .unwrap()
+            .0
+            .push(item("b/claude-2", 3))
+            .unwrap();
+        let (mut q, _) = Queue::open(&dir).unwrap();
+        let at: Vec<u64> = q.take(|_| true).iter().map(|i| i.at).collect();
+        assert_eq!(at, [1, 2, 3]);
         // One past the limit is refused; and age prunes.
         let mut m = Queue::memory();
         for i in 0..MAX_QUEUE {
