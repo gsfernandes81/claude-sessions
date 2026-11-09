@@ -1295,6 +1295,10 @@ mod tests {
         std::fs::write(&f, "{not json").unwrap();
         assert!(save_default_model(&f, "opus").is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{not json");
+        // Nor one that is not text at all: written over, it would lose what it held.
+        std::fs::write(&f, b"\xff\xfe").unwrap();
+        assert!(save_default_model(&f, "opus").is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"\xff\xfe");
         // An empty file is no settings yet.
         std::fs::write(&f, " \n").unwrap();
         save_default_model(&f, "opus").unwrap();
