@@ -92,4 +92,8 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # statusline.rs: the pool's and the container's swap, thin wrappers over `mem::swap_at` and
+    # `cgroup_swap` (each tested on its own) that cap at this machine's `/proc/meminfo`
+    # `SwapTotal`, which a test cannot set, so no figure through them is the same everywhere.
+    'src/statusline\.rs:.*: replace (pool_swap|own_swap) -> ',
 ]
