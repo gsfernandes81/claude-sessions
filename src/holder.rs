@@ -224,7 +224,7 @@ impl Log {
     /// grow this.
     fn model_asked(&mut self, v: &Value) {
         if let Some((id, model)) = set_model(v) {
-            if self.models.len() < 64 {
+            if self.models.len() < MODELS_WAITING {
                 self.models.insert(id, model);
             }
         }
@@ -243,6 +243,9 @@ impl Log {
         self.open.remove(request_id) && self.open.is_empty()
     }
 }
+
+/// How many `set_model` requests the holder keeps waiting for claude's answer at once.
+const MODELS_WAITING: usize = 64;
 
 struct Shared {
     log: Mutex<Log>,
@@ -296,7 +299,15 @@ pub fn serve(
     // own lines never say the alias or the effort, so `/model` and `/effort` could not mark
     // the session's own without it.
     let cwd = std::env::current_dir().unwrap_or_default();
-    let (model, effort) = configured(args, &|k| std::env::var(k).ok(), &settings_layers(&cwd));
+    let (model, effort) = configured(
+        args,
+        &|k| std::env::var(k).ok(),
+        &settings_layers(
+            &crate::live::config_dir(),
+            &cwd,
+            Path::new("/etc/claude-code"),
+        ),
+    );
     {
         let mut start = Value::obj();
         start.set("type", Value::string("_cfg"));
@@ -662,14 +673,15 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
 /// first, each with whether it is the user's own: the user's, the project's, the project's
 /// local one, then the managed file and its drop-ins in name order (managed outranks the rest,
 /// local outranks project outranks user). A file that is missing or is not JSON is skipped.
-fn settings_layers(cwd: &Path) -> Vec<(bool, Value)> {
+/// `config` is Claude Code's config directory and `managed` its managed one, `/etc/claude-code`.
+fn settings_layers(config: &Path, cwd: &Path, managed: &Path) -> Vec<(bool, Value)> {
     let mut paths = vec![
-        crate::live::config_dir().join("settings.json"),
+        config.join("settings.json"),
         cwd.join(".claude/settings.json"),
         cwd.join(".claude/settings.local.json"),
-        PathBuf::from("/etc/claude-code/managed-settings.json"),
+        managed.join("managed-settings.json"),
     ];
-    let mut drop_ins: Vec<PathBuf> = std::fs::read_dir("/etc/claude-code/managed-settings.d")
+    let mut drop_ins: Vec<PathBuf> = std::fs::read_dir(managed.join("managed-settings.d"))
         .into_iter()
         .flatten()
         .flatten()
@@ -797,16 +809,24 @@ fn prompt_answered(slot: &str) {
         let Ok(Some(mut rec)) = registry::load(&slot) else {
             return;
         };
-        let ev = crate::events::Event::parse(r#"{"hook_event_name":"PromptAnswered"}"#)
-            .expect("a fixed payload");
-        let own = crate::events::Binding::Own;
-        if crate::events::apply(&mut rec, &ev, fired, own, None, None)
-            == crate::events::Outcome::Changed
-        {
-            rec.updated_ms = clock::now();
+        if answer_prompt(&mut rec, fired, clock::now()) {
             let _ = registry::store(&rec);
         }
     });
+}
+
+/// The record's side of `prompt_answered`: claude's open prompts answered at `fired`, read as
+/// pi's `PromptAnswered`. True when that changed the record, which is then stamped `now`.
+fn answer_prompt(rec: &mut registry::SlotRecord, fired: clock::Moment, now: Millis) -> bool {
+    let ev = crate::events::Event::parse(r#"{"hook_event_name":"PromptAnswered"}"#)
+        .expect("a fixed payload");
+    let own = crate::events::Binding::Own;
+    let changed =
+        crate::events::apply(rec, &ev, fired, own, None, None) == crate::events::Outcome::Changed;
+    if changed {
+        rec.updated_ms = now;
+    }
+    changed
 }
 
 /// `claude-sessions tap <slot> [from] [run]`: what the hub runs over `ssh -T` to reach a
@@ -857,31 +877,38 @@ const RESTAMP: Duration = Duration::from_secs(60);
 /// whatever stopped while it was connected, the owner saw.
 struct Viewing {
     stop: Arc<(Mutex<bool>, Condvar)>,
-    slot: String,
+    stamp: Stamp,
 }
+
+/// What a view writes to the registry: `stamp` for its slot, given `attach`.
+type Stamp = Arc<dyn Fn(bool) + Send + Sync>;
 
 impl Viewing {
     fn start(slot: &str) -> Viewing {
-        stamp(slot, true);
+        let slot = slot.to_string();
+        Viewing::every(RESTAMP, Arc::new(move |attach| stamp(&slot, attach)))
+    }
+
+    /// Stamped with `attach` now, without it each `period` until dropped, and with it again
+    /// when dropped.
+    fn every(period: Duration, stamp: Stamp) -> Viewing {
+        stamp(true);
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
-        let (s, theirs) = (slot.to_string(), Arc::clone(&stop));
+        let (s, theirs) = (Arc::clone(&stamp), Arc::clone(&stop));
         std::thread::spawn(move || {
             let (done, cv) = &*theirs;
             let mut done = done.lock().unwrap_or_else(|e| e.into_inner());
             while !*done {
                 done = cv
-                    .wait_timeout(done, RESTAMP)
+                    .wait_timeout(done, period)
                     .unwrap_or_else(|e| e.into_inner())
                     .0;
                 if !*done {
-                    stamp(&s, false);
+                    s(false);
                 }
             }
         });
-        Viewing {
-            stop,
-            slot: slot.to_string(),
-        }
+        Viewing { stop, stamp }
     }
 }
 
@@ -890,7 +917,7 @@ impl Drop for Viewing {
         let (done, cv) = &*self.stop;
         *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
         cv.notify_all();
-        stamp(&self.slot, true);
+        (self.stamp)(true);
     }
 }
 
@@ -904,7 +931,12 @@ pub(crate) fn stamp(slot: &str, attach: bool) {
     let Ok(Some(mut rec)) = registry::load(slot) else {
         return;
     };
-    let now = clock::now();
+    stamped(&mut rec, attach, clock::now());
+    let _ = registry::store(&rec);
+}
+
+/// The record's side of `stamp`, at `now`.
+fn stamped(rec: &mut registry::SlotRecord, attach: bool, now: Millis) {
     let keep = now + KEEP_FOR;
     // A longer keep-alive asked for from inside the slot stands.
     if rec.keep_until_ms.is_none_or(|k| k < keep) {
@@ -914,7 +946,6 @@ pub(crate) fn stamp(slot: &str, attach: bool) {
         rec.last_attach_ms = now;
     }
     rec.updated_ms = now;
-    let _ = registry::store(&rec);
 }
 
 #[cfg(test)]
@@ -923,7 +954,7 @@ mod tests {
     use std::sync::mpsc;
 
     /// A stand-in claude: echoes each line it is given back as an assistant-shaped line, and
-    /// ends on `{"quit":1}`. Ignores the headless flags, as a stand-in may.
+    /// ends on `{"quit":1}`, or, given `{"hold":1}`, once a file `go` is made beside it. Ignores the headless flags, as a stand-in may.
     fn stand_in(dir: &Path) -> PathBuf {
         let p = dir.join("claude");
         std::fs::write(
@@ -931,6 +962,7 @@ mod tests {
             "#!/bin/sh\n\
              while IFS= read -r l; do\n\
                case \"$l\" in *quit*) exit 3;; \
+                 *hold*) while [ ! -e \"$(dirname \"$0\")/go\" ]; do sleep 0.01; done; exit 0;; \
                  *entrypoint*) printf '{\"ep\":\"%s\"}\\n' \"$CLAUDE_CODE_ENTRYPOINT\"; continue;; esac\n\
                printf '%s\\n' \"$l\"\n\
              done\n",
@@ -985,6 +1017,11 @@ mod tests {
             json::to_line(&user)
         );
         assert_eq!(workflow_file_name("  "), "workflow");
+        assert_eq!(
+            workflow_file_name("Keep_this-and THAT"),
+            "keep_this-and-that",
+            "letters, digits, `_` and `-` kept"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1258,6 +1295,10 @@ mod tests {
         std::fs::write(&f, "{not json").unwrap();
         assert!(save_default_model(&f, "opus").is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{not json");
+        // An empty file is no settings yet.
+        std::fs::write(&f, " \n").unwrap();
+        save_default_model(&f, "opus").unwrap();
+        assert_eq!(read(&f), json::parse(r#"{"model":"opus"}"#).unwrap());
         // A linked file is written through, and stays linked.
         let real = d.join("real.json");
         std::fs::write(&real, "{}").unwrap();
@@ -1446,5 +1487,236 @@ mod tests {
         ] {
             assert!(joined.contains(need), "{need}");
         }
+    }
+
+    /// A holder on the stand-in claude in `dir`, serving `history`, and a tap on it past its
+    /// header and `_cfg` line: the header, the tap's reader and writer, and the holder.
+    #[allow(clippy::type_complexity)]
+    fn holder_with_tap(
+        dir: &Path,
+        history: Option<PathBuf>,
+    ) -> (
+        Value,
+        BufReader<UnixStream>,
+        UnixStream,
+        std::thread::JoinHandle<i32>,
+    ) {
+        let program = stand_in(dir);
+        let paths = Paths {
+            sock: dir.join("s.sock"),
+            log: dir.join("s.log"),
+        };
+        let sock = paths.sock.clone();
+        let holder = std::thread::spawn(move || {
+            serve(
+                &program,
+                &[],
+                &paths,
+                history.as_deref(),
+                "claude-9",
+                &mut |_: &str| {},
+            )
+            .unwrap()
+        });
+        let (mut a, a_out) = connect(&sock, 0, "");
+        let header = json::parse(&line(&mut a)).unwrap();
+        line(&mut a); // the holder's `_cfg` line
+        (header, a, a_out, holder)
+    }
+
+    #[test]
+    fn a_resumed_conversations_history_is_served_to_a_tap_and_an_empty_one_offers_none() {
+        let dir = scratch("served-history");
+        let transcript = dir.join("t.jsonl");
+        let prompt =
+            |t: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":"{t}"}}}}"#);
+        let reply = |t: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"r{t}","content":[{{"type":"text","text":"{t}"}}]}}}}"#
+            )
+        };
+        let first = format!("{}\n{}\n", prompt("one"), reply("first"));
+        std::fs::write(
+            &transcript,
+            format!("{first}{}\n{}\n", prompt("two"), reply("second")),
+        )
+        .unwrap();
+        let (header, mut a, mut a_out, holder) = holder_with_tap(&dir, Some(transcript.clone()));
+        assert_eq!(header.get("older"), Some(&Value::Bool(true)));
+        a_out
+            .write_all(b"{\"type\":\"_older\",\"want\":1}\n")
+            .unwrap();
+        let answer = line(&mut a);
+        let body = answer.strip_prefix("H\t").expect("the holder's own line");
+        let v = json::parse(body).unwrap();
+        let lines = v.get("lines").and_then(Value::as_arr).unwrap();
+        assert_eq!(lines.len(), 2, "the last turn, whole: {body}");
+        assert!(json::to_line(&lines[0]).contains("two"), "{body}");
+        assert_eq!(
+            v.get("before").and_then(Value::as_u64),
+            Some(first.len() as u64)
+        );
+        assert_eq!(v.get("more"), Some(&Value::Bool(true)));
+        a_out.write_all(b"{\"quit\":1}\n").unwrap();
+        holder.join().unwrap();
+
+        // A transcript with nothing in it is no history to ask for.
+        std::fs::write(&transcript, "").unwrap();
+        let (header, _a, mut a_out, holder) = holder_with_tap(&dir, Some(transcript));
+        assert_eq!(header.get("older"), Some(&Value::Bool(false)));
+        a_out.write_all(b"{\"quit\":1}\n").unwrap();
+        holder.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tap_that_has_every_line_when_claude_ends_sees_the_end() {
+        let dir = scratch("caught-up");
+        let (_, mut a, mut a_out, holder) = holder_with_tap(&dir, None);
+        a_out.write_all(b"{\"hold\":1}\n").unwrap();
+        // The tap has every line there is; only then does claude end.
+        assert!(line(&mut a).starts_with("2\t"));
+        std::fs::write(dir.join("go"), "").unwrap();
+        assert_eq!(holder.join().unwrap(), 0);
+        let mut rest = String::new();
+        assert_eq!(
+            a.read_line(&mut rest).expect("the end, before the timeout"),
+            0,
+            "{rest}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sessions_line_says_waiting_for_you_while_claude_asks() {
+        let read = |l: &str| sdk::classify(&json::parse(l).unwrap());
+        let ask = |tool: &str| {
+            read(&format!(
+                r#"{{"type":"control_request","request_id":"p1","request":{{"subtype":"can_use_tool","tool_name":"{tool}","input":{{"questions":[]}}}}}}"#
+            ))
+        };
+        assert_eq!(doing(&ask("Bash")), Some("waiting for you"));
+        assert_eq!(doing(&ask("AskUserQuestion")), Some("waiting for you"));
+        let done = read(r#"{"type":"result","subtype":"success","session_id":"s"}"#);
+        assert_eq!(doing(&done), Some("idle"), "calibration");
+    }
+
+    #[test]
+    fn a_view_that_asks_for_models_while_claude_is_stuck_cannot_grow_the_holder() {
+        let mut log = Log {
+            file: File::create(scratch("many-models").join("l")).unwrap(),
+            offsets: Vec::new(),
+            end: 0,
+            closed: false,
+            answered: HashSet::new(),
+            open: HashSet::new(),
+            models: HashMap::new(),
+        };
+        for i in 0..1000 {
+            log.model_asked(&sdk::set_model(&format!("c{i}"), "opus"));
+        }
+        assert_eq!(log.models.len(), MODELS_WAITING);
+        assert!(log.models.contains_key("c0"), "the first asked are kept");
+    }
+
+    #[test]
+    fn settings_are_read_from_each_of_claude_codes_layers_lowest_first() {
+        let d = scratch("layers");
+        let (config, cwd, managed) = (d.join("config"), d.join("proj"), d.join("etc"));
+        let put = |p: PathBuf, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        put(config.join("settings.json"), r#"{"model":"user"}"#);
+        put(cwd.join(".claude/settings.json"), r#"{"model":"project"}"#);
+        put(cwd.join(".claude/settings.local.json"), "{not json");
+        put(
+            managed.join("managed-settings.json"),
+            r#"{"model":"managed"}"#,
+        );
+        let drop_ins = managed.join("managed-settings.d");
+        put(drop_ins.join("20-b.json"), r#"{"model":"b"}"#);
+        put(drop_ins.join("10-a.json"), r#"{"model":"a"}"#);
+        put(drop_ins.join("30-c.txt"), r#"{"model":"not a drop-in"}"#);
+        let got: Vec<(bool, String)> = settings_layers(&config, &cwd, &managed)
+            .iter()
+            .map(|(user, v)| {
+                (
+                    *user,
+                    v.get("model").and_then(Value::as_str).unwrap().into(),
+                )
+            })
+            .collect();
+        let want: Vec<(bool, String)> = [
+            (true, "user"),
+            (false, "project"),
+            (false, "managed"),
+            (false, "a"),
+            (false, "b"),
+        ]
+        .iter()
+        .map(|(u, m)| (*u, m.to_string()))
+        .collect();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_connected_view_keeps_the_slot_and_a_longer_keep_alive_stands() {
+        let mut rec = registry::SlotRecord::new("claude-9", clock::Moment::ms(1_000));
+        rec.keep_until_ms = Some(5_000);
+        rec.last_attach_ms = 2_000;
+        stamped(&mut rec, false, 10_000);
+        assert_eq!(
+            rec.keep_until_ms,
+            Some(10_000 + KEEP_FOR),
+            "an old keep-alive moves on"
+        );
+        assert_eq!(
+            rec.last_attach_ms, 2_000,
+            "a restamp is not the owner looking"
+        );
+        stamped(&mut rec, true, 11_000);
+        assert_eq!(rec.keep_until_ms, Some(11_000 + KEEP_FOR));
+        assert_eq!(rec.last_attach_ms, 11_000);
+        let far = 11_000 + 10 * KEEP_FOR;
+        rec.keep_until_ms = Some(far);
+        stamped(&mut rec, false, 12_000);
+        assert_eq!(rec.keep_until_ms, Some(far));
+        assert_eq!(rec.updated_ms, 12_000);
+    }
+
+    #[test]
+    fn an_answer_from_a_view_clears_the_mark_unless_a_newer_prompt_landed() {
+        let mut rec = registry::SlotRecord::new("claude-9", clock::Moment::ms(1_000));
+        rec.needs_you = true;
+        assert!(answer_prompt(&mut rec, clock::Moment::ms(4_000), 9));
+        assert!(!rec.needs_you);
+        assert_eq!(rec.updated_ms, 9);
+        // One fired before what last wrote the mark changes nothing.
+        rec.needs_you = true;
+        assert!(!answer_prompt(&mut rec, clock::Moment::ms(2_000), 10));
+        assert!(rec.needs_you);
+        assert_eq!(rec.updated_ms, 9);
+    }
+
+    #[test]
+    fn a_view_stamps_as_it_connects_while_it_stays_and_as_it_goes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let theirs = Arc::clone(&calls);
+        let viewing = Viewing::every(
+            Duration::from_millis(1),
+            Arc::new(move |attach| theirs.lock().unwrap().push(attach)),
+        );
+        assert_eq!(calls.lock().unwrap().first(), Some(&true), "on connecting");
+        // Restamped meanwhile, without the owner looking. The deadline is only for a failure.
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while calls.lock().unwrap().len() < 3 {
+            assert!(std::time::Instant::now() < until, "never restamped");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(calls.lock().unwrap()[1..].iter().all(|a| !a));
+        drop(viewing);
+        assert_eq!(calls.lock().unwrap().last(), Some(&true), "on going");
     }
 }
