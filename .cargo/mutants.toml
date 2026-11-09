@@ -59,7 +59,7 @@ exclude_re = [
     'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with|btw_within)$',
     'src/launch\.rs:.* in wait_session_gone$',
     'src/launch\.rs:.*: replace && with \|\| in settle$',
-    'src/hub\.rs:.*: replace < with <= in offload_all$',
+    'src/hub\.rs:.*: replace < with <= in offload_all_within$',
     'src/zmx\.rs:.*: replace < with <= in list_from$',
     'src/activity\.rs:.*: replace < with <= in pass$',
     'src/run\.rs:.*: replace \+ with - in run$',

@@ -396,6 +396,11 @@ const PASS_BOUND: Duration = Duration::from_secs(120);
 /// Run from the hub's timer, every three minutes: the CPU budget is per window, so the cadence
 /// is part of the rule (design § The offloader).
 pub fn offload_all(dry_run: bool) -> io::Result<()> {
+    offload_all_within(dry_run, PASS_BOUND)
+}
+
+/// [`offload_all`], stopping a pass still running after `bound`.
+fn offload_all_within(dry_run: bool, bound: Duration) -> io::Result<()> {
     let hosts = hosts();
     let mut args = vec!["offload"];
     if dry_run {
@@ -433,7 +438,7 @@ pub fn offload_all(dry_run: bool) -> io::Result<()> {
             Err(e) => running.push((host, Err(e))),
         }
     }
-    let deadline = Instant::now() + PASS_BOUND;
+    let deadline = Instant::now() + bound;
     let mut failed = 0;
     for (host, run) in running {
         let (mut child, out, err) = match run {
@@ -477,7 +482,7 @@ pub fn offload_all(dry_run: bool) -> io::Result<()> {
                 match code {
                     None => say_as(
                         &host,
-                        &format!("pass failed: stopped after {}s{why}", PASS_BOUND.as_secs()),
+                        &format!("pass failed: stopped after {}s{why}", bound.as_secs()),
                     ),
                     Some(c) => say_as(&host, &format!("pass failed: exit {c}{why}")),
                 }
@@ -578,7 +583,16 @@ mod tests {
     /// `offload_all(true)` run in a process of its own over `hosts`, reached through `ssh`;
     /// what it printed.
     fn offload_all_over(hosts: &str, ssh: &std::path::Path) -> String {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        offload_all_bounded(hosts, ssh, None)
+    }
+
+    /// [`offload_all_over`], stopping a pass after `bound_ms` when it is given.
+    fn offload_all_bounded(hosts: &str, ssh: &std::path::Path, bound_ms: Option<u64>) -> String {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        if let Some(ms) = bound_ms {
+            cmd.env("CS_OFFLOAD_ALL_BOUND_MS", ms.to_string());
+        }
+        let out = cmd
             .args(["--exact", "hub::tests::offload_all_child", "--nocapture"])
             .env("CS_OFFLOAD_ALL_CHILD", "1")
             .env("CLAUDE_SESSIONS_HOSTS", hosts)
@@ -608,6 +622,8 @@ case $host in
   good) echo "claude-1: kept — attached"; echo "args: $*"; echo "a note" >&2; echo >&2 ;;
   gone) echo "ssh: connect to host gone port 2222: Connection refused" >&2; exit 255 ;;
   bad)  echo "registry unreadable" >&2; exit 1 ;;
+  slow) sleep 1; echo "claude-2: kept — attached" ;;
+  hung) i=0; while [ $i -lt 150 ]; do sleep 0.2; i=$((i+1)); done; echo "finished late" ;;
 esac
 "#,
         )
@@ -626,9 +642,15 @@ esac
         }
         // A successful pass's blank stderr lines are not said.
         assert!(!text.lines().any(|l| l.trim_end() == "good:"), "{text}");
-        // All of them succeeding is success.
-        let text = offload_all_over("good", &ssh);
+        // All of them succeeding is success, however long each takes within the bound.
+        let text = offload_all_over("good slow", &ssh);
+        assert!(text.contains("slow: claude-2: kept — attached"), "{text}");
         assert!(text.contains("RESULT: ok"), "{text}");
+        // One still running at the bound is stopped, said, and counted.
+        let text = offload_all_bounded("good hung", &ssh, Some(300));
+        assert!(text.contains("hung: pass failed: stopped after"), "{text}");
+        assert!(!text.contains("finished late"), "{text}");
+        assert!(text.contains("RESULT: 1 of 2 container(s)"), "{text}");
         // One that could not even be started is a failure too, and counted.
         let text = offload_all_over("a b", &dir.join("no-such-ssh"));
         assert!(
@@ -718,7 +740,15 @@ esac
         if std::env::var_os("CS_OFFLOAD_ALL_CHILD").is_none() {
             return;
         }
-        match offload_all(true) {
+        let bound = std::env::var("CS_OFFLOAD_ALL_BOUND_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map(Duration::from_millis);
+        let result = match bound {
+            Some(bound) => offload_all_within(true, bound),
+            None => offload_all(true),
+        };
+        match result {
             Ok(()) => println!("RESULT: ok"),
             Err(e) => println!("RESULT: {e}"),
         }
