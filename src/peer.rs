@@ -39,7 +39,7 @@ use crate::json::{self, Value};
 use crate::lockfile::SlotLock;
 use crate::registry;
 use std::collections::HashMap;
-use std::ffi::{c_int, c_void};
+use std::ffi::{OsString, c_int, c_void};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -78,10 +78,15 @@ const PID_BASE: u64 = 5_000_000;
 /// Where Claude Code keeps its session records: `$CLAUDE_CONFIG_DIR/sessions`, else
 /// `~/.claude/sessions`.
 pub fn sessions_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+    sessions_dir_from(|k| std::env::var_os(k))
+}
+
+/// [`sessions_dir`] from `env`. An empty variable is an unset one.
+fn sessions_dir_from(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    if let Some(d) = env("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(d).join("sessions");
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/".into());
+    let home = env("HOME").unwrap_or_else(|| "/".into());
     PathBuf::from(home).join(".claude/sessions")
 }
 
@@ -89,7 +94,12 @@ pub fn sessions_dir() -> PathBuf {
 /// `$XDG_RUNTIME_DIR/cc-socks`, else `/tmp/cc-socks`. `CLAUDE_SESSIONS_PEER_SOCKS` overrides
 /// both, for the tests.
 pub fn socket_dir() -> PathBuf {
-    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    socket_dir_from(|k| std::env::var_os(k))
+}
+
+/// [`socket_dir`] from `env`. An empty variable is an unset one.
+fn socket_dir_from(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty());
     if let Some(d) = var("CLAUDE_SESSIONS_PEER_SOCKS") {
         return PathBuf::from(d);
     }
@@ -1383,7 +1393,7 @@ fn log(line: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn at<'a>(v: &'a Value, path: &[&str]) -> &'a Value {
@@ -1419,6 +1429,78 @@ mod tests {
             ..Wrapper::default()
         };
         assert_eq!(Wrapper::parse(&w.render()), Some(w));
+        // Every attribute reads into its own field, in Claude Code's order.
+        let all = "<cross-session-message from=\"f\" from-session=\"s\" hop-chain=\"h\" \
+                   from-name=\"n\" from-mode=\"m\" from-plugin=\"p\">\nbody\n</cross-session-message>";
+        let w = Wrapper::parse(all).unwrap();
+        let got = [
+            &w.from,
+            &w.from_session,
+            &w.hop_chain,
+            &w.from_name,
+            &w.from_mode,
+            &w.from_plugin,
+        ]
+        .map(|a| a.as_deref());
+        assert_eq!(
+            got,
+            [
+                Some("f"),
+                Some("s"),
+                Some("h"),
+                Some("n"),
+                Some("m"),
+                Some("p")
+            ]
+        );
+        assert_eq!(w.render(), all);
+    }
+
+    /// A lookup over `pairs`, standing in for the environment.
+    pub(crate) fn env<'a>(pairs: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |k| pairs.iter().find(|p| p.0 == k).map(|p| p.1.into())
+    }
+
+    #[test]
+    fn claude_codes_records_and_inboxes_are_found_where_it_keeps_them() {
+        let s = |pairs: &[(&str, &str)]| sessions_dir_from(env(pairs));
+        assert_eq!(
+            s(&[("CLAUDE_CONFIG_DIR", "/cc"), ("HOME", "/h")]),
+            PathBuf::from("/cc/sessions")
+        );
+        assert_eq!(
+            s(&[("CLAUDE_CONFIG_DIR", ""), ("HOME", "/h")]),
+            PathBuf::from("/h/.claude/sessions"),
+            "an empty variable is an unset one"
+        );
+        assert_eq!(s(&[]), PathBuf::from("/.claude/sessions"));
+        let k = |pairs: &[(&str, &str)]| socket_dir_from(env(pairs));
+        let all = [
+            ("CLAUDE_SESSIONS_PEER_SOCKS", "/t"),
+            ("XDG_RUNTIME_DIR", "/run/user/7"),
+        ];
+        assert_eq!(k(&all), PathBuf::from("/t"));
+        assert_eq!(k(&all[1..]), PathBuf::from("/run/user/7/cc-socks"));
+        assert_eq!(
+            k(&[("CLAUDE_SESSIONS_PEER_SOCKS", ""), ("XDG_RUNTIME_DIR", "")]),
+            PathBuf::from("/tmp/cc-socks")
+        );
+    }
+
+    #[test]
+    fn an_address_is_two_names_either_side_of_one_slash() {
+        assert_eq!(split_addr("or3/claude-2"), Some(("or3", "claude-2")));
+        for bad in [
+            "or3",
+            "/claude-2",
+            "or3/",
+            "or3/claude 2",
+            "or 3/claude-2",
+            "../x/y",
+            "a/b/c",
+        ] {
+            assert_eq!(split_addr(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -1521,6 +1603,14 @@ mod tests {
         let word = listed_name("infra/claude-14", &"x".repeat(100));
         assert_eq!(word.chars().count(), MAX_LISTED);
         assert!(word.starts_with("infra/claude-14 xxx"));
+        // The room is used to the last character, counting the spaces between words: here
+        // the title has exactly the 60 left after `a/b `, and one more letter is a word too
+        // many.
+        let (x, y) = ("x".repeat(29), "y".repeat(30));
+        let full = listed_name("a/b", &format!("{x} {y}"));
+        assert_eq!(full, format!("a/b {x} {y}"));
+        assert_eq!(full.chars().count(), MAX_LISTED);
+        assert_eq!(listed_name("a/b", &format!("{x} {y}y")), format!("a/b {x}"));
         // Counted in characters, as Claude Code counts them.
         let wide = listed_name("a/claude-1", &"é".repeat(100));
         assert_eq!(wide.chars().count(), MAX_LISTED);
@@ -1631,6 +1721,20 @@ mod tests {
         assert_eq!(at(&former[0], &["sessionId"]).as_str(), Some("s1"));
         assert_eq!(at(&former[1], &["name"]).as_str(), Some("older"));
 
+        // Back to the name it had: that one is current, not former, and the one it is leaving
+        // goes first.
+        assert!(name_local(&dir, 42, "workspace-01", 11).unwrap());
+        let v = read();
+        let names: Vec<&str> = v
+            .get("formerNames")
+            .and_then(Value::as_arr)
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names, ["near/claude-1 t", "older"]);
+        assert!(name_local(&dir, 42, "near/claude-1 t", 9).unwrap());
+
         // Already so: not written again.
         let before = fs::read_to_string(&path).unwrap();
         assert!(!name_local(&dir, 42, "near/claude-1 t", 10).unwrap());
@@ -1714,9 +1818,18 @@ mod tests {
             p,
             stand_in_path(Path::new("/tmp/cc-socks"), "infra/claude-15")
         );
-        let pid = stand_in_pid("infra/claude-14");
-        assert!(pid > 4_194_304, "above any real pid");
-        assert!(pid < 9_007_199_254_740_991, "a whole number in JavaScript");
+        // Above any real pid, and still a pid: the kernel's `pid_t` is 32 bits, signed.
+        for addr in [
+            "infra/claude-14",
+            "or3/claude-2",
+            "a/b",
+            "near/claude-1",
+            "hub/router",
+        ] {
+            let pid = stand_in_pid(addr);
+            assert!(pid > 4_194_304, "{addr}: above any real pid");
+            assert!(pid <= i32::MAX as u64, "{addr}: {pid} is no pid_t");
+        }
     }
 
     #[test]
