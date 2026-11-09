@@ -94,18 +94,22 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # client.rs: the second Left's window and two minutes' quiet compared with or without
-    # their bounds (timing only); a selection's empty span on a row, which draws and copies the
-    # same as none; base64's bytes packed with `|`, whose bits do not overlap; `date` failing,
-    # which no test can make it do; and what runs only against the real terminal and ssh, over
-    # the parts that are tested: the size read live (`screen`), `paint` writing `paint_bytes`,
-    # `dial` opening ssh (`dial_over`), and `run`'s loop (`keys`, `take`, `due`,
-    # `hosts_changed`).
-    'src/client\.rs:.*: replace < with <= in App::conv_key$',
-    'src/client\.rs:.*: replace > with >= in App::key$',
-    'src/client\.rs:.*: replace < with <= in Selection::cols$',
-    'src/client\.rs:.*: replace \| with \^ in base64$',
-    'src/client\.rs:.*: replace match guard o\.status\.success\(\) with true in clock_time$',
-    'src/client\.rs:.*: replace (size|App::paint|run) -> ',
-    'src/client\.rs:.*: replace App::dial with \(\)$',
+    # The phone client's renderer (src/convo.rs, 2026-11-09). A loop's index that only moves
+    # forward: stalled, the suite hangs, which cargo-mutants can only report as a timeout.
+    # Each is the walk over the transcript, the prompt's characters or a word's; the column
+    # picks soft_wrap's and wrap's from the counters beside them.
+    'src/convo\.rs:.*: replace \+= with [-*]= in (transcript|slash_runs)$',
+    'src/convo\.rs:\d+:19: replace \+= with [-*]= in soft_wrap$',
+    'src/convo\.rs:\d+:34: replace > with < in wrap$',
+    # The same, where only a character wider than the whole row tells them apart: soft_wrap
+    # refusing to break before a row's first character, which would leave it empty forever.
+    'src/convo\.rs:\d+:49: replace > with >= in soft_wrap$',
+    # Equivalent: a header already cut to `…` cuts to `…` again, so ask_tabs' guard only
+    # stops early; typing is only ever open on the cursor's row (client.rs opens it there and
+    # Up and Down edit the field); and claude summarises a step once its calls have answered,
+    # so the step with the call still running is never the summarised one.
+    'src/convo\.rs:.*: replace match guard width\(&tabs\[i\]\.1\) > 1 with true in ask_tabs$',
+    'src/convo\.rs:\d+:42: replace > with >= in ask_tabs$',
+    'src/convo\.rs:.*: replace match guard i == \*sel with true in ask_dialog$',
+    'src/convo\.rs:.*: replace match guard st\.summary\.is_none\(\) with true in transcript$',
 ]
