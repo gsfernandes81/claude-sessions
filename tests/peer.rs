@@ -267,6 +267,15 @@ exit 2"#,
         .unwrap();
     }
 
+    /// The containers' pool as infra mounts it for the router: a ceiling and what is charged.
+    /// Until this is called there is no pool, as on a host without one.
+    fn pool(&self, limit_mb: u64, used_mb: u64) {
+        let pool = self.dir.join("pool");
+        fs::create_dir_all(&pool).unwrap();
+        fs::write(pool.join("memory.max"), format!("{}\n", limit_mb << 20)).unwrap();
+        fs::write(pool.join("memory.current"), format!("{}\n", used_mb << 20)).unwrap();
+    }
+
     fn route(&mut self, hosts: &str) {
         if !self.dir.join("meminfo").exists() {
             self.host_free(8192);
@@ -284,6 +293,7 @@ exit 2"#,
             .env("CLAUDE_SESSIONS_DIR", self.dir.join("hub-registry-unused"))
             .env("HUB_QUEUE", self.dir.join("queue"))
             .env("CLAUDE_SESSIONS_MEMINFO", self.dir.join("meminfo"))
+            .env("CLAUDE_SESSIONS_POOL", self.dir.join("pool"))
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -779,6 +789,31 @@ fn a_wake_is_not_asked_for_when_the_host_has_no_room_whatever_the_container_says
     assert!(
         content.contains("it was not woken: the host has 300M available"),
         "{content}"
+    );
+}
+
+#[test]
+fn a_wake_is_not_asked_for_when_the_containers_pool_has_no_room() {
+    let mut root = Root::new("pool");
+    root.container("a");
+    root.container("b");
+    root.live("a", "claude-1");
+    root.offloaded("b", "claude-2");
+    // The host has room (8G available), but the pool every container shares has 196 MB.
+    root.pool(4096, 3900);
+    let _a_in = root.inbox("a", 1);
+    let _b_in = root.inbox("b", 1);
+    root.route("a b");
+    let a_sock = root.d("a").join("in.sock");
+    send(
+        &root.stand_in("a", "b/claude-2"),
+        &frame(&a_sock, "x", "wake up"),
+    );
+    root.logs("did not ask to wake b/claude-2: the containers' pool has 196M free");
+    assert!(
+        !root.seen.contains("asked b to wake"),
+        "no container was asked:\n{}",
+        root.seen
     );
 }
 
