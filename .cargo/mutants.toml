@@ -92,8 +92,30 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # statusline.rs: the pool's and the container's swap, thin wrappers over `mem::swap_at` and
-    # `cgroup_swap` (each tested on its own) that cap at this machine's `/proc/meminfo`
-    # `SwapTotal`, which a test cannot set, so no figure through them is the same everywhere.
-    'src/statusline\.rs:.*: replace (pool_swap|own_swap) -> ',
+    # Agent messaging, `peer.rs` and `router.rs` (2026-11-09).
+    # The kernel gives a socket's peer pid as 0 only for a peer in another pid namespace, and a
+    # failed getsockopt leaves it 0: neither happens to a socket in this container.
+    'src/peer\.rs:.*: replace (&& with \|\||> with >=) in peer_pid$',
+    # The log alone: which relay-lock failure, read error or frame of no known type is logged,
+    # whether the relay says it is on again, what came of naming a record, which kind a frame
+    # is, how a notice was handed on, a host the router refuses, a container still not
+    # answering; and the agent's own log.
+    'src/peer\.rs:.*: replace (match guard e\.kind\(\) == io::ErrorKind::WouldBlock with (true|false)|== with !=) in Relay::start$',
+    'src/peer\.rs:.*: replace match guard st\.off\.is_some\(\) with (true|false) in Relay::apply$',
+    'src/peer\.rs:.*: replace (!= with ==|&& with \|\|) in Relay::take$',
+    'src/peer\.rs:.*: delete match arm Some\("auth"\) in Relay::take$',
+    'src/peer\.rs:.*log_naming',
+    'src/peer\.rs:.*: replace log with \(\)$',
+    'src/router\.rs:.*: delete match arm Some\("user"\) in Item::kind$',
+    'src/router\.rs:.*: delete match arm Some\(Ok\(\(\)\)\) in notify$',
+    'src/router\.rs:.*: delete ! in serve$',
+    'src/router\.rs:.*: replace != with == in watch$',
+    # Timing only: how long peer-check waits for a record (the verdict is the same, or comes
+    # later) and for the checked claude to leave (it leaves or is killed, and the scratch
+    # directory goes either way), how often old messages are pruned (the same ones go), and
+    # how fast a container that does not answer is asked again.
+    'src/peer\.rs:.*: replace (> with (==|>=)|\|\| with &&) in check$',
+    'src/peer\.rs:.*: replace [^ ]+ with [^ ]+ in end_checked$',
+    'src/router\.rs:.*: replace >= with < in serve$',
+    'src/router\.rs:.*: replace \* with / in watch$',
 ]
