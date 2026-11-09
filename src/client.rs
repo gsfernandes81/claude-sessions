@@ -6264,6 +6264,10 @@ mod tests {
             set_ui(&mut app, |ui| ui.dialog = Some(Dialog::Effort { sel: 0 }));
             assert_eq!(app.next_wake(now), None, "{st} behind a dialog");
         }
+        // `paste again to expand`, taken down after its eight seconds.
+        let mut app = app_in(&[]);
+        set_ui(&mut app, |ui| ui.paste_hint = Some(now));
+        assert_eq!(app.next_wake(now), Some(PASTE_HINT_FOR));
         // A prompt on its way, and a link down, turn too.
         let mut app = app_in(&[]);
         if let Screen::Conv { c, .. } = &mut app.screen {
