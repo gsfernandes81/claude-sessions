@@ -94,4 +94,7 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # reduce.rs and sdk.rs (2026-11-09). A base64 digit goes into bits the shift just
+    # cleared, so `|` and `^` are the same value.
+    'src/sdk\.rs:.*: replace \| with \^ in base64_decode$',
 ]
