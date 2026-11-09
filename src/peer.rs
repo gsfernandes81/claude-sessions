@@ -213,7 +213,7 @@ pub fn listed_name(addr: &str, title: &str) -> String {
     let mut kept = String::new();
     for w in words.split_whitespace() {
         let n = kept.chars().count();
-        let want = n + usize::from(n > 0) + w.chars().count();
+        let want = n + usize::from(n != 0) + w.chars().count();
         if want > room {
             // One word longer than the room is cut, rather than leaving no title at all.
             if n == 0 {
@@ -899,13 +899,10 @@ impl Relay {
                 &format!("{repo}/{}", r.slot),
                 if named { &title } else { "" },
             );
-            match name_local(&self.sessions, pid, &name, crate::clock::now()) {
-                Ok(true) => log(&format!("peer: {} is listed here as {name:?}", r.slot)),
-                Ok(false) => {}
-                // No record yet: a claude just starting, named and fronted at the next look.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => log(&format!("peer: naming {}: {e}", r.slot)),
-            }
+            let named = name_local(&self.sessions, pid, &name, crate::clock::now());
+            log_naming(&r.slot, &name, named);
+            // No record yet (a claude just starting) names no inbox: named and fronted at the
+            // next look.
             if let Some(inbox) = inbox_of(&self.sessions, pid) {
                 wanted.insert(r.slot, (pid, name, inbox.socket));
             }
@@ -1190,6 +1187,17 @@ impl Relay {
         s.write_all(line.as_bytes())
             .and_then(|()| s.shutdown(std::net::Shutdown::Write))
             .map_err(|e| Later(format!("{to}'s inbox: {e}")))
+    }
+}
+
+/// Say in the agent's log what came of naming `slot`'s record: nothing when it was already so,
+/// or when there is no record yet, a claude just starting.
+fn log_naming(slot: &str, name: &str, named: io::Result<bool>) {
+    match named {
+        Ok(true) => log(&format!("peer: {slot} is listed here as {name:?}")),
+        Ok(false) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => log(&format!("peer: naming {slot}: {e}")),
     }
 }
 
