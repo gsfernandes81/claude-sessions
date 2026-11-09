@@ -1380,7 +1380,14 @@ pub fn check(claude: Option<&str>) -> Result<String, String> {
             }
         }
     };
-    // End of input ends a headless claude, which takes its record and inbox down itself.
+    end_checked(&mut child);
+    let _ = fs::remove_dir_all(&root);
+    verdict
+}
+
+/// Stop a checked claude: end of input ends a headless claude, which takes its record and
+/// inbox down itself; one still there after [`CHECK_EXIT`] is killed.
+fn end_checked(child: &mut std::process::Child) {
     drop(child.stdin.take());
     let until = std::time::Instant::now() + CHECK_EXIT;
     while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < until {
@@ -1390,8 +1397,6 @@ pub fn check(claude: Option<&str>) -> Result<String, String> {
         let _ = child.kill();
     }
     let _ = child.wait();
-    let _ = fs::remove_dir_all(&root);
-    verdict
 }
 
 /// A directory only we can enter, as Claude Code wants its sockets' and records' to be.
@@ -2113,14 +2118,16 @@ pub(crate) mod tests {
         let inbox = dir.join("inbox.sock");
         let _listening = UnixListener::bind(&inbox).unwrap();
         // A stand-in claude: it writes its record as Claude Code does, then waits for its input
-        // to close, as a headless claude does.
+        // to close, as a headless claude does, and says it has left.
+        let left = dir.join("left");
         let claude = |name: &str, record: Option<String>| {
             let path = dir.join(name);
             let body = match record {
                 Some(r) => format!(
                     "#!/bin/sh\nmkdir -p \"$CLAUDE_CONFIG_DIR/sessions\"\n\
                      printf '%s' '{r}' > \"$CLAUDE_CONFIG_DIR/sessions/$$.json\"\n\
-                     exec cat >/dev/null\n"
+                     cat >/dev/null\ntouch '{}'\n",
+                    left.display()
                 ),
                 None => "#!/bin/sh\nexit 0\n".into(),
             };
@@ -2138,6 +2145,10 @@ pub(crate) mod tests {
         assert_eq!(
             check(Some(&good)),
             Ok("claude 9.9.9 speaks peer protocol 1, and its inbox answers".into())
+        );
+        assert!(
+            left.exists(),
+            "the claude was ended, and had left, before the answer"
         );
         let two = claude("two", Some(rec(2, &inbox)));
         let why = check(Some(&two)).unwrap_err();
