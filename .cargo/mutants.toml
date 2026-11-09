@@ -56,7 +56,7 @@ exclude_re = [
     'src/term\.rs:.*: replace match guard c >= 0x80 with false in parse_escape$',
     'src/term\.rs:.*: replace \+ with \* in parse_escape$',
     # Timing only: a deadline compared with `<` or `<=`, a wait that only adds a wait.
-    'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with)$',
+    'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with|btw_within)$',
     'src/launch\.rs:.* in wait_session_gone$',
     'src/launch\.rs:.*: replace && with \|\| in settle$',
     'src/hub\.rs:.*: replace < with <= in offload_all$',
@@ -94,7 +94,9 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
-    # reduce.rs and sdk.rs (2026-11-09). A base64 digit goes into bits the shift just
-    # cleared, so `|` and `^` are the same value.
-    'src/sdk\.rs:.*: replace \| with \^ in base64_decode$',
+    # launch.rs, activity.rs, offload.rs, hub.rs (2026-11-09). Bits that do not overlap, so
+    # `|` and `^` are the same value: a UUID's version and variant marks over the bits they
+    # clear, and the fallback id's pid (under 2^32) beside the clock shifted past it.
+    'src/launch\.rs:.*: replace \| with \^ in fresh_session_id$',
+    'src/launch\.rs:.*: replace \^ with \| in clock_bytes$',
 ]
