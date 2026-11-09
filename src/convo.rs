@@ -132,7 +132,7 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
             cur_w += 1 + ww;
             continue;
         }
-        if cur_w > 0 || !cur.is_empty() {
+        if !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
         }
         // A word wider than the line: broken at the width.
@@ -460,9 +460,9 @@ impl Convo {
         back.into_iter().map(|p| (p.text, p.uuid)).unzip()
     }
 
-    /// `older`'s entries in front of these.
+    /// `older`'s entries in front of these. Only `apply` calls it, which has counted the
+    /// change.
     fn prepend(&mut self, older: Convo) {
-        self.changes += 1;
         let k = older.entries.len();
         for at in self.index.values_mut() {
             *at += k;
@@ -1695,7 +1695,7 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     let mut out: Line = Vec::new();
     let mut left = w.saturating_sub(1);
     for (t, st) in parts {
-        let t = if width(&t) > left { cut(&t, left) } else { t };
+        let t = cut(&t, left);
         left -= width(&t).min(left);
         if !t.is_empty() {
             out.push((t, st));
@@ -1864,9 +1864,10 @@ pub fn slash_runs(chars: &[char], commands: &[String]) -> Vec<std::ops::Range<us
             i += 1;
             continue;
         }
-        let end = (i + 1..chars.len())
-            .find(|&k| chars[k].is_whitespace())
-            .unwrap_or(chars.len());
+        let end = chars[i..]
+            .iter()
+            .position(|c| c.is_whitespace())
+            .map_or(chars.len(), |k| i + k);
         let name: String = chars[i + 1..end].iter().collect();
         if !name.is_empty()
             && (commands.contains(&name) || CLIENT_COMMANDS.contains(&name.as_str()))
@@ -1914,7 +1915,8 @@ pub fn soft_wrap(
                 brk = Some(i);
             }
             Some(&c) if col + cw(c) > room && i > start => {
-                let at = brk.filter(|&b| b > start && b <= i).unwrap_or(i);
+                // `brk` is reset with each row, so it is inside this one.
+                let at = brk.unwrap_or(i);
                 rows.push((start, at));
                 start = at;
                 col = chars[start..i].iter().map(|&c| cw(c)).sum();
@@ -2049,7 +2051,7 @@ fn usage(m: &Meta, now_ms: u64) -> Option<String> {
 
 /// The input box and footer: R1's last five rows. A prompt taller than half the screen shows
 /// that many rows, scrolled to keep the cursor in them, `↑`/`↓` leading a row with more past it.
-fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usize)) {
+fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> (Vec<Line>, (usize, usize)) {
     let mut out = Vec::new();
     let now_ms = ui.now_ms();
     let viewing = c.viewing.as_ref().map(|(id, _)| id.as_str());
@@ -2162,7 +2164,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     let place = format!("{}/{}", c.host, c.slot);
     let first_foot = match (&ui.link, &ui.status, &ui.load) {
         (Link::Down { since, not_sent }, _, _) => {
-            let gone = since.elapsed();
+            let gone = now.saturating_duration_since(*since);
             let frame = (gone.as_millis() / 120) as usize % crate::ui::SPINNER.len();
             let tail = if *not_sent { " · not sent" } else { "" };
             let down = format!(
@@ -2233,8 +2235,8 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     if subagents {
         extra.push(("/tasks to see subagents".into(), fg(GREY)));
     }
-    for (i, run) in extra.into_iter().enumerate() {
-        if i > 0 || !foot.is_empty() {
+    for run in extra {
+        if !foot.is_empty() {
             foot.push((" · ".into(), fg(GREY)));
         } else {
             foot.push(("  ".into(), PLAIN));
@@ -2493,7 +2495,12 @@ fn ask_tabs(questions: &[Question], d: &Dialog, w: usize) -> Line {
     tabs.push(('✔', "Submit".into()));
     // `← ` and ` →`, and each tab ` m header `.
     let total = |t: &[(char, String)]| 4 + t.iter().map(|(_, h)| 4 + width(h)).sum::<usize>();
-    while total(&tabs) > w {
+    // A step takes a cell off a header, so there are never more steps than cells.
+    let cells: usize = tabs.iter().map(|(_, h)| width(h)).sum();
+    for _ in 0..cells {
+        if total(&tabs) <= w {
+            break;
+        }
         let longest = (0..n)
             .filter(|i| *i != *q)
             .max_by_key(|i| (width(&tabs[*i].1), std::cmp::Reverse(*i)));
@@ -2702,7 +2709,9 @@ fn ask_dialog(questions: &[Question], d: &Dialog, w: usize, room: usize) -> Vec<
             let body: usize = blocks[lo..hi].iter().map(Vec::len).sum();
             body + usize::from(lo > 0) + usize::from(hi < blocks.len()) <= list_room
         };
-        loop {
+        // A pass that grows the window takes in an option, so there are never more passes
+        // than options.
+        for _ in 0..blocks.len() {
             let grew_down = hi < blocks.len() && fits(lo, hi + 1);
             if grew_down {
                 hi += 1;
@@ -2749,8 +2758,8 @@ fn model_dialog(
         Some(list) => {
             const SHOWN: usize = 4;
             // One past the cursor stays in view, as Claude Code's list scrolls.
-            let lo = sel
-                .saturating_sub(SHOWN - 2)
+            let lo = (sel + 2)
+                .saturating_sub(SHOWN)
                 .min(list.len().saturating_sub(SHOWN));
             let hi = (lo + SHOWN).min(list.len());
             let own = current_model(&c.meta, list);
@@ -3070,7 +3079,7 @@ fn parts(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Parts {
             } else {
                 suggest_lines(&list, ui.suggest, w)
             };
-            let (boxed, cur) = input_box(c, ui, w, h);
+            let (boxed, cur) = input_box(c, ui, w, h, now);
             prompt = true;
             // No cursor in a prompt that takes nothing.
             if c.viewing.is_none() {
@@ -3174,9 +3183,7 @@ pub fn draw(c: &Convo, ui: &Ui, w: usize, h: usize, now: Instant) -> Frame {
     lines.extend(spinner);
     lines.extend(bottom);
     if ask_top {
-        while lines.len() < h {
-            lines.push(Vec::new());
-        }
+        lines.resize(h, Vec::new());
     }
     lines.truncate(h);
     Frame {
@@ -3989,6 +3996,21 @@ mod tests {
 
     #[test]
     fn r4_long_options_scroll_around_the_cursor() {
+        let c = long_options();
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Ask {
+            q: 0,
+            sel: 1,
+            answers: vec![],
+            typing: None,
+            ticked: vec![],
+        });
+        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert_eq!(got, mockup("R4"));
+    }
+
+    /// Mockup R4's question: four options, one with a long description.
+    fn long_options() -> Convo {
         let mut c = convo();
         let q = r#"{"t":"add","id":2,"k":"ask","r":"q1","q":[{"q":"Where should the hub keep a session's log between reconnects?","h":"Log store","m":false,"o":[["In the relay","Gone with it."],["On disk beside the registry","Survives a hub restart. One write per line, fsynced at the end of each turn; files older than 7 days are pruned by the offloader."],["In memory only","Fastest and nothing to prune, but a hub restart loses the history."],["In the holder","Already there."]]}]}"#;
         feed(
@@ -4000,16 +4022,7 @@ mod tests {
                 r#"{"t":"st","s":"waiting"}"#,
             ],
         );
-        let mut ui = Ui::new();
-        ui.dialog = Some(Dialog::Ask {
-            q: 0,
-            sel: 1,
-            answers: vec![],
-            typing: None,
-            ticked: vec![],
-        });
-        let got = text(&draw(&c, &ui, 40, 24, Instant::now()));
-        assert_eq!(got, mockup("R4"));
+        c
     }
 
     /// Mockups R4d and R4e: three questions, drawn as Claude Code 2.1.311 draws them.
@@ -4983,6 +4996,1248 @@ mod tests {
         assert_eq!(
             tools_summary(&[("Bash", "a"), ("Read", "b"), ("Bash", "c")], false),
             "Ran 2 shell commands, read 1 file"
+        );
+    }
+
+    // ── rules the mutation pass found unpinned ──────────────────────────────
+
+    #[test]
+    fn a_character_takes_the_cells_a_terminal_gives_it() {
+        // A combining mark, a zero-width space and the emoji selector take none.
+        for c in ['\u{301}', '\u{200b}', '\u{fe0f}'] {
+            assert_eq!(cw(c), 0, "{c:?}");
+        }
+        // Each wide East Asian and emoji range takes two.
+        for c in [
+            '\u{1100}', '中', '한', '\u{f900}', '\u{fe30}', 'Ａ', '￠', '😀', '🤔',
+        ] {
+            assert_eq!(cw(c), 2, "{c:?}");
+        }
+        for c in ['a', '❯', '●', '─'] {
+            assert_eq!(cw(c), 1, "{c:?}");
+        }
+        assert_eq!(width("中文 ok"), 7);
+    }
+
+    #[test]
+    fn a_word_as_wide_as_the_line_takes_the_line_and_nothing_after_it() {
+        assert_eq!(wrap("abcde", 5), ["abcde"]);
+        assert_eq!(wrap("ab abcde", 5), ["ab", "abcde"]);
+        assert_eq!(wrap("ab abcde fg", 5), ["ab", "abcde", "fg"]);
+    }
+
+    #[test]
+    fn hint_lines_break_between_hints_and_never_run_past_the_width() {
+        let segs = ["Enter to select", "Esc to cancel"];
+        for w in 10..60 {
+            let got: Vec<String> = hints(&segs, "   ", w).iter().map(plain).collect();
+            let one = "   Enter to select · Esc to cancel";
+            if width(one) <= w {
+                assert_eq!(got, [one], "at {w}");
+            } else {
+                assert_eq!(got, ["   Enter to select ·", "   Esc to cancel"], "at {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_paste_sent_before_anything_came_is_drawn_as_it_was_typed() {
+        let mut c = Convo::new("h", "claude-3", "r");
+        let full = "look: one\ntwo\nthree";
+        c.collapsed(full, "look: [Pasted text #1 +3 lines]");
+        let body = |c: &Convo| -> Vec<String> { laid_out(c, 40).iter().map(plain).collect() };
+        feed(
+            &mut c,
+            &[&format!(
+                r#"{{"t":"add","id":1,"k":"user","x":"{}"}}"#,
+                full.replace('\n', "\\n")
+            )],
+        );
+        assert!(
+            body(&c)
+                .iter()
+                .any(|l| l.contains("[Pasted text #1 +3 lines]")),
+            "{:?}",
+            body(&c)
+        );
+        // Collapsed after its echo was laid out, the layout follows.
+        let mut c = convo();
+        feed(&mut c, &[r#"{"t":"add","id":1,"k":"user","x":"a b c d"}"#]);
+        assert!(body(&c).iter().any(|l| l.contains("a b c d")));
+        c.collapsed("a b c d", "a [Pasted text #1]");
+        assert!(
+            body(&c).iter().any(|l| l.contains("a [Pasted text #1]")),
+            "{:?}",
+            body(&c)
+        );
+    }
+
+    #[test]
+    fn ops_for_newer_items_still_find_them_once_an_older_stretch_is_in_front() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":30,"k":"text","x":"newer"}"#,
+                r#"{"t":"add","id":31,"k":"text","x":"newest"}"#,
+                r#"{"t":"old","o":[{"t":"add","id":1,"k":"user","x":"older"},{"t":"add","id":2,"k":"text","x":"older reply"}]}"#,
+                r#"{"t":"set","id":30,"x":"newer, set"}"#,
+                r#"{"t":"app","id":31,"x":", appended"}"#,
+            ],
+        );
+        assert_eq!(
+            c.entries,
+            [
+                Entry::Prompt("older".into()),
+                Entry::Text("older reply".into()),
+                Entry::Text("newer, set".into()),
+                Entry::Text("newest, appended".into()),
+            ]
+        );
+        assert_eq!(c.entry(30), Some(&Entry::Text("newer, set".into())));
+    }
+
+    #[test]
+    fn a_turn_whose_only_text_is_blank_has_no_response_to_copy() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"one"}"#,
+                r#"{"t":"add","id":2,"k":"text","x":"  \n"}"#,
+                r#"{"t":"add","id":3,"k":"user","x":"two"}"#,
+                r#"{"t":"add","id":4,"k":"text","x":"answer"}"#,
+                r#"{"t":"add","id":5,"k":"text","x":" "}"#,
+                r#"{"t":"add","id":6,"k":"text","x":"more"}"#,
+            ],
+        );
+        assert_eq!(c.responses(), ["answer\n\nmore"]);
+    }
+
+    #[test]
+    fn an_echo_or_a_hand_back_takes_away_its_own_prompt_not_another_on_its_way() {
+        let now = Instant::now();
+        let mut c = convo();
+        c.sent("first", now);
+        let second = c.sent("second", now);
+        feed(&mut c, &[r#"{"t":"add","id":1,"k":"user","x":"second"}"#]);
+        let left: Vec<&str> = c.pending.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(left, ["first"]);
+        // By its uuid: the other, of the same text, stays.
+        let mut c = convo();
+        c.sent("again", now);
+        let later = c.sent("again", now);
+        assert_ne!(later, second);
+        let back = format!(r#"{{"t":"back","x":"again","u":"{later}","q":true}}"#);
+        assert_eq!(c.apply(&parse(&back).unwrap(), now), Applied::Nothing);
+        assert_eq!(c.pending.len(), 1);
+        assert_ne!(c.pending[0].uuid, later);
+    }
+
+    #[test]
+    fn a_prompt_handed_back_goes_to_the_input_only_live_and_only_if_it_was_not_queued() {
+        let now = Instant::now();
+        let back = |c: &mut Convo, uuid: &str, queued: bool| {
+            let op = format!(r#"{{"t":"back","x":"hi","u":"{uuid}","q":{queued}}}"#);
+            c.apply(&parse(&op).unwrap(), now)
+        };
+        // Live, not queued: the text goes back.
+        let mut c = convo();
+        let u = c.sent("hi", now);
+        assert_eq!(back(&mut c, &u, false), Applied::Back("hi".into()));
+        // Live, but it was waiting behind the turn: withdrawn quietly.
+        let mut c = convo();
+        let u = c.sent("hi", now);
+        assert_eq!(back(&mut c, &u, true), Applied::Nothing);
+        assert!(c.pending.is_empty());
+        // Read from the log before the live ops: nothing goes back.
+        let mut c = Convo::new("h", "claude-3", "r");
+        let u = c.sent("hi", now);
+        assert_eq!(back(&mut c, &u, false), Applied::Nothing);
+        assert!(c.pending.is_empty());
+    }
+
+    #[test]
+    fn each_background_tasks_notice_is_counted_and_a_compaction_is_drawn() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"note","x":"Shell finished","tn":true}"#,
+                r#"{"t":"add","id":2,"k":"note","x":"said by a command"}"#,
+                r#"{"t":"add","id":3,"k":"note","x":"Monitor fired","tn":true}"#,
+                r#"{"t":"add","id":4,"k":"compact"}"#,
+            ],
+        );
+        assert_eq!(c.notices, 2);
+        let body: Vec<String> = transcript(&c, 40).0.iter().map(plain).collect();
+        assert!(
+            body.iter().any(|l| l == "✻ Conversation compacted"),
+            "{body:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_of_calls_is_summed_kind_by_kind_in_claude_codes_words() {
+        let calls = [
+            ("Bash", "ls"),
+            ("Read", "a"),
+            ("Edit", "a"),
+            ("MultiEdit", "b"),
+            ("Write", "c"),
+            ("Grep", "x"),
+            ("Glob", "*"),
+            ("WebFetch", "u"),
+            ("WebSearch", "q"),
+            ("Task", "t"),
+            ("Agent", "t"),
+            ("Skill", "s"),
+        ];
+        assert_eq!(
+            tools_summary(&calls, false),
+            "Ran 1 shell command, read 1 file, edited 2 files, wrote 1 file, \
+             searched 2 patterns, fetched 1 page, searched 1 web query, ran 2 agents, \
+             used 1 tool"
+        );
+        assert_eq!(
+            tools_summary(&calls[2..6], true),
+            "Editing 2 files, writing 1 file, searching 1 pattern…"
+        );
+    }
+
+    #[test]
+    fn a_call_cut_off_when_the_turn_ended_is_said_as_done() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"user","x":"go"}"#,
+                r#"{"t":"st","s":"working"}"#,
+                r#"{"t":"add","id":2,"k":"tool","n":"Read","a":"a.txt"}"#,
+            ],
+        );
+        let body = |c: &Convo| -> Vec<String> { transcript(c, 40).0.iter().map(plain).collect() };
+        assert!(body(&c).contains(&"● Reading 1 file…".to_string()));
+        feed(&mut c, &[r#"{"t":"st","s":"idle"}"#]);
+        let b = body(&c);
+        assert_eq!(b.last().unwrap(), "  Read 1 file", "{b:?}");
+        assert!(!b.iter().any(|l| l.contains("Reading")), "{b:?}");
+    }
+
+    #[test]
+    fn under_a_running_call_is_what_it_was_given_or_its_name() {
+        let running = |n: &str, a: &str| {
+            let mut c = convo();
+            feed(
+                &mut c,
+                &[
+                    r#"{"t":"st","s":"working"}"#,
+                    &format!(r#"{{"t":"add","id":1,"k":"tool","n":"{n}","a":"{a}"}}"#),
+                ],
+            );
+            plain(transcript(&c, 40).0.last().unwrap())
+        };
+        assert_eq!(running("Read", "a.txt"), "  ⎿  a.txt");
+        assert_eq!(running("TodoWrite", ""), "  ⎿  TodoWrite");
+        assert_eq!(running("Bash", "ls"), "  ⎿  $ ls");
+    }
+
+    #[test]
+    fn a_permission_prompt_without_words_leaves_the_calls_said_as_under_way() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"st","s":"waiting"}"#,
+                r#"{"t":"add","id":1,"k":"tool","n":"Bash","a":"rm x"}"#,
+                r#"{"t":"add","id":2,"k":"perm","r":"p1","n":"Bash","a":"rm x","d":""}"#,
+            ],
+        );
+        let body: Vec<String> = transcript(&c, 40).0.iter().map(plain).collect();
+        assert!(
+            body.contains(&"● Running 1 shell command…".to_string()),
+            "{body:?}"
+        );
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":3,"k":"tool","n":"Bash","a":"rm y"}"#,
+                r#"{"t":"add","id":4,"k":"perm","r":"p2","n":"Bash","a":"rm y","d":"Remove y"}"#,
+            ],
+        );
+        let body: Vec<String> = transcript(&c, 40).0.iter().map(plain).collect();
+        assert!(body.contains(&"● Remove y".to_string()), "{body:?}");
+    }
+
+    #[test]
+    fn an_agents_dot_is_plain_while_it_runs_and_red_once_it_failed() {
+        let dot = |state: &str| {
+            let mut c = convo();
+            feed(
+                &mut c,
+                &[
+                    r#"{"t":"add","id":1,"k":"agent","n":"Explore","a":"look"}"#,
+                    &format!(r#"{{"t":"prog","id":1,"p":["x"],"st":"{state}"}}"#),
+                ],
+            );
+            let lines = transcript(&c, 40).0;
+            let head = lines
+                .iter()
+                .find(|l| plain(l).starts_with("● Explore"))
+                .unwrap()
+                .clone();
+            head[0].1
+        };
+        assert_eq!(dot("running"), PLAIN);
+        assert_eq!(dot("completed"), fg(GREEN));
+        assert_eq!(dot("failed"), fg(RED));
+        assert_eq!(dot("stopped"), fg(RED));
+    }
+
+    #[test]
+    fn a_closing_fence_is_the_opening_ones_alone_on_its_line() {
+        let text = "```\na\n~~~\n```js\nb\n```\nafter\n~~~py\nc\n~~~";
+        assert_eq!(
+            code_blocks(text),
+            [
+                (String::new(), "a\n~~~\n```js\nb".to_string()),
+                ("py".to_string(), "c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_working_directory_is_said_from_home() {
+        assert_eq!(home_short("/home/dev"), "~");
+        assert_eq!(home_short("/home/dev/workspace/x"), "~/workspace/x");
+        assert_eq!(home_short("/root"), "~");
+        assert_eq!(home_short("/srv/x"), "/srv/x");
+    }
+
+    #[test]
+    fn a_command_name_without_its_slash_is_text() {
+        let chars: Vec<char> = "use  model or /model x/model".chars().collect();
+        let runs = slash_runs(&chars, &[]);
+        assert_eq!(runs, vec![14..20]);
+    }
+
+    #[test]
+    fn the_input_fills_a_row_and_a_cursor_after_a_full_row_and_a_newline_stays_on_it() {
+        let chars: Vec<char> = "abcd".chars().collect();
+        assert_eq!(soft_wrap(&chars, 2, 4), (vec![(0, 4)], (0, 2)));
+        assert_eq!(soft_wrap(&chars, 4, 4), (vec![(0, 4), (4, 4)], (1, 0)));
+        let chars: Vec<char> = "abcd\nx".chars().collect();
+        assert_eq!(soft_wrap(&chars, 4, 4), (vec![(0, 4), (5, 6)], (0, 3)));
+    }
+
+    fn task(id: &str, kind: &str, status: &str) -> Task {
+        Task {
+            id: id.into(),
+            kind: kind.into(),
+            description: format!("the {kind} {id}"),
+            status: status.into(),
+            ..Task::default()
+        }
+    }
+
+    /// The screens a phone shows, each a way to set up the client's side.
+    fn screens() -> Vec<(&'static str, Convo, Ui)> {
+        let mut out = Vec::new();
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta_used("a title long enough to crowd a narrow rule", "auto", 12, 72),
+                r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#,
+                r#"{"t":"add","id":2,"k":"text","x":"Some words in reply, enough of them to wrap."}"#,
+            ],
+        );
+        c.tasks = vec![
+            task("b1", "shell", "running"),
+            task("a1", "agent", "running"),
+        ];
+        let mut ui = Ui::new();
+        ui.wall = Some(BEFORE_RESET_MS);
+        ui.load = Some(figures(0.9, 2.0, 70));
+        ui.toast = Some("Shell details dismissed".into());
+        ui.input = format!("abcdefghijklmnopqrstuvwxyz{}and on", " ".repeat(30));
+        ui.cursor = 3;
+        out.push(("prompt", c, ui.clone()));
+        let mut c = convo();
+        feed(&mut c, &[&meta("t", "plan")]);
+        let mut ui = Ui::new();
+        ui.catalog = vec![Command {
+            name: "review".into(),
+            about: "Review a pull request".into(),
+            hint: "[pr-number] [--comment] [--fix] [--level low|medium|high|max]".into(),
+        }];
+        ui.input = "/review ".into();
+        ui.cursor = 8;
+        out.push(("hint", c, ui));
+        let mut ui = Ui::new();
+        ui.input = "/".into();
+        ui.cursor = 1;
+        ui.suggest = 6;
+        out.push(("suggestions", convo(), ui));
+        let choices = copy_choices(
+            "All of it\n```rust\nfn main() {}\n```\n```\nmake\n```\n```sh\nls\n```\n```py\nx\n```\n```go\ny\n```",
+        );
+        for (name, d) in [
+            ("copy", Dialog::Copy { sel: 5, choices }),
+            ("mode", Dialog::Mode { sel: 2 }),
+            ("effort", Dialog::Effort { sel: 9 }),
+            (
+                "model",
+                Dialog::Model {
+                    sel: 5,
+                    list: Some(
+                        (1..=8)
+                            .map(|i| (format!("m{i}"), format!("Model number {i}")))
+                            .collect(),
+                    ),
+                },
+            ),
+            (
+                "btw",
+                Dialog::Btw {
+                    question: "what is this all about, at some length?".into(),
+                    answer: Some(Ok((1..=40)
+                        .map(|i| format!("line {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"))),
+                    top: 7,
+                },
+            ),
+        ] {
+            let mut ui = Ui::new();
+            ui.dialog = Some(d);
+            out.push((name, convo(), ui));
+        }
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Ask {
+            q: 1,
+            sel: 2,
+            answers: vec![Some("Red".into()), None, None],
+            typing: None,
+            ticked: vec![vec![], vec![true, false, false], vec![]],
+        });
+        out.push(("ask", three_questions(), ui));
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Ask {
+            q: 0,
+            sel: 1,
+            answers: vec![],
+            typing: None,
+            ticked: vec![],
+        });
+        out.push(("long ask", long_options(), ui));
+        let plan = (1..=30)
+            .map(|i| format!("{i}. Step number {i} of the plan."))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        for (name, tool, arg) in [
+            ("plan", "ExitPlanMode", plan.as_str()),
+            (
+                "perm",
+                "Bash",
+                "rm -rf /tmp/a-rather-long-path/that-wraps/at-forty",
+            ),
+        ] {
+            let mut c = convo();
+            feed(
+                &mut c,
+                &[
+                    &format!(
+                        r#"{{"t":"add","id":1,"k":"perm","r":"p","n":"{tool}","a":"{arg}","d":"Remove it","al":"Yes, always"}}"#
+                    ),
+                    r#"{"t":"st","s":"waiting"}"#,
+                ],
+            );
+            let mut ui = Ui::new();
+            ui.dialog = Some(Dialog::Perm {
+                sel: 1,
+                top: 4,
+                typing: None,
+            });
+            out.push((name, c, ui));
+        }
+        out
+    }
+
+    #[test]
+    fn every_screen_is_its_height_and_no_row_is_wider_than_it() {
+        // From the mockups' narrowest, 40.
+        for (name, c, ui) in screens() {
+            for w in 40..=100 {
+                for h in [12, 24] {
+                    let f = draw(&c, &ui, w, h, Instant::now());
+                    assert_eq!(f.lines.len(), h, "{name} at {w}x{h}");
+                    for (i, l) in f.lines.iter().enumerate() {
+                        assert!(
+                            width(&plain(l)) <= w,
+                            "{name} at {w}x{h}, row {i} is {}: {:?}",
+                            width(&plain(l)),
+                            plain(l)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_status_line_is_the_fullest_form_that_keeps_the_last_column_clear() {
+        let f = figures(0.9, 2.0, 70);
+        let place = "claude-sessions/claude-3";
+        let figs = format!("{}, {}, {}", f.ram().0, f.swap().0, f.load().0);
+        let forms = [
+            format!("  {place} · {figs}"),
+            format!("  {figs}, {}", f.place()),
+            format!("  {figs}"),
+        ];
+        // From 33: narrower, a squeezed line cut short still gets a `…` for every part after
+        // the cut, which runs into the last column.
+        for w in 33..=120 {
+            let got = plain(&status_line(place, &f, w));
+            match forms.iter().find(|l| width(l) < w) {
+                Some(want) => assert_eq!(&got, want, "at {w}"),
+                None => {
+                    assert!(got.starts_with("  RAM "), "squeezed at {w}: {got:?}");
+                    assert!(width(&got) < w, "at {w}: {got:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reconnecting_is_beside_the_figures_only_when_they_are_whole() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("t", "auto")]);
+        let now = Instant::now();
+        let mut ui = Ui::new();
+        ui.load = Some(figures(0.9, 2.0, 70));
+        ui.link = Link::Down {
+            since: now - Duration::from_secs(8),
+            not_sent: false,
+        };
+        let f = figures(0.9, 2.0, 70);
+        let whole = [f.ram().0, f.swap().0, f.load().0];
+        for w in 20..=140 {
+            let rows = text(&draw(&c, &ui, w, 24, now));
+            let row = rows
+                .iter()
+                .find(|l| l.contains("Reconnecting…"))
+                .unwrap_or_else(|| panic!("at {w}: {rows:?}"));
+            if row.contains("RAM") {
+                for t in &whole {
+                    assert!(row.contains(t.as_str()), "at {w}: {row:?}");
+                }
+            } else {
+                assert!(row.starts_with("  ⠦ Reconnecting… (8s)"), "at {w}: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_reconnecting_spinner_turns_a_frame_a_step_and_counts_the_seconds() {
+        let c = convo();
+        let now = Instant::now() + Duration::from_secs(60);
+        let mut ui = Ui::new();
+        let row = |ui: &Ui| {
+            text(&draw(&c, ui, 40, 24, now))
+                .into_iter()
+                .find(|l| l.contains("Reconnecting"))
+                .unwrap()
+        };
+        let mut seen = Vec::new();
+        for step in 0..12u64 {
+            ui.link = Link::Down {
+                since: now - Duration::from_millis(step * 120),
+                not_sent: false,
+            };
+            let r = row(&ui);
+            let glyph = r.trim_start().chars().next().unwrap().to_string();
+            assert_eq!(
+                glyph,
+                crate::ui::SPINNER[step as usize % crate::ui::SPINNER.len()],
+                "{r:?}"
+            );
+            seen.push(r);
+        }
+        assert!(seen[0].ends_with("(0s)"), "{seen:?}");
+        assert!(seen[9].ends_with("(1s)"), "{seen:?}");
+    }
+
+    #[test]
+    fn the_work_spinner_turns_and_its_word_follows_the_conversation() {
+        let t0 = Instant::now();
+        let spin = |c: &Convo, at: u64| {
+            let f = draw(c, &Ui::new(), 40, 24, t0 + Duration::from_millis(at));
+            text(&f)
+                .into_iter()
+                .find(|l| l.contains("…") && l.contains("s)"))
+                .unwrap()
+        };
+        let mut c = convo();
+        c.apply(&parse(r#"{"t":"st","s":"working"}"#).unwrap(), t0);
+        let frames: Vec<String> = (0..7)
+            .map(|k| spin(&c, k * 120).chars().next().unwrap().to_string())
+            .collect();
+        assert_eq!(frames[..6], SPIN, "a frame a step");
+        assert_eq!(frames[6], SPIN[0], "and round again");
+        let word = |c: &Convo| spin(c, 0).split(' ').nth(1).unwrap().to_string();
+        let first = word(&c);
+        feed(&mut c, &[r#"{"t":"add","id":1,"k":"text","x":"x"}"#]);
+        assert_ne!(word(&c), first, "a new word as the conversation grows");
+        feed(&mut c, &[r#"{"t":"st","s":"compacting"}"#]);
+        assert!(spin(&c, 0).contains("Compacting conversation…"));
+    }
+
+    #[test]
+    fn a_toast_sits_at_the_right_two_columns_short_of_the_edge() {
+        let mut ui = Ui::new();
+        ui.toast = Some("Shell details dismissed".into());
+        for w in [30, 40, 80] {
+            let rows: Vec<String> = draw(&convo(), &ui, w, 24, Instant::now())
+                .lines
+                .iter()
+                .map(plain)
+                .collect();
+            let row = rows.iter().find(|l| l.contains("dismissed")).unwrap();
+            assert_eq!(width(row), w - 2, "at {w}");
+            assert!(row.trim_start() == "Shell details dismissed", "at {w}");
+        }
+    }
+
+    #[test]
+    fn the_title_goes_on_the_rule_only_where_it_fits_whole() {
+        let rule_at = |title: &str, w: usize| {
+            let mut c = convo();
+            feed(&mut c, &[&meta(title, "default")]);
+            let f = draw(&c, &Ui::new(), w, 24, Instant::now());
+            let rows = text(&f);
+            let i = rows.iter().position(|l| l.starts_with("❯")).unwrap();
+            rows[i - 1].clone()
+        };
+        assert_eq!(rule_at("", 30), "─".repeat(30));
+        let title = "x".repeat(26);
+        assert_eq!(rule_at(&title, 30), format!("─ {title} ─"));
+        assert_eq!(rule_at(&title, 29), "─".repeat(29));
+    }
+
+    #[test]
+    fn a_focused_pill_is_black_on_cyan_and_the_footer_starts_with_it_without_a_mode() {
+        let mut c = convo();
+        c.tasks = vec![task("b1", "shell", "running")];
+        let mut ui = Ui::new();
+        ui.focus = Focus::Pill;
+        let f = draw(&c, &ui, 40, 24, Instant::now());
+        let foot = f.lines.last().unwrap();
+        assert_eq!(plain(foot).trim_end(), "  1 shell");
+        let pill = foot.iter().find(|(t, _)| t == "1 shell").unwrap();
+        assert_eq!(
+            pill.1,
+            St {
+                fg: Some(0),
+                bg: Some(crate::tasks::CYAN),
+                ..PLAIN
+            }
+        );
+    }
+
+    #[test]
+    fn the_mode_hint_goes_only_when_it_would_crowd_out_the_usage() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[&meta_used("", "auto", 12, 72).replace(r#""m":"claude-opus-5-5","#, "")],
+        );
+        let mut ui = Ui::new();
+        ui.wall = Some(BEFORE_RESET_MS);
+        let mode = mode_line("auto").unwrap().0;
+        let usage = "5h 12% · 7d 72%";
+        for w in 30..=80 {
+            let foot = text(&draw(&c, &ui, w, 24, Instant::now())).pop().unwrap();
+            let keeps = 2 + width(&mode) + 2 + width(usage) <= w - 2;
+            assert_eq!(foot.contains(MODE_HINT), keeps, "at {w}: {foot:?}");
+        }
+    }
+
+    #[test]
+    fn with_the_strip_focused_the_footer_says_its_keys_and_the_strip_its_cursor() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "auto")]);
+        c.tasks = vec![task("a1", "agent", "running")];
+        let mut ui = Ui::new();
+        ui.focus = Focus::Strip(1);
+        let rows = text(&draw(&c, &ui, 60, 24, Instant::now()));
+        let at = rows.iter().position(|l| l.contains("main")).unwrap();
+        assert!(
+            rows[at - 2].starts_with("  Enter to view · x to stop "),
+            "{rows:?}"
+        );
+        assert!(!rows[at - 2].contains("mode"), "{rows:?}");
+        assert!(!rows[at - 2].contains("/tasks"), "{rows:?}");
+        assert!(rows[at + 1].starts_with("❯ "), "{rows:?}");
+        assert!(rows[at].starts_with("  "), "{rows:?}");
+    }
+
+    #[test]
+    fn only_the_last_option_takes_what_is_typed() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                r#"{"t":"add","id":1,"k":"perm","r":"p","n":"ExitPlanMode","a":"Do it."}"#,
+                r#"{"t":"st","s":"waiting"}"#,
+            ],
+        );
+        let mut ui = Ui::new();
+        ui.dialog = Some(Dialog::Perm {
+            sel: 2,
+            top: 0,
+            typing: Some(Field::from("less")),
+        });
+        let rows = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        assert!(
+            rows.contains(&"   1. Yes, and use auto mode".to_string()),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&"   2. Yes, manually approve edits".to_string()));
+        assert!(rows.contains(&" ❯ 3. less▏".to_string()), "{rows:?}");
+    }
+
+    /// What a scrolled stretch holds, read back from its rows: how many above, the body rows
+    /// shown, how many below.
+    fn read_scroll(rows: &[String], body: &[String]) -> (usize, Vec<usize>, usize) {
+        let count = |l: &str, arrow: &str| -> Option<usize> {
+            let rest = l.trim_start().strip_prefix(arrow)?;
+            rest.trim().strip_suffix(" more")?.parse().ok()
+        };
+        let mut rows = rows;
+        let mut above = 0;
+        if let Some(n) = rows.first().and_then(|l| count(l, "↑")) {
+            above = n;
+            rows = &rows[1..];
+        }
+        let mut below = 0;
+        if let Some(n) = rows.last().and_then(|l| count(l, "↓")) {
+            below = n;
+            rows = &rows[..rows.len() - 1];
+        }
+        let shown = rows
+            .iter()
+            .map(|r| body.iter().position(|b| b == r).expect("a body row"))
+            .collect();
+        (above, shown, below)
+    }
+
+    #[test]
+    fn a_scrolled_stretch_fills_its_room_and_says_what_is_above_and_below() {
+        let body: Vec<String> = (0..12).map(|i| format!(" row {i}")).collect();
+        let lines: Vec<Line> = body.iter().map(|b| line(b.clone(), PLAIN)).collect();
+        for room in 3..15 {
+            for top in 0..15 {
+                let rows: Vec<String> = scrolled(lines.clone(), top, room)
+                    .iter()
+                    .map(plain)
+                    .collect();
+                assert_eq!(rows.len(), room.min(body.len()), "{room} {top}: {rows:?}");
+                let (above, shown, below) = read_scroll(&rows, &body);
+                assert!(!shown.is_empty(), "{room} {top}");
+                assert_eq!(shown[0], above, "{room} {top}: {rows:?}");
+                assert!(shown.windows(2).all(|p| p[1] == p[0] + 1), "{rows:?}");
+                assert_eq!(
+                    above + shown.len() + below,
+                    body.len(),
+                    "{room} {top}: {rows:?}"
+                );
+                assert!(above <= top, "{room} {top}: {rows:?}");
+                if body.len() > room {
+                    assert_eq!(above == 0, top == 0, "{room} {top}: {rows:?}");
+                }
+            }
+            // Scrolled to the end, the last row is in view.
+            let rows: Vec<String> = scrolled(lines.clone(), 99, room)
+                .iter()
+                .map(plain)
+                .collect();
+            assert_eq!(rows.last().unwrap(), &body[11], "{room}");
+        }
+    }
+
+    #[test]
+    fn a_btw_answer_is_as_tall_as_it_needs_up_to_three_rows_short_of_the_screen() {
+        let body: Vec<String> = (1..=40).map(|i| format!("   line {i}")).collect();
+        for n in 1..=40 {
+            let answer = (1..=n)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for h in [16, 24] {
+                for top in [0, 1, 7, 30, 99] {
+                    let d = btw_dialog("q", &Some(Ok(answer.clone())), top, 40, h);
+                    let ctx = format!("{n} {h} {top}");
+                    // The rule, the question, a blank, the answer, a blank and the hint.
+                    assert_eq!(d.len(), (n + 5).min(h - 3), "{ctx}");
+                    let rows: Vec<String> = d.iter().map(plain).collect();
+                    assert!(
+                        !rows.iter().any(|l| l.contains(" 0 more")),
+                        "{ctx}: {rows:?}"
+                    );
+                    let (above, shown, below) = read_scroll(&rows[3..rows.len() - 2], &body);
+                    assert_eq!(shown[0], above, "{ctx}: {rows:?}");
+                    assert!(shown.windows(2).all(|p| p[1] == p[0] + 1), "{rows:?}");
+                    assert_eq!(above + shown.len() + below, n, "{ctx}: {rows:?}");
+                    if n + 5 <= h - 3 {
+                        assert_eq!(shown.len(), n, "whole, {ctx}: {rows:?}");
+                    } else {
+                        assert_eq!(above == 0, top == 0, "{ctx}: {rows:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A list's window read back from a dialog's rows: the numbers shown, in order, how many
+    /// it says are above and below, and which row has the cursor.
+    fn read_window(rows: &[String]) -> (usize, Vec<usize>, usize, Option<usize>) {
+        let more = |l: &str, arrow: &str| -> Option<usize> {
+            let rest = l.trim_start().strip_prefix(arrow)?.trim_start();
+            let n = rest.split(' ').next()?.trim_start_matches('+');
+            n.parse().ok()
+        };
+        let (mut above, mut below, mut cursor) = (0, 0, None);
+        let mut shown = Vec::new();
+        for l in rows {
+            if let Some(n) = more(l, "↑") {
+                above = n;
+            } else if let Some(n) = more(l, "…") {
+                below = n;
+            } else if let Some(n) = more(l, "↓") {
+                below = n;
+            } else {
+                let t = l.trim_start().trim_start_matches(['❯', '↑']).trim_start();
+                if let Some((n, _)) = t.split_once(". ") {
+                    if let Ok(n) = n.parse::<usize>() {
+                        if l.trim_start().starts_with('❯') {
+                            cursor = Some(n);
+                        }
+                        shown.push(n);
+                    }
+                }
+            }
+        }
+        (above, shown, below, cursor)
+    }
+
+    #[test]
+    fn copy_and_model_lists_keep_the_cursor_and_one_past_it_in_view() {
+        let labels: Vec<(String, String)> = (1..=8)
+            .map(|i| (format!("Choice {i}"), String::new()))
+            .collect();
+        let models: Vec<(String, String)> = (1..=8)
+            .map(|i| (format!("m{i}"), format!("Model {i}")))
+            .collect();
+        for (name, shown_at_once) in [("copy", 5), ("model", 4)] {
+            for sel in 0..8 {
+                let d = if name == "copy" {
+                    copy_dialog(sel, &labels, 40)
+                } else {
+                    model_dialog(&convo(), sel, &Some(models.clone()), 40)
+                };
+                let rows: Vec<String> = d.iter().map(plain).collect();
+                let (_, shown, below, cursor) = read_window(&rows);
+                assert_eq!(cursor, Some(sel + 1), "{name} {sel}: {rows:?}");
+                assert_eq!(shown.len(), shown_at_once, "{name} {sel}: {rows:?}");
+                assert!(shown.windows(2).all(|p| p[1] == p[0] + 1), "{rows:?}");
+                // One past the cursor, while there is one; the rest as far back as fits.
+                assert_eq!(
+                    *shown.last().unwrap(),
+                    (sel + 2).clamp(shown_at_once, 8),
+                    "{name} {sel}: {rows:?}"
+                );
+                assert_eq!(below, 8 - shown.last().unwrap(), "{name} {sel}: {rows:?}");
+                assert!(!rows.iter().any(|l| l.contains("+0")), "{rows:?}");
+                // Only the cursor's row is lavender.
+                for l in &d {
+                    let t = plain(l);
+                    if t.trim_start().starts_with('❯') {
+                        assert_eq!(l[0].1, fg(LAVENDER), "{t:?}");
+                    } else if read_window(std::slice::from_ref(&t)).1.len() == 1 {
+                        assert_eq!(l[0].1, PLAIN, "{t:?}");
+                    }
+                }
+                if name == "model" {
+                    // `↑` on the top row when there is more above it.
+                    let first = rows.iter().find(|l| l.contains(".  Model")).unwrap();
+                    let top_more = shown[0] > 1 && cursor != Some(shown[0]);
+                    assert_eq!(first.trim_start().starts_with('↑'), top_more, "{rows:?}");
+                }
+            }
+        }
+        // A label longer than the row is cut.
+        let long = vec![("x".repeat(60), String::new())];
+        let rows: Vec<String> = copy_dialog(0, &long, 40).iter().map(plain).collect();
+        assert!(
+            rows.iter().any(|l| l.ends_with('…') && width(l) == 39),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_mode_picker_opens_on_the_sessions_own_mode() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "plan")]);
+        let sel = mode_index(&c.meta);
+        assert_eq!(MODES[sel].0, "plan");
+        let d = mode_dialog(&c, sel, 40);
+        let row = d.iter().find(|l| plain(l).contains("Plan")).unwrap();
+        assert_eq!(plain(row), "   ❯ 3.  Plan ✔");
+        assert_eq!(row[0].1, fg(LAVENDER));
+        let other = d.iter().find(|l| plain(l).contains("Manual")).unwrap();
+        assert_eq!(other[0].1, PLAIN);
+    }
+
+    #[test]
+    fn every_dialog_is_drawn_over_the_prompt() {
+        let mut c = convo();
+        c.tasks = vec![task("b1", "shell", "running")];
+        for (d, says) in [
+            (
+                Dialog::Copy {
+                    sel: 0,
+                    choices: copy_choices("x"),
+                },
+                "Copy to clipboard",
+            ),
+            (Dialog::Tasks(crate::tasks::View::default()), "the shell b1"),
+            (
+                Dialog::Btw {
+                    question: "why".into(),
+                    answer: None,
+                    top: 0,
+                },
+                "/btw why",
+            ),
+        ] {
+            let mut ui = Ui::new();
+            ui.dialog = Some(d);
+            let f = draw(&c, &ui, 40, 24, Instant::now());
+            let rows = text(&f);
+            assert!(rows.iter().any(|l| l.contains(says)), "{says}: {rows:?}");
+            assert!(!rows.iter().any(|l| l.starts_with("❯")), "{says}: {rows:?}");
+            assert_eq!(f.cursor, None, "{says}");
+        }
+    }
+
+    #[test]
+    fn a_question_keeps_what_was_typed_on_its_row_and_marks_only_its_options() {
+        let mut c = convo();
+        let q = r#"{"t":"add","id":2,"k":"ask","r":"q1","q":[{"q":"Which?","h":"Pick","m":false,"o":[["Red",""],["Blue",""]]}]}"#;
+        feed(&mut c, &[q, r#"{"t":"st","s":"waiting"}"#]);
+        let rows = |answers: Vec<Option<String>>, typing: Option<Field>, sel: usize| {
+            let Some(Entry::Ask { questions, .. }) = c.waiting() else {
+                panic!()
+            };
+            let d = Dialog::Ask {
+                q: 0,
+                sel,
+                answers,
+                typing,
+                ticked: vec![],
+            };
+            ask_dialog(questions, &d, 40, 30)
+                .iter()
+                .map(plain)
+                .collect::<Vec<_>>()
+        };
+        let typed = rows(vec![Some("Green, really".into())], None, 0);
+        assert!(
+            typed.contains(&"  3. Green, really ✔".to_string()),
+            "{typed:?}"
+        );
+        assert!(typed.contains(&"  2. Blue".to_string()), "{typed:?}");
+        let chosen = rows(vec![Some("Blue".into())], None, 0);
+        assert!(chosen.contains(&"  2. Blue ✔".to_string()), "{chosen:?}");
+        assert!(
+            chosen.contains(&"  3. Type something.".to_string()),
+            "{chosen:?}"
+        );
+        let typing = rows(vec![], Some(Field::from("Gr")), 2);
+        assert!(typing.contains(&"❯ 3. Gr▏".to_string()), "{typing:?}");
+        // A multi-select ticks its options, not "Type something." or "Submit".
+        let c = three_questions();
+        let Some(Entry::Ask { questions, .. }) = c.waiting() else {
+            panic!()
+        };
+        let d = Dialog::Ask {
+            q: 1,
+            sel: 0,
+            answers: vec![],
+            typing: None,
+            ticked: vec![vec![], vec![false, true, false]],
+        };
+        let got: Vec<String> = ask_dialog(questions, &d, 40, 30)
+            .iter()
+            .map(plain)
+            .collect();
+        assert!(got.contains(&"  2. [✔] Medium".to_string()), "{got:?}");
+        assert!(got.contains(&"  4. Type something.".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn the_tabs_arrows_are_grey_where_there_is_nowhere_further_to_go() {
+        let c = three_questions();
+        let Some(Entry::Ask { questions, .. }) = c.waiting() else {
+            panic!()
+        };
+        let tabs = |q: usize| {
+            let d = Dialog::Ask {
+                q,
+                sel: 0,
+                answers: vec![],
+                typing: None,
+                ticked: vec![],
+            };
+            ask_tabs(questions, &d, 80)
+        };
+        let row = tabs(0);
+        assert_eq!(row[0].1, fg(GREY));
+        assert_eq!(row.last().unwrap(), &(" →".to_string(), PLAIN));
+        let row = tabs(1);
+        assert_eq!(row[0].1, PLAIN);
+        assert_eq!(row.last().unwrap(), &(" →".to_string(), PLAIN));
+        let row = tabs(3);
+        assert_eq!(row.last().unwrap(), &(" →".to_string(), fg(GREY)));
+        // The Submit tab's heading is bold.
+        let d = Dialog::Ask {
+            q: 3,
+            sel: 0,
+            answers: vec![],
+            typing: None,
+            ticked: vec![],
+        };
+        let review = ask_review(questions, &d, 80);
+        let head = review
+            .iter()
+            .find(|l| plain(l) == "Review your answers")
+            .unwrap();
+        assert!(head[0].1.bold);
+    }
+
+    #[test]
+    fn a_long_question_list_shows_as_many_whole_options_as_fit_around_the_cursor() {
+        let c = long_options();
+        let Some(Entry::Ask { questions, .. }) = c.waiting() else {
+            panic!()
+        };
+        let at = |sel: usize, room: usize, w: usize| -> Vec<String> {
+            let d = Dialog::Ask {
+                q: 0,
+                sel,
+                answers: vec![],
+                typing: None,
+                ticked: vec![],
+            };
+            ask_dialog(questions, &d, w, room)
+                .iter()
+                .map(plain)
+                .collect()
+        };
+        for w in [40, 60] {
+            // Each option's rows, from a room that holds them all.
+            let all = at(0, 1000, w);
+            let mut heights = [0; 5];
+            let mut cur = None;
+            for l in &all[1..] {
+                if l.starts_with("─") || l.starts_with("╌") {
+                    break;
+                }
+                match read_window(std::slice::from_ref(l)).1.first() {
+                    Some(&n) => cur = Some(n),
+                    None if l.is_empty() => cur = None,
+                    None => {}
+                }
+                if let Some(n) = cur {
+                    heights[n - 1] += 1;
+                }
+            }
+            let fixed = all.len() - heights.iter().sum::<usize>();
+            for sel in 0..5 {
+                for room in fixed + 3..fixed + 14 {
+                    let rows = at(sel, room, w);
+                    assert!(rows.len() <= room, "{w} {sel} {room}: {rows:?}");
+                    let slack = room - rows.len();
+                    let end = 1 + rows[1..]
+                        .iter()
+                        .position(|l| l.starts_with('─') || l.starts_with('╌'))
+                        .unwrap();
+                    let (above, shown, below, cursor) = read_window(&rows[..end]);
+                    let ctx = format!("{w} {sel} {room}: {rows:?}");
+                    assert_eq!(cursor, Some(sel + 1), "{ctx}");
+                    assert!(shown.windows(2).all(|p| p[1] == p[0] + 1), "{ctx}");
+                    assert_eq!(above, shown[0] - 1, "{ctx}");
+                    assert_eq!(below, 5 - shown.last().unwrap(), "{ctx}");
+                    // Whether every option shown is shown whole.
+                    let whole: usize = shown.iter().map(|n| heights[n - 1]).sum();
+                    let marks = usize::from(above > 0) + usize::from(below > 0);
+                    let head = rows[1..].iter().position(String::is_empty).unwrap() + 2;
+                    let head = head + rows[head..].iter().position(String::is_empty).unwrap() + 1;
+                    if end - head != whole + marks {
+                        // The cursor's option alone, cut to the room: nothing else fits.
+                        assert_eq!(shown, [sel + 1], "{ctx}");
+                        assert_eq!(slack, 0, "{ctx}");
+                        continue;
+                    }
+                    // No hidden neighbour would have fitted in what is left over.
+                    if above > 0 {
+                        let freed = usize::from(above == 1);
+                        assert!(heights[above - 1] > slack + freed, "above, {ctx}");
+                    }
+                    if below > 0 {
+                        let freed = usize::from(below == 1);
+                        let next = *shown.last().unwrap();
+                        assert!(heights[next] > slack + freed, "below, {ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrolled_back_the_prompt_is_pinned_whole_or_with_its_ellipsis() {
+        let pinned = |prompt: &str| {
+            let mut c = convo();
+            let numbers: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+            feed(
+                &mut c,
+                &[
+                    &format!(r#"{{"t":"add","id":1,"k":"user","x":"{prompt}"}}"#),
+                    &format!(
+                        r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+                        numbers.join("\\n")
+                    ),
+                ],
+            );
+            let mut ui = Ui::new();
+            ui.scroll = 4;
+            text(&draw(&c, &ui, 40, 24, Instant::now()))[0].clone()
+        };
+        assert_eq!(pinned("short one"), "❯ short one");
+        assert_eq!(
+            pinned("Write the numbers 1 to 60, one per line."),
+            "❯ Write the numbers 1 to 60, one per…"
+        );
+    }
+
+    #[test]
+    fn scrolled_back_the_way_down_sits_over_the_prompt_however_little_there_is() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[r#"{"t":"add","id":1,"k":"text","x":"only this"}"#],
+        );
+        let mut ui = Ui::new();
+        ui.scroll = 3;
+        let rows = text(&draw(&c, &ui, 40, 24, Instant::now()));
+        let jump = rows
+            .iter()
+            .position(|l| l.contains("Jump to bottom"))
+            .unwrap();
+        let rule = rows.iter().position(|l| l.starts_with("────")).unwrap();
+        assert_eq!(jump + 2, rule, "{rows:?}");
+    }
+
+    #[test]
+    fn while_claude_works_the_cursor_is_still_in_the_prompt() {
+        let mut c = convo();
+        feed(&mut c, &[r#"{"t":"st","s":"working"}"#]);
+        let mut ui = Ui::new();
+        ui.input = "abc".into();
+        ui.cursor = 3;
+        let f = draw(&c, &ui, 40, 24, Instant::now());
+        let (row, col) = f.cursor.unwrap();
+        assert_eq!(plain(&f.lines[row]), "❯ abc");
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn a_dialogs_title_is_bold_lavender() {
+        let titled = |d: Vec<Line>, title: &str| {
+            let row = d.into_iter().find(|l| plain(l) == title).unwrap();
+            assert_eq!(row[0].1, bold(LAVENDER), "{title}");
+        };
+        titled(mode_dialog(&convo(), 0, 40), "   Permission mode");
+        titled(model_dialog(&convo(), 0, &None, 40), "   Select model");
+        titled(effort_dialog(1, 40), "   Effort");
+        assert_eq!(
+            bold(LAVENDER),
+            St {
+                fg: Some(LAVENDER),
+                bold: true,
+                ..PLAIN
+            }
+        );
+    }
+
+    #[test]
+    fn each_effort_level_has_claude_codes_glyph() {
+        let glyphs: Vec<&str> = EFFORT_CHOICES[1..]
+            .iter()
+            .map(|l| effort_glyph(l))
+            .collect();
+        assert_eq!(glyphs, ["○", "◐", "●", "◉", "◉"]);
+        let m = Meta {
+            model: "claude-opus-5-5".into(),
+            effort: "low".into(),
+            ..Meta::default()
+        };
+        assert_eq!(settings(&m).as_deref(), Some("Opus 5.5 ○ low"));
+    }
+
+    #[test]
+    fn the_suggestion_list_shows_the_chosen_one_with_as_many_before_it_as_fit() {
+        // Ten commands, each one line but the chosen one, which takes two.
+        let list: Vec<Command> = (0..10)
+            .map(|i| Command {
+                name: format!("c{i}"),
+                about: if i == 7 {
+                    "What this one does takes more words than one line holds at forty".into()
+                } else {
+                    "Short".into()
+                },
+                hint: String::new(),
+            })
+            .collect();
+        let names = |sel: usize| -> Vec<String> {
+            suggest_lines(&list, sel, 40)
+                .iter()
+                .map(plain)
+                .filter_map(|l| {
+                    l.trim_start_matches([' ', '❯'])
+                        .split(' ')
+                        .next()
+                        .filter(|n| n.starts_with('/'))
+                        .map(String::from)
+                })
+                .collect()
+        };
+        assert_eq!(names(7), ["/c4", "/c5", "/c6", "/c7"]);
+        assert_eq!(names(8), ["/c5", "/c6", "/c7", "/c8"]);
+        assert_eq!(names(2), ["/c0", "/c1", "/c2", "/c3", "/c4"]);
+        // A name exactly as wide as its column allows keeps two spaces before what it does;
+        // one wider is cut from the left.
+        let named = |name: &str| Command {
+            name: name.into(),
+            about: "Does it".into(),
+            hint: String::new(),
+        };
+        let first = |c: Command| plain(&suggest_lines(&[c], 0, 40)[0]);
+        assert_eq!(first(named("abcdefghijklm")), "  ❯ /abcdefghijklm  Does it");
+        assert_eq!(
+            first(named("abcdefghijklmn")),
+            "  ❯ …bcdefghijklmn  Does it"
         );
     }
 }
