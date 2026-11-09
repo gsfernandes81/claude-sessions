@@ -1950,6 +1950,207 @@ pub(crate) mod tests {
         }
     }
 
+    /// What was written to `inbox` by a delivery that has returned: its one line, read, or
+    /// `None` when nothing was written there.
+    fn received(inbox: &UnixListener) -> Option<Value> {
+        inbox.set_nonblocking(true).unwrap();
+        let (mut conn, _) = inbox.accept().ok()?;
+        conn.set_nonblocking(false).unwrap();
+        let mut text = String::new();
+        conn.read_to_string(&mut text).unwrap();
+        assert!(
+            text.ends_with('\n') && text.matches('\n').count() == 1,
+            "{text:?}"
+        );
+        Some(json::parse(&text).unwrap())
+    }
+
+    /// The `from` and `from-name` a delivered frame carries, as its wrapper says them.
+    fn sender(v: &Value) -> (String, String) {
+        let w = Wrapper::parse(at(v, &["message", "content"]).as_str().unwrap()).unwrap();
+        assert_eq!(w.from.as_deref(), at(v, &["from"]).as_str());
+        (w.from.unwrap(), w.from_name.unwrap())
+    }
+
+    #[test]
+    fn a_delivery_reaches_the_slots_claude_from_the_senders_stand_in_and_listed_name() {
+        let fx = Fx::new("deliver");
+        let claude = fx.claude("claude-3", 4_000_011);
+        let _other = fx.claude("claude-4", 4_000_012);
+        let mut tunnel = entry("b/claude-1", true);
+        tunnel.title = "fix the tunnel".into();
+        fx.relay
+            .set_roster(vec![tunnel], Some("a".into()), Vec::new());
+        let msg = json::parse(&message_of(300)).unwrap();
+        let uds = |p: PathBuf| format!("uds:{}", p.display());
+        let socks = fx.dir.join("socks");
+
+        // From another container: from its stand-in here, by the name it is listed by.
+        fx.relay.deliver("claude-3", "b/claude-1", &msg).unwrap();
+        let got = received(&claude).expect("written to the claude's own socket, moved aside");
+        assert_eq!(
+            sender(&got),
+            (
+                uds(stand_in_path(&socks, "b/claude-1")),
+                "b/claude-1 fix the tunnel".into()
+            )
+        );
+        // A sender the roster has not reached yet: a stand-in made for it, named by its
+        // address alone.
+        fx.relay.deliver("claude-3", "c/claude-9", &msg).unwrap();
+        let got = received(&claude).unwrap();
+        assert_eq!(
+            sender(&got),
+            (
+                uds(stand_in_path(&socks, "c/claude-9")),
+                "c/claude-9".into()
+            )
+        );
+        assert!(stand_in_path(&socks, "c/claude-9").exists());
+        // From another slot here: from its own path, which the relay fronts.
+        fx.relay.deliver("claude-3", "a/claude-4", &msg).unwrap();
+        let got = received(&claude).unwrap();
+        assert_eq!(
+            sender(&got),
+            (uds(socks.join("4000012.sock")), "a/claude-4".into())
+        );
+        // A control frame goes the same way, its fields kept.
+        let ctl =
+            json::parse(r#"{"type":"control","action":"peer_message_status","orig_msg_id":"m1"}"#)
+                .unwrap();
+        fx.relay.deliver("claude-3", "b/claude-1", &ctl).unwrap();
+        let got = received(&claude).unwrap();
+        assert_eq!(at(&got, &["orig_msg_id"]).as_str(), Some("m1"));
+        assert!(received(&claude).is_none(), "calibration: one each");
+    }
+
+    #[test]
+    fn a_delivery_that_cannot_be_written_now_is_bounced_and_one_that_never_can_is_refused() {
+        use Undelivered::{Later, Never};
+        let fx = Fx::new("undelivered");
+        let claude = fx.claude("claude-3", 4_000_021);
+        fx.relay
+            .set_roster(Vec::new(), Some("a".into()), Vec::new());
+        let msg = json::parse(&message_of(300)).unwrap();
+        let later = |r: Result<(), Undelivered>, says: &str| match r {
+            Err(Later(why)) => assert!(why.contains(says), "{why:?} should say {says:?}"),
+            other => panic!("{other:?}"),
+        };
+        later(
+            fx.relay.deliver("claude-7", "b/claude-1", &msg),
+            "no claude running",
+        );
+        later(
+            fx.relay.deliver("claude-3", "a/claude-8", &msg),
+            "not fronted here yet",
+        );
+        assert!(matches!(
+            fx.relay.deliver("claude-3", "b", &msg),
+            Err(Never(_))
+        ));
+        let raw = json::parse(r#"{"type":"user","message":{"content":"hi"}}"#).unwrap();
+        assert!(matches!(
+            fx.relay.deliver("claude-3", "b/claude-1", &raw),
+            Err(Never(_))
+        ));
+        // A claude speaking another protocol is not written to.
+        let _two = fx.claude("claude-5", 4_000_022);
+        fs::write(
+            fx.dir.join("sessions/4000022.json"),
+            r#"{"pid":4000022,"messagingSocketPath":"/nowhere.sock","peerProtocol":2}"#,
+        )
+        .unwrap();
+        later(
+            fx.relay.deliver("claude-5", "b/claude-1", &msg),
+            "does not speak peer protocol 1",
+        );
+        assert!(received(&claude).is_none(), "nothing written");
+        // A delivery's line, its newline counted, may be as long as Claude Code's cap and no
+        // longer. The relay's rewrite sets `from`, so the frame is sized by what it becomes.
+        let sized = |len: usize| {
+            let stand_in = stand_in_path(&fx.dir.join("socks"), "b/claude-1");
+            let grown = json::to_line(&rewrite(&msg, &stand_in, "b/claude-1").unwrap()).len() + 1
+                - json::to_line(&msg).len();
+            json::parse(&message_of(len - grown)).unwrap()
+        };
+        let at_cap = sized(MAX_LINE);
+        let reader = {
+            let inbox = claude.try_clone().unwrap();
+            std::thread::spawn(move || {
+                inbox.set_nonblocking(false).unwrap();
+                let (mut conn, _) = inbox.accept().unwrap();
+                let mut text = String::new();
+                conn.read_to_string(&mut text).unwrap();
+                text.len()
+            })
+        };
+        fx.relay.deliver("claude-3", "b/claude-1", &at_cap).unwrap();
+        assert_eq!(reader.join().unwrap(), MAX_LINE);
+        assert_eq!(
+            fx.relay
+                .deliver("claude-3", "b/claude-1", &sized(MAX_LINE + 1)),
+            Err(Never("over Claude Code's line cap".into()))
+        );
+        // A relay that has lost its lock, or is off, bounces what it is given.
+        fx.relay.lock().off = Some("protocol".into());
+        later(
+            fx.relay.deliver("claude-3", "b/claude-1", &msg),
+            "the relay is off",
+        );
+        fx.relay.lock().off = None;
+        fx.relay.stop();
+        later(
+            fx.relay.deliver("claude-3", "b/claude-1", &msg),
+            "another agent holds",
+        );
+    }
+
+    #[test]
+    fn peer_check_passes_a_claude_whose_inbox_speaks_protocol_1_and_answers() {
+        let dir = std::env::temp_dir().join(format!("cs-check-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let inbox = dir.join("inbox.sock");
+        let _listening = UnixListener::bind(&inbox).unwrap();
+        // A stand-in claude: it writes its record as Claude Code does, then waits for its input
+        // to close, as a headless claude does.
+        let claude = |name: &str, record: Option<String>| {
+            let path = dir.join(name);
+            let body = match record {
+                Some(r) => format!(
+                    "#!/bin/sh\nmkdir -p \"$CLAUDE_CONFIG_DIR/sessions\"\n\
+                     printf '%s' '{r}' > \"$CLAUDE_CONFIG_DIR/sessions/$$.json\"\n\
+                     exec cat >/dev/null\n"
+                ),
+                None => "#!/bin/sh\nexit 0\n".into(),
+            };
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        };
+        let rec = |protocol: u32, sock: &Path| {
+            format!(
+                r#"{{"version":"9.9.9","peerProtocol":{protocol},"messagingSocketPath":"{}"}}"#,
+                sock.display()
+            )
+        };
+        let good = claude("good", Some(rec(1, &inbox)));
+        assert_eq!(
+            check(Some(&good)),
+            Ok("claude 9.9.9 speaks peer protocol 1, and its inbox answers".into())
+        );
+        let two = claude("two", Some(rec(2, &inbox)));
+        let why = check(Some(&two)).unwrap_err();
+        assert!(why.contains("speaks peer protocol 2, not 1"), "{why}");
+        let deaf = claude("deaf", Some(rec(1, &dir.join("nothing.sock"))));
+        let why = check(Some(&deaf)).unwrap_err();
+        assert!(why.contains("does not answer"), "{why}");
+        let silent = claude("silent", None);
+        let why = check(Some(&silent)).unwrap_err();
+        assert!(why.contains("wrote no session record"), "{why}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Whether `listener`, a stand-in claude's own socket, takes a connection within a second.
     fn answers(listener: &UnixListener) -> bool {
         listener.set_nonblocking(true).unwrap();
