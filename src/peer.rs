@@ -512,9 +512,13 @@ fn local_claudes() -> Vec<(String, u32)> {
 }
 
 fn running_claudes() -> Vec<registry::SlotRecord> {
-    registry::all()
-        .unwrap_or_default()
-        .into_iter()
+    claudes_running(registry::all().unwrap_or_default())
+}
+
+/// The records of `all` that are claude slots with a claude running: a pi slot is not carried
+/// (design § *Agent messaging*), and an offloaded or closed slot has no inbox to front.
+fn claudes_running(all: Vec<registry::SlotRecord>) -> Vec<registry::SlotRecord> {
+    all.into_iter()
         .filter(|r| r.state.is_running() && r.harness == crate::harness::Harness::Claude)
         .collect()
 }
@@ -683,20 +687,7 @@ impl Relay {
     /// relay lock (one agent per container relays; another, from a hub not yet gone, may
     /// still hold it) and a roster.
     pub fn start(tell: Tell) -> Arc<Relay> {
-        let relay = Arc::new(Relay {
-            tell,
-            sessions: sessions_dir(),
-            socks: socket_dir(),
-            state: Mutex::new(State {
-                lock: None,
-                roster: Vec::new(),
-                own: Vec::new(),
-                repo: None,
-                stand_ins: HashMap::new(),
-                fronted: HashMap::new(),
-                off: None,
-            }),
-        });
+        let relay = Relay::new(tell, sessions_dir(), socket_dir());
         let r = relay.clone();
         std::thread::spawn(move || {
             let path = registry::dir().join("peer.lock");
@@ -722,6 +713,25 @@ impl Relay {
             }
         });
         relay
+    }
+
+    /// A relay holding nothing yet, over Claude Code's records in `sessions` and its inboxes
+    /// in `socks`.
+    fn new(tell: Tell, sessions: PathBuf, socks: PathBuf) -> Arc<Relay> {
+        Arc::new(Relay {
+            tell,
+            sessions,
+            socks,
+            state: Mutex::new(State {
+                lock: None,
+                roster: Vec::new(),
+                own: Vec::new(),
+                repo: None,
+                stand_ins: HashMap::new(),
+                fronted: HashMap::new(),
+                off: None,
+            }),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1488,6 +1498,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn only_a_running_claude_slot_is_a_local_claude() {
+        use crate::clock::Moment;
+        use registry::{SlotRecord, State};
+        let rec = |slot: &str, state: State| SlotRecord {
+            state,
+            ..SlotRecord::new(slot, Moment::ms(0))
+        };
+        let all = vec![
+            rec("claude-1", State::Live),
+            rec("claude-2", State::Offloading),
+            rec("claude-3", State::Offloaded),
+            rec("claude-4", State::Closed),
+            rec("pi-1", State::Live),
+        ];
+        let got: Vec<String> = claudes_running(all).into_iter().map(|r| r.slot).collect();
+        assert_eq!(got, ["claude-1", "claude-2"]);
+    }
+
+    #[test]
     fn an_address_is_two_names_either_side_of_one_slash() {
         assert_eq!(split_addr("or3/claude-2"), Some(("or3", "claude-2")));
         for bad in [
@@ -1635,20 +1664,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("123.sock");
         let claude = UnixListener::bind(&path).unwrap();
-        let relay = Arc::new(Relay {
-            tell: Arc::new(|_| {}),
-            sessions: dir.join("sessions"),
-            socks: dir.clone(),
-            state: Mutex::new(State {
-                lock: None,
-                roster: Vec::new(),
-                own: Vec::new(),
-                repo: None,
-                stand_ins: HashMap::new(),
-                fronted: HashMap::new(),
-                off: None,
-            }),
-        });
+        let relay = Relay::new(Arc::new(|_| {}), dir.join("sessions"), dir.clone());
         UnixStream::connect(&path).unwrap();
         assert!(
             answers(&claude),
@@ -1689,6 +1705,71 @@ pub(crate) mod tests {
         UnixStream::connect(&path).unwrap();
         assert!(answers(&claude));
         assert!(!moved_path(&path).exists());
+
+        // A claude that binds a new socket at its path is let go: the new socket is left
+        // alone, and the old one moved aside goes.
+        let f = relay
+            .front("near", "claude-1", 7, &path, "near/claude-1 t".into())
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+        let rebound = UnixListener::bind(&path).unwrap();
+        assert!(!f.ours());
+        drop(f);
+        assert!(!moved_path(&path).exists());
+        UnixStream::connect(&path).unwrap();
+        assert!(
+            answers(&rebound),
+            "the claude's new socket is still its own"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relay_starting_removes_only_the_stand_ins_an_earlier_one_left() {
+        let dir = std::env::temp_dir().join(format!("cs-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (sessions, socks, elsewhere) = (dir.join("sessions"), dir.join("socks"), dir.join("x"));
+        for d in [&sessions, &socks, &elsewhere] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let sock = |p: PathBuf| {
+            drop(UnixListener::bind(&p).unwrap());
+            p
+        };
+        let rec = |name: &str, domain: &str, sock: &Path| {
+            let path = sessions.join(name);
+            let text = format!(
+                r#"{{"pidDomain":"{domain}","messagingSocketPath":"{}"}}"#,
+                sock.display()
+            );
+            fs::write(&path, text).unwrap();
+            path
+        };
+        // An earlier agent's stand-in: its record and its socket go.
+        let left_sock = sock(socks.join("00000000000000aa.sock"));
+        let left = rec("5000001.json", "claude-sessions:or3", &left_sock);
+        // A claude's own record and inbox stay.
+        let claude_sock = sock(socks.join("42.sock"));
+        let claude = rec("42.json", "host-1", &claude_sock);
+        // A record of ours naming a socket outside the inbox directory: the record goes, and
+        // nothing outside the directory is touched.
+        let outside = sock(elsewhere.join("bb.sock"));
+        let stray = rec("5000002.json", "claude-sessions:or3", &outside);
+        // Not a record at all.
+        let notes = rec("notes.txt", "claude-sessions:or3", &left_sock);
+        let relay = Relay::new(Arc::new(|_| {}), sessions.clone(), socks.clone());
+        relay.sweep();
+        assert!(
+            !left.exists() && !left_sock.exists(),
+            "an earlier stand-in goes"
+        );
+        assert!(!stray.exists());
+        assert!(
+            claude.exists() && claude_sock.exists(),
+            "a claude's own stays"
+        );
+        assert!(outside.exists(), "nothing outside the inbox directory");
+        assert!(notes.exists(), "only records are read");
         let _ = fs::remove_dir_all(&dir);
     }
 
