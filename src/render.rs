@@ -337,10 +337,6 @@ fn text(s: &str, style: Style) -> Line {
     line
 }
 
-fn blank() -> Line {
-    Line::default()
-}
-
 fn rule(w: usize) -> Line {
     text(&"─".repeat(w), DIM)
 }
@@ -609,7 +605,7 @@ fn list_lines(view: &View, w: usize, room: usize) -> Vec<Line> {
                 let label = format!("{} · {says}", view.rows[i].age);
                 heading(Group::Archived, &label, w, i == view.cursor)
             }
-            Item::Blank => blank(),
+            Item::Blank => Line::default(),
         })
         .collect();
     if more > 0 {
@@ -768,7 +764,7 @@ fn list_screen(view: &View, w: usize, h: usize) -> (Vec<Line>, Vec<Line>) {
     let mut out = vec![header(view), rule(w)];
     let hints = if let Some(b) = view.busy.as_ref().filter(|b| b.loading) {
         // Mockup 10: the frame at once, and the spinner where the list will go.
-        out.push(blank());
+        out.push(Line::default());
         let mut line = Line::default();
         line.push(b.glyph(), FG).push(" ", FG).push(&b.what, DIM);
         out.push(line);
@@ -886,9 +882,9 @@ pub fn status_line_count(width: u16, status: &str) -> usize {
 /// Mockup 2, between the rules. `s   a shell instead` is the owner's correction of
 /// 2026-10-02 (it read `q`, which quits).
 fn empty_body(view: &View, w: usize) -> Vec<Line> {
-    let mut out = vec![blank()];
+    let mut out = vec![Line::default()];
     paragraph(&mut out, "No claude session in this container.", 2, w, FG);
-    out.push(blank());
+    out.push(Line::default());
     let start = format!("start one in {}", view.workspace);
     keyed(&mut out, 2, ("n", BLUE), 4, &[&start], w);
     keyed(&mut out, 2, ("s", BLUE), 4, &["a shell instead"], w);
@@ -902,18 +898,18 @@ fn empty_body(view: &View, w: usize) -> Vec<Line> {
             w,
         );
     }
-    out.push(blank());
+    out.push(Line::default());
     out
 }
 
 /// Mockup 14: one container that is not answering, between the rules — that it is not, what
 /// was said about it, and the two ways on.
 fn down_body(view: &View, why: &str, w: usize) -> Vec<Line> {
-    let mut out = vec![blank()];
+    let mut out = vec![Line::default()];
     let said = format!("{} is not answering:", view.header.host);
     paragraph(&mut out, &said, 2, w, FG);
     paragraph(&mut out, why, 2, w, DIM);
-    out.push(blank());
+    out.push(Line::default());
     keyed(
         &mut out,
         2,
@@ -930,7 +926,7 @@ fn down_body(view: &View, why: &str, w: usize) -> Vec<Line> {
         &["back to every container"],
         w,
     );
-    out.push(blank());
+    out.push(Line::default());
     out
 }
 
@@ -991,7 +987,7 @@ fn keys_screen(view: &View, w: usize) -> (Vec<Line>, Vec<Line>) {
     for (key, what) in keys.into_iter().filter(|(k, _)| offered(k)) {
         keyed(&mut out, 0, (key, BLUE), 7, what, w);
     }
-    out.push(blank());
+    out.push(Line::default());
     // The home has its containers; one container's screen has no containers.
     let groups = Group::ALL.into_iter().filter(|g| match g {
         Group::Containers => view.home,
@@ -1061,7 +1057,7 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
     match dialog {
         Dialog::NoRoom { used, limit, want } => {
             paragraph(&mut out, "No room for another claude", 0, tw, BOLD);
-            out.push(blank());
+            out.push(Line::default());
             let why = format!(
                 "{} of {} used. A new one wants about {}.",
                 human(*used),
@@ -1069,12 +1065,12 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
                 human(*want)
             );
             paragraph(&mut out, &why, 0, tw, FG);
-            out.push(blank());
+            out.push(Line::default());
             // No session is offered (owner, 2026-11-03): `c` offloads whichever one the owner
             // picks, so that is the advice, as the remote view gives it.
             let how = "c on a loaded session offloads it to make room.";
             paragraph(&mut out, how, 0, tw, FG);
-            out.push(blank());
+            out.push(Line::default());
             out.extend(hint_lines(&[("Esc", "back")], GAP, tw));
         }
         Dialog::ResumeFailed {
@@ -1087,7 +1083,7 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
         } => {
             paragraph(&mut out, "This session did not resume", 0, tw, BOLD);
             paragraph(&mut out, title, 2, tw, FG);
-            out.push(blank());
+            out.push(Line::default());
             // zmx does not report its program's status (owner, 2026-10-06: `ended`, not
             // `exited 1`); the one thing the number told, a kill for memory, is read from the
             // cgroup instead.
@@ -1111,14 +1107,14 @@ fn dialog_body(dialog: &Dialog, tw: usize, room: usize) -> Vec<Line> {
             if said.is_empty() {
                 paragraph(&mut said, "and wrote nothing to stderr", 2, tw, FG);
             }
-            let mut tail = vec![blank()];
+            let mut tail = vec![Line::default()];
             let left = if *closed {
                 "Left archived. Nothing was deleted; the transcript may be gone."
             } else {
                 "Left offloaded. Nothing was deleted; the transcript may be gone."
             };
             paragraph(&mut tail, left, 0, tw, FG);
-            tail.push(blank());
+            tail.push(Line::default());
             let buttons = [("r", "retry"), ("c", "archive it"), ("Esc", "back")];
             tail.extend(hint_lines(&buttons, GAP, tw));
             // stderr is the one part of unbounded length. When it cannot all fit, its last
@@ -1628,15 +1624,18 @@ mod tests {
             ("", Some(BRANCH)),
             ("!", Some(CORNER)),
         ] {
-            for indent in [0, 2] {
-                let r = row(flags, &long, "14m");
+            // A pi session's mark takes its columns from the title too.
+            for (indent, r) in [0, 2].into_iter().flat_map(|i| {
+                [
+                    (i, row(flags, &long, "14m")),
+                    (i, pi_row(flags, &long, "14m")),
+                ]
+            }) {
                 let line = super::row(&r, 40, indent, false, None, branch);
                 let text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
-                assert_eq!(width(&text), 40, "{flags:?} {branch:?} {indent}: {text:?}");
-                assert!(
-                    text.ends_with("  14m"),
-                    "{flags:?} {branch:?} {indent}: {text:?}"
-                );
+                let at = format!("{flags:?} {branch:?} {indent} {:?}", r.key);
+                assert_eq!(width(&text), 40, "{at}: {text:?}");
+                assert!(text.ends_with("  14m"), "{at}: {text:?}");
             }
         }
     }
@@ -1670,6 +1669,58 @@ mod tests {
         assert_eq!(wrap("  a   b ", 3), ["a b"]);
         assert_eq!(wrap("", 3), [""]);
         assert_eq!(wrap("abc", 0), ["abc"]);
+    }
+
+    fn plain_of(line: &Line) -> String {
+        line.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn the_load_figures_are_squeezed_only_where_they_do_not_fit_and_never_cut() {
+        let f = load_of("infra-dev", 812, 1024);
+        // Wide enough for everything, and too narrow for anything: the two forms, whole.
+        let full = plain_of(&figures_line(&f, 1000));
+        let full = full.strip_suffix(", infra-dev").expect(&full).to_string();
+        let squeezed = plain_of(&figures_line(&f, 0));
+        assert!(width(&squeezed) < width(&full), "{squeezed:?} {full:?}");
+        for w in 0..width(&full) + 20 {
+            let text = plain_of(&figures_line(&f, w));
+            let figures = if width(&full) <= w { &full } else { &squeezed };
+            let place = format!("{figures}, infra-dev");
+            assert!(text == *figures || text == place, "{w}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_link_is_said_whole_after_the_figures_where_both_fit() {
+        let down = "⠋ Reconnecting… (8s)";
+        let mut v = view(40, listed(), 812);
+        v.reconnecting = Some(down.to_string());
+        let f = v.load.clone().unwrap();
+        for w in width(down)..120 {
+            let text = plain_of(&load_line(&v, w).unwrap());
+            let figures = plain_of(&figures_line(&f, w));
+            if width(&figures) + width(" · ") + width(down) <= w {
+                assert_eq!(text, format!("{figures} · {down}"), "{w}");
+            } else {
+                assert_eq!(text, down, "{w}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_pi_conversation_is_marked_as_pi_and_a_claude_one_is_not() {
+        let stored = |harness| Row {
+            key: RowKey::Conversation {
+                id: "c".to_string(),
+                cwd: "/workspace".to_string(),
+                harness,
+            },
+            ..row("x", "an old one", "3d")
+        };
+        let text = |r: &Row| plain_of(&super::row(r, 40, 0, false, None, None));
+        assert!(text(&stored(crate::harness::Harness::Pi)).starts_with("pi: an old one"));
+        assert!(text(&stored(crate::harness::Harness::Claude)).starts_with("an old one"));
     }
 
     fn lines(frame: &Frame) -> Vec<String> {
