@@ -1129,6 +1129,11 @@ mod tests {
         assert_eq!(line(&mut a), format!("6\t{}", inp(yes)));
         assert_eq!(line(&mut a), format!("7\t{yes}"));
         c_out.write_all(format!("{no}\n").as_bytes()).unwrap();
+        // A view's lines are taken in order: once its next line is in, the answer was handled.
+        let after = &canon(r#"{"type":"user","message":{"role":"user","content":"after"}}"#);
+        c_out.write_all(format!("{after}\n").as_bytes()).unwrap();
+        assert_eq!(line(&mut a), format!("8\t{}", inp(after)));
+        assert_eq!(line(&mut a), format!("9\t{after}"));
 
         a_out.write_all(b"{\"quit\":1}\n").unwrap();
         assert_eq!(holder.join().unwrap(), 3, "claude's own exit status");
@@ -1141,10 +1146,11 @@ mod tests {
         assert_eq!(
             rest,
             format!(
-                "{}\n{prompt}\n{}\n{done}\n{}\n{yes}\n{}\n",
+                "{}\n{prompt}\n{}\n{done}\n{}\n{yes}\n{}\n{after}\n{}\n",
                 inp(prompt),
                 inp(done),
                 inp(yes),
+                inp(after),
                 inp(quit)
             ),
             "claude's lines raw, each view's line before it, and the late answer nowhere"
