@@ -94,4 +94,12 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # term.rs, 2026-11-13. `readable_within`: a poll that timed out (0) leaves `revents` 0,
+    # so `rc >= 0` answers as `rc > 0`. `read_keys`: a Linux pty's hangup polls with POLLIN
+    # set beside POLLHUP (tested), so the no-POLLIN branch is reached only for a descriptor
+    # closed under it. `size`: reads the live process's stdout and stdin, over `size_of`,
+    # which is tested on a pty.
+    'src/term\.rs:.*: replace > with >= in readable_within$',
+    'src/term\.rs:.*: replace & with \| in RawTerminal::read_keys$',
+    'src/term\.rs:.*: replace size -> ',
 ]
