@@ -2926,36 +2926,41 @@ fn effort_dialog(sel: usize, w: usize) -> Vec<Line> {
         format!(" {} {level} · /effort ", effort_glyph(level))
     };
     let left = w.saturating_sub(width(&tag) + 1);
-    let mut out = vec![vec![
-        ("▔".repeat(left), fg(LAVENDER)),
-        (tag, fg(LAVENDER)),
-        ("▔".into(), fg(LAVENDER)),
-    ]];
+    let mut out = vec![clip(
+        vec![
+            ("▔".repeat(left), fg(LAVENDER)),
+            (tag, fg(LAVENDER)),
+            ("▔".into(), fg(LAVENDER)),
+        ],
+        w,
+    )];
     out.push(line("   Effort", bold(LAVENDER)));
     out.push(Vec::new());
-    out.push(line(
-        format!("   Faster{}Smarter", " ".repeat(20)),
-        fg(GREY),
-    ));
+    // R6's slider wherever its labels fit, from 38 columns. Narrower, the labels close up to
+    // a space apart and the track and its ends shrink with them, so a phone keeps them all;
+    // what still does not fit is clipped at the edge.
+    let wide = w >= 38;
     // The labels, and the slider's mark under the chosen one.
     let mut labels = String::new();
     let mut at = 0;
     for (i, l) in EFFORT_CHOICES.iter().enumerate() {
         if i > 0 {
-            labels.push_str("  ");
+            labels.push_str(if wide { "  " } else { " " });
         }
         if i == sel {
             at = width(&labels) + (width(l) / 2).saturating_sub(1);
         }
         labels.push_str(l);
     }
-    let track = 34;
+    let track = if wide { 34 } else { width(&labels) };
+    let ends = format!("   Faster{}Smarter", " ".repeat(track - 14));
+    out.push(clip(line(ends, fg(GREY)), w));
     let mut slider = String::new();
     for i in 0..track {
         slider.push(if i == at { '▲' } else { '─' });
     }
-    out.push(vec![("   ".into(), PLAIN), (slider, fg(GREY))]);
-    out.push(line(format!("   {labels}"), PLAIN));
+    out.push(clip(vec![("   ".into(), PLAIN), (slider, fg(GREY))], w));
+    out.push(clip(line(format!("   {labels}"), PLAIN), w));
     out.push(Vec::new());
     out.extend(hints(
         &["←/→ to adjust", "Enter to confirm", "Esc to cancel"],
@@ -6224,6 +6229,43 @@ mod tests {
                 ..PLAIN
             }
         );
+    }
+
+    #[test]
+    fn the_effort_slider_closes_up_where_r6s_does_not_fit_and_never_runs_off() {
+        let rows = |sel: usize, w: usize| -> Vec<String> {
+            effort_dialog(sel, w).iter().map(plain).collect::<Vec<_>>()[3..6].to_vec()
+        };
+        // R6's own from 38 columns.
+        assert_eq!(rows(2, 38), rows(2, 40));
+        assert_eq!(rows(2, 40)[2], "   auto  low  medium  high  xhigh  max");
+        // Narrower, a space apart, the track as long as the labels and its mark under the
+        // chosen one.
+        assert_eq!(
+            rows(2, 37),
+            [
+                "   Faster                Smarter",
+                "   ───────────▲──────────────────",
+                "   auto low medium high xhigh max",
+            ]
+        );
+        for w in 20..=60 {
+            for (sel, label) in EFFORT_CHOICES.iter().enumerate() {
+                let d = effort_dialog(sel, w);
+                for l in &d {
+                    assert!(width(&plain(l)) <= w, "at {w}: {:?}", plain(l));
+                }
+                if w >= 33 {
+                    let r = rows(sel, w);
+                    let mark = r[1].chars().position(|c| c == '▲').unwrap();
+                    let under: String = r[2].chars().skip(mark).take(2).collect();
+                    assert!(
+                        label.contains(under.trim()) && !under.trim().is_empty(),
+                        "at {w}, {label}: {r:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
