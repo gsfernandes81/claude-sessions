@@ -241,7 +241,8 @@ pub fn route(fleet: &Fleet, host: &str, peer: &Value, now: u64) -> Route {
     ) {
         return Route::Drop("not a message or a control frame".into());
     }
-    if json::to_line(frame).len() > peer::MAX_LINE {
+    // Measured as it came; the relay measures it again once its `from` is rewritten.
+    if !peer::fits(&json::to_line(frame)) {
         return Route::Drop("over Claude Code's line cap".into());
     }
     if !fleet.slot(host, from_slot).is_some_and(|s| s.live) {
@@ -1163,26 +1164,38 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_up_to_claude_codes_line_cap_is_carried_and_one_past_it_is_not() {
+    fn a_frame_up_to_claude_codes_inbox_cap_in_characters_is_carried_and_one_past_it_is_not() {
         let f = fleet();
-        let sized = |len: usize| {
+        // A frame's line `len` characters long, as Claude Code counts them, of `c`s.
+        let sized_in = |len: usize, c: char| {
             let mut frame = json::parse(r#"{"type":"user","message":{"content":""}}"#).unwrap();
             let bare = json::to_line(&frame).len();
             let mut m = Value::obj();
-            m.set("content", Value::string("x".repeat(len - bare)));
+            m.set("content", Value::string(c.to_string().repeat(len - bare)));
             frame.set("message", m);
-            assert_eq!(json::to_line(&frame).len(), len, "calibration");
+            assert_eq!(
+                json::to_line(&frame).encode_utf16().count(),
+                len,
+                "calibration"
+            );
             let mut p = Value::obj();
             p.set("from", Value::string("claude-1"));
             p.set("to", Value::string("b/claude-1"));
             p.set("frame", frame);
             route(&f, "a", &p, 0)
         };
-        assert!(matches!(sized(peer::MAX_LINE), Route::Deliver(..)));
+        let sized = |len: usize| sized_in(len, 'x');
+        // With its newline, as long as the cap and no longer.
+        assert!(matches!(sized(peer::MAX_LINE - 1), Route::Deliver(..)));
         assert_eq!(
-            sized(peer::MAX_LINE + 1),
+            sized(peer::MAX_LINE),
             Route::Drop("over Claude Code's line cap".into())
         );
+        // In characters, not bytes: these take three each.
+        assert!(matches!(
+            sized_in(peer::MAX_LINE - 1, '中'),
+            Route::Deliver(..)
+        ));
     }
 
     #[test]

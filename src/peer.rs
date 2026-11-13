@@ -60,8 +60,19 @@ pub const DOMAIN_PREFIX: &str = "claude-sessions:";
 pub const HUB: &str = "hub";
 /// The tag Claude Code wraps a peer's message in.
 const TAG: &str = "cross-session-message";
-/// Claude Code's own cap on one line to an inbox.
+/// Claude Code's own cap on what an inbox holds unread (`bBn` in 2.1.323's bundle): it reads
+/// a connection's text into a buffer and drops the connection once that passes this many
+/// characters, JavaScript's (UTF-16 units, not bytes), before it splits a line off. So a
+/// line and its newline must come within it. Its sender budgets its auth line on top, so a
+/// frame from a real claude is shorter still.
 pub const MAX_LINE: usize = 1 << 20;
+
+/// Whether `line`, with the newline that ends it, is within an inbox's cap, counted as
+/// Claude Code counts it. The router, the relay and a stand-in all measure by this, so a
+/// frame one of them passes is not one another refuses for its length.
+pub fn fits(line: &str) -> bool {
+    line.encode_utf16().count() < MAX_LINE
+}
 /// How long a connection to a stand-in may take to say what it has.
 const READ_WAIT: Duration = Duration::from_secs(10);
 /// How long a write into a local inbox may take.
@@ -1047,9 +1058,9 @@ impl Relay {
         };
         let _ = conn.set_read_timeout(Some(READ_WAIT));
         let mut buf = Vec::new();
-        let read = (&mut conn)
-            .take(2 * MAX_LINE as u64 + 2)
-            .read_to_end(&mut buf);
+        // All a claude may send on one connection: the cap's characters at the most bytes
+        // UTF-8 takes for one (three, for a character UTF-16 holds in one unit).
+        let read = (&mut conn).take(3 * MAX_LINE as u64).read_to_end(&mut buf);
         if buf.is_empty() {
             // A liveness probe: Claude Code connects and closes before it sends.
             return;
@@ -1072,7 +1083,7 @@ impl Relay {
         };
         let text = String::from_utf8_lossy(&buf);
         for line in text.split('\n') {
-            if line.trim().is_empty() || line.len() > MAX_LINE {
+            if line.trim().is_empty() || !fits(line) {
                 continue;
             }
             let Ok(frame) = json::parse(line) else {
@@ -1177,10 +1188,10 @@ impl Relay {
         let out = rewrite(frame, &stand_in, &from_name)
             .ok_or_else(|| Never("not a message Claude Code would take".into()))?;
         let mut line = json::to_line(&out);
-        line.push('\n');
-        if line.len() > MAX_LINE {
+        if !fits(&line) {
             return Err(Never("over Claude Code's line cap".into()));
         }
+        line.push('\n');
         let mut s =
             UnixStream::connect(&socket).map_err(|e| Later(format!("{to}'s inbox: {e}")))?;
         let _ = s.set_write_timeout(Some(WRITE_WAIT));
@@ -1760,6 +1771,11 @@ pub(crate) mod tests {
 
     /// A peer message in Claude Code's form whose line is exactly `len` bytes.
     fn message_of(len: usize) -> String {
+        message_in(len, 'x')
+    }
+
+    /// A message's line `len` characters long, as Claude Code counts them, its body `c`s.
+    fn message_in(len: usize, c: char) -> String {
         let line = |body: &str| {
             let w = Wrapper {
                 from: Some("uds:/tmp/cc-socks/1.sock".into()),
@@ -1775,8 +1791,8 @@ pub(crate) mod tests {
             json::to_line(&f)
         };
         let bare = line("").len();
-        let out = line(&"x".repeat(len - bare));
-        assert_eq!(out.len(), len, "calibration");
+        let out = line(&c.to_string().repeat((len - bare) / c.len_utf16()));
+        assert_eq!(out.encode_utf16().count(), len, "calibration");
         out
     }
 
@@ -1818,17 +1834,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_frame_up_to_the_line_cap_is_carried_and_a_connection_is_read_to_two_lines() {
+    fn a_frame_within_the_inbox_cap_is_carried_counted_in_characters_as_claude_code_counts() {
         let fx = Fx::new("cap");
         let _inbox = fx.claude("claude-3", std::process::id());
         let small = message_of(300);
-        // Two lines at Claude Code's cap are read whole; what follows them is not read, so one
-        // connection cannot make the relay hold more.
-        let full = message_of(MAX_LINE);
-        fx.send("b/claude-1", format!("{full}\n{full}\n{small}\n"));
-        assert_eq!(fx.carried().len(), 2);
-        // A line past the cap is passed over, whatever it holds.
-        let over = message_of(MAX_LINE + 1);
+        // A line that with its newline is as long as Claude Code's cap is carried, however
+        // many bytes its characters take: three each here, so over twice the cap in bytes.
+        let full = message_in(MAX_LINE - 1, '中');
+        assert!(full.len() > 2 * MAX_LINE, "calibration");
+        fx.send("b/claude-1", format!("{full}\n"));
+        assert_eq!(fx.carried().len(), 1);
+        // What follows the most a connection can carry is not read, so one connection cannot
+        // make the relay hold more.
+        fx.send("b/claude-1", format!("{full}\n{full}\n"));
+        assert_eq!(fx.carried().len(), 1);
+        // A character more is passed over, whatever it holds.
+        let over = message_of(MAX_LINE);
         fx.send("b/claude-1", format!("{over}\n{small}\n"));
         let got: Vec<Value> = fx.carried().into_iter().map(|(_, _, f)| f).collect();
         assert_eq!(got, [json::parse(&small).unwrap()]);
@@ -2189,6 +2210,25 @@ pub(crate) mod tests {
                 .deliver("claude-3", "b/claude-1", &sized(MAX_LINE + 1)),
             Err(Never("over Claude Code's line cap".into()))
         );
+        // Counted in characters, as Claude Code counts them, not bytes: one that takes three
+        // bytes still counts one.
+        let wide = {
+            let stand_in = stand_in_path(&fx.dir.join("socks"), "b/claude-1");
+            let grown = json::to_line(&rewrite(&msg, &stand_in, "b/claude-1").unwrap()).len() + 1
+                - json::to_line(&msg).len();
+            json::parse(&message_in(MAX_LINE - grown, '中')).unwrap()
+        };
+        let reader = {
+            let inbox = claude.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let (mut conn, _) = inbox.accept().unwrap();
+                let mut text = String::new();
+                conn.read_to_string(&mut text).unwrap();
+                text.encode_utf16().count()
+            })
+        };
+        fx.relay.deliver("claude-3", "b/claude-1", &wide).unwrap();
+        assert_eq!(reader.join().unwrap(), MAX_LINE);
         // A relay that has lost its lock, or is off, bounces what it is given.
         fx.relay.lock().off = Some("protocol".into());
         later(
