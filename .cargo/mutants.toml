@@ -94,4 +94,17 @@ exclude_re = [
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # relay.rs and holder.rs. Only a chunk's size changes: the transcript read backwards a
+    # block at a time (BACK_BLOCK, the only const multiplied at that column in those lines)
+    # and the tap's read buffer give the same lines either way.
+    'src/holder\.rs:1\d\d:28: replace \* with \+$',
+    'src/holder\.rs:.*: replace \* with \+ in tap$',
+    # A slot's keep-alive already ending exactly when the view's would is the same either way.
+    'src/holder\.rs:.*: replace < with <= in stamped$',
+    # How often the relay reads the load, `next_load = now + load_every` (the column tells it
+    # from the retry's `+`, which tests/relay.rs kills): only the load read more often.
+    'src/relay\.rs:\d+:29: replace \+ with - in serve$',
+    # Only an agent asking the phone for a terminal reaches it, and offloading and archiving
+    # never do.
+    'src/relay\.rs:.*: replace home_job::<impl crate::ui::Terminal for NoTerminal>::run -> ',
 ]
