@@ -408,13 +408,11 @@ fn list(
     let mut gap = false;
     while i < lines.len() {
         let l = lines[i];
+        // Claude Code's marked takes the next item as one more of this list when it starts
+        // within three spaces with the first's own bullet, or its own delimiter after the
+        // number, and is not a rule; anything indented under the item above was taken there.
         match item(l) {
-            Some(it)
-                if it.indent < first.content
-                    && it.number.is_some() == ordered
-                    && (ordered || it.bullet == first.bullet)
-                    && it.indent + 3 >= first.indent =>
-            {
+            Some(it) if it.indent <= 3 && it.bullet == first.bullet && !is_hr(l) => {
                 let text = l.get(it.content.min(l.len())..).unwrap_or("").to_string();
                 items.push((vec![text], gap && !items.is_empty()));
                 gap = false;
@@ -1274,6 +1272,25 @@ mod tests {
             text("  - a\n- b", 40),
             ["- a", "- b"],
             "or less indented than the first"
+        );
+        // Less than the text of the item above it, though no less than the first's: still
+        // a sibling (marked's list, as Claude Code bundles it).
+        assert_eq!(text("- a\n-   b\n  - c", 40), ["- a", "- b", "- c"]);
+    }
+
+    #[test]
+    fn a_list_goes_on_only_with_its_own_bullet_or_delimiter_and_never_through_a_rule() {
+        // Claude Code's marked builds a list's item pattern from its first bullet: the mark
+        // itself, or the digits and that delimiter. A change starts a list of its own.
+        assert_eq!(text("1. a\n2) b", 40), ["1. a", "", "2. b"]);
+        assert_eq!(text("1) a\n2) b", 40), ["1. a", "2. b"], "calibration");
+        assert_eq!(text("- a\n* b", 40), ["- a", "", "- b"]);
+        // A rule spelt with the list's own bullet is a rule, not an item.
+        assert_eq!(text("- a\n- - -", 40), ["- a", "", "---"]);
+        assert_eq!(
+            text("- a\n- - b", 40),
+            ["- a", "- - b"],
+            "calibration: an item"
         );
     }
 
