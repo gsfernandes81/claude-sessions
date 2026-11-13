@@ -191,9 +191,7 @@ pub(crate) fn fresh_session_id() -> String {
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
         .is_ok();
     if !read {
-        let now = clock::now() as u128;
-        let pid = std::process::id() as u128;
-        bytes = ((now << 32) ^ pid).to_be_bytes();
+        bytes = clock_bytes(clock::now(), std::process::id());
     }
     // Version 4, variant 1, as a UUID is marked.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -207,6 +205,12 @@ pub(crate) fn fresh_session_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+/// The fallback's sixteen bytes: the clock in milliseconds above the pid, so two ids made in
+/// one millisecond by two processes, or by one process a millisecond apart, differ.
+fn clock_bytes(now: Millis, pid: u32) -> [u8; 16] {
+    ((u128::from(now) << 32) ^ u128::from(pid)).to_be_bytes()
 }
 
 // ── the menu's entry points ─────────────────────────────────────────────────
@@ -1465,6 +1469,17 @@ pub(crate) fn remote_btw(
     question: &str,
     deps: &Deps,
 ) -> Result<String, String> {
+    btw_within(slot, model, question, deps, BTW_WAIT)
+}
+
+/// [`remote_btw`], giving claude `wait` to answer.
+fn btw_within(
+    slot: &str,
+    model: &str,
+    question: &str,
+    deps: &Deps,
+    wait: Duration,
+) -> Result<String, String> {
     use std::io::{Read as _, Write as _};
     let rec = match registry::load(slot) {
         Ok(Some(rec)) => rec,
@@ -1506,7 +1521,7 @@ pub(crate) fn remote_btw(
     };
     let out = read(child.stdout.take().map(|p| Box::new(p) as _));
     let err = read(child.stderr.take().map(|p| Box::new(p) as _));
-    let deadline = Instant::now() + BTW_WAIT;
+    let deadline = Instant::now() + wait;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -3604,5 +3619,100 @@ exit 1"#,
         // And a slot with no record is left alone, not made.
         crate::holder::stamp("claude-9", true);
         assert!(registry::load("claude-9").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_fresh_id_is_marked_as_a_random_uuid_and_its_fallback_differs_by_moment_and_process() {
+        // Sixty-four ids, so a mark that holds by chance for some random bytes cannot pass.
+        for _ in 0..64 {
+            let id = fresh_session_id();
+            let c: Vec<char> = id.chars().collect();
+            assert_eq!(c[14], '4', "version 4: {id}");
+            assert!("89ab".contains(c[19]), "variant 1: {id}");
+        }
+        assert_ne!(clock_bytes(1, 7), clock_bytes(2, 7), "a millisecond apart");
+        assert_ne!(clock_bytes(1, 7), clock_bytes(1, 8), "two processes");
+    }
+
+    #[test]
+    fn a_side_question_answered_with_nothing_or_not_in_time_says_so() {
+        let f = Fixture::new("btw-none");
+        registry::store(&offloaded("claude-3", "s-9", &f.work())).unwrap();
+        let silent = f.script("claude", "cat >/dev/null; exit 0");
+        let deps = f.deps(f.zmx(":"), silent);
+        assert_eq!(
+            remote_btw("claude-3", "", "q", &deps),
+            Err("claude did not answer".into()),
+            "a clean exit with nothing said is no answer"
+        );
+        // Answers only after half a minute, long past the bound it is given, and never holds
+        // its stdout longer than one short sleep once it is stopped.
+        let late = f.script(
+            "claude2",
+            "cat >/dev/null; i=0; while [ $i -lt 150 ]; do sleep 0.2; i=$((i+1)); done; echo late",
+        );
+        let deps = f.deps(f.zmx(":"), late);
+        assert_eq!(
+            btw_within("claude-3", "", "q", &deps, Duration::from_millis(300)),
+            Err("the side question took too long".into())
+        );
+    }
+
+    #[test]
+    fn a_stored_conversation_in_the_remote_view_goes_through_the_slot_that_holds_it() {
+        let f = Fixture::new("remote-held");
+        registry::store(&offloaded("claude-2", "conv-2", &f.work())).unwrap();
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        assert_eq!(
+            remote_resume("conv-2", &f.work(), "t", &deps),
+            Ok("claude-2".into())
+        );
+        let started = wait_for("the stand-in holder", || f.claude_log().pop());
+        assert!(started.ends_with("holder --resume conv-2"), "{started}");
+        let transcript = load("claude-2").transcript_path.expect("a transcript");
+        let calls = f.calls();
+        assert!(
+            calls[0].contains(&format!("CLAUDE_SESSIONS_HISTORY={transcript}")),
+            "a resume's holder is given what came before: {calls:?}"
+        );
+
+        // One another menu is starting is left to it.
+        let mut starting = SlotRecord::new("claude-5", Moment::now());
+        starting.session_id = Some("conv-5".into());
+        registry::store(&starting).unwrap();
+        let why = remote_resume("conv-5", &f.work(), "t", &deps).unwrap_err();
+        assert!(why.contains("being started somewhere else"), "{why}");
+        assert_eq!(f.calls().len(), 1, "nothing more started");
+    }
+
+    #[test]
+    fn a_conversation_live_in_a_slot_opens_in_the_remote_view_only_if_it_drives_it() {
+        let mut f = Fixture::new("remote-live-in");
+        let (pid, start) = f.process();
+        let mut other = live("claude-2", pid, start);
+        other.session_id = Some("conv-0".into());
+        other.driver = Driver::Holder;
+        registry::store(&other).unwrap();
+        std::fs::write(
+            f.path(&format!("config/sessions/{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"conv-1","procStart":{start}}}"#),
+        )
+        .unwrap();
+        f.session("claude-2", false);
+        let mut deps = f.deps(f.zmx(":"), f.claude_ok());
+        deps.holder = holder_ok(&f);
+        let resume = || remote_resume("conv-1", &f.work(), "t", &deps);
+        assert_eq!(resume(), Ok("claude-2".into()));
+
+        // A terminal's, unless its holder answers (a record an older release rewrote).
+        other.driver = Driver::Terminal;
+        registry::store(&other).unwrap();
+        let why = resume().unwrap_err();
+        assert!(why.contains("running in a terminal"), "{why}");
+        let _holder =
+            std::os::unix::net::UnixListener::bind(crate::holder::paths("claude-2").sock).unwrap();
+        assert_eq!(resume(), Ok("claude-2".into()));
+        assert!(f.calls().is_empty(), "nothing started");
     }
 }

@@ -636,17 +636,52 @@ fn a_keepalive_from_a_hand_started_session_finds_its_slot() {
     );
 }
 
-/// Hold `path` locked (flock(1), the same advisory lock the crate takes) for `secs`.
-fn hold_lock(path: &Path, secs: f64) -> Child {
-    let child = Command::new("flock")
-        .env_remove("ZMX_SESSION")
-        .arg(path)
-        .args(["sleep", &secs.to_string()])
-        .spawn()
-        .expect("flock(1) runs");
-    // Let it take the lock before the test goes on.
-    std::thread::sleep(Duration::from_millis(150));
-    child
+/// `path` held locked by another process (flock(1), the same advisory lock the crate takes)
+/// until this is dropped. Held for as long as the test needs, not for a set time, so a slow or
+/// loaded machine cannot let it lapse halfway through and change what the test sees.
+struct Held(Child);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // Closing its stdin ends `cat`, and with it flock(1) and the lock; the kill is only for
+        // a holder that did not go.
+        drop(self.0.stdin.take());
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            std::thread::sleep(Duration::from_millis(20));
+            self.0.kill().ok();
+        }
+        self.0.wait().ok();
+    }
+}
+
+fn hold_lock(path: &Path) -> Held {
+    // `-o` keeps the lock in flock(1) itself rather than in `cat`, so nothing outlives it.
+    let held = Held(
+        Command::new("flock")
+            .env_remove("ZMX_SESSION")
+            .arg("-o")
+            .arg(path)
+            .arg("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("flock(1) runs"),
+    );
+    // Go on only once it really holds the lock: a non-blocking try then fails as a conflict.
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let tried = Command::new("flock")
+            .args(["-n", "-E", "99"])
+            .arg(path)
+            .arg("true")
+            .status()
+            .expect("flock(1) runs");
+        if tried.code() == Some(99) {
+            return held;
+        }
+        assert!(Instant::now() < until, "flock(1) never took the lock");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
@@ -655,7 +690,7 @@ fn a_dry_run_takes_no_lock_but_a_live_pass_does() {
     // was dropped. A dry run writes nothing, so it must not take the lock at all.
     let s = idle_slot("drylock", false);
     let lock = s.root.join("registry/offload-t1.lock");
-    let mut holder = hold_lock(&lock, 3.0);
+    let _held = hold_lock(&lock);
     let (ok, out) = offload(&s.root, &["--dry-run"]);
     assert!(ok, "offload failed: {out}");
     assert!(
@@ -668,8 +703,6 @@ fn a_dry_run_takes_no_lock_but_a_live_pass_does() {
     assert!(ok, "offload failed: {out}");
     assert!(out.contains("its lock is busy"), "got: {out}");
     assert!(alive(s.claude, s.claude_start), "nothing was stopped");
-    holder.kill().ok();
-    holder.wait().ok();
 }
 
 #[test]
@@ -688,18 +721,17 @@ fn a_lock_that_cannot_be_taken_at_all_fails_the_pass() {
 #[test]
 fn a_kept_slot_never_waits_for_its_lock() {
     // The common case — a slot that is not idle — is decided from the snapshot and the
-    // record alone, so a held lock does not even slow it down.
+    // record alone, never under its lock. The lock is held for the whole pass, so a pass that
+    // took it would wait out its timeout and say the lock is busy (the dry-run test above shows
+    // that it does); judging by what it says rather than by a stopwatch keeps a loaded machine
+    // from failing it.
     let s = idle_slot("keptlock", true);
-    let mut holder = hold_lock(&s.root.join("registry/offload-t1.lock"), 3.0);
-    let started = Instant::now();
+    let _held = hold_lock(&s.root.join("registry/offload-t1.lock"));
     let (ok, out) = offload(&s.root, &[]);
     assert!(ok, "offload failed: {out}");
     assert!(out.contains("offload-t1: kept — attached"), "got: {out}");
     assert!(
-        started.elapsed() < Duration::from_millis(1500),
-        "it waited for a lock it had no need of: {:?}",
-        started.elapsed()
+        !out.contains("its lock is busy"),
+        "it took a lock it had no need of: {out}"
     );
-    holder.kill().ok();
-    holder.wait().ok();
 }

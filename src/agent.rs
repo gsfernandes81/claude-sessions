@@ -255,7 +255,13 @@ pub fn serve() -> io::Result<()> {
                     out: agent.out.clone(),
                     ran: rx,
                 };
-                let outcome = act(&msg, &agent.shown(), &agent.workspace, &mut term);
+                let outcome = act(
+                    &msg,
+                    &agent.shown(),
+                    &agent.workspace,
+                    &mut term,
+                    &mut archive::set,
+                );
                 agent
                     .waiting
                     .lock()
@@ -385,8 +391,15 @@ fn refused() -> Outcome {
 }
 
 /// One action, as the local menu did it (`run.rs` before the hub): find the row the hub
-/// named among the rows it was shown, and hand it to the launcher.
-fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome {
+/// named among the rows it was shown, and hand it to the launcher. The archive is marked
+/// through `set` (`archive::set`).
+fn act(
+    msg: &Value,
+    rows: &[Row],
+    ws: &str,
+    term: &mut dyn Terminal,
+    set: &mut dyn FnMut(&str, Mark) -> io::Result<()>,
+) -> Outcome {
     let index = |field: &str| {
         let key = key_of(msg, field)?;
         rows.iter().position(|r| r.key == key)
@@ -405,7 +418,7 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             // not leave it folded straight back by its age.
             if rows[i].archived {
                 if let Some(id) = id(i) {
-                    let _ = archive::set(&id, Mark::Kept(clock::now()));
+                    let _ = set(&id, Mark::Kept(clock::now()));
                 }
             }
             launch::open(rows, i, ws, term)
@@ -431,7 +444,7 @@ fn act(msg: &Value, rows: &[Row], ws: &str, term: &mut dyn Terminal) -> Outcome 
             let Some(conv) = index("key").and_then(id) else {
                 return refused();
             };
-            mark(op == "archive", &conv, clock::now(), archive::set)
+            mark(op == "archive", &conv, clock::now(), set)
         }
         other => Outcome::Refused(format!(
             "this container's claude-sessions does not know how to {other:?} — it may be older \
@@ -586,10 +599,62 @@ mod tests {
             }
         }
         let msg = json::parse(r#"{"id":1,"op":"close","key":{"slot":"claude-9"}}"#).unwrap();
-        assert_eq!(act(&msg, &[], "/w", &mut No), refused());
+        let mut set = |_: &str, _: Mark| -> io::Result<()> { panic!("nothing is marked") };
+        assert_eq!(act(&msg, &[], "/w", &mut No, &mut set), refused());
         let msg = json::parse(r#"{"id":1,"op":"fly"}"#).unwrap();
         assert!(
-            matches!(act(&msg, &[], "/w", &mut No), Outcome::Refused(why) if why.contains("fly"))
+            matches!(act(&msg, &[], "/w", &mut No, &mut set), Outcome::Refused(why) if why.contains("fly"))
+        );
+    }
+
+    #[test]
+    fn archive_and_unarchive_mark_the_conversation_the_hub_named() {
+        struct No;
+        impl Terminal for No {
+            fn suspend(&mut self) -> io::Result<()> {
+                panic!("nothing should run")
+            }
+            fn resume(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let key = RowKey::Conversation {
+            id: "c1".into(),
+            cwd: "/w".into(),
+            harness: Harness::Claude,
+        };
+        let rows = [Row {
+            host: String::new(),
+            key: key.clone(),
+            wants_you: false,
+            busy: false,
+            unread: false,
+            attached: false,
+            offloaded: false,
+            closed: true,
+            archived: false,
+            title: "dns".into(),
+            age: "2d".into(),
+            at: 0,
+            nested: false,
+            remote: false,
+            named: false,
+        }];
+        let mut marked = Vec::new();
+        for op in ["archive", "unarchive"] {
+            let mut msg = Value::obj();
+            msg.set("op", Value::string(op));
+            msg.set("key", proto::key_to(&key));
+            let mut set = |id: &str, m: Mark| {
+                marked.push((id.to_string(), matches!(m, Mark::Archived(_))));
+                Ok(())
+            };
+            act(&msg, &rows, "/w", &mut No, &mut set);
+        }
+        assert_eq!(
+            marked,
+            [("c1".to_string(), true), ("c1".to_string(), false)],
+            "archived, then kept"
         );
     }
 }

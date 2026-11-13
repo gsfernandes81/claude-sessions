@@ -278,28 +278,11 @@ fn italic_grey() -> St {
     }
 }
 
-/// Claude Code's hint line here, grey and italic, broken between whole segments.
+/// Claude Code's hint line here, grey and italic: its segments joined by ` · ` and wrapped
+/// as text, at words, as Claude Code wraps it, not at its segments.
 fn hint(segs: &[&str], ind: &str, w: usize) -> Vec<Line> {
     let room = w.saturating_sub(width(ind)).max(1);
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for seg in segs {
-        let next = if cur.is_empty() {
-            seg.to_string()
-        } else {
-            format!("{cur} · {seg}")
-        };
-        if cur.is_empty() || width(&next) <= room {
-            cur = next;
-            continue;
-        }
-        // Claude Code wraps the joined hint as text, at words, not at its segments.
-        lines.push(cur);
-        cur = seg.to_string();
-    }
-    lines.push(cur);
-    let joined = lines.join(" · ");
-    convo::wrap(&joined, room)
+    convo::wrap(&segs.join(" · "), room)
         .into_iter()
         .map(|l| vec![(ind.to_string(), PLAIN), (l, italic_grey())])
         .collect()
@@ -535,8 +518,8 @@ fn shell_details(t: &Task, v: &View, w: usize, h: usize) -> Vec<Line> {
             // The box fits the screen with its hint, rather than running off the bottom
             // as Claude Code's does at 24 rows; nine lines where there is room.
             // Around the lines: the box's edges, its blank row, `Showing`, a blank and the
-            // hint; and three rows of the transcript left above.
-            let fixed = out.len() + 6 + tail.len() + 3;
+            // hint; and four rows of the transcript left above, as the list leaves.
+            let fixed = out.len() + 5 + tail.len() + 4;
             let shown = h.saturating_sub(fixed).clamp(1, OUTPUT_LINES);
             let all: Vec<&str> = text
                 .strip_suffix('\n')
@@ -1153,7 +1136,8 @@ pub fn strip(
             right.push(format!("↓ {} tokens", tokens(t.tokens)));
         }
         let mut right = right.join(" · ");
-        let lead = 2 + 2 + width(&name);
+        // The mark and the dot, two cells each.
+        let lead = 4 + width(&name);
         // What goes between: a workflow's bar, an agent's latest call or its description.
         let middle = |room: usize| -> String {
             if t.kind == "workflow" {
@@ -1175,7 +1159,7 @@ pub fn strip(
                 }
             }
         };
-        if lead + 2 + width(&right) > w {
+        if overflows(lead, &right, w) {
             right = run_only(t, now);
         }
         let room = w.saturating_sub(lead + 2 + width(&right) + 1);
@@ -1195,6 +1179,12 @@ pub fn strip(
         ]);
     }
     out.into_iter().map(|l| clip(l, w)).collect()
+}
+
+/// Whether a strip row's name, `lead` cells, and its counts overflow `w` columns.
+fn overflows(lead: usize, right: &str, w: usize) -> bool {
+    // The two cells after the name, and at least one before the counts.
+    lead + 2 + 1 + width(right) > w
 }
 
 fn run_only(t: &Task, now: u64) -> String {
@@ -1698,5 +1688,525 @@ mod tests {
             text(&draw(&c, &v, 40, 24, NOW))[0],
             "Background task update waiting while th…"
         );
+    }
+
+    /// The style of the first span drawn with `needle` in it.
+    fn style_of(lines: &[Line], needle: &str) -> St {
+        lines
+            .iter()
+            .flatten()
+            .find(|(t, _)| t.contains(needle))
+            .map(|(_, st)| *st)
+            .unwrap_or_else(|| panic!("{needle:?} is not drawn"))
+    }
+
+    /// The first line drawn with `needle` in it, as text.
+    fn row_with(lines: &[String], needle: &str) -> String {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is not drawn in {lines:?}"))
+            .clone()
+    }
+
+    fn wf_agent(label: &str, phase: u64, state: &str) -> WfAgent {
+        WfAgent {
+            label: label.into(),
+            phase,
+            state: state.into(),
+            started_ms: Some(1_018_000),
+            ..WfAgent::default()
+        }
+    }
+
+    /// A workflow open in the browser, with these phases and agents.
+    fn browsing(phases: &[&str], agents: Vec<WfAgent>) -> (Convo, View) {
+        let mut c = Convo::new("h", "s", "r");
+        let mut w = task("w", "workflow", "", "survey", "running");
+        w.agents = agents.len() as u64;
+        c.tasks = vec![w];
+        let v = View {
+            open: Some("w".into()),
+            wf: Some(Wf {
+                phases: phases.iter().map(|p| p.to_string()).collect(),
+                agents,
+            }),
+            ..View::default()
+        };
+        (c, v)
+    }
+
+    #[test]
+    fn tokens_read_as_claude_code_counts_them() {
+        assert_eq!(tokens(0), "0");
+        assert_eq!(tokens(999), "999");
+        assert_eq!(tokens(77_800), "77.8k");
+        assert_eq!(tokens(1_234_567), "1.2M");
+    }
+
+    #[test]
+    fn a_rows_status_names_an_agents_model_where_there_is_room_and_a_workflows_agents() {
+        let mut c = Convo::new("h", "s", "r");
+        let mut modelled = task("a", "agent", "modelled", "Explore", "running");
+        modelled.model = "claude-haiku-5-5".into();
+        let mut two = task("w", "workflow", "wf-two", "", "running");
+        two.agents = 2;
+        c.tasks = vec![
+            modelled,
+            task("b", "agent", "unmodelled", "Explore", "running"),
+            two,
+            task("z", "workflow", "wf-none", "", "running"),
+        ];
+        let wide = text(&draw(&c, &View::default(), 80, 30, NOW));
+        assert!(row_with(&wide, "modelled").ends_with("running · Haiku 5.5"));
+        assert!(row_with(&wide, "unmodelled").ends_with("running"));
+        assert!(row_with(&wide, "wf-two").ends_with("2 agents"));
+        assert!(row_with(&wide, "wf-none").ends_with("running"));
+        // Claude Code drops the model at 40 columns.
+        let narrow = text(&draw(&c, &View::default(), 40, 30, NOW));
+        assert!(row_with(&narrow, " modelled").ends_with("running"));
+    }
+
+    #[test]
+    fn the_details_say_a_status_in_its_colour_under_a_bold_label_and_hints_are_grey_italic() {
+        let mut c = Convo::new("h", "s", "r");
+        let statuses = ["running", "completed", "failed", "killed"];
+        c.tasks = statuses
+            .iter()
+            .map(|s| task(s, "shell", "", "true", s))
+            .collect();
+        let want = [fg(CYAN), fg(GREEN), fg(convo::RED), fg(GREY)];
+        for (s, want) in statuses.iter().zip(want) {
+            let v = View {
+                open: Some(s.to_string()),
+                ..View::default()
+            };
+            let got = draw(&c, &v, 80, 24, NOW);
+            assert_eq!(style_of(&got, s), want, "{s}");
+            assert!(style_of(&got, "Status:").bold, "{s}");
+        }
+        let got = draw(&c, &View::default(), 80, 24, NOW);
+        let st = style_of(&got, "Esc to close");
+        assert!(st.italic && st.fg == Some(GREY), "{st:?}");
+    }
+
+    #[test]
+    fn colour_escapes_and_control_characters_in_a_shells_output_are_not_drawn() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = shells();
+        let v = View {
+            open: Some("t".into()),
+            output: Some(Ok(
+                "\u{1b}[1;31merror\u{1b}[0m\tdone\u{7}\n\u{1b}7saved\n".into()
+            )),
+            ..View::default()
+        };
+        let got = text(&draw(&c, &v, 80, 40, NOW));
+        assert!(
+            got.iter().any(|l| l.starts_with("   │ error    done ")),
+            "{got:?}"
+        );
+        assert!(got.iter().any(|l| l.starts_with("   │ saved ")), "{got:?}");
+    }
+
+    #[test]
+    fn counts_that_are_zero_are_left_out() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = vec![task("a", "agent", "quiet", "Explore", "running")];
+        let v = View {
+            open: Some("a".into()),
+            ..View::default()
+        };
+        assert_eq!(text(&draw(&c, &v, 80, 24, NOW))[2], "   1m 0s");
+        let mut idle = wf_agent("idle", 1, "progress");
+        idle.tools = 3;
+        let (c, mut v) = browsing(&["Read"], vec![idle]);
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(!row_with(&got, "idle").contains("tokens"), "{got:?}");
+        v.pane = Pane::Agent;
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(row_with(&got, "3 tool calls").contains("running · 42s · 3 tool calls"));
+        assert!(!got.iter().any(|l| l.contains("tokens")), "{got:?}");
+    }
+
+    #[test]
+    fn an_agents_details_keep_a_right_margin_as_wide_as_their_indent() {
+        let mut c = Convo::new("h", "s", "r");
+        let mut a = task("a", "agent", "survey", "Explore", "running");
+        a.tokens = 237_500;
+        a.tools = 51;
+        a.model = "claude-haiku-5-5".into();
+        a.prompt = "List the docs under /usr/share and read each of the copyright files, \
+                    then say which licence each package is under and why it matters."
+            .into();
+        c.tasks = vec![a];
+        let v = View {
+            open: Some("a".into()),
+            ..View::default()
+        };
+        for w in 24..=100 {
+            let got = text(&draw(&c, &v, w, 40, NOW));
+            // The counts, from under the title to the blank; the prompt, under its heading. The
+            // ` ·` a line of counts ends with where it breaks may hang into the margin.
+            let counts = got[2..].iter().take_while(|l| !l.is_empty());
+            let prompt = got
+                .iter()
+                .skip_while(|l| *l != "   Prompt")
+                .skip(1)
+                .take_while(|l| !l.is_empty());
+            for l in counts.chain(prompt) {
+                assert!(width(l.trim_end_matches(" ·")) <= w - 3, "at {w}: {l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prompt_shows_five_lines_and_is_cut_only_when_there_is_more() {
+        let five = "one\ntwo\nthree\nfour\nfive";
+        let seven = "one\ntwo\nthree\nfour\nfive\nsix\nseven";
+        let shown = |lines: &[String], heading: &str| -> Vec<String> {
+            lines
+                .iter()
+                .skip_while(|l| l.trim() != heading)
+                .skip(1)
+                .take_while(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        let whole = ["one", "two", "three", "four", "five"];
+        let cut_short = ["one", "two", "three", "four", "five…"];
+        for (prompt, want) in [(five, whole), (seven, cut_short)] {
+            // An agent's details.
+            let mut c = Convo::new("h", "s", "r");
+            let mut a = task("a", "agent", "survey", "Explore", "running");
+            a.prompt = prompt.into();
+            c.tasks = vec![a];
+            let v = View {
+                open: Some("a".into()),
+                ..View::default()
+            };
+            assert_eq!(shown(&text(&draw(&c, &v, 80, 40, NOW)), "Prompt"), want);
+            // A workflow agent's pane, read inside the box.
+            let mut a = wf_agent("reader", 1, "progress");
+            a.prompt = prompt.into();
+            let (c, mut v) = browsing(&["Read"], vec![a]);
+            v.pane = Pane::Agent;
+            let inside: Vec<String> = text(&draw(&c, &v, 80, 40, NOW))
+                .iter()
+                .map(|l| l.split('│').nth(2).unwrap_or("").to_string())
+                .collect();
+            assert_eq!(shown(&inside, "Prompt"), want);
+        }
+    }
+
+    #[test]
+    fn the_browser_lists_the_chosen_phases_agents_through_the_filter() {
+        let agents = vec![
+            wf_agent("a1", 1, "done"),
+            wf_agent("a2", 1, "progress"),
+            wf_agent("a3", 2, "error"),
+            wf_agent("a4", 2, "queued"),
+        ];
+        let wf = Wf {
+            phases: vec!["Read".into(), "Write".into()],
+            agents: agents.clone(),
+        };
+        let labels = |phase: usize, filter: &str| -> Vec<String> {
+            let v = View {
+                phase,
+                filter: filter.into(),
+                ..View::default()
+            };
+            wf_agents(&wf, &v)
+                .iter()
+                .map(|(_, a)| a.label.clone())
+                .collect()
+        };
+        assert_eq!(labels(0, ""), ["a1", "a2"]);
+        assert_eq!(labels(1, ""), ["a3", "a4"]);
+        assert_eq!(labels(0, "done"), ["a1"]);
+        assert_eq!(labels(0, "running"), ["a2"]);
+        assert_eq!(labels(1, "failed"), ["a3"], "an error is a failure");
+        assert!(labels(1, "running").is_empty(), "queued is not running");
+        // A workflow that has no phases lists all its agents under one.
+        let flat = Wf {
+            phases: Vec::new(),
+            agents: agents.clone(),
+        };
+        assert_eq!(wf_agents(&flat, &View::default()).len(), 4);
+        // The counts: done of all, the workflow's and each phase's.
+        let (c, mut v) = browsing(&["Read", "Write"], agents);
+        v.phase = 1;
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(got[3].ends_with("1/4 agents · 1m 0s"), "{got:?}");
+        // Only the chosen phase has the cursor, and only while the phases have it.
+        for w in [80, 40] {
+            let got = text(&draw(&c, &v, w, 24, NOW));
+            assert!(row_with(&got, "1 Read 1/2").contains("  1 Read"), "{got:?}");
+            assert!(
+                row_with(&got, "2 Write 0/2").contains("❯ 2 Write"),
+                "{got:?}"
+            );
+            let agents_have_it = View {
+                pane: Pane::Agents,
+                ..v.clone()
+            };
+            let got = text(&draw(&c, &agents_have_it, w, 24, NOW));
+            assert!(!row_with(&got, "2 Write").contains('❯'), "{got:?}");
+        }
+    }
+
+    #[test]
+    fn an_agents_state_shows_in_its_glyph_and_the_cursor_row_in_lavender() {
+        let (c, mut v) = browsing(
+            &["Read"],
+            vec![
+                wf_agent("done-one", 1, "done"),
+                wf_agent("failed-one", 1, "failed"),
+                wf_agent("error-one", 1, "error"),
+                wf_agent("queued-one", 1, "queued"),
+                wf_agent("running-one", 1, "progress"),
+            ],
+        );
+        v.pane = Pane::Agents;
+        v.agent = 4;
+        for w in [80, 40] {
+            let got = draw(&c, &v, w, 30, NOW);
+            let glyph = |label: &str| -> (String, St) {
+                let row = got
+                    .iter()
+                    .find(|l| l.iter().any(|(t, _)| t.contains(label)))
+                    .unwrap_or_else(|| panic!("{label} not drawn"));
+                row.iter()
+                    .find(|(t, _)| t == "●" || t == "✔")
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{label} has no glyph: {row:?}"))
+            };
+            assert_eq!(glyph("done-one"), ("✔".into(), fg(GREEN)));
+            assert_eq!(glyph("failed-one"), ("●".into(), fg(convo::RED)));
+            assert_eq!(glyph("error-one"), ("●".into(), fg(convo::RED)));
+            assert_eq!(glyph("queued-one"), ("●".into(), fg(GREY)));
+            assert_eq!(glyph("running-one").1, fg(0x50_5050));
+            assert_eq!(style_of(&got, "running-one"), fg(LAVENDER), "at {w}");
+            assert_eq!(style_of(&got, "queued-one"), fg(GREY), "at {w}");
+        }
+    }
+
+    #[test]
+    fn the_browser_keeps_three_rows_of_the_transcript_and_its_box_edges_straight() {
+        let (c, mut v) = workflow();
+        for h in [18, 24, 30] {
+            assert_eq!(draw(&c, &v, 80, h, NOW).len(), h - 3, "at {h} rows");
+        }
+        // Every row of the box ends at its right edge, an agent's pane open or not.
+        for pane in [Pane::Agents, Pane::Agent] {
+            v.pane = pane;
+            for w in [80, 40] {
+                let got = text(&draw(&c, &v, w, 24, NOW));
+                let boxed: Vec<&String> = got
+                    .iter()
+                    .skip_while(|l| !l.contains('╭'))
+                    .take_while(|l| !l.contains('╯'))
+                    .collect();
+                assert!(boxed.len() > 2, "{got:?}");
+                for l in boxed {
+                    assert_eq!(width(l), w - 3, "{pane:?} at {w}: {l:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_phases_take_at_most_a_third_of_the_box() {
+        let (c, v) = browsing(
+            &["Read every licence file in the whole of the archive"],
+            vec![wf_agent("a1", 1, "done")],
+        );
+        for w in [60, 80, 120] {
+            let got = text(&draw(&c, &v, w, 24, NOW));
+            let head = row_with(&got, "╭");
+            let left = head.chars().position(|ch| ch == '┬').unwrap() - 4;
+            assert!(left <= (w - 6) / 3, "at {w}: {head}");
+        }
+    }
+
+    #[test]
+    fn a_workflow_without_a_name_of_its_own_is_not_described_twice() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = vec![
+            task("u", "workflow", "unnamed survey", "", "running"),
+            task("n", "workflow", "", "named", "running"),
+        ];
+        for (id, name) in [("u", "unnamed survey"), ("n", "named")] {
+            let v = View {
+                open: Some(id.into()),
+                ..View::default()
+            };
+            let got = text(&draw(&c, &v, 80, 24, NOW));
+            assert_eq!(got[2], format!("   {name}"));
+            assert_eq!(got[3], "   0/0 agents · 1m 0s");
+        }
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_rests_on_the_last_row() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = shells();
+        let v = View {
+            sel: 99,
+            ..View::default()
+        };
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(row_with(&got, "sleep 300").contains("❯"), "{got:?}");
+        let (c, mut v) = workflow();
+        v.pane = Pane::Agents;
+        v.agent = 99;
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(row_with(&got, "pkgs-211-260").contains("❯"), "{got:?}");
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_its_cursor_and_keeps_four_rows_of_the_transcript_on_a_phone() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = (1..=30)
+            .map(|n| task(&n.to_string(), "shell", "", &format!("echo {n}"), "running"))
+            .collect();
+        for h in [16, 24, 30] {
+            let v = View {
+                sel: 29,
+                ..View::default()
+            };
+            let got = text(&draw(&c, &v, 40, h, NOW));
+            assert_eq!(got.len(), h - 4, "at {h} rows: {got:?}");
+            assert!(row_with(&got, "echo 30").contains("❯"), "{got:?}");
+        }
+        // The workflow browser's agents scroll the same way.
+        let agents = (1..=30)
+            .map(|n| wf_agent(&format!("agent-{n}"), 1, "progress"))
+            .collect();
+        let (c, mut v) = browsing(&["Read"], agents);
+        v.pane = Pane::Agents;
+        v.agent = 29;
+        let got = text(&draw(&c, &v, 80, 24, NOW));
+        assert!(row_with(&got, "agent-30").contains("❯"), "{got:?}");
+    }
+
+    #[test]
+    fn a_shells_details_take_the_same_rows_however_the_hint_wraps() {
+        let mut c = Convo::new("h", "s", "r");
+        c.tasks = shells();
+        let out: String = (1..=30).map(|n| format!("tick {n}\n")).collect();
+        let v = View {
+            open: Some("s".into()),
+            output: Some(Ok(out)),
+            ..View::default()
+        };
+        let wide = draw(&c, &v, 80, 26, NOW);
+        let narrow = draw(&c, &v, 40, 26, NOW);
+        assert!(
+            text(&narrow).last().unwrap().ends_with("to stop"),
+            "the hint wraps"
+        );
+        assert_eq!(wide.len(), narrow.len());
+        // Four rows of the transcript left above, as the list leaves, where the box is not
+        // at its most lines.
+        assert_eq!(narrow.len(), 26 - 4);
+        assert_eq!(draw(&c, &v, 40, 20, NOW).len(), 20 - 4);
+    }
+
+    #[test]
+    fn a_file_name_keeps_underscores_and_hyphens() {
+        assert_eq!(file_name("my_flow v2-final"), "my_flow-v2-final");
+    }
+
+    #[test]
+    fn an_ended_agent_stays_in_the_strip_for_a_minute_and_the_one_in_view_stays() {
+        let ended = |id: &str, ago: u64| {
+            let mut t = task(id, "agent", id, "Explore", "completed");
+            t.ended_ms = Some(NOW - ago);
+            t
+        };
+        let ts = vec![ended("recent", 10_000), ended("old", 120_000)];
+        let ids = |viewing: Option<&str>| -> Vec<String> {
+            strip_tasks(&ts, NOW, viewing)
+                .iter()
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(None), ["recent"]);
+        assert_eq!(ids(Some("old")), ["recent", "old"]);
+        // A finished agent's dot is green; main is bold while it is in view.
+        let got = strip(&ts, None, None, 80, NOW);
+        assert_eq!(style_of(&got, "◯"), fg(GREEN));
+        assert!(style_of(&got, "main").bold);
+    }
+
+    #[test]
+    fn a_workflows_bar_and_count_in_the_strip_say_how_far_it_is() {
+        let mut most = task("w", "workflow", "", "most", "running");
+        most.agents = 4;
+        most.agents_done = 3;
+        let none = task("z", "workflow", "", "none", "running");
+        let got = text(&strip(&[most, none], None, None, 100, NOW));
+        let bar = row_with(&got, "most");
+        assert_eq!(bar.matches('▰').count(), 15, "{bar}");
+        assert!(bar.contains(" 3/4 · "), "{bar}");
+        assert!(!row_with(&got, "none").contains("0/0"), "{got:?}");
+    }
+
+    #[test]
+    fn an_agents_call_in_the_strip_is_drawn_down_to_six_cells() {
+        let mut a = task("a", "agent", "survey", "general-purpose", "running");
+        a.activity = "Read(/usr/share/doc/libgnutls30t64/copyright)".into();
+        let shortest = (20..80)
+            .filter_map(|w| {
+                let got = text(&strip(std::slice::from_ref(&a), None, None, w, NOW));
+                got[2]
+                    .split_whitespace()
+                    .find(|s| s.starts_with("Read") || s == &"…")
+                    .map(width)
+            })
+            .min();
+        assert_eq!(shortest, Some(6));
+    }
+
+    #[test]
+    fn what_does_not_fit_in_the_strip_goes_the_counts_before_the_time() {
+        let mut a = task("a", "agent", "survey", "general-purpose", "running");
+        a.tokens = 48_100;
+        // `  ◯ general-purpose  `, a cell, then `1m 0s · ↓ 48.1k tokens`: 44 columns. At 43
+        // the counts were once kept and the line cut a cell short.
+        for w in 30..=70 {
+            let got = text(&strip(std::slice::from_ref(&a), None, None, w, NOW));
+            let want = if w < 44 {
+                " 1m 0s"
+            } else {
+                " 1m 0s · ↓ 48.1k tokens"
+            };
+            assert!(got[2].ends_with(want), "at {w}: {:?}", got[2]);
+        }
+    }
+
+    #[test]
+    fn the_strip_is_never_wider_than_the_screen() {
+        let (c, _) = workflow();
+        let mut a = task("a", "agent", "survey", "general-purpose", "running");
+        a.tokens = 48_100;
+        let ts = vec![a, c.tasks[0].clone()];
+        for w in 4..=40 {
+            for l in strip(&ts, None, Some(1), w, NOW) {
+                assert!(width(&plain(&l)) <= w, "at {w}: {:?}", plain(&l));
+            }
+        }
+    }
+
+    #[test]
+    fn the_strips_hint_offers_stop_only_on_a_running_row() {
+        let mut done = task("d", "agent", "done", "Explore", "completed");
+        done.ended_ms = Some(NOW - 1_000);
+        let ts = vec![task("a", "agent", "running", "Explore", "running"), done];
+        assert_eq!(strip_hint(&ts, None, 1, NOW), "Enter to view · x to stop");
+        assert_eq!(strip_hint(&ts, None, 2, NOW), "Enter to view");
+        assert_eq!(strip_hint(&ts, None, 3, NOW), "↑/↓ to select");
     }
 }

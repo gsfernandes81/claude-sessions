@@ -56,10 +56,10 @@ exclude_re = [
     'src/term\.rs:.*: replace match guard c >= 0x80 with false in parse_escape$',
     'src/term\.rs:.*: replace \+ with \* in parse_escape$',
     # Timing only: a deadline compared with `<` or `<=`, a wait that only adds a wait.
-    'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with)$',
+    'src/launch\.rs:.*: replace < with <= in (resume|resume_conversation|new_session_with|btw_within)$',
     'src/launch\.rs:.* in wait_session_gone$',
     'src/launch\.rs:.*: replace && with \|\| in settle$',
-    'src/hub\.rs:.*: replace < with <= in offload_all$',
+    'src/hub\.rs:.*: replace < with <= in offload_all_within$',
     'src/zmx\.rs:.*: replace < with <= in list_from$',
     'src/activity\.rs:.*: replace < with <= in pass$',
     'src/run\.rs:.*: replace \+ with - in run$',
@@ -69,29 +69,126 @@ exclude_re = [
     # that are equal only where the result is the same or at widths the menu refuses.
     'src/launch\.rs:.*: replace match guard procinfo::is_alive\(pid, start\) with true in (offload|close)$',
     'src/lockfile\.rs:.*<impl Drop for SlotLock>::drop with \(\)$',
-    'src/mem\.rs:.*: replace match guard s\.trim\(\) == "max" with false in read_at$',
+    'src/mem\.rs:.*: replace match guard s\.trim\(\) == "max" with false in (read_at|swap_at)$',
     'src/menu\.rs:.*: replace && with \|\| in Menu::container_row$',
     'src/run\.rs:.*: replace != with == in drive$',
     'src/render\.rs:.*: replace < with <= in (Line::pad|scroll_to)$',
     'src/render\.rs:.*: replace > with >= in wrap$',
     'src/render\.rs:.*: replace \+ with [-*] in heading$',
     'src/render\.rs:.*: replace \+ with \* in row$',
-    # Caches whose miss only costs a read: an unchanged transcript read again, a size or a
-    # modification time alone (an append moves both), a newline's offset kept or not.
-    'src/transcript\.rs:.*: replace match guard upto == len with false in titles_cached$',
-    'src/transcript\.rs:.*: replace < with <= in titles_cached$',
+    # A cache's newline offset kept one byte short costs only a read again (`whole_lines`); and
+    # `titles_cached_by`'s `upto < len` is reached only past the arm that takes `upto == len`.
+    'src/transcript\.rs:.*: replace < with <= in titles_cached_by$',
     'src/transcript\.rs:.*: replace \+ with \* in whole_lines$',
-    'src/store\.rs:12\d:\d+: replace && with \|\| in in_workspace$',
     # Thin wrappers that read the live machine, over functions tested on their own:
-    # `marks_in`/`set_in`, `oom_kill_in`, `teardown_listed`, `orphans`/`kill_tree`,
+    # `marks_in`/`set_in`, `oom_kill_in` and `swap_at`, `teardown_listed`, `orphans`/`kill_tree`,
     # `socket_dir_from`, `Watch::refresh`, `term::size`, `Deps`' parts, `snapshot_of` (whose
     # `/proc` readers these are); and the agent's own log.
     'src/archive\.rs:.*: replace (dir|marks|set) -> ',
-    'src/mem\.rs:.*: replace oom_kills -> ',
+    'src/mem\.rs:.*: replace (oom_kills|swap) -> ',
     'src/offload\.rs:.*: replace (teardown_zmx -> |sweep_orphans with)',
     'src/zmx\.rs:.*: replace (socket_dir|Watch::sessions) -> ',
     'src/run\.rs:.*<impl Console for RawTerminal>::size',
     'src/agent\.rs:.*: replace log with \(\)$',
     'src/launch\.rs:.* in Deps::from_env$',
     'src/activity\.rs:.*<impl Members for Procfs>::',
+    # The same for pi's store (main.rs and its modules, 2026-11-09): the live layout and the
+    # two readers over it, `conversation_path_in` and `in_workspace_in`, are tested on their
+    # own; the live one would read the owner's real `~/.pi`.
+    'src/pisession\.rs:.*: replace (conversation_path|in_workspace) -> ',
+    # drafts.rs and tasks.rs (2026-11-08). The drafts file exactly at its cap: telling `>`
+    # from `>=` needs a file of exactly 4 MiB, a size only the serializer's arithmetic gives.
+    'src/drafts\.rs:.*: replace > with >= in save$',
+    # client.rs: the second Left's window and two minutes' quiet compared with or without
+    # their bounds (timing only); a selection's empty span on a row, which draws and copies the
+    # same as none; base64's bytes packed with `|`, whose bits do not overlap; `date` failing,
+    # which no test can make it do; and what runs only against the real terminal and ssh, over
+    # the parts that are tested: the size read live (`screen`), `paint` writing `paint_bytes`,
+    # `dial` opening ssh (`dial_over`), and `run`'s loop (`keys`, `take`, `due`,
+    # `hosts_changed`).
+    'src/client\.rs:.*: replace < with <= in App::conv_key$',
+    'src/client\.rs:.*: replace > with >= in App::key$',
+    'src/client\.rs:.*: replace < with <= in Selection::cols$',
+    'src/client\.rs:.*: replace \| with \^ in base64$',
+    'src/client\.rs:.*: replace match guard o\.status\.success\(\) with true in clock_time$',
+    'src/client\.rs:.*: replace (size|App::paint|run) -> ',
+    'src/client\.rs:.*: replace App::dial with \(\)$',
+    # The phone client's renderer (src/convo.rs, 2026-11-09). A loop's index that only moves
+    # forward: stalled, the suite hangs, which cargo-mutants can only report as a timeout.
+    # Each is the walk over the transcript or the prompt's characters; the column picks
+    # soft_wrap's from the counters beside it.
+    'src/convo\.rs:.*: replace \+= with [-*]= in (transcript|slash_runs)$',
+    'src/convo\.rs:\d+:19: replace \+= with [-*]= in soft_wrap$',
+    # The same, where only a character wider than the whole row tells them apart: soft_wrap
+    # refusing to break before a row's first character, which would leave it empty forever.
+    'src/convo\.rs:\d+:49: replace > with >= in soft_wrap$',
+    # Equivalent: a header already cut to `…` cuts to `…` again, so ask_tabs' guard only
+    # stops early; typing is only ever open on the cursor's row (client.rs opens it there and
+    # Up and Down edit the field); and claude summarises a step once its calls have answered,
+    # so the step with the call still running is never the summarised one.
+    'src/convo\.rs:.*: replace match guard width\(&tabs\[i\]\.1\) > 1 with true in ask_tabs$',
+    'src/convo\.rs:\d+:42: replace > with >= in ask_tabs$',
+    'src/convo\.rs:.*: replace match guard i == \*sel with true in ask_dialog$',
+    'src/convo\.rs:.*: replace match guard st\.summary\.is_none\(\) with true in transcript$',
+    # reduce.rs and sdk.rs (2026-11-09). A base64 digit goes into bits the shift just
+    # cleared, so `|` and `^` are the same value.
+    'src/sdk\.rs:.*: replace \| with \^ in base64_decode$',
+    # launch.rs, activity.rs, offload.rs, hub.rs (2026-11-09). Bits that do not overlap, so
+    # `|` and `^` are the same value: a UUID's version and variant marks over the bits they
+    # clear, and the fallback id's pid (under 2^32) beside the clock shifted past it.
+    'src/launch\.rs:.*: replace \| with \^ in fresh_session_id$',
+    'src/launch\.rs:.*: replace \^ with \| in clock_bytes$',
+    # statusline.rs: the pool's and the container's swap, thin wrappers over `mem::swap_at` and
+    # `cgroup_swap` (each tested on its own) that cap at this machine's `/proc/meminfo`
+    # `SwapTotal`, which a test cannot set, so no figure through them is the same everywhere.
+    'src/statusline\.rs:.*: replace (pool_swap|own_swap) -> ',
+    # Agent messaging, `peer.rs` and `router.rs` (2026-11-09).
+    # The kernel gives a socket's peer pid as 0 only for a peer in another pid namespace, and a
+    # failed getsockopt leaves it 0: neither happens to a socket in this container.
+    'src/peer\.rs:.*: replace (&& with \|\||> with >=) in peer_pid$',
+    # The log alone: which relay-lock failure, read error or frame of no known type is logged,
+    # whether the relay says it is on again, what came of naming a record, which kind a frame
+    # is, how a notice was handed on, a host the router refuses, a container still not
+    # answering; and the agent's own log.
+    'src/peer\.rs:.*: replace (match guard e\.kind\(\) == io::ErrorKind::WouldBlock with (true|false)|== with !=) in Relay::start$',
+    'src/peer\.rs:.*: replace match guard st\.off\.is_some\(\) with (true|false) in Relay::apply$',
+    'src/peer\.rs:.*: replace (!= with ==|&& with \|\|) in Relay::take$',
+    'src/peer\.rs:.*: delete match arm Some\("auth"\) in Relay::take$',
+    'src/peer\.rs:.*log_naming',
+    'src/peer\.rs:.*: replace log with \(\)$',
+    'src/router\.rs:.*: delete match arm Some\("user"\) in Item::kind$',
+    'src/router\.rs:.*: delete match arm Some\(Ok\(\(\)\)\) in notify$',
+    'src/router\.rs:.*: delete ! in serve$',
+    'src/router\.rs:.*: replace != with == in watch$',
+    # Timing only: how long peer-check waits for a record (the verdict is the same, or comes
+    # later) and for the checked claude to leave (it leaves or is killed, and the scratch
+    # directory goes either way), how often old messages are pruned (the same ones go), and
+    # how fast a container that does not answer is asked again.
+    'src/peer\.rs:.*: replace (> with (==|>=)|\|\| with &&) in check$',
+    'src/peer\.rs:.*: replace [^ ]+ with [^ ]+ in end_checked$',
+    'src/router\.rs:.*: replace >= with < in serve$',
+    'src/router\.rs:.*: replace \* with / in watch$',
+    # Equivalent where the tests run as root, as a cloud sandbox's do: there 0 is this
+    # process's uid. `the_uid_is_this_processs_own` catches it for any other user, `dev` in
+    # the dev container among them.
+    'src/zmx\.rs:.*: replace uid -> Option<u32> with Some\(0\)$',
+    # relay.rs and holder.rs. Only a chunk's size changes: the transcript read backwards a
+    # block at a time (BACK_BLOCK, the only const multiplied at that column in those lines)
+    # and the tap's read buffer give the same lines either way.
+    'src/holder\.rs:1\d\d:28: replace \* with \+$',
+    'src/holder\.rs:.*: replace \* with \+ in tap$',
+    # A slot's keep-alive already ending exactly when the view's would is the same either way.
+    'src/holder\.rs:.*: replace < with <= in stamped$',
+    # How often the relay reads the load, `next_load = now + load_every` (the column tells it
+    # from the retry's `+`, which tests/relay.rs kills): only the load read more often.
+    'src/relay\.rs:\d+:29: replace \+ with - in serve$',
+    # Only an agent asking the phone for a terminal reaches it, and offloading and archiving
+    # never do.
+    'src/relay\.rs:.*: replace home_job::<impl crate::ui::Terminal for NoTerminal>::run -> ',
+    # term.rs, 2026-11-13. `readable_within`: a poll that timed out (0) leaves `revents` 0,
+    # so `rc >= 0` answers as `rc > 0`. `read_keys`: a Linux pty's hangup polls with POLLIN
+    # set beside POLLHUP (tested), so the no-POLLIN branch is reached only for a descriptor
+    # closed under it.
+    'src/term\.rs:.*: replace > with >= in readable_within$',
+    'src/term\.rs:.*: replace & with \| in RawTerminal::read_keys$',
 ]

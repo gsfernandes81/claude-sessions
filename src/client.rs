@@ -82,8 +82,15 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
         std::env::var("CLAUDE_REMOTE_RELAY").unwrap_or_else(|_| "claude-sessions relay".into());
     let mut cmd = Command::new(ssh);
     cmd.args(["-T", "-C", "-o", "BatchMode=yes", "--", name])
-        .arg(relay)
-        .stdin(Stdio::piped())
+        .arg(relay);
+    link(cmd, epoch, tx, term::wake)
+}
+
+/// The link over `cmd`: what it prints, a JSON value a line, comes to `tx` as `Heard::Line`,
+/// and its end as `Heard::Gone`, with the last thing it said on stderr, `wake` called after each
+/// so the terminal's wait takes them.
+fn link(mut cmd: Command, epoch: u64, tx: &Sender<Heard>, wake: fn()) -> io::Result<Wire> {
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
@@ -95,9 +102,7 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
         let said = said.clone();
         std::thread::spawn(move || {
             for l in BufReader::new(err).lines().map_while(Result::ok) {
-                if !l.trim().is_empty() {
-                    *said.lock().unwrap_or_else(|p| p.into_inner()) = l.trim().to_string();
-                }
+                last_word(&mut said.lock().unwrap_or_else(|p| p.into_inner()), &l);
             }
         });
     }
@@ -108,15 +113,23 @@ fn connect(name: &str, epoch: u64, tx: &Sender<Heard>) -> io::Result<Wire> {
                 if tx.send(Heard::Line(epoch, v)).is_err() {
                     return;
                 }
-                term::wake();
+                wake();
             }
         }
         std::thread::sleep(Duration::from_millis(50));
         let why = said.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let _ = tx.send(Heard::Gone(epoch, why));
-        term::wake();
+        wake();
     });
     Ok(Wire { child, stdin })
+}
+
+/// A line of ssh's stderr: what it said last, the blank lines it ends with skipped, is why the
+/// link went.
+fn last_word(said: &mut String, line: &str) {
+    if !line.trim().is_empty() {
+        *said = line.trim().to_string();
+    }
 }
 
 enum Screen {
@@ -194,15 +207,18 @@ struct App {
     dirty: Option<Instant>,
     /// The conversation whose kept draft was looked for, so it is looked for once.
     restored: Option<(String, String)>,
+    /// The containers the menu was last built for (`hosts_changed`).
+    menu_hosts: Vec<String>,
     /// Something was typed in this conversation before its id came: what is in the prompt is
     /// newer than any draft kept, which is not put back over it.
     touched: bool,
 }
 
 impl App {
-    fn send(&mut self, v: Value) -> bool {
+    /// A message to the relay; the first of any not yet answered starts the wait for one.
+    fn send(&mut self, v: Value) {
         let Some(w) = self.wire.as_mut() else {
-            return false;
+            return;
         };
         let ok = writeln!(w.stdin, "{}", json::to_line(&v))
             .and_then(|()| w.stdin.flush())
@@ -210,7 +226,6 @@ impl App {
         if ok && self.awaiting.is_none() {
             self.awaiting = Some(Instant::now());
         }
-        ok
     }
 
     fn msg(t: &str, rest: Vec<(&str, Value)>) -> Value {
@@ -261,10 +276,16 @@ impl App {
     }
 
     fn dial(&mut self, now: Instant, tx: &Sender<Heard>) {
+        let name = self.name.clone();
+        self.dial_over(now, |epoch| connect(&name, epoch, tx));
+    }
+
+    /// A new link, opened by `open` for its epoch, and what it is told first.
+    fn dial_over(&mut self, now: Instant, open: impl FnOnce(u64) -> io::Result<Wire>) {
         self.retry_at = None;
         self.epoch += 1;
         self.hello_due = true;
-        match connect(&self.name, self.epoch, tx) {
+        match open(self.epoch) {
             Ok(w) => {
                 self.wire = Some(w);
                 self.last_heard = now;
@@ -1648,8 +1669,9 @@ fn tasks_key(
         (None, Key::Down) => v.sel = (v.sel + 1).min(rows.len().saturating_sub(1)),
         (None, Key::Enter) => {
             if let Some((_, t)) = rows.get(v.sel) {
-                // A finished agent opens its conversation, as Claude Code's does.
-                if t.kind == "agent" && !t.running() {
+                // A finished agent opens its conversation, as Claude Code's does: the only
+                // finished rows listed are agents' (`tasks::listed`).
+                if !t.running() {
                     *fg = Some((*t).clone());
                     return None;
                 }
@@ -1673,12 +1695,12 @@ fn tasks_key(
     Some(Dialog::Tasks(v))
 }
 
-/// What Claude Code calls a task's details: `Shell details`, `Monitor details`.
+/// What Claude Code calls a task's details: `Shell details`, `Monitor details`. A workflow's
+/// are its browser, which says nothing on closing (`workflow_key`).
 fn kind_word(t: &convo::Task) -> &'static str {
     match t.kind.as_str() {
         "shell" => "Shell",
         "monitor" => "Monitor",
-        "workflow" => "Workflow",
         _ => "Agent",
     }
 }
@@ -1962,7 +1984,12 @@ fn copied(text: &str) -> String {
 /// A key in the prompt: typing, moving and deleting.
 /// The terminal's columns and rows, or the narrow mockups' when it cannot say.
 fn size() -> (usize, usize) {
-    term::size().map_or((40, 24), |(w, h)| (w as usize, h as usize))
+    screen(term::size())
+}
+
+/// A size the terminal said, or the narrow mockups' 40×24 when it said none.
+fn screen(said: Option<(u16, u16)>) -> (usize, usize) {
+    said.map_or((40, 24), |(w, h)| (w as usize, h as usize))
 }
 
 /// `\` then Enter is a newline, as in Claude Code: the backslash before the cursor gives way
@@ -2310,24 +2337,20 @@ fn edit_line(chars: &mut Vec<char>, at: usize, k: Key) -> usize {
         // A word at a time, as Claude Code's prompt: back to the start of a word, on to the
         // end of one, a word being letters, digits and `_`.
         Key::WordLeft => {
-            let mut i = at;
-            while i > 0 && !is_word(chars[i - 1]) {
-                i -= 1;
-            }
-            while i > 0 && is_word(chars[i - 1]) {
-                i -= 1;
-            }
-            i
+            let before = &chars[..at];
+            let gap = before.iter().rev().take_while(|c| !is_word(**c)).count();
+            let word = before[..at - gap]
+                .iter()
+                .rev()
+                .take_while(|c| is_word(**c))
+                .count();
+            at - gap - word
         }
         Key::WordRight => {
-            let mut i = at;
-            while i < chars.len() && !is_word(chars[i]) {
-                i += 1;
-            }
-            while i < chars.len() && is_word(chars[i]) {
-                i += 1;
-            }
-            i
+            let after = &chars[at..];
+            let gap = after.iter().take_while(|c| !is_word(**c)).count();
+            let word = after[gap..].iter().take_while(|c| is_word(**c)).count();
+            at + gap + word
         }
         Key::Right => (at + 1).min(chars.len()),
         Key::Home | Key::Char('\x01') => 0,
@@ -2476,12 +2499,11 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 })
             };
             let tab = match (&typing, k) {
-                (None, Key::Left | Key::BackTab) if several => Some(q.saturating_sub(1)),
-                (None, Key::Right | Key::Char('\t')) if several => {
-                    Some((q + 1).min(questions.len()))
-                }
+                (None, Key::Left | Key::BackTab) => Some(q.saturating_sub(1)),
+                (None, Key::Right | Key::Char('\t')) => Some((q + 1).min(questions.len())),
                 _ => None,
-            };
+            }
+            .filter(|_| several);
             if let Some(to) = tab {
                 let sel = if to == q { sel } else { 0 };
                 return ask(to, sel, answers, None, ticked);
@@ -2559,8 +2581,9 @@ fn dialog_key(c: &Convo, d: Dialog, k: Key, out: &mut Vec<Value>) -> Option<Dial
                 return ask(q, i, answers, Some(before.into()), ticked);
             }
             if question.multi {
-                if i < own {
-                    ticked[q][i] = !ticked[q][i];
+                // One of its own options ticked or not; the row after them goes on.
+                if let Some(t) = ticked[q].get_mut(i) {
+                    *t = !*t;
                     return ask(q, i, answers, None, ticked);
                 }
                 return advance(answers, ticked, out);
@@ -2696,12 +2719,15 @@ fn took(d: Duration) -> String {
 fn clock_time() -> String {
     let out = Command::new("date").arg("+%I:%M %p").output();
     match out {
-        Ok(o) if o.status.success() => {
-            let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            t.strip_prefix('0').map(str::to_string).unwrap_or(t)
-        }
+        Ok(o) if o.status.success() => twelve_hour(&String::from_utf8_lossy(&o.stdout)),
         _ => String::new(),
     }
+}
+
+/// `date +%I:%M %p`'s `01:12 AM` as Claude Code writes it, `1:12 AM`.
+fn twelve_hour(said: &str) -> String {
+    let t = said.trim();
+    t.strip_prefix('0').unwrap_or(t).to_string()
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -2831,6 +2857,13 @@ impl App {
 
     fn paint(&mut self, term: &mut RawTerminal, now: Instant) -> io::Result<()> {
         let (w, h) = term::size().unwrap_or((40, 24));
+        let out = self.paint_bytes(w, h, now);
+        term.write_all(out.as_bytes())
+    }
+
+    /// What painting a `w`×`h` screen writes: the clipboard's escape if one is due, the rows
+    /// that differ from what was drawn, and the cursor.
+    fn paint_bytes(&mut self, w: u16, h: u16, now: Instant) -> String {
         let (rows, cursor) = self.frame(w, h, now);
         let mut out = String::new();
         if let Some(t) = self.clip.take() {
@@ -2849,10 +2882,7 @@ impl App {
             Some((r, c)) => out.push_str(&format!("\x1b[{};{}H\x1b[?25h", r + 1, c + 1)),
             None => out.push_str("\x1b[?25l"),
         }
-        if !out.is_empty() {
-            term.write_all(out.as_bytes())?;
-        }
-        Ok(())
+        out
     }
 
     /// How long something sent may go unanswered before the link is thought dead: longer while
@@ -2922,6 +2952,49 @@ impl App {
     }
 }
 
+impl App {
+    /// The containers the relay names changed since the menu was last built for them.
+    fn hosts_changed(&mut self) -> bool {
+        if self.hosts == self.menu_hosts {
+            return false;
+        }
+        self.menu_hosts = self.hosts.clone();
+        true
+    }
+
+    /// Keys from the terminal. A resize is the screen's, drawn again whole; whether there was
+    /// one, so the screen is cleared first.
+    fn keys(&mut self, keys: Vec<Key>, now: Instant) -> bool {
+        let mut resized = false;
+        for k in keys {
+            if k == Key::Resize {
+                self.drawn.clear();
+                resized = true;
+                continue;
+            }
+            self.key(k, now);
+        }
+        resized
+    }
+
+    /// What the link's reader said: a line from the link in use, or a link's end.
+    fn take(&mut self, h: Heard, now: Instant) {
+        match h {
+            Heard::Line(e, v) if e == self.epoch => self.heard(v, now),
+            Heard::Gone(e, why) => self.gone(e, why, now),
+            _ => {}
+        }
+    }
+
+    /// The link taken for dead if an answer is overdue; whether a dial is due.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.awaiting.is_some_and(|a| now >= a + self.ack_wait()) {
+            self.link_down(now);
+        }
+        self.retry_at.is_some_and(|r| now >= r)
+    }
+}
+
 /// `claude-remote <ssh name>`.
 /// Mockup 10's spinner and word, before the relay's hello.
 fn connecting(frame: usize) -> Busy {
@@ -2982,6 +3055,7 @@ impl App {
             seen: None,
             dirty: None,
             restored: None,
+            menu_hosts: Vec::new(),
             touched: false,
         };
         app.menu.remote = true;
@@ -3001,11 +3075,9 @@ pub fn run(name: &str) -> Result<(), String> {
     term.write_all(b"\x1b[2J\x1b[?2004h\x1b[?1002h")
         .map_err(|e| e.to_string())?;
     app.dial(Instant::now(), &tx);
-    let mut hosts_seen: Vec<String> = Vec::new();
     loop {
         let now = Instant::now();
-        if app.hosts != hosts_seen {
-            hosts_seen = app.hosts.clone();
+        if app.hosts_changed() {
             let (w, h) = term::size().unwrap_or((40, 24));
             app.rebuild_menu(w, h);
         }
@@ -3023,29 +3095,17 @@ pub fn run(name: &str) -> Result<(), String> {
         let now = Instant::now();
         match input {
             Ok(Input::Keys(keys)) => {
-                for k in keys {
-                    if k == Key::Resize {
-                        app.drawn.clear();
-                        let _ = term.write_all(b"\x1b[2J");
-                        continue;
-                    }
-                    app.key(k, now);
+                if app.keys(keys, now) {
+                    let _ = term.write_all(b"\x1b[2J");
                 }
             }
             Ok(Input::Timeout) | Ok(Input::Woken) => {}
             Err(_) => break,
         }
         while let Ok(h) = rx.try_recv() {
-            match h {
-                Heard::Line(e, v) if e == app.epoch => app.heard(v, now),
-                Heard::Gone(e, why) => app.gone(e, why, now),
-                _ => {}
-            }
+            app.take(h, now);
         }
-        if app.awaiting.is_some_and(|a| now >= a + app.ack_wait()) {
-            app.link_down(now);
-        }
-        if app.retry_at.is_some_and(|r| now >= r) {
+        if app.due(now) {
             app.dial(now, &tx);
         }
     }
@@ -3108,6 +3168,11 @@ mod tests {
             moved: true,
         };
         assert_eq!(selected_text(&rows, sel((0, 2), (0, 10))), "the quick");
+        assert_eq!(
+            selected_text(&rows, sel((0, 2), (0, 3))),
+            "th",
+            "both ends in it, and no more"
+        );
         // Backwards is the same; across rows, each row from its start; trailing spaces go.
         assert_eq!(
             selected_text(&rows, sel((3, 9), (0, 12))),
@@ -3291,6 +3356,7 @@ mod tests {
         // Backspace after one takes it whole, and the paste.
         edit(&mut ui, Key::Char('\x7f'));
         assert_eq!(ui.input, "look: [Pasted text #1 +3 lines]");
+        assert_eq!(ui.cursor, ui.input.chars().count(), "where it began");
         assert_eq!(ui.pastes.len(), 1);
         edit(&mut ui, Key::Char('\x7f'));
         assert_eq!(ui.input, "look: ");
@@ -4490,8 +4556,50 @@ mod tests {
         assert_eq!(base64(b"hi"), "aGk=");
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"abc"), "YWJj");
-        assert_eq!(took(Duration::from_secs(41)), "41s");
-        assert_eq!(took(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(base64(b"h"), "aA==");
+        assert_eq!(base64(b"\xff\xfe\xfd"), "//79");
+        assert_eq!(base64(b""), "");
+        assert_eq!(copy_seq("hi"), "\x1b]52;c;aGk=\x07", "the clipboard escape");
+    }
+
+    #[test]
+    fn a_turn_took_seconds_then_minutes_and_seconds_then_hours_and_minutes() {
+        for (s, want) in [
+            (0, "0s"),
+            (41, "41s"),
+            (59, "59s"),
+            (60, "1m 0s"),
+            (125, "2m 5s"),
+            (3599, "59m 59s"),
+            (3600, "1h 0m"),
+            (3725, "1h 2m"),
+            (90061, "25h 1m"),
+        ] {
+            assert_eq!(took(Duration::from_secs(s)), want);
+        }
+    }
+
+    #[test]
+    fn a_styled_run_is_its_sgr_and_reset_and_a_plain_one_is_only_its_text() {
+        let all = convo::St {
+            fg: Some(0x11_2233),
+            bg: Some(0x44_5566),
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+        };
+        assert_eq!(sgr(&all), "\x1b[1;3;4;9;38;2;17;34;51;48;2;68;85;102m");
+        assert_eq!(sgr(&convo::PLAIN), "");
+        let bold = convo::St {
+            bold: true,
+            ..convo::PLAIN
+        };
+        assert_eq!(
+            ansi(&vec![("a".into(), convo::PLAIN), ("b".into(), bold)]),
+            "\x1b[2Ka\x1b[1mb\x1b[0m",
+            "the row cleared first"
+        );
     }
 
     fn pasted(app: &mut App, text: &str) {
@@ -4696,5 +4804,2214 @@ mod tests {
             drafts::load(&file, "h", "s1").map(|d| d.text),
             Some("half".into())
         );
+    }
+
+    /// A link to `cat` in the relay's place: everything the client sends comes back, in order.
+    fn cat_relay(app: &mut App) -> Receiver<Heard> {
+        let (tx, rx) = mpsc::channel();
+        app.dial_over(Instant::now(), |e| link(Command::new("cat"), e, &tx, || {}));
+        rx
+    }
+
+    /// Set once a mark never came back: nothing is being sent, and every test waiting on one
+    /// gives up at once rather than each waiting out its own time.
+    static NOTHING_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// What the client sent since last asked, a line each: everything `cat` echoed before a
+    /// mark sent after it, on the link's own epoch.
+    fn sent(app: &mut App, rx: &Receiver<Heard>) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+        let awaiting = app.awaiting;
+        app.send(App::msg("mark", vec![]));
+        app.awaiting = awaiting;
+        let mut out = Vec::new();
+        loop {
+            let wait = if NOTHING_SENT.load(Ordering::Relaxed) {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(10)
+            };
+            let got = rx.recv_timeout(wait);
+            if got.is_err() {
+                NOTHING_SENT.store(true, Ordering::Relaxed);
+            }
+            match got {
+                Ok(Heard::Line(e, v)) => {
+                    assert_eq!(e, app.epoch, "heard on the link's own epoch");
+                    let l = json::to_line(&v);
+                    if l == r#"{"t":"mark"}"# {
+                        return out;
+                    }
+                    out.push(l);
+                }
+                Ok(Heard::Gone(..)) => {}
+                Err(e) => panic!("the mark never came back: {e} (after {out:?})"),
+            }
+        }
+    }
+
+    const HI: &str = r#"{"t":"hi","v":1}"#;
+
+    #[test]
+    fn what_is_sent_goes_down_the_link_a_line_each_and_the_first_unanswered_is_timed() {
+        let mut app = App::new("dev", 40, 24, 1);
+        // No link: nothing goes, and nothing waits for an answer.
+        app.send(App::msg("ping", vec![]));
+        assert_eq!(app.awaiting, None);
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI], "a new link says hello");
+        assert!(app.awaiting.is_some(), "an answer is now due");
+        // A second before the first is answered: the wait still runs from the first.
+        let first = Instant::now() - Duration::from_secs(3);
+        app.awaiting = Some(first);
+        app.send(App::msg("ping", vec![]));
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"ping"}"#]);
+        assert_eq!(app.awaiting, Some(first));
+    }
+
+    #[test]
+    fn each_dial_is_a_new_epoch_and_one_that_fails_waits_out_the_backoff() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        assert_eq!((app.epoch, app.hello_due), (1, true));
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(app.epoch, 2, "what the old link still says is not heard");
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        // ssh that will not start: down, a retry due after the backoff, from its first second.
+        let mut app = App::new("dev", 40, 24, 1);
+        let now = Instant::now();
+        app.dial_over(now, |_| Err(io::Error::other("no ssh")));
+        assert!(!app.up());
+        assert_eq!(app.down_since, Some(now));
+        assert_eq!(app.retry_at, Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_new_link_opens_again_what_was_opening_and_catches_up_what_was_open() {
+        // An existing conversation opening: asked for again on the new link.
+        let open = r#"{"c":"claude-sessions","k":{"slot":"claude-3"},"t":"open"}"#;
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", parse(open).unwrap());
+        let first = sent(&mut app, &rx);
+        assert_eq!(first.len(), 1, "{first:?}");
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI.to_string(), first[0].clone()]);
+        assert!(matches!(app.screen, Screen::Conv { opening: true, .. }));
+        // A new one: not started twice, but home, where it is listed if it started.
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        app.held.push(App::msg("say", vec![]));
+        sent(&mut app, &rx);
+        app.link_down(Instant::now());
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI]);
+        assert!(matches!(app.screen, Screen::Home));
+        assert!(app.open_msg.is_none() && app.held.is_empty());
+        assert!(app.menu.view().status.unwrap().contains("listed if it did"));
+        // Open, on a slot: where it got to, and the agent in view.
+        let mut app = app_in(&[AGENTS]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            c.slot = "claude-3".into();
+            c.run = "r9".into();
+            c.n = 5;
+            let t = c.tasks[0].clone();
+            view_agent(c, ui, &t);
+        }
+        let rx = cat_relay(&mut app);
+        let (w, r) = size();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [
+                HI.to_string(),
+                format!(r#"{{"c":"h","n":5,"r":{r},"run":"r9","s":"claude-3","t":"re","w":{w}}}"#),
+                r#"{"i":"ag1","t":"fg"}"#.to_string(),
+            ]
+        );
+        // Open but its slot not yet said, or opened with no agent in view: no more than it has.
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.slot.clear();
+        }
+        let rx = cat_relay(&mut app);
+        assert_eq!(sent(&mut app, &rx), [HI]);
+    }
+
+    #[test]
+    fn the_reason_a_link_went_is_the_last_thing_ssh_said_not_a_blank_line() {
+        let mut said = String::new();
+        for l in ["  Permission denied (publickey).  ", "", "   "] {
+            last_word(&mut said, l);
+        }
+        assert_eq!(said, "Permission denied (publickey).");
+        last_word(&mut said, "Connection closed by 10.0.0.1");
+        assert_eq!(said, "Connection closed by 10.0.0.1");
+    }
+
+    fn conv_of(app: &App) -> &Convo {
+        let Screen::Conv { c, .. } = &app.screen else {
+            panic!("not in a conversation")
+        };
+        c
+    }
+
+    fn hear(app: &mut App, line: &str) {
+        app.heard(parse(line).unwrap(), Instant::now());
+    }
+
+    #[test]
+    fn the_relays_hello_lists_its_containers_and_ends_connecting_once() {
+        let mut app = App::new("dev", 40, 24, 1);
+        app.menu.set_busy(Some(connecting(0)));
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.greeted);
+        assert_eq!(app.hosts, ["a", "b"]);
+        assert!(app.menu.view().busy.is_none(), "connected: no more spinner");
+        // A new link's hello leaves an action's spinner turning: its answer is still to come.
+        app.menu.set_busy(Some(connecting(3)));
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.menu.view().busy.is_some());
+    }
+
+    #[test]
+    fn the_home_is_the_hubs_header_and_each_containers_snapshot_or_why_it_is_down() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        hear(
+            &mut app,
+            r#"{"t":"hub","h":{"host":"zero","memory":[1,2]}}"#,
+        );
+        assert_eq!(app.hub.host, "zero");
+        assert_eq!(app.menu.view().header.host, "zero");
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let rows = [row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", &rows));
+        app.heard(snap, Instant::now());
+        let listed = |app: &App| {
+            app.menu
+                .all_rows()
+                .iter()
+                .any(|r| r.title == "immich upgrade")
+        };
+        assert!(listed(&app), "{:?}", app.menu.all_rows());
+        assert_eq!(app.places["claude-sessions"].reach, Reach::Up);
+        hear(
+            &mut app,
+            r#"{"t":"down","c":"claude-sessions","x":"no route"}"#,
+        );
+        assert_eq!(
+            app.places["claude-sessions"].reach,
+            Reach::Down("no route".into())
+        );
+        assert!(!listed(&app), "a container down lists nothing");
+    }
+
+    #[test]
+    fn a_home_actions_answer_stops_its_spinner_and_says_how_it_went() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        app.working = Some((Instant::now(), 0, "offloading session".into()));
+        app.menu.set_busy(Some(connecting(1)));
+        hear(&mut app, r#"{"t":"did","x":"offloaded claude-3"}"#);
+        assert!(app.working.is_none());
+        assert!(app.menu.view().busy.is_none());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("offloaded claude-3")
+        );
+        hear(&mut app, r#"{"t":"did","x":""}"#);
+        assert_eq!(app.menu.view().status, None, "nothing said: nothing shown");
+    }
+
+    #[test]
+    fn once_open_the_conversation_takes_its_slot_and_what_was_typed_meanwhile_goes() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        sent(&mut app, &rx);
+        type_in(&mut app, "hello");
+        assert_eq!(
+            sent(&mut app, &rx),
+            Vec::<String>::new(),
+            "held while it opens"
+        );
+        hear(&mut app, r#"{"t":"open","s":"claude-3","run":"r1"}"#);
+        let Screen::Conv { c, ui, opening } = &app.screen else {
+            panic!()
+        };
+        assert!(!opening);
+        assert_eq!((c.slot.as_str(), c.run.as_str()), ("claude-3", "r1"));
+        assert_eq!(ui.status, None, "no longer Opening…");
+        assert!(app.open_msg.is_none());
+        let uuid = c.pending[0].uuid.clone();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [
+                r#"{"t":"models"}"#.to_string(),
+                format!(r#"{{"t":"say","u":"{uuid}","x":"hello"}}"#),
+            ],
+            "the command list asked for, then what was held"
+        );
+        // With the command list in hand, it is not asked for again.
+        app.catalog = vec![convo::Command {
+            name: "review".into(),
+            about: String::new(),
+            hint: String::new(),
+        }];
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"open","s":"claude-4","run":"r2"}"#);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_reset_starts_the_transcript_again_and_keeps_what_is_on_its_way() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"text","x":"hello"}"#]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("on its way", Instant::now());
+        }
+        hear(&mut app, r#"{"t":"reset"}"#);
+        let c = conv_of(&app);
+        assert!(
+            !c.entries.contains(&Entry::Text("hello".into())),
+            "{:?}",
+            c.entries
+        );
+        assert_eq!(c.pending.len(), 1);
+        assert_eq!((c.host.as_str(), c.slot.as_str()), ("h", "claude-3"));
+    }
+
+    #[test]
+    fn the_model_list_fills_the_picker_and_the_command_list_the_suggestions() {
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            c.meta.chosen = "sonnet".into();
+            ui.dialog = Some(Dialog::Model { sel: 0, list: None });
+        }
+        hear(
+            &mut app,
+            r#"{"t":"models","m":[{"v":"default","d":"Opus"},{"v":"sonnet","d":"Sonnet"}],"c":[["review","Review &lt;pr&gt; &amp; more",""],["","nameless",""]]}"#,
+        );
+        let list = vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ];
+        assert_eq!(app.models.as_ref(), Some(&list));
+        assert_eq!(
+            dialog(&app),
+            Some(&Dialog::Model {
+                sel: 1,
+                list: Some(list)
+            }),
+            "on the model in use"
+        );
+        let review = convo::Command {
+            name: "review".into(),
+            about: "Review <pr> & more".into(),
+            hint: String::new(),
+        };
+        assert_eq!(
+            app.catalog,
+            std::slice::from_ref(&review),
+            "a command with no name is none"
+        );
+        assert_eq!(ui_of(&app).catalog, [review]);
+    }
+
+    #[test]
+    fn remote_control_on_is_said_with_its_link_copied_and_off_is_said_too() {
+        let mut app = app_in(&[]);
+        hear(
+            &mut app,
+            r#"{"t":"rc","on":true,"x":"https://claude.ai/x"}"#,
+        );
+        assert_eq!(
+            conv_of(&app).entries.last(),
+            Some(&Entry::Note(
+                "Remote Control active · https://claude.ai/x".into()
+            ))
+        );
+        assert_eq!(app.clip.as_deref(), Some("https://claude.ai/x"));
+        assert_eq!(
+            ui_of(&app).status.as_deref(),
+            Some("Copied 19 characters to the clipboard")
+        );
+        hear(&mut app, r#"{"t":"rc","on":false}"#);
+        assert_eq!(
+            conv_of(&app).entries.last(),
+            Some(&Entry::Note("Remote Control disconnected.".into()))
+        );
+        assert_eq!(ui_of(&app).status, None);
+    }
+
+    #[test]
+    fn a_workflows_browser_and_its_save_form_take_the_relays_answers_for_them() {
+        let mut app = app_in(&[AGENTS]);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[1]);
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Tasks(v));
+        }
+        let view = |app: &App| match dialog(app) {
+            Some(Dialog::Tasks(v)) => v.clone(),
+            d => panic!("{d:?}"),
+        };
+        hear(&mut app, r#"{"t":"wf","i":"other","p":[]}"#);
+        assert!(view(&app).wf.is_none(), "another workflow's");
+        hear(&mut app, r#"{"t":"wf","i":"wf1","p":[]}"#);
+        assert!(view(&app).wf.is_some());
+        if let Some(Dialog::Tasks(v)) = app_dialog_mut(&mut app) {
+            v.save = Some(tasks::Save::default());
+        }
+        hear(
+            &mut app,
+            r#"{"t":"wsaved","x":"/w/.claude/workflows/two.js"}"#,
+        );
+        assert_eq!(
+            view(&app).save.unwrap().said,
+            Some(Ok("/w/.claude/workflows/two.js".into()))
+        );
+        hear(&mut app, r#"{"t":"wsaved","e":"read-only"}"#);
+        assert_eq!(view(&app).save.unwrap().said, Some(Err("read-only".into())));
+    }
+
+    fn app_dialog_mut(app: &mut App) -> Option<&mut Dialog> {
+        match &mut app.screen {
+            Screen::Conv { ui, .. } => ui.dialog.as_mut(),
+            Screen::Home => None,
+        }
+    }
+
+    #[test]
+    fn a_pong_is_only_the_link_alive_and_touches_nothing_in_the_conversation() {
+        let mut app = app_in(&[TASKS]);
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Perm {
+                sel: 1,
+                top: 0,
+                typing: None,
+            });
+        }
+        app.awaiting = Some(Instant::now());
+        for t in ["pong", "full"] {
+            hear(&mut app, &format!(r#"{{"t":"{t}"}}"#));
+            assert!(app.awaiting.is_none(), "answered");
+            assert!(dialog(&app).is_some(), "{t}: as it was");
+        }
+    }
+
+    #[test]
+    fn a_conversation_that_ends_goes_home_saying_so_and_an_error_is_said_in_place() {
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"err","x":"no such command"}"#);
+        assert_eq!(ui_of(&app).status.as_deref(), Some("no such command"));
+        hear(&mut app, r#"{"t":"end"}"#);
+        assert!(matches!(app.screen, Screen::Home));
+        assert_eq!(app.menu.view().status.as_deref(), Some("claude-3 ended"));
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"end","x":"claude-3 was offloaded"}"#);
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("claude-3 was offloaded")
+        );
+    }
+
+    #[test]
+    fn a_model_list_without_commands_keeps_the_ones_it_has() {
+        let mut app = app_in(&[]);
+        let review = convo::Command {
+            name: "review".into(),
+            about: String::new(),
+            hint: String::new(),
+        };
+        app.catalog = vec![review.clone()];
+        hear(
+            &mut app,
+            r#"{"t":"models","m":[{"v":"default","d":"Opus"}]}"#,
+        );
+        assert_eq!(app.catalog, [review]);
+    }
+
+    #[test]
+    fn remote_control_on_with_no_link_copies_nothing() {
+        let mut app = app_in(&[]);
+        hear(&mut app, r#"{"t":"rc","on":true}"#);
+        assert_eq!(app.clip, None);
+        assert_eq!(ui_of(&app).status, None);
+    }
+
+    #[test]
+    fn the_agent_in_view_counts_from_its_own_start_and_its_ops_add_to_what_it_has() {
+        let t0 = crate::clock::now() - 60_000;
+        let tasks = format!(
+            r#"{{"t":"tasks","l":[{{"i":"ag0","k":"agent","d":"quick","st":"running","t0":{}}},{{"i":"ag1","k":"agent","d":"slow reader","st":"running","t0":{t0}}}]}}"#,
+            t0 + 55_000
+        );
+        let mut app = app_in(&[&tasks]);
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            let t = c.tasks[1].clone();
+            view_agent(c, ui, &t);
+        }
+        hear(
+            &mut app,
+            r#"{"t":"fgo","i":"ag1","reset":true,"o":[{"t":"add","id":1,"k":"user","x":"Read it."},{"t":"st","s":"working"}]}"#,
+        );
+        hear(
+            &mut app,
+            r#"{"t":"fgo","i":"ag1","o":[{"t":"add","id":2,"k":"text","x":"Reading."}]}"#,
+        );
+        let a = &conv_of(&app).viewing.as_ref().unwrap().1;
+        assert_eq!(
+            a.entries,
+            [
+                Entry::Prompt("Read it.".into()),
+                Entry::Text("Reading.".into())
+            ]
+        );
+        let since = a.working_since.expect("it is working");
+        assert!(
+            since + Duration::from_secs(30) < Instant::now(),
+            "its spinner counts from a minute ago"
+        );
+    }
+
+    #[test]
+    fn at_the_bottom_the_view_follows_what_arrives() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"count"}"#]);
+        for id in 2..40 {
+            hear(
+                &mut app,
+                &format!(r#"{{"t":"add","id":{id},"k":"text","x":"line {id}"}}"#),
+            );
+            assert_eq!(ui_of(&app).scroll, 0);
+        }
+    }
+
+    #[test]
+    fn the_menu_rebuilt_for_the_screen_lists_every_container_as_the_phones_home() {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let rows = [row(RowKey::Slot("claude-3".into()), false, false)];
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", &rows));
+        app.heard(snap, Instant::now());
+        app.rebuild_menu(80, 30);
+        let v = app.menu.view();
+        assert_eq!((v.width, v.height, v.remote), (80, 30, true));
+        assert!(
+            app.menu
+                .all_rows()
+                .iter()
+                .any(|r| r.title == "term: immich upgrade"),
+            "{:?}",
+            app.menu.all_rows()
+        );
+    }
+
+    #[test]
+    fn the_conversations_status_line_totals_the_containers_answering_under_its_own_name() {
+        let mut app = app_in(&[]);
+        let place = |host: &str, reach: Reach, used: u64| {
+            let mut p = Place::new(host);
+            p.header.host = format!("{host}-host");
+            p.header.memory = Some((used << 30, 4 << 30));
+            p.reach = reach;
+            p
+        };
+        app.places.insert("h".into(), place("h", Reach::Up, 1));
+        app.places
+            .insert("x".into(), place("x", Reach::Down("gone".into()), 2));
+        hear(&mut app, r#"{"t":"pong"}"#);
+        let load = ui_of(&app).load.clone().expect("a status line");
+        assert_eq!(load.place, "h-host", "the container's own name");
+        assert_eq!(load.used, Some(1 << 30), "only what answers counts");
+    }
+
+    #[test]
+    fn a_drag_over_the_conversation_copies_what_it_covers_and_over_nothing_copies_nothing() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        let (w, _) = size();
+        let now = Instant::now();
+        // Under the banner, the prompt sent: row 5.
+        app.key(Key::Click { row: 4, col: 0 }, now);
+        app.key(Key::Drag { row: 5, col: 5 }, now);
+        app.key(
+            Key::Release {
+                row: 6,
+                col: w as u16 - 1,
+            },
+            now,
+        );
+        let clip = app.clip.take().expect("copied");
+        assert!(clip.contains("hello there"), "{clip:?}");
+        assert_eq!(ui_of(&app).status, Some(selection_copied(&clip)));
+        // Over blank rows only: nothing to copy, and the selection goes.
+        app.key(Key::Click { row: 8, col: 0 }, now);
+        app.key(Key::Drag { row: 9, col: 5 }, now);
+        app.key(Key::Release { row: 9, col: 9 }, now);
+        assert_eq!(app.clip, None);
+        assert_eq!(app.select, None);
+    }
+
+    #[test]
+    fn an_open_shells_output_is_asked_for_now_and_every_two_seconds_while_up() {
+        let mut app = app_in(&[TASKS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let open = |app: &mut App, i: usize| {
+            if let Screen::Conv { c, ui, .. } = &mut app.screen {
+                let mut v = tasks::View::default();
+                open_task(&mut v, &c.tasks[i]);
+                ui.dialog = Some(Dialog::Tasks(v));
+            }
+        };
+        let t0 = Instant::now();
+        open(&mut app, 0);
+        app.want_output(t0);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        app.want_output(t0 + Duration::from_secs(1));
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new(), "not yet");
+        app.want_output(t0 + OUTPUT_EVERY);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        // Another task's details: asked for at once.
+        open(&mut app, 1);
+        app.want_output(t0 + OUTPUT_EVERY + Duration::from_millis(500));
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"m1","t":"tout"}"#]);
+        // The link down: nothing goes, and it is asked for once it is back.
+        open(&mut app, 0);
+        app.down_since = Some(t0);
+        app.want_output(t0 + OUTPUT_EVERY * 3);
+        app.down_since = None;
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        app.want_output(t0 + OUTPUT_EVERY * 3);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"b1","t":"tout"}"#]);
+        // Closed: nothing is wanted.
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = None;
+        }
+        app.want_output(t0 + OUTPUT_EVERY * 9);
+        assert_eq!(app.output_for, None);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_workflows_browser_asks_for_its_phases_and_the_open_agents_previews() {
+        let mut app = app_in(&[AGENTS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["read"],"ag":[{"l":"a","ph":1},{"l":"b","ph":1}]}"#).unwrap(),
+        ));
+        v.pane = tasks::Pane::Agents;
+        v.agent = 1;
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.dialog = Some(Dialog::Tasks(v));
+        }
+        let t0 = Instant::now();
+        app.want_output(t0);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"wf1","t":"wf"}"#]);
+        if let Some(Dialog::Tasks(v)) = app_dialog_mut(&mut app) {
+            v.pane = tasks::Pane::Agent;
+        }
+        app.want_output(t0);
+        assert_eq!(
+            sent(&mut app, &rx),
+            [r#"{"a":1,"i":"wf1","t":"wf"}"#],
+            "its pane open: that agent's previews too, at once"
+        );
+    }
+
+    /// A conversation of `n` lines of text, its history said to go further back.
+    fn long_app(n: usize) -> App {
+        let lines: Vec<String> = (1..=n).map(|n| n.to_string()).collect();
+        let add = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"count"}"#, &add]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.more = true;
+        }
+        app
+    }
+
+    fn top(app: &App) -> usize {
+        let (w, h) = size();
+        let Screen::Conv { c, ui, .. } = &app.screen else {
+            panic!()
+        };
+        convo::max_scroll(c, ui, w, h)
+    }
+
+    #[test]
+    fn older_history_is_asked_for_once_fewer_than_five_screens_are_above_the_view() {
+        let (_, h) = size();
+        // Two or three screens above: asked for, once.
+        let mut app = long_app(3 * h);
+        assert!(
+            top(&app) > AHEAD + h && top(&app) < AHEAD * h,
+            "{}",
+            top(&app)
+        );
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"older"}"#]);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new(), "already asked");
+        // Nothing further back: nothing to ask for.
+        let mut app = long_app(3 * h);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.more = false;
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        // Plenty above already.
+        let mut app = long_app(8 * h);
+        assert!(top(&app) >= AHEAD * h);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.want_older();
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        // No link: not asked, so asked once it is back.
+        let mut app = long_app(3 * h);
+        app.want_older();
+        assert!(!conv_of(&app).asking);
+    }
+
+    #[test]
+    fn a_draft_comes_back_unless_something_was_typed_before_the_conversation_was_known() {
+        let file = scratch_drafts("typed");
+        let kept = Draft {
+            text: "kept".into(),
+            cursor: 4,
+            pastes: Vec::new(),
+        };
+        drafts::save(&file, "h", "s1", Some(&kept), crate::clock::now());
+        let mut app = App::new("dev", 40, 24, 1);
+        app.drafts = Some(file.clone());
+        // Opened, its id not yet known, nothing typed: the kept draft comes back with it.
+        reopen(&mut app, &[]);
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "kept");
+        // Typed and rubbed out before the id came: the empty prompt is the newer.
+        reopen(&mut app, &[]);
+        type_in_only(&mut app, "x");
+        app.note_draft(Instant::now());
+        app.key(Key::Char('\x7f'), Instant::now());
+        app.note_draft(Instant::now());
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "");
+        // Typed in the same moment the id came: what was typed stays.
+        reopen(&mut app, &[]);
+        type_in_only(&mut app, "new");
+        hear(&mut app, &meta("s1"));
+        app.note_draft(Instant::now());
+        assert_eq!(ui_of(&app).input, "new");
+    }
+
+    fn type_in_only(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.key(Key::Char(ch), Instant::now());
+        }
+    }
+
+    #[test]
+    fn more_typed_into_a_kept_draft_waits_for_a_pause_too() {
+        let file = scratch_drafts("more");
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        let t0 = Instant::now();
+        app.note_draft(t0);
+        type_in_only(&mut app, "half");
+        app.note_draft(t0);
+        app.note_draft(t0 + DRAFT_QUIET);
+        let saved = || drafts::load(&file, "h", "s1").map(|d| d.text);
+        assert_eq!(saved(), Some("half".into()));
+        type_in_only(&mut app, "f");
+        app.note_draft(t0 + DRAFT_QUIET * 2);
+        assert_eq!(saved(), Some("half".into()), "still typing");
+        app.note_draft(t0 + DRAFT_QUIET * 3);
+        assert_eq!(saved(), Some("halff".into()));
+    }
+
+    #[test]
+    fn an_empty_prompt_never_wipes_the_draft_kept_for_another_conversation() {
+        let file = scratch_drafts("other");
+        let elsewhere = Draft {
+            text: "elsewhere".into(),
+            cursor: 0,
+            pastes: Vec::new(),
+        };
+        drafts::save(&file, "h", "s2", Some(&elsewhere), crate::clock::now());
+        let mut app = app_in(&[&meta("s1")]);
+        app.drafts = Some(file.clone());
+        app.note_draft(Instant::now());
+        // The slot's conversation changes under it, and it goes home in the same moment.
+        hear(&mut app, &meta("s2"));
+        app.home(None);
+        assert_eq!(
+            drafts::load(&file, "h", "s2").map(|d| d.text),
+            Some("elsewhere".into())
+        );
+    }
+
+    #[test]
+    fn a_key_after_two_minutes_of_silence_first_checks_the_link_with_a_ping() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now() + QUIET_PROBE * 2;
+        for (quiet, want) in [
+            (
+                QUIET_PROBE + Duration::from_secs(1),
+                vec![r#"{"t":"ping"}"#],
+            ),
+            (QUIET_PROBE - Duration::from_secs(1), vec![]),
+        ] {
+            app.last_heard = now - quiet;
+            app.key(Key::End, now);
+            assert_eq!(sent(&mut app, &rx), want, "{quiet:?} quiet");
+        }
+    }
+
+    #[test]
+    fn only_a_drag_over_the_conversation_selects_and_a_key_puts_the_selection_away() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        let now = Instant::now();
+        let press = |app: &mut App, keys: &[Key]| {
+            for k in keys {
+                app.key(*k, now);
+            }
+            app.clip.take()
+        };
+        let (click, drag, release) = (
+            |c| Key::Click { row: 5, col: c },
+            |c| Key::Drag { row: 5, col: c },
+            |c| Key::Release { row: 5, col: c },
+        );
+        // Row 5 is `❯ hello there`, under the banner.
+        assert_eq!(press(&mut app, &[click(2), release(2)]), None, "a click");
+        assert_eq!(app.select, None);
+        assert_eq!(
+            press(&mut app, &[click(2), release(6)]),
+            None,
+            "a press and a release with no motion between"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(6), drag(2), release(2)]),
+            None,
+            "a drag that ends where it began"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(6), release(2)]),
+            Some("h".into()),
+            "one that came back to it before letting go: the cell it began on"
+        );
+        assert_eq!(
+            press(&mut app, &[click(2), drag(4), release(6)]),
+            Some("hello".into())
+        );
+        // On the home a click is the menu's.
+        app.home(None);
+        app.key(click(2), now);
+        assert_eq!(app.select, None);
+        // Held over a paste's markers, put away by a key.
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello there"}"#]);
+        app.key(click(2), now);
+        app.key(drag(4), now);
+        app.key(Key::PasteStart, now);
+        app.key(Key::PasteEnd, now);
+        assert!(app.select.is_some());
+        app.key(Key::Char('a'), now);
+        assert_eq!(app.select, None);
+    }
+
+    #[test]
+    fn a_paste_is_text_whatever_keys_it_holds_and_a_dialogs_field_takes_it_on_one_line() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "hi");
+        let now = Instant::now();
+        for k in [Key::PasteStart, Key::Left, Key::Char('x'), Key::PasteEnd] {
+            app.key(k, now);
+        }
+        assert_eq!(ui_of(&app).input, "hix");
+        // A plan's "Tell Claude what to change".
+        let mut app = app_in(&[]);
+        hear(
+            &mut app,
+            r##"{"t":"add","id":1,"k":"perm","r":"p1","n":"ExitPlanMode","a":"# Plan"}"##,
+        );
+        app.key(Key::Char('3'), now);
+        pasted(&mut app, "a\nb");
+        assert!(
+            matches!(dialog(&app), Some(Dialog::Perm { typing: Some(f), .. }) if f.text == "a b"),
+            "{:?}",
+            dialog(&app)
+        );
+    }
+
+    /// A home with one container and `rows` in it, the relay's hello said.
+    fn home_with(rows: &[Row]) -> App {
+        let mut app = App::new("dev", 40, 24, 1);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["claude-sessions"]}"#);
+        // As the client's loop does on a change of containers.
+        app.rebuild_menu(40, 24);
+        let header = Header {
+            host: "cs".into(),
+            memory: None,
+            swap: None,
+            load: None,
+        };
+        let mut snap = App::msg("snap", vec![("c", Value::string("claude-sessions"))]);
+        snap.set("s", proto::snapshot_to(&header, "/workspace", rows));
+        app.heard(snap, Instant::now());
+        app
+    }
+
+    #[test]
+    fn c_on_the_home_offloads_a_session_only_while_the_link_is_up() {
+        let rows = [row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut app = home_with(&rows);
+        app.key(Key::Char('c'), Instant::now());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("not connected: try again once it is")
+        );
+        assert!(app.working.is_none());
+        let mut app = home_with(&rows);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.key(Key::Char('c'), Instant::now());
+        assert_eq!(
+            sent(&mut app, &rx),
+            [r#"{"c":"claude-sessions","k":{"slot":"claude-3"},"t":"offload"}"#]
+        );
+        assert!(app.working.is_some(), "its spinner turns");
+    }
+
+    #[test]
+    fn ctrl_x_then_ctrl_s_sends_what_waits_behind_the_turn_now() {
+        let mut app = app_in(&[r#"{"t":"st","s":"working"}"#]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        // Nothing queued: the chord sends nothing.
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char(CTRL_S), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("next", now);
+        }
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char(CTRL_S), now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"now"}"#]);
+        // Ctrl+X then anything else: that key, as itself.
+        app.key(Key::Char(CTRL_X), now);
+        app.key(Key::Char('a'), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(ui_of(&app).input, "a");
+    }
+
+    #[test]
+    fn the_suggestion_list_has_the_arrows_tab_esc_and_enter_while_it_shows() {
+        let mut app = app_in(&[]);
+        app.history = vec!["sent before".into()];
+        let now = Instant::now();
+        type_in_only(&mut app, "/");
+        let list = convo::suggestions(ui_of(&app));
+        assert!(list.len() > 2);
+        app.key(Key::Up, now);
+        assert_eq!(ui_of(&app).suggest, 0, "nothing above the first");
+        assert_eq!(ui_of(&app).input, "/", "the list's, not what was sent");
+        app.key(Key::Down, now);
+        assert_eq!(ui_of(&app).suggest, 1);
+        for _ in 0..list.len() + 2 {
+            app.key(Key::Down, now);
+        }
+        assert_eq!(
+            ui_of(&app).suggest,
+            list.len() - 1,
+            "nothing below the last"
+        );
+        app.key(Key::Up, now);
+        assert_eq!(ui_of(&app).suggest, list.len() - 2);
+        app.key(Key::Char('\t'), now);
+        let want = format!("/{} ", list[list.len() - 2].name);
+        assert_eq!(
+            (ui_of(&app).input.clone(), ui_of(&app).cursor),
+            (want.clone(), want.chars().count()),
+            "Tab takes the chosen name"
+        );
+        assert!(
+            convo::suggestions(ui_of(&app)).is_empty(),
+            "and the list goes"
+        );
+        // Esc puts the list away, and only that; typing on brings it back, from its top.
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "/");
+        app.key(Key::Down, now);
+        app.key(Key::Esc, now);
+        assert!(ui_of(&app).suggest_off);
+        assert_eq!(ui_of(&app).input, "/");
+        type_in_only(&mut app, "m");
+        assert!(!ui_of(&app).suggest_off);
+        assert_eq!(ui_of(&app).suggest, 0);
+        // A choice past the end of a list that shrank under it is the last.
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "/");
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.suggest = 999;
+        }
+        app.key(Key::Char('\t'), now);
+        assert_eq!(
+            ui_of(&app).input,
+            format!("/{} ", list[list.len() - 1].name)
+        );
+    }
+
+    #[test]
+    fn enter_on_the_list_sends_the_chosen_command_unless_one_was_typed_whole() {
+        let catalog = vec![convo::Command {
+            name: "design:ux-copy".into(),
+            about: String::new(),
+            hint: String::new(),
+        }];
+        let mut app = app_in(&[]);
+        app.catalog = catalog.clone();
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            ui.catalog = catalog.clone();
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        // `/cop`, the second chosen: Enter sends that.
+        type_in_only(&mut app, "/cop");
+        app.key(Key::Down, now);
+        app.key(Key::Enter, now);
+        let uuid = conv_of(&app).pending[0].uuid.clone();
+        assert_eq!(
+            sent(&mut app, &rx),
+            [format!(
+                r#"{{"t":"say","u":"{uuid}","x":"/design:ux-copy"}}"#
+            )]
+        );
+        // `/copy` typed whole is `/copy`, whatever is chosen.
+        type_in_only(&mut app, "/copy");
+        app.key(Key::Down, now);
+        app.key(Key::Enter, now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(ui_of(&app).status.as_deref(), Some("Nothing to copy yet"));
+    }
+
+    const SHELL_AND_AGENT: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running","t0":1000},{"i":"ag1","k":"agent","d":"slow reader","c":"general-purpose","st":"running","t0":1000},{"i":"wf1","k":"workflow","d":"Two agents","c":"two-readers","st":"running","an":2,"t0":1000}]}"#;
+
+    #[test]
+    fn down_goes_from_the_pill_to_the_strip_and_up_comes_back_the_same_way() {
+        let mut app = app_in(&[SHELL_AND_AGENT]);
+        let now = Instant::now();
+        let focus = |app: &mut App, k: Key| {
+            app.key(k, now);
+            ui_of(app).focus
+        };
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Strip(0));
+        assert_eq!(focus(&mut app, Key::Up), Focus::Pill, "back to the pill");
+        assert_eq!(focus(&mut app, Key::Up), Focus::Prompt, "and off it");
+        // A pill with no strip under it keeps the focus on Down.
+        let mut app = app_in(&[TASKS]);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+        assert_eq!(focus(&mut app, Key::Down), Focus::Pill);
+    }
+
+    #[test]
+    fn up_or_esc_on_the_pill_only_put_the_focus_away() {
+        let mut app = app_in(&[TASKS, r#"{"t":"st","s":"working"}"#]);
+        app.history = vec!["sent before".into()];
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        for k in [Key::Up, Key::Esc] {
+            app.key(Key::Down, now);
+            assert_eq!(ui_of(&app).focus, Focus::Pill);
+            app.key(k, now);
+            assert_eq!(ui_of(&app).focus, Focus::Prompt, "{k:?}");
+            assert_eq!(ui_of(&app).input, "", "{k:?}: not back into what was sent");
+            assert_eq!(
+                sent(&mut app, &rx),
+                Vec::<String>::new(),
+                "{k:?}: no interrupt"
+            );
+        }
+    }
+
+    #[test]
+    fn x_on_an_agents_row_of_the_strip_stops_it_and_on_main_is_typed() {
+        let mut app = app_in(&[AGENTS]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.key(Key::Down, now);
+        app.key(Key::Down, now);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1));
+        app.key(Key::Char('x'), now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"ag1","t":"tstop"}"#]);
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1), "the focus stays on it");
+        app.key(Key::Up, now);
+        app.key(Key::Char('x'), now);
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        assert_eq!(
+            (ui_of(&app).focus, ui_of(&app).input.as_str()),
+            (Focus::Prompt, "x")
+        );
+    }
+
+    #[test]
+    fn the_tasks_view_counts_as_waiting_only_the_notices_since_it_opened() {
+        for (keys, open) in [
+            (&[Key::Down, Key::Enter][..], None),
+            (
+                &[Key::Down, Key::Down, Key::Down, Key::Down, Key::Enter][..],
+                Some("wf1"),
+            ),
+        ] {
+            let mut app = app_in(&[SHELL_AND_AGENT]);
+            if let Screen::Conv { c, .. } = &mut app.screen {
+                c.notices = 3;
+            }
+            for k in keys {
+                app.key(*k, Instant::now());
+            }
+            let Some(Dialog::Tasks(v)) = dialog(&app) else {
+                panic!("{keys:?}: {:?}", dialog(&app))
+            };
+            assert_eq!(v.open.as_deref(), open);
+            assert_eq!(v.notices_at, 3, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn a_side_answer_scrolls_a_line_or_ten_at_a_time_and_not_above_its_top() {
+        let mut app = app_in(&[]);
+        type_in(&mut app, "/btw what?");
+        let now = Instant::now();
+        let top = |app: &App| match dialog(app) {
+            Some(Dialog::Btw { top, .. }) => *top,
+            d => panic!("{d:?}"),
+        };
+        for (k, want) in [
+            (Key::PageDown, 10),
+            (Key::Down, 11),
+            (Key::WheelDown, 12),
+            (Key::Up, 11),
+            (Key::PageUp, 1),
+            (Key::WheelUp, 0),
+            (Key::Up, 0),
+        ] {
+            app.key(k, now);
+            assert_eq!(top(&app), want, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn the_copy_picker_moves_and_esc_closes_it_copying_nothing() {
+        let mut app = app_in(&[
+            r#"{"t":"add","id":1,"k":"user","x":"two"}"#,
+            r#"{"t":"add","id":2,"k":"text","x":"Run:\n\n```sh\nmake test\n```\n\nthen look."}"#,
+        ]);
+        type_in(&mut app, "/copy");
+        let now = Instant::now();
+        let sel = |app: &App| match dialog(app) {
+            Some(Dialog::Copy { sel, .. }) => *sel,
+            d => panic!("{d:?}"),
+        };
+        app.key(Key::Down, now);
+        assert_eq!(sel(&app), 1);
+        app.key(Key::Down, now);
+        assert_eq!(sel(&app), 1, "not past the last");
+        app.key(Key::Up, now);
+        assert_eq!(sel(&app), 0);
+        app.key(Key::Esc, now);
+        assert!(dialog(&app).is_none());
+        assert_eq!(app.clip, None);
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_prompt_and_on_an_empty_one_leaves_as_ctrl_d_does() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "half");
+        app.key(Key::Char('\x03'), Instant::now());
+        assert_eq!((ui_of(&app).input.as_str(), ui_of(&app).cursor), ("", 0));
+        app.key(Key::Char('\x03'), Instant::now());
+        assert!(matches!(app.screen, Screen::Home));
+        let mut app = app_in(&[]);
+        app.key(Key::Char('\x04'), Instant::now());
+        assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn painting_writes_only_the_rows_that_changed_then_the_cursor() {
+        let mut app = app_in(&[r#"{"t":"add","id":1,"k":"user","x":"hello"}"#]);
+        let now = Instant::now();
+        let first = app.paint_bytes(40, 24, now);
+        for r in 1..=24 {
+            assert!(first.contains(&format!("\x1b[{r};1H")), "row {r} drawn");
+        }
+        assert!(first.ends_with("\x1b[?25h"), "the prompt's cursor shown");
+        let again = app.paint_bytes(40, 24, now);
+        assert!(!again.contains(";1H\x1b[2K"), "nothing redrawn: {again:?}");
+        type_in_only(&mut app, "x");
+        let typed = app.paint_bytes(40, 24, now);
+        assert_eq!(
+            typed.matches(";1H").count(),
+            1,
+            "the prompt's row: {typed:?}"
+        );
+        assert!(typed.contains("❯ x"), "{typed:?}");
+        // A copy rides on the next frame, once; the home hides the cursor.
+        app.clip = Some("hi".into());
+        assert!(
+            app.paint_bytes(40, 24, now)
+                .starts_with("\x1b]52;c;aGk=\x07")
+        );
+        assert!(!app.paint_bytes(40, 24, now).contains("\x1b]52"));
+        app.home(None);
+        assert!(app.paint_bytes(40, 24, now).ends_with("\x1b[?25l"));
+        // A screen of another height is drawn whole.
+        let mut app = app_in(&[]);
+        app.paint_bytes(40, 24, now);
+        assert_eq!(app.paint_bytes(40, 20, now).matches(";1H").count(), 20);
+    }
+
+    fn set_ui(app: &mut App, f: impl FnOnce(&mut Ui)) {
+        if let Screen::Conv { ui, .. } = &mut app.screen {
+            f(ui);
+        }
+    }
+
+    #[test]
+    fn esc_goes_back_to_the_bottom_first_then_interrupts_what_is_under_way() {
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let long = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let now = Instant::now();
+        for (state, pending, scroll, want) in [
+            ("working", false, 5, vec![]),
+            ("working", false, 0, vec![r#"{"t":"esc"}"#]),
+            ("idle", true, 0, vec![r#"{"t":"esc"}"#]),
+            ("idle", false, 0, vec![]),
+        ] {
+            let st = format!(r#"{{"t":"st","s":"{state}"}}"#);
+            let mut app = app_in(&[&long, &st]);
+            if pending {
+                if let Screen::Conv { c, .. } = &mut app.screen {
+                    c.sent("waiting", now);
+                }
+            }
+            set_ui(&mut app, |ui| ui.scroll = scroll);
+            let rx = cat_relay(&mut app);
+            sent(&mut app, &rx);
+            app.key(Key::Esc, now);
+            assert_eq!(ui_of(&app).scroll, 0, "{state} {scroll}");
+            assert_eq!(
+                sent(&mut app, &rx),
+                want,
+                "{state} pending {pending} {scroll}"
+            );
+            assert!(matches!(app.screen, Screen::Conv { .. }));
+        }
+    }
+
+    #[test]
+    fn in_an_agents_view_esc_interrupts_it_unless_scrolled_back_or_ended() {
+        let now = Instant::now();
+        let view = |app: &mut App| {
+            if let Screen::Conv { c, ui, .. } = &mut app.screen {
+                let t = c.tasks.iter().find(|t| t.id == "ag1").unwrap().clone();
+                view_agent(c, ui, &t);
+            }
+        };
+        let mut app = app_in(&[AGENTS]);
+        view(&mut app);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        set_ui(&mut app, |ui| ui.scroll = 3);
+        app.key(Key::Esc, now);
+        assert_eq!(ui_of(&app).scroll, 0, "back to the bottom");
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        app.key(Key::Esc, now);
+        assert_eq!(sent(&mut app, &rx), [r#"{"i":"ag1","t":"tesc"}"#]);
+        // Ended, though something else still runs: Esc leaves its view.
+        let mut app = app_in(&[
+            r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"},{"i":"ag1","k":"agent","d":"slow reader","st":"stopped"}]}"#,
+        ]);
+        view(&mut app);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.key(Key::Esc, now);
+        assert_eq!(viewing(&app), None);
+        assert_eq!(sent(&mut app, &rx), [r#"{"t":"fg"}"#]);
+    }
+
+    #[test]
+    fn in_an_agents_view_the_prompt_keeps_what_was_typed_and_end_only_scrolls() {
+        let mut app = app_in(&[AGENTS]);
+        set_ui(&mut app, |ui| {
+            ui.input = "half a prompt".into();
+            ui.cursor = 4;
+        });
+        if let Screen::Conv { c, ui, .. } = &mut app.screen {
+            let t = c.tasks[0].clone();
+            view_agent(c, ui, &t);
+        }
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        for k in [
+            Key::Left,
+            Key::Right,
+            Key::Home,
+            Key::Delete,
+            Key::End,
+            Key::Up,
+            Key::Enter,
+        ] {
+            app.key(k, now);
+            assert_eq!(
+                (ui_of(&app).input.as_str(), ui_of(&app).cursor),
+                ("half a prompt", 4),
+                "{k:?}"
+            );
+        }
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        set_ui(&mut app, |ui| ui.scroll = 4);
+        app.key(Key::End, now);
+        assert_eq!(ui_of(&app).scroll, 0);
+        assert_eq!(ui_of(&app).cursor, 4);
+    }
+
+    #[test]
+    fn end_goes_to_the_bottom_when_scrolled_back_and_else_to_the_end_of_the_prompt() {
+        let mut app = app_in(&[]);
+        type_in_only(&mut app, "abc");
+        set_ui(&mut app, |ui| {
+            ui.cursor = 1;
+            ui.scroll = 4;
+        });
+        app.key(Key::End, Instant::now());
+        assert_eq!((ui_of(&app).scroll, ui_of(&app).cursor), (0, 1));
+        app.key(Key::End, Instant::now());
+        assert_eq!(ui_of(&app).cursor, 3);
+    }
+
+    #[test]
+    fn enter_after_a_backslash_is_a_newline_and_an_empty_enter_is_not_history() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        type_in(&mut app, "one\\");
+        assert_eq!(ui_of(&app).input, "one\n");
+        assert_eq!(sent(&mut app, &rx), Vec::<String>::new());
+        let mut app = app_in(&[]);
+        app.key(Key::Enter, Instant::now());
+        assert!(app.history.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_sent_with_a_paste_in_it_is_shown_as_it_was_typed() {
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        type_in_only(&mut app, "see ");
+        pasted(&mut app, "a\nb\nc\nd");
+        app.key(Key::Enter, Instant::now());
+        let c = conv_of(&app);
+        assert_eq!(c.display("see a\nb\nc\nd"), "see [Pasted text #1 +3 lines]");
+        assert_eq!(app.history, ["see a\nb\nc\nd"]);
+    }
+
+    #[test]
+    fn down_with_text_in_the_prompt_stays_in_it_and_up_climbs_its_rows() {
+        let mut app = app_in(&[TASKS]);
+        type_in_only(&mut app, "a");
+        type_in(&mut app, "\\");
+        type_in_only(&mut app, "bb");
+        app.key(Key::Down, Instant::now());
+        assert_eq!(ui_of(&app).focus, Focus::Prompt, "no pill while typing");
+        app.key(Key::Up, Instant::now());
+        assert_eq!(ui_of(&app).cursor, 1, "up a row, to the end of `a`");
+    }
+
+    #[test]
+    fn page_up_scrolls_ten_lines_and_the_wheel_its_own_step_never_past_the_top() {
+        let lines: Vec<String> = (1..=60).map(|n| n.to_string()).collect();
+        let long = format!(
+            r#"{{"t":"add","id":2,"k":"text","x":"{}"}}"#,
+            lines.join("\\n")
+        );
+        let mut app = app_in(&[&long]);
+        app.wheel = 3;
+        let now = Instant::now();
+        let scroll = |app: &mut App, k: Key| {
+            app.key(k, now);
+            ui_of(app).scroll
+        };
+        assert_eq!(scroll(&mut app, Key::PageUp), 10);
+        assert_eq!(scroll(&mut app, Key::WheelUp), 13);
+        assert_eq!(scroll(&mut app, Key::WheelDown), 10);
+        assert_eq!(scroll(&mut app, Key::PageDown), 0);
+        assert_eq!(scroll(&mut app, Key::WheelDown), 0);
+        let most = top(&app);
+        for _ in 0..20 {
+            app.key(Key::PageUp, now);
+        }
+        assert_eq!(ui_of(&app).scroll, most);
+    }
+
+    #[test]
+    fn enter_while_the_link_is_down_keeps_the_prompt_and_says_it_was_not_sent() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("earlier", now);
+        }
+        app.link_down(now);
+        type_in(&mut app, "hello");
+        assert_eq!(ui_of(&app).input, "hello", "back in the prompt");
+        assert!(matches!(
+            ui_of(&app).link,
+            Link::Down { not_sent: true, .. }
+        ));
+        let pending = |app: &App| {
+            conv_of(app)
+                .pending
+                .iter()
+                .map(|p| p.text.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pending(&app), ["earlier"], "nothing new on its way");
+        set_ui(&mut app, |ui| ui.input.clear());
+        type_in(&mut app, "/rename door");
+        assert_eq!(pending(&app), ["earlier"], "a command was never on its way");
+    }
+
+    #[test]
+    fn the_client_wakes_for_the_soonest_thing_that_changes_the_screen_and_else_sleeps() {
+        let now = Instant::now();
+        let greeted = || {
+            let mut app = App::new("dev", 40, 24, 1);
+            app.greeted = true;
+            app
+        };
+        assert_eq!(greeted().next_wake(now), None, "nothing to wait for");
+        let spin = Some(SPIN_EVERY);
+        // The home's spinners: connecting, reconnecting, an action under way.
+        assert_eq!(App::new("dev", 40, 24, 1).next_wake(now), spin);
+        let mut app = greeted();
+        app.down_since = Some(now);
+        assert_eq!(app.next_wake(now), spin);
+        let mut app = greeted();
+        app.working = Some((now, 0, "offloading session".into()));
+        assert_eq!(app.next_wake(now), spin);
+        // A retry due, an answer due, a draft to save: each when it is due.
+        let mut app = greeted();
+        app.retry_at = Some(now + Duration::from_secs(4));
+        assert_eq!(app.next_wake(now), Some(Duration::from_secs(4)));
+        let mut app = greeted();
+        app.awaiting = Some(now);
+        assert_eq!(app.next_wake(now), Some(ACK_WAIT));
+        let mut app = greeted();
+        app.dirty = Some(now);
+        assert_eq!(app.next_wake(now), Some(DRAFT_QUIET));
+        // The soonest of several.
+        let mut app = greeted();
+        app.retry_at = Some(now + Duration::from_secs(4));
+        app.awaiting = Some(now - Duration::from_secs(3));
+        assert_eq!(app.next_wake(now), Some(Duration::from_secs(2)));
+        // A conversation: idle, nothing; working, its spinner, but not behind a dialog.
+        let app = app_in(&[]);
+        assert_eq!(app.next_wake(now), None);
+        for st in ["working", "compacting"] {
+            let mut app = app_in(&[&format!(r#"{{"t":"st","s":"{st}"}}"#)]);
+            assert_eq!(app.next_wake(now), spin, "{st}");
+            set_ui(&mut app, |ui| ui.dialog = Some(Dialog::Effort { sel: 0 }));
+            assert_eq!(app.next_wake(now), None, "{st} behind a dialog");
+        }
+        // `paste again to expand`, taken down after its eight seconds.
+        let mut app = app_in(&[]);
+        set_ui(&mut app, |ui| ui.paste_hint = Some(now));
+        assert_eq!(app.next_wake(now), Some(PASTE_HINT_FOR));
+        // A prompt on its way, and a link down, turn too.
+        let mut app = app_in(&[]);
+        if let Screen::Conv { c, .. } = &mut app.screen {
+            c.sent("on its way", now);
+        }
+        assert_eq!(app.next_wake(now), spin);
+        let mut app = app_in(&[]);
+        app.link_down(now);
+        app.retry_at = None;
+        assert_eq!(app.next_wake(now), spin);
+        // An open shell's output: at once the first time, then when it is due again.
+        let mut app = app_in(&[TASKS]);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &conv_of(&app).tasks[0]);
+        set_ui(&mut app, |ui| ui.dialog = Some(Dialog::Tasks(v)));
+        assert_eq!(app.next_wake(now), Some(Duration::ZERO));
+        app.output_for = Some(("b1".into(), now + OUTPUT_EVERY));
+        assert_eq!(app.next_wake(now), Some(OUTPUT_EVERY));
+    }
+
+    #[test]
+    fn an_answer_may_take_longer_while_a_conversation_opens() {
+        let mut app = App::new("dev", 40, 24, 1);
+        assert_eq!(app.ack_wait(), ACK_WAIT);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        app.open_conv("claude-sessions", App::msg("new", vec![]));
+        assert_eq!(app.ack_wait(), OPEN_WAIT);
+    }
+
+    #[test]
+    fn the_links_end_takes_it_down_saying_why_and_an_old_links_end_is_ignored() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.gone(app.epoch - 1, "an old link".into(), now);
+        assert!(app.up(), "an earlier link's end is not this one's");
+        app.gone(app.epoch, "Connection reset by peer".into(), now);
+        assert!(!app.up());
+        assert_eq!(
+            app.menu.view().status.as_deref(),
+            Some("Connection reset by peer")
+        );
+        // In a conversation it is said there; ssh saying nothing says nothing.
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        app.gone(app.epoch, "Connection reset by peer".into(), now);
+        assert_eq!(
+            ui_of(&app).status.as_deref(),
+            Some("Connection reset by peer")
+        );
+        let mut app = app_in(&[]);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        set_ui(&mut app, |ui| ui.status = Some("as it was".into()));
+        app.gone(app.epoch, String::new(), now);
+        assert!(!app.up());
+        assert_eq!(ui_of(&app).status.as_deref(), Some("as it was"));
+    }
+
+    #[test]
+    fn the_focus_follows_the_task_list_off_a_pill_or_strip_that_is_gone() {
+        let mut app = app_in(&[TASKS]);
+        set_ui(&mut app, |ui| ui.focus = Focus::Pill);
+        hear(
+            &mut app,
+            r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"}]}"#,
+        );
+        assert_eq!(
+            ui_of(&app).focus,
+            Focus::Pill,
+            "a pill still there keeps it"
+        );
+        hear(&mut app, r#"{"t":"tasks","l":[]}"#);
+        assert_eq!(ui_of(&app).focus, Focus::Prompt);
+        let mut app = app_in(&[AGENTS]);
+        set_ui(&mut app, |ui| ui.focus = Focus::Strip(2));
+        hear(
+            &mut app,
+            r#"{"t":"tasks","l":[{"i":"ag1","k":"agent","d":"slow reader","st":"running"}]}"#,
+        );
+        assert_eq!(ui_of(&app).focus, Focus::Strip(1), "on the last row left");
+        hear(&mut app, r#"{"t":"tasks","l":[]}"#);
+        assert_eq!(ui_of(&app).focus, Focus::Prompt);
+    }
+
+    const MIXED: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","st":"running"},{"i":"m1","k":"monitor","d":"Watch it","st":"running"},{"i":"ag1","k":"agent","d":"slow reader","st":"running"},{"i":"ag2","k":"agent","d":"done reader","st":"completed"},{"i":"b2","k":"shell","d":"Old","st":"completed"}]}"#;
+
+    #[test]
+    fn closing_details_with_esc_says_which_were_dismissed_and_nothing_else_does() {
+        let app = app_in(&[MIXED]);
+        let c = conv_of(&app);
+        for (id, k, direct, want) in [
+            ("b1", Key::Esc, false, Some("Shell details dismissed")),
+            ("m1", Key::Esc, false, Some("Monitor details dismissed")),
+            ("ag1", Key::Esc, false, Some("Agent details dismissed")),
+            ("b1", Key::Enter, false, None),
+            ("b1", Key::Esc, true, None),
+        ] {
+            let mut v = tasks::View {
+                direct,
+                ..tasks::View::default()
+            };
+            open_task(&mut v, c.tasks.iter().find(|t| t.id == id).unwrap());
+            let mut toast = None;
+            let d = tasks_key(c, v, k, &mut Vec::new(), &mut toast, &mut None);
+            assert!(d.is_none(), "{id} {k:?}: closed");
+            assert_eq!(toast.as_deref(), want, "{id} {k:?} direct {direct}");
+        }
+    }
+
+    #[test]
+    fn f_brings_a_running_agent_into_view_and_enter_a_finished_ones_conversation() {
+        let app = app_in(&[MIXED]);
+        let c = conv_of(&app);
+        let task = |id: &str| c.tasks.iter().find(|t| t.id == id).unwrap().clone();
+        // `f` in details: only a running agent's.
+        for (id, fg_wanted) in [("ag1", true), ("ag2", false), ("b1", false)] {
+            let mut v = tasks::View::default();
+            open_task(&mut v, &task(id));
+            let mut fg = None;
+            let d = tasks_key(c, v, Key::Char('f'), &mut Vec::new(), &mut None, &mut fg);
+            assert_eq!(fg.map(|t| t.id), fg_wanted.then(|| id.to_string()), "{id}");
+            assert_eq!(d.is_none(), fg_wanted, "{id}: the view closes for it");
+        }
+        // Enter on the list: a finished agent's conversation, else the details.
+        let rows = tasks::listed(&c.tasks);
+        for (id, fg_wanted) in [("ag2", true), ("ag1", false), ("b1", false)] {
+            let sel = rows.iter().position(|(_, t)| t.id == id).unwrap();
+            let v = tasks::View {
+                sel,
+                ..tasks::View::default()
+            };
+            let mut fg = None;
+            let d = tasks_key(c, v, Key::Enter, &mut Vec::new(), &mut None, &mut fg);
+            assert_eq!(fg.map(|t| t.id), fg_wanted.then(|| id.to_string()), "{id}");
+            if !fg_wanted {
+                assert!(
+                    matches!(&d, Some(Dialog::Tasks(v)) if v.open.as_deref() == Some(id)),
+                    "{id}: {d:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_workflows_save_form_edits_its_name_sends_it_and_once_saved_enter_closes_it() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.save = Some(tasks::Save {
+            name: "two-readers".into(),
+            ..tasks::Save::default()
+        });
+        let mut out = Vec::new();
+        let step = |v: tasks::View, k: Key, out: &mut Vec<Value>| match tasks_key(
+            c, v, k, out, &mut None, &mut None,
+        ) {
+            Some(Dialog::Tasks(v)) => v,
+            d => panic!("{d:?}"),
+        };
+        for k in [
+            Key::Char('\x7f'),
+            Key::Char('\x08'),
+            Key::Char('s'),
+            Key::Char('!'),
+            Key::Char('\x01'),
+        ] {
+            v = step(v, k, &mut out);
+        }
+        assert_eq!(v.save.as_ref().unwrap().name, "two-reades!");
+        v = step(v, Key::Enter, &mut out);
+        assert_eq!(
+            out.iter().map(json::to_line).collect::<Vec<_>>(),
+            [r#"{"i":"wf1","n":"two-reades!","sc":"project","t":"wsave"}"#]
+        );
+        v.save.as_mut().unwrap().said = Some(Ok("/w/two-reades!.js".into()));
+        let mut out = Vec::new();
+        v = step(v, Key::Enter, &mut out);
+        assert!(out.is_empty(), "saved: Enter does not save it again");
+        assert!(v.save.is_none(), "but closes the form");
+    }
+
+    #[test]
+    fn the_browsers_phases_move_with_up_and_down_and_stop_at_either_end() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["one","two","three"],"ag":[]}"#).unwrap(),
+        ));
+        let phase = |v: &mut tasks::View, k: Key| {
+            let Some(Dialog::Tasks(next)) =
+                tasks_key(c, v.clone(), k, &mut Vec::new(), &mut None, &mut None)
+            else {
+                panic!()
+            };
+            *v = next;
+            v.phase
+        };
+        assert_eq!(phase(&mut v, Key::Up), 0);
+        assert_eq!(phase(&mut v, Key::Down), 1);
+        assert_eq!(phase(&mut v, Key::Down), 2);
+        assert_eq!(phase(&mut v, Key::Down), 2);
+        assert_eq!(phase(&mut v, Key::Up), 1);
+    }
+
+    #[test]
+    fn the_browsers_agents_move_within_their_list_and_one_agents_pane_goes_back_to_it() {
+        let app = app_in(&[AGENTS]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[1]);
+        v.wf = Some(tasks::parse_wf(
+            &parse(r#"{"ph":["read"],"ag":[{"l":"a","ph":1},{"l":"b","ph":1},{"l":"c","ph":1}]}"#)
+                .unwrap(),
+        ));
+        let key = |v: &mut tasks::View, k: Key| {
+            let Some(Dialog::Tasks(next)) =
+                tasks_key(c, v.clone(), k, &mut Vec::new(), &mut None, &mut None)
+            else {
+                panic!()
+            };
+            *v = next;
+            (v.pane, v.agent)
+        };
+        use tasks::Pane::{Agent, Agents};
+        assert_eq!(key(&mut v, Key::Right), (Agents, 0));
+        assert_eq!(key(&mut v, Key::Up), (Agents, 0));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 1));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 2));
+        assert_eq!(key(&mut v, Key::Down), (Agents, 2));
+        assert_eq!(key(&mut v, Key::Up), (Agents, 1));
+        for back in [Key::Esc, Key::Left, Key::Enter] {
+            assert_eq!(key(&mut v, Key::Enter), (Agent, 1));
+            assert_eq!(key(&mut v, back), (Agents, 1), "{back:?}");
+        }
+    }
+
+    #[test]
+    fn s_saves_only_a_workflow_that_can_be_saved() {
+        let app = app_in(&[SHELL_AND_AGENT]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, c.tasks.iter().find(|t| t.id == "wf1").unwrap());
+        let d = tasks_key(c, v, Key::Char('s'), &mut Vec::new(), &mut None, &mut None);
+        assert!(matches!(d, Some(Dialog::Tasks(v)) if v.save.is_none()));
+    }
+
+    #[test]
+    fn x_stops_only_a_running_workflow_and_enter_opens_no_pane_on_an_empty_list() {
+        let app = app_in(&[
+            r#"{"t":"tasks","l":[{"i":"wf1","k":"workflow","d":"Two agents","c":"two","st":"completed"}]}"#,
+        ]);
+        let c = conv_of(&app);
+        let mut v = tasks::View::default();
+        open_task(&mut v, &c.tasks[0]);
+        let mut out = Vec::new();
+        let d = tasks_key(c, v, Key::Char('x'), &mut out, &mut None, &mut None);
+        assert!(out.is_empty(), "already ended");
+        let Some(Dialog::Tasks(v)) = d else { panic!() };
+        let Some(Dialog::Tasks(v)) = tasks_key(c, v, Key::Right, &mut out, &mut None, &mut None)
+        else {
+            panic!()
+        };
+        let d = tasks_key(c, v, Key::Enter, &mut out, &mut None, &mut None);
+        assert!(
+            matches!(&d, Some(Dialog::Tasks(v)) if v.pane == tasks::Pane::Agents),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn the_clients_slash_commands_say_what_they_take_and_send_what_they_mean() {
+        let mut c = convo_with(&[
+            r#"{"t":"meta","sid":"s","m":"claude-opus-5-5","pm":"default","ti":"","e":"high","cwd":"","ver":""}"#,
+        ]);
+        let mut ui = Ui::new();
+        let mut run = |text: &str, models: &Option<Vec<(String, String)>>| {
+            ui.status = None;
+            ui.dialog = None;
+            let got = match submit(&mut c, &mut ui, text, models) {
+                Submit::Send(v) => v.iter().map(line).collect::<Vec<_>>().join(" "),
+                Submit::Copy(t) => format!("copy {t}"),
+                Submit::Home => "home".into(),
+                Submit::Nothing => String::new(),
+            };
+            (got, ui.status.clone(), ui.dialog.clone())
+        };
+        let said = |s: &str| Some(s.to_string());
+        assert_eq!(run("", &None), (String::new(), None, None));
+        // `/effort` bare: the picker on the session's own; `auto` and `default` take it out.
+        assert_eq!(
+            run("/effort", &None),
+            (String::new(), None, Some(Dialog::Effort { sel: 3 }))
+        );
+        for e in ["auto", "default"] {
+            assert_eq!(
+                run(&format!("/effort {e}"), &None).0,
+                r#"{"e":null,"t":"effort"}"#
+            );
+        }
+        assert_eq!(
+            run("/rename", &None),
+            (String::new(), said("/rename takes the new title"), None)
+        );
+        for q in ["/exit", "/quit"] {
+            assert_eq!(run(q, &None).0, r#"{"t":"exit"}"#);
+        }
+        for rc in ["/rc", "/remote-control"] {
+            assert_eq!(
+                run(rc, &None),
+                (r#"{"t":"rc"}"#.into(), said("Remote Control…"), None)
+            );
+        }
+        assert!(matches!(run("/bashes", &None).2, Some(Dialog::Tasks(_))));
+        assert_eq!(
+            run("/btw", &None),
+            (String::new(), said("/btw takes a question"), None)
+        );
+        // `/model` with the list already here: the picker on the model in use, nothing sent.
+        let list = Some(vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ]);
+        let (sent, _, d) = run("/model", &list);
+        assert_eq!(sent, "");
+        assert!(matches!(d, Some(Dialog::Model { list: Some(_), .. })));
+        assert_eq!(
+            run("/model sonnet", &list),
+            (r#"{"m":"sonnet","t":"model"}"#.into(), None, None)
+        );
+        // `/copy`: how many back, 1 the latest; not 0, not a word, not more than there are.
+        for bad in ["/copy 0", "/copy two"] {
+            assert_eq!(
+                run(bad, &None).1,
+                said("/copy takes how many responses back, 1 the latest")
+            );
+        }
+        c.apply(
+            &parse(r#"{"t":"add","id":1,"k":"text","x":"hello"}"#).unwrap(),
+            Instant::now(),
+        );
+        let mut ui2 = Ui::new();
+        assert!(matches!(
+            submit(&mut c, &mut ui2, "/copy 2", &None),
+            Submit::Nothing
+        ));
+        assert_eq!(ui2.status, said("Only 1 responses to copy from"));
+        assert!(
+            matches!(submit(&mut c, &mut ui2, "/copy 1", &None), Submit::Copy(t) if t == "hello")
+        );
+        assert_eq!(ui2.status, said("Copied 5 characters to the clipboard"));
+    }
+
+    #[test]
+    fn the_pickers_move_within_their_choices_and_enter_sends_the_one_chosen() {
+        let c = convo_with(&[]);
+        let key = |d: Dialog, k: Key| {
+            let mut out = Vec::new();
+            let d = dialog_key(&c, d, k, &mut out);
+            (d, out.iter().map(line).collect::<Vec<_>>().join(" "))
+        };
+        let list = Some(vec![
+            ("default".to_string(), "Opus".to_string()),
+            ("sonnet".to_string(), "Sonnet".to_string()),
+        ]);
+        let model = |sel| Dialog::Model {
+            sel,
+            list: list.clone(),
+        };
+        assert_eq!(key(model(0), Key::Up), (Some(model(0)), String::new()));
+        assert_eq!(key(model(0), Key::Down), (Some(model(1)), String::new()));
+        assert_eq!(key(model(1), Key::Down), (Some(model(1)), String::new()));
+        assert_eq!(key(model(1), Key::Up), (Some(model(0)), String::new()));
+        assert_eq!(
+            key(model(1), Key::Char('q')),
+            (Some(model(1)), String::new())
+        );
+        assert_eq!(key(model(1), Key::Esc), (None, String::new()));
+        assert_eq!(
+            key(model(1), Key::Enter),
+            (None, r#"{"m":"sonnet","t":"model"}"#.into())
+        );
+        let none = Dialog::Model { sel: 0, list: None };
+        assert_eq!(key(none, Key::Enter), (None, String::new()), "no list yet");
+        let effort = |sel| Dialog::Effort { sel };
+        let last = convo::EFFORT_CHOICES.len() - 1;
+        assert_eq!(key(effort(0), Key::Left).0, Some(effort(0)));
+        assert_eq!(key(effort(0), Key::Right).0, Some(effort(1)));
+        assert_eq!(key(effort(last), Key::Right).0, Some(effort(last)));
+        assert_eq!(key(effort(2), Key::Left).0, Some(effort(1)));
+        assert_eq!(key(effort(2), Key::Up).0, Some(effort(2)));
+        assert_eq!(key(effort(2), Key::Esc), (None, String::new()));
+        assert_eq!(
+            key(effort(0), Key::Enter).1,
+            r#"{"e":null,"t":"effort"}"#,
+            "auto: the model's own"
+        );
+        assert_eq!(key(effort(3), Key::Enter).1, r#"{"e":"high","t":"effort"}"#);
+        let mode = |sel| Dialog::Mode { sel };
+        let last = convo::MODES.len() - 1;
+        assert_eq!(key(mode(0), Key::Up).0, Some(mode(0)));
+        assert_eq!(key(mode(last), Key::Down).0, Some(mode(last)));
+        assert_eq!(key(mode(2), Key::Up).0, Some(mode(1)));
+        assert_eq!(key(mode(2), Key::Left).0, Some(mode(2)));
+        assert_eq!(key(mode(2), Key::Esc), (None, String::new()));
+        assert_eq!(key(mode(last), Key::Enter).1, r#"{"m":"auto","t":"mode"}"#);
+        assert_eq!(
+            key(mode(9), Key::Enter).1,
+            r#"{"m":"auto","t":"mode"}"#,
+            "a choice past the end is the last"
+        );
+    }
+
+    #[test]
+    fn a_permission_dialogs_keys_stay_within_its_options_and_its_plan_scrolls_within_its_lines() {
+        let c = convo_with(&[
+            r#"{"t":"add","id":1,"k":"perm","r":"p1","n":"Bash","a":"touch x","d":"","al":"Yes, and don't ask again for touch commands in this project"}"#,
+        ]);
+        let perm = |sel, top| Dialog::Perm {
+            sel,
+            top,
+            typing: None,
+        };
+        let key = |c: &Convo, d: Dialog, k: Key| {
+            let mut out = Vec::new();
+            let d = dialog_key(c, d, k, &mut out);
+            (d, out.len())
+        };
+        assert_eq!(key(&c, perm(1, 0), Key::Up), (Some(perm(0, 0)), 0));
+        assert_eq!(key(&c, perm(0, 0), Key::Up), (Some(perm(0, 0)), 0));
+        assert_eq!(key(&c, perm(2, 0), Key::Down), (Some(perm(2, 0)), 0));
+        for k in ['0', '4', '9', 'y'] {
+            assert_eq!(
+                key(&c, perm(1, 0), Key::Char(k)),
+                (Some(perm(1, 0)), 0),
+                "{k}"
+            );
+        }
+        let lines: Vec<String> = (1..=30).map(|n| format!("{n}. step")).collect();
+        let plan = convo_with(&[&format!(
+            r#"{{"t":"add","id":1,"k":"perm","r":"p1","n":"ExitPlanMode","a":"{}"}}"#,
+            lines.join("\\n")
+        )]);
+        let mut d = perm(0, 0);
+        for (k, want) in [
+            (Key::PageDown, 10),
+            (Key::WheelDown, 11),
+            (Key::PageUp, 1),
+            (Key::WheelUp, 0),
+            (Key::WheelUp, 0),
+        ] {
+            d = key(&plan, d, k).0.unwrap();
+            assert_eq!(d, perm(0, want), "{k:?}");
+        }
+        for _ in 0..5 {
+            d = key(&plan, d, Key::PageDown).0.unwrap();
+        }
+        assert_eq!(d, perm(0, 30), "held to its lines");
+        assert_eq!(key(&plan, perm(0, 99), Key::PageUp).0, Some(perm(0, 20)));
+    }
+
+    #[test]
+    fn the_screen_is_what_the_terminal_says_or_the_narrow_mockups_when_it_cannot() {
+        assert_eq!(screen(Some((80, 30))), (80, 30));
+        assert_eq!(screen(None), (40, 24));
+    }
+
+    #[test]
+    fn up_and_down_keep_the_column_across_wrapped_rows_and_never_land_past_a_wrap() {
+        let at = |input: &str, cursor: usize, up: bool, room: usize| {
+            let mut ui = Ui::new();
+            ui.input = input.into();
+            ui.cursor = cursor;
+            assert!(row_step(&mut ui, up, room));
+            ui.cursor
+        };
+        assert_eq!(at("abcdefghijklmno", 12, true, 10), 2, "the same column");
+        assert_eq!(at("abcdefghijklmno", 2, false, 10), 12);
+        // Wrapped at the space: Up stops on it, not on the next row's first letter.
+        assert_eq!(at("aaa bbbbbb", 9, true, 6), 3);
+        // A last row shorter than the column: its end.
+        assert_eq!(at("abcdef\nxyz", 5, false, 6), 10);
+    }
+
+    #[test]
+    fn the_tasks_view_from_slash_tasks_counts_only_notices_since_it_opened() {
+        let mut c = convo_with(&[]);
+        c.notices = 2;
+        let mut ui = Ui::new();
+        submit(&mut c, &mut ui, "/tasks", &None);
+        assert!(matches!(ui.dialog, Some(Dialog::Tasks(v)) if v.notices_at == 2));
+    }
+
+    #[test]
+    fn a_paste_of_800_characters_goes_in_as_itself_and_one_more_stands_in() {
+        let mut ui = Ui::new();
+        paste(&mut ui, &"x".repeat(800), 32, Instant::now());
+        assert!(ui.pastes.is_empty());
+        let mut ui = Ui::new();
+        paste(&mut ui, &"x".repeat(801), 32, Instant::now());
+        assert_eq!(ui.input, "[Pasted text #1]");
+    }
+
+    #[test]
+    fn pasting_again_expands_a_paste_of_up_to_a_hundred_thousand_characters() {
+        let now = Instant::now();
+        let mut ui = Ui::new();
+        let most = "x".repeat(PASTE_EXPANDS);
+        paste(&mut ui, &most, 32, now);
+        paste(&mut ui, &most, 32, now);
+        assert_eq!(ui.input.chars().count(), PASTE_EXPANDS, "expanded");
+        let mut ui = Ui::new();
+        let more = "x".repeat(PASTE_EXPANDS + 1);
+        paste(&mut ui, &more, 32, now);
+        assert_eq!(ui.paste_hint, None, "no hint for what will not expand");
+        paste(&mut ui, &more, 32, now);
+        assert_eq!(ui.input, "[Pasted text #1][Pasted text #2]");
+    }
+
+    #[test]
+    fn the_line_editor_deletes_and_moves_within_the_line_and_types_no_control_keys() {
+        let key = |text: &str, at: usize, k: Key| {
+            let mut chars: Vec<char> = text.chars().collect();
+            let at = edit_line(&mut chars, at, k);
+            (chars.into_iter().collect::<String>(), at)
+        };
+        let back = Key::Char('\x7f');
+        assert_eq!(key("hello", 3, back), ("helo".into(), 2));
+        assert_eq!(key("hello", 0, back), ("hello".into(), 0), "nothing before");
+        assert_eq!(key("hello", 3, Key::Delete), ("helo".into(), 3));
+        assert_eq!(
+            key("hello", 5, Key::Delete),
+            ("hello".into(), 5),
+            "nothing after"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x15')),
+            ("llo".into(), 0),
+            "Ctrl+U"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x01')),
+            ("hello".into(), 0),
+            "Ctrl+A"
+        );
+        assert_eq!(
+            key("hello", 2, Key::Char('\x05')),
+            ("hello".into(), 5),
+            "Ctrl+E"
+        );
+        assert_eq!(key("hello", 2, Key::Char('\x02')), ("hello".into(), 2));
+        assert_eq!(key("hello", 5, Key::Right), ("hello".into(), 5));
+        assert_eq!(key("hello", 0, Key::Left), ("hello".into(), 0));
+    }
+
+    #[test]
+    fn an_answer_typed_comes_back_to_be_edited_and_a_multi_select_keeps_its_tab() {
+        let c = convo_with(&[
+            r#"{"t":"add","id":1,"k":"ask","r":"q1","q":[{"q":"Colour?","h":"C","m":false,"o":[["Red",""],["Blue",""]]},{"q":"Sizes?","h":"S","m":true,"o":[["S",""],["M",""]]}]}"#,
+        ]);
+        let mut ui = Ui::new();
+        follow_prompts(&c, &mut ui);
+        let start = ui.dialog.clone().unwrap();
+        let keys = |d: Dialog, keys: &[Key]| {
+            let mut d = Some(d);
+            let mut out = Vec::new();
+            for k in keys {
+                d = dialog_key(&c, d.expect("open"), *k, &mut out);
+            }
+            (d, out.len())
+        };
+        let typing = |d: &Option<Dialog>| match d {
+            Some(Dialog::Ask { typing, q, sel, .. }) => {
+                (*q, *sel, typing.as_ref().map(|f| f.text.clone()))
+            }
+            d => panic!("{d:?}"),
+        };
+        let typed = |s: &str| s.chars().map(Key::Char).collect::<Vec<_>>();
+        // Typed, moved on, and back: the row for typing has it again.
+        let mut ks = vec![Key::Char('3')];
+        ks.extend(typed("teal"));
+        ks.extend([Key::Enter, Key::Left, Key::Char('3')]);
+        assert_eq!(
+            typing(&keys(start.clone(), &ks).0),
+            (0, 2, Some("teal".into()))
+        );
+        // A label chosen is not brought back as typing.
+        let (d, _) = keys(start.clone(), &[Key::Char('1'), Key::Left, Key::Char('3')]);
+        assert_eq!(typing(&d), (0, 2, Some(String::new())));
+        // Nothing typed: Enter stays on the question, unanswered.
+        let (d, _) = keys(start.clone(), &[Key::Char('3'), Key::Enter]);
+        assert_eq!(typing(&d), (0, 2, None));
+        // A multi-select keeps its tab once something is typed, so more can be ticked.
+        let mut ks = vec![Key::Right, Key::Char('3')];
+        ks.extend(typed("XL"));
+        ks.push(Key::Enter);
+        assert_eq!(typing(&keys(start.clone(), &ks).0), (1, 2, None));
+        // Left on the first tab goes nowhere and keeps the row chosen.
+        let (d, _) = keys(start.clone(), &[Key::Down, Key::Left]);
+        assert_eq!(typing(&d), (0, 1, None));
+        // Down stops on the last row, "Chat about this", after Red, Blue and typing.
+        let mut d = Some(start);
+        for _ in 0..9 {
+            d = keys(d.unwrap(), &[Key::Down]).0;
+        }
+        assert_eq!(typing(&d), (0, 3, None));
+    }
+
+    #[test]
+    fn the_time_a_turn_ended_is_claude_codes_twelve_hour_clock() {
+        assert_eq!(twelve_hour("01:12 AM\n"), "1:12 AM");
+        assert_eq!(twelve_hour("11:05 PM\n"), "11:05 PM");
+        // From `date`, whose AM or PM the locale decides.
+        let now = clock_time();
+        assert!(now.contains(':') && !now.starts_with('0'), "{now:?}");
+    }
+
+    fn plain_frame(app: &mut App, now: Instant) -> Vec<String> {
+        let (rows, _) = app.frame(40, 24, now);
+        rows.iter()
+            .map(|r| {
+                // The row's text, its escapes taken out.
+                let mut out = String::new();
+                let mut esc = false;
+                for ch in r.chars() {
+                    match ch {
+                        '\x1b' => esc = true,
+                        c if esc && c.is_ascii_alphabetic() => esc = false,
+                        _ if esc => {}
+                        c => out.push(c),
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_homes_spinners_turn_with_time_saying_what_they_wait_for() {
+        let t0 = Instant::now();
+        let spinner = |frame: usize| crate::ui::SPINNER[frame % crate::ui::SPINNER.len()];
+        // Before the hello: connecting, a frame each SPIN_EVERY since the client started.
+        let mut app = App::new("dev", 40, 24, 1);
+        app.started = t0;
+        let has = |rows: &[String], s: &str| rows.iter().any(|r| r.contains(s));
+        let rows = plain_frame(&mut app, t0 + SPIN_EVERY * 3);
+        assert!(
+            has(&rows, &format!("{} connecting", spinner(3))),
+            "{rows:?}"
+        );
+        // The link down after it: reconnecting, with the seconds.
+        app.greeted = true;
+        app.menu.set_busy(None);
+        app.down_since = Some(t0);
+        let rows = plain_frame(&mut app, t0 + Duration::from_secs(8));
+        let frame = (8000 / SPIN_EVERY.as_millis()) as usize;
+        assert!(
+            has(&rows, &format!("{} Reconnecting… (8s)", spinner(frame))),
+            "{rows:?}"
+        );
+        // Not before the hello: then it is still connecting.
+        let mut app = App::new("dev", 40, 24, 1);
+        app.down_since = Some(t0);
+        assert!(!has(&plain_frame(&mut app, t0), "Reconnecting"));
+        // An action under way: its words, turning from when it began.
+        let rows = vec![row(RowKey::Slot("claude-3".into()), true, false)];
+        let mut app = home_with(&rows);
+        app.working = Some((t0, 1, "offloading session".into()));
+        let rows = plain_frame(&mut app, t0 + SPIN_EVERY * 2);
+        assert!(
+            has(&rows, &format!("{} offloading session", spinner(2))),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_menu_is_built_again_only_when_the_containers_change() {
+        let mut app = App::new("dev", 40, 24, 1);
+        assert!(!app.hosts_changed(), "none yet, none built for");
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a"]}"#);
+        assert!(app.hosts_changed());
+        assert!(!app.hosts_changed(), "built for them");
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":["a","b"]}"#);
+        assert!(app.hosts_changed());
+    }
+
+    #[test]
+    fn a_resize_redraws_the_whole_screen_and_is_no_key() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        app.paint_bytes(40, 24, now);
+        assert!(!app.keys(vec![Key::Char('a'), Key::Char('b')], now));
+        assert_eq!(ui_of(&app).input, "ab");
+        app.paint_bytes(40, 24, now);
+        assert!(app.keys(vec![Key::Resize, Key::Char('c')], now));
+        assert_eq!(ui_of(&app).input, "abc");
+        assert_eq!(app.paint_bytes(40, 24, now).matches(";1H").count(), 24);
+    }
+
+    #[test]
+    fn only_the_link_in_use_is_heard_and_a_links_end_is_taken() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        let now = Instant::now();
+        app.take(
+            Heard::Line(
+                app.epoch - 1,
+                parse(r#"{"t":"hi","v":1,"hosts":["old"]}"#).unwrap(),
+            ),
+            now,
+        );
+        assert!(app.hosts.is_empty(), "an earlier link's");
+        app.take(
+            Heard::Line(
+                app.epoch,
+                parse(r#"{"t":"hi","v":1,"hosts":["a"]}"#).unwrap(),
+            ),
+            now,
+        );
+        assert_eq!(app.hosts, ["a"]);
+        app.take(Heard::Gone(app.epoch, String::new()), now);
+        assert!(!app.up());
+    }
+
+    #[test]
+    fn an_answer_overdue_takes_the_link_down_and_a_retry_falls_due_on_time() {
+        let mut app = App::new("dev", 40, 24, 1);
+        let rx = cat_relay(&mut app);
+        sent(&mut app, &rx);
+        hear(&mut app, r#"{"t":"hi","v":1,"hosts":[]}"#);
+        let now = Instant::now();
+        app.awaiting = Some(now);
+        assert!(!app.due(now + Duration::from_secs(1)));
+        assert!(app.up(), "still within its five seconds");
+        assert!(!app.due(now + ACK_WAIT), "down, its retry a second off");
+        assert!(!app.up());
+        assert!(app.due(now + ACK_WAIT + Duration::from_secs(1)));
     }
 }

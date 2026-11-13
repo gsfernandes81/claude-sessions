@@ -774,15 +774,7 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
     // a conversation from before a `/clear`, or from a `claude` run by hand, is one `Enter`
     // away. Not one that is running — Claude Code's live sessions say which — and not the
     // current conversation of a slot listed above, which is that slot's row.
-    let mut taken: std::collections::HashSet<String> = live::all()
-        .into_iter()
-        .filter_map(|s| s.session_id)
-        .collect();
-    taken.extend(
-        recs.iter()
-            .filter(|r| r.state != State::Closed)
-            .filter_map(|r| r.session_id.clone()),
-    );
+    let taken = not_archived(live::all().into_iter().filter_map(|s| s.session_id), &recs);
     let marks = archive::marks();
     // pi's conversations are listed with Claude Code's, from pi's own store (`pisession.rs`),
     // and resume in a `pi-<n>` slot.
@@ -823,6 +815,22 @@ pub fn gather(now: Millis, workspace: &str, sessions: &[zmx::Session]) -> Vec<Ro
     let mut rows: Vec<Row> = dated.into_iter().map(|(_, row)| row).collect();
     rows.extend(socket_rows(&recs, sessions, clock));
     rows
+}
+
+/// The conversations not listed from the store: each one running — `running`, from Claude
+/// Code's live sessions — and each listed slot's current one, which is that slot's row. A
+/// closed slot is not listed, so its last conversation is, from the store.
+fn not_archived(
+    running: impl IntoIterator<Item = String>,
+    recs: &[SlotRecord],
+) -> std::collections::HashSet<String> {
+    let mut taken: std::collections::HashSet<String> = running.into_iter().collect();
+    taken.extend(
+        recs.iter()
+            .filter(|r| r.state != State::Closed)
+            .filter_map(|r| r.session_id.clone()),
+    );
+    taken
 }
 
 /// A row for every zmx session no record names: somebody's `zmx attach`, or a slot whose
@@ -894,11 +902,16 @@ fn slot_row(r: &SlotRecord, clock: Millis, sessions: &[zmx::Session]) -> Row {
         age: fmt::age(clock.saturating_sub(r.last_activity_ms)),
         at: r.last_activity_ms,
         nested: false,
-        // Said by the record, or by the holder's socket where an older release rewrote it.
-        remote: r.driver == crate::registry::Driver::Holder
-            || (alive || r.pid.is_none()) && crate::holder::paths(&r.slot).sock.exists(),
+        remote: held(r, alive, || crate::holder::paths(&r.slot).sock.exists()),
         named,
     }
+}
+
+/// Whether the remote view's holder drives the slot: said by the record, or by the holder's
+/// socket (`has_socket`, asked only when needed) where an older release rewrote the record —
+/// though not for a slot whose process is known to be gone.
+fn held(r: &SlotRecord, alive: bool, has_socket: impl FnOnce() -> bool) -> bool {
+    r.driver == crate::registry::Driver::Holder || (alive || r.pid.is_none()) && has_socket()
 }
 
 /// The container's name, as the header shows it: its hostname.
@@ -1072,6 +1085,48 @@ mod tests {
         };
         assert!(slot_row(&closed, 0, &[]).closed);
         assert!(!slot_row(&r, 0, &[]).closed);
+    }
+
+    #[test]
+    fn a_slot_is_remote_when_its_record_says_so_or_its_holders_socket_does_while_it_runs() {
+        use crate::registry::Driver;
+        let held = |driver, alive, pid: Option<u32>, socket| {
+            let r = SlotRecord {
+                driver,
+                pid,
+                ..SlotRecord::new("claude-1", Moment::ms(0))
+            };
+            held(&r, alive, || socket)
+        };
+        // The record says so, whatever else does.
+        assert!(held(Driver::Holder, false, Some(1), false));
+        // An older release rewrote the record: the socket says so, for a slot that runs or
+        // is still starting.
+        assert!(held(Driver::Terminal, true, Some(1), true));
+        assert!(held(Driver::Terminal, false, None, true));
+        // Its process gone, a socket left behind says nothing.
+        assert!(!held(Driver::Terminal, false, Some(1), true));
+        // Calibration: a terminal's slot with no socket.
+        assert!(!held(Driver::Terminal, true, Some(1), false));
+    }
+
+    #[test]
+    fn a_closed_slots_last_conversation_is_archived_and_a_listed_slots_is_its_row() {
+        let with = |slot: &str, state, id: &str| SlotRecord {
+            state,
+            session_id: Some(id.into()),
+            ..SlotRecord::new(slot, Moment::ms(0))
+        };
+        let recs = [
+            with("claude-1", State::Live, "live"),
+            with("claude-2", State::Offloaded, "offloaded"),
+            with("claude-3", State::Closed, "closed"),
+            SlotRecord::new("claude-4", Moment::ms(0)),
+        ];
+        let taken = not_archived(["running".to_string()], &recs);
+        let mut taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+        taken.sort();
+        assert_eq!(taken, ["live", "offloaded", "running"]);
     }
 
     #[test]

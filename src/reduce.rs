@@ -3080,4 +3080,344 @@ mod tests {
         );
         assert!(r.workflow_view("nope", None).is_none());
     }
+
+    #[test]
+    fn an_agents_lines_count_only_what_there_is() {
+        let ended = |workflow: bool, tokens: u64| TaskView {
+            workflow,
+            ended: Some("completed".into()),
+            usage: sdk::Usage {
+                tokens,
+                tool_uses: 1,
+                duration_ms: 7_600,
+            },
+            ..TaskView::default()
+        };
+        assert_eq!(ended(false, 0).lines(), ["Done (1 tool use · 7.6s)"]);
+        assert_eq!(ended(true, 0).lines(), ["Done (1 tool use · 7.6s)"]);
+        assert_eq!(
+            ended(false, 512).lines(),
+            ["Done (1 tool use · 512 tokens · 7.6s)"]
+        );
+        // A workflow's running agents: two by name, a count of the rest.
+        let running = |n: usize| TaskView {
+            workflow: true,
+            agents: (1..=n)
+                .map(|i| sdk::WorkflowAgent {
+                    label: format!("r{i}"),
+                    phase: 1,
+                    state: "progress".into(),
+                    ..sdk::WorkflowAgent::default()
+                })
+                .collect(),
+            ..TaskView::default()
+        };
+        assert_eq!(running(2).lines(), ["0 of 2 agents done", "r1", "r2"]);
+        assert_eq!(
+            running(4).lines(),
+            ["0 of 4 agents done", "r1", "r2", "+2 more running"]
+        );
+    }
+
+    #[test]
+    fn tokens_are_counted_as_claude_code_counts_them() {
+        assert_eq!(tokens(0), "0");
+        assert_eq!(tokens(999), "999");
+        assert_eq!(tokens(21_600), "21.6k");
+        assert_eq!(tokens(1_234_567), "1.2m");
+    }
+
+    #[test]
+    fn an_agent_is_named_by_its_type_and_a_general_purpose_one_is_agent() {
+        let named = |input: &str| agent_name("Agent", &parse(input).unwrap());
+        assert_eq!(named(r#"{"subagent_type":"Explore"}"#), "Explore");
+        assert_eq!(named(r#"{"subagent_type":"general-purpose"}"#), "Agent");
+        assert_eq!(named(r#"{"subagent_type":""}"#), "Agent");
+        assert_eq!(named(r#"{}"#), "Agent");
+    }
+
+    #[test]
+    fn a_stretch_numbered_on_its_own_hands_over_its_next_number_and_its_results() {
+        let mut r = Reducer::numbered_from(10);
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"t1","type":"tool_result","content":"a\nb\nc\nd\ne"}]}}"#,
+                r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"Five."}]}}"#,
+            ],
+        );
+        let ids: Vec<u64> = o
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Add { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, [10, 11]);
+        assert_eq!(r.next_number(), 12);
+        let results = r.take_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results.get(&10).map(String::as_str), Some("a\nb\nc\nd\ne"));
+        assert!(r.full_result(10).is_none(), "taken, not copied");
+    }
+
+    #[test]
+    fn a_known_tools_argument_is_its_own_field_whatever_else_its_input_holds() {
+        for (name, key) in [
+            ("Bash", "command"),
+            ("Read", "file_path"),
+            ("Write", "file_path"),
+            ("Edit", "file_path"),
+            ("MultiEdit", "file_path"),
+            ("NotebookEdit", "notebook_path"),
+            ("Grep", "pattern"),
+            ("Glob", "pattern"),
+            ("WebFetch", "url"),
+            ("WebSearch", "query"),
+            ("Task", "description"),
+            ("Agent", "description"),
+            ("Skill", "skill"),
+        ] {
+            // `a` sorts first, so it is what an unknown tool would show.
+            let input = parse(&format!(r#"{{"a":"noise","{key}":"it"}}"#)).unwrap();
+            assert_eq!(tool_arg(name, &input), "it", "{name}");
+        }
+        // Without its field, a known tool shows nothing rather than another one.
+        let input = parse(r#"{"description":"List files"}"#).unwrap();
+        assert_eq!(tool_arg("Bash", &input), "");
+        // Only ExitPlanMode's prompt shows a plan.
+        let input = parse(r#"{"command":"ls","plan":"rm everything"}"#).unwrap();
+        assert_eq!(perm_arg("Bash", &input), "ls");
+        assert_eq!(perm_arg(PLAN_TOOL, &input), "rm everything");
+    }
+
+    #[test]
+    fn dont_ask_again_names_each_command_and_tool_once() {
+        let v = |s: &str| parse(s).unwrap();
+        let same = v(
+            r#"{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"git status"},{"toolName":"Bash","ruleContent":"git diff:*"}]}"#,
+        );
+        assert_eq!(
+            always_label(&[same]).as_deref(),
+            Some("Yes, and don't ask again for git commands in this project")
+        );
+        let tools = v(
+            r#"{"type":"addRules","rules":[{"toolName":"Read"},{"toolName":"Edit"},{"toolName":"Read"}]}"#,
+        );
+        assert_eq!(
+            always_label(&[tools]).as_deref(),
+            Some("Yes, and don't ask again for Read and Edit")
+        );
+    }
+
+    #[test]
+    fn a_task_list_in_a_batch_replaces_only_the_task_list_before_it() {
+        let merged = coalesce(vec![
+            Op::State("working".into()),
+            Op::Tasks(Vec::new()),
+            Op::State("idle".into()),
+            Op::Tasks(Vec::new()),
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                Op::State("working".into()),
+                Op::State("idle".into()),
+                Op::Tasks(Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn init_and_a_title_change_say_where_claude_runs_what_it_offers_and_what_it_is_called() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s1","cwd":"/w","model":"claude-haiku-5-5","permissionMode":"default","claude_code_version":"2.1.311","slash_commands":["usage","compact"]}"#,
+                r#"{"type":"system","subtype":"session_title_changed","title":"Fix the relay"}"#,
+            ],
+        );
+        let m = r.meta();
+        assert_eq!(
+            (m.cwd.as_str(), m.version.as_str(), m.title.as_str()),
+            ("/w", "2.1.311", "Fix the relay")
+        );
+        assert_eq!(m.commands, ["usage", "compact"]);
+        // An effort a view set, read back from the log, and then reset.
+        let mut effort = |e: Option<&str>| {
+            let mut l = Value::obj();
+            l.set("type", Value::string("_in"));
+            l.set("line", sdk::set_effort("c", e));
+            r.feed(&l);
+            r.meta().effort.clone()
+        };
+        assert_eq!(effort(Some("high")), "high");
+        assert_eq!(effort(None), "");
+    }
+
+    #[test]
+    fn answering_one_of_two_prompts_leaves_claude_waiting_on_the_other() {
+        let ask = |id: &str| {
+            format!(
+                r#"{{"type":"control_request","request_id":"{id}","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"touch {id}"}}}}}}"#
+            )
+        };
+        let mut r = Reducer::new();
+        feed_all(&mut r, &[&ask("p1"), &ask("p2")]);
+        let states = |o: Out| {
+            o.ops
+                .into_iter()
+                .filter(|op| matches!(op, Op::State(_)))
+                .collect::<Vec<_>>()
+        };
+        assert!(states(r.answered("p1", "allowed", vec![]).unwrap()).is_empty());
+        assert_eq!(
+            states(r.answered("p2", "allowed", vec![]).unwrap()),
+            [Op::State("working".into())]
+        );
+    }
+
+    #[test]
+    fn an_echo_marks_only_the_prompt_it_echoes_as_arrived() {
+        let mut r = Reducer::new();
+        for (uuid, text) in [("u1", "first"), ("u2", "second")] {
+            let mut l = Value::obj();
+            l.set("type", Value::string("_in"));
+            l.set("line", sdk::prompt(text, uuid));
+            r.feed(&l);
+        }
+        feed_all(
+            &mut r,
+            &[r#"{"type":"user","message":{"role":"user","content":"second"},"isReplay":true}"#],
+        );
+        let waiting: Vec<String> = r.waiting_prompts().into_iter().map(|w| w.1).collect();
+        assert_eq!(waiting, ["first"]);
+    }
+
+    #[test]
+    fn only_a_shell_still_running_can_be_moved_to_the_background() {
+        let mut r = Reducer::new();
+        feed_all(&mut r, &BACKGROUND[..3]);
+        assert!(r.shell_movable(), "started, its task made, no result yet");
+        feed_all(&mut r, &BACKGROUND[3..4]);
+        assert!(!r.shell_movable(), "its result came");
+    }
+
+    #[test]
+    fn a_subagents_own_view_stops_working_only_when_its_task_ends() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tu_a","name":"Agent","input":{"description":"reader","prompt":"Read.","run_in_background":true}}]}}"#,
+                r#"{"type":"system","subtype":"task_started","task_id":"ae72","tool_use_id":"tu_a","description":"reader","task_type":"local_agent","prompt":"Read."}"#,
+                r#"{"type":"assistant","parent_tool_use_id":"tu_a","message":{"id":"s1","content":[{"type":"tool_use","id":"tu_r","name":"Read","input":{"file_path":"/a"}}]}}"#,
+            ],
+        );
+        let idle = |line: &str, r: &mut Reducer| {
+            r.feed(&parse(line).unwrap())
+                .sub
+                .iter()
+                .any(|(_, op)| *op == Op::State("idle".into()))
+        };
+        assert!(!idle(
+            r#"{"type":"system","subtype":"task_updated","task_id":"ae72","tool_use_id":"tu_a","patch":{"status":"running"}}"#,
+            &mut r
+        ));
+        assert!(idle(
+            r#"{"type":"system","subtype":"task_updated","task_id":"ae72","tool_use_id":"tu_a","patch":{"status":"completed"}}"#,
+            &mut r
+        ));
+    }
+
+    #[test]
+    fn an_empty_tool_use_summary_says_nothing() {
+        let mut r = Reducer::new();
+        feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ],
+        );
+        let o = feed_all(
+            &mut r,
+            &[r#"{"type":"tool_use_summary","summary":"  ","preceding_tool_use_ids":["t1"]}"#],
+        );
+        assert!(o.ops.is_empty(), "{:?}", wire(&o.ops));
+    }
+
+    #[test]
+    fn a_synthetic_message_is_a_commands_reply_only_when_it_is_all_text() {
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","model":"<synthetic>","content":[{"type":"text","text":"note"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ],
+        );
+        assert!(
+            wire(&o.ops).iter().any(|l| l.contains(r#""k":"tool""#)),
+            "{:?}",
+            wire(&o.ops)
+        );
+    }
+
+    #[test]
+    fn a_tasks_status_is_what_claude_last_said_of_it() {
+        let mut r = Reducer::new();
+        // Started, with no list from claude yet: running.
+        let start = r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"Sleep","task_type":"local_bash"}"#;
+        let status = |r: &mut Reducer, line: &str| {
+            let list = last_tasks(&r.feed(&parse(line).unwrap()).ops).unwrap_or_default();
+            list.split(r#""st":""#)
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .map(String::from)
+        };
+        assert_eq!(status(&mut r, start).as_deref(), Some("running"));
+        // An update that says no status leaves it as it was; one that says one sets it.
+        r.feed(&parse(r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"end_time":1793763624232}}"#).unwrap());
+        assert_eq!(r.bg[0].task.status, "running");
+        assert_eq!(
+            status(
+                &mut r,
+                r#"{"type":"system","subtype":"task_updated","task_id":"b1","patch":{"status":"failed"}}"#
+            )
+            .as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn a_workflow_run_by_name_is_not_saveable_and_its_counts_are_its_agents() {
+        let mut r = Reducer::new();
+        let agent = |label: &str, state: &str, counts: &str| {
+            format!(
+                r#"{{"type":"workflow_agent","label":"{label}","phaseIndex":1,"state":"{state}"{counts}}}"#
+            )
+        };
+        let progress = format!(
+            r#"{{"type":"system","subtype":"task_progress","task_id":"wm5","tool_use_id":"tu_w","usage":{{"total_tokens":0,"tool_uses":0,"duration_ms":1}},"workflow_progress":[{{"type":"workflow_phase","index":1,"title":"Read"}},{},{},{}]}}"#,
+            agent("a", "done", r#","tokens":10,"toolCalls":1"#),
+            agent("b", "done", r#","tokens":20,"toolCalls":2"#),
+            agent("c", "queued", r#","tokens":0,"toolCalls":0"#),
+        );
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"assistant","message":{"id":"m","content":[{"type":"tool_use","id":"tu_w","name":"Workflow","input":{"name":"audit"}}]}}"#,
+                r#"{"type":"system","subtype":"task_started","task_id":"wm5","tool_use_id":"tu_w","description":"audit","task_type":"local_workflow"}"#,
+                &progress,
+            ],
+        );
+        let list = last_tasks(&o.ops).unwrap();
+        assert!(list.contains(r#""ad":2,"an":3"#), "{list}");
+        assert!(!list.contains(r#""sv""#), "no script to save: {list}");
+        // A queued agent has nothing counted yet, and the browser is sent no counts for it.
+        let v = to_line(&r.workflow_view("wm5", None).unwrap());
+        assert!(v.contains(r#"{"l":"c","ph":1,"st":"queued"}"#), "{v}");
+    }
 }

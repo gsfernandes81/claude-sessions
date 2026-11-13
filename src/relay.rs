@@ -1107,10 +1107,11 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
     ops.extend(c.shown.ops(c.from..c.shown.items.len()));
     ops.extend(c.state_op.iter().cloned());
     ops.extend(c.tasks_op.iter().cloned());
+    let any = !ops.is_empty();
     c.pending = ops;
     flush(c, out);
     // `flush` says nothing for nothing; the client still needs to hear the log is in.
-    if c.shown.items.is_empty() && c.meta_op.is_none() && c.state_op.is_none() {
+    if !any {
         out.push(Effect::Send(msg(
             "n",
             vec![("n", Value::num(c.pending_n as f64))],
@@ -1523,8 +1524,7 @@ fn open(epoch: u64, host: &str, args: &[String], tx: &Sender<Input>) -> Option<R
         let said = said.clone();
         std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let line = line.trim().to_string();
-                if !line.is_empty() {
+                if let Some(line) = worth_saying(&line) {
                     *said.lock().unwrap_or_else(|p| p.into_inner()) = line;
                 }
             }
@@ -1583,30 +1583,39 @@ fn side(epoch: u64, host: &str, args: &[String], input: String, tx: &Sender<Inpu
                 }
                 match child.wait_with_output() {
                     Err(e) => Err(e.to_string()),
-                    Ok(o) => {
-                        let text = String::from_utf8_lossy(&o.stdout);
-                        let v = text
-                            .lines()
-                            .rev()
-                            .find_map(|l| json::parse(l.trim()).ok())
-                            .unwrap_or(Value::Null);
-                        match (s(&v, "answer"), s(&v, "error")) {
-                            (Some(a), _) => Ok(a),
-                            (None, Some(e)) => Err(e),
-                            (None, None) => Err(String::from_utf8_lossy(&o.stderr)
-                                .lines()
-                                .rev()
-                                .find(|l| !l.trim().is_empty())
-                                .unwrap_or("the container did not answer")
-                                .trim()
-                                .to_string()),
-                        }
-                    }
+                    Ok(o) => side_answer(&o.stdout, &o.stderr),
                 }
             }
         };
         let _ = tx.send(Input::Side { epoch, answer });
     });
+}
+
+/// A line the command wrote on stderr, trimmed, when it says anything: the last of them is
+/// the reason when ssh failed.
+fn worth_saying(line: &str) -> Option<String> {
+    let line = line.trim();
+    (!line.is_empty()).then(|| line.to_string())
+}
+
+/// A side question's answer from what its command wrote: the last JSON line's `answer` or
+/// `error`, else the last thing it said on stderr.
+fn side_answer(stdout: &[u8], stderr: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let v = text
+        .lines()
+        .rev()
+        .find_map(|l| json::parse(l.trim()).ok())
+        .unwrap_or(Value::Null);
+    match (s(&v, "answer"), s(&v, "error")) {
+        (Some(a), _) => Ok(a),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err(String::from_utf8_lossy(stderr)
+            .lines()
+            .rev()
+            .find_map(worth_saying)
+            .unwrap_or_else(|| "the container did not answer".to_string())),
+    }
 }
 
 #[cfg(test)]
@@ -2646,5 +2655,593 @@ mod tests {
             ))[0]
                 .contains("no such container")
         );
+    }
+
+    /// Open `claude-3` for a client `w` columns by `rows` rows, and take the command's slot
+    /// line and the holder's header, whose next line is `next`.
+    fn opened_lazy(r: &mut Relay, w: u64, rows: u64, next: u64) -> (u64, Vec<Effect>) {
+        let fx = client(
+            r,
+            &format!(
+                r#"{{"t":"open","c":"claude-sessions","k":{{"slot":"claude-3"}},"w":{w},"r":{rows}}}"#
+            ),
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let now = Instant::now();
+        let mut fx = r.handle(
+            Input::Conv {
+                epoch,
+                line: r#"{"slot":"claude-3"}"#.into(),
+            },
+            now,
+        );
+        fx.extend(r.handle(
+            Input::Conv {
+                epoch,
+                line: format!(r#"{{"next":{next},"run":"run-1"}}"#),
+            },
+            now,
+        ));
+        (epoch, fx)
+    }
+
+    fn reply(n: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"id":"m{n}","content":[{{"type":"text","text":"reply {n}"}}]}}}}"#
+        )
+    }
+
+    fn request_id(line: &str) -> String {
+        parse(line)
+            .unwrap()
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    fn text_add(id: u64, t: &str) -> Op {
+        Op::Add {
+            id,
+            item: Item::Text(t.into()),
+        }
+    }
+
+    #[test]
+    fn what_is_kept_of_an_item_is_the_item_as_it_now_stands() {
+        let mut shown = Shown::default();
+        assert_eq!(shown.record(&text_add(1, "he")), Some(0));
+        let tool = Op::Add {
+            id: 2,
+            item: Item::Tool {
+                name: "Bash".into(),
+                arg: "ls".into(),
+            },
+        };
+        assert_eq!(shown.record(&tool), Some(1));
+        // Streamed text is folded into its item, and a whole text replaces it.
+        let app = Op::Append {
+            id: 1,
+            text: "llo".into(),
+        };
+        assert_eq!(shown.record(&app), Some(0));
+        assert_eq!(shown.ops(0..1), [text_add(1, "hello")]);
+        let set = Op::SetText {
+            id: 1,
+            text: "hi".into(),
+        };
+        shown.record(&set);
+        assert_eq!(shown.ops(0..1), [text_add(1, "hi")]);
+        // A result or progress replaces the one before it.
+        let res = |preview: &str| Op::Result {
+            id: 2,
+            ok: true,
+            preview: vec![preview.into()],
+            lines: 1,
+        };
+        let progress = |line: &str| Op::Progress {
+            id: 2,
+            lines: vec![line.into()],
+            state: "running".into(),
+        };
+        for op in [res("a"), progress("p"), res("b"), progress("q")] {
+            assert_eq!(shown.record(&op), Some(1));
+        }
+        assert_eq!(shown.ops(1..2), [tool.clone(), res("b"), progress("q")]);
+        // Text for an item that is not text is kept as it came.
+        shown.record(&Op::Append {
+            id: 2,
+            text: "x".into(),
+        });
+        shown.record(&Op::SetText {
+            id: 2,
+            text: "y".into(),
+        });
+        assert_eq!(shown.ops(1..2).len(), 5);
+        assert_eq!(shown.record(&Op::State("idle".into())), None, "no item's");
+    }
+
+    #[test]
+    fn a_stretch_of_items_is_sized_by_the_rows_they_take() {
+        let tool = Op::Add {
+            id: 1,
+            item: Item::Tool {
+                name: "Bash".into(),
+                arg: "ls".into(),
+            },
+        };
+        let result = Op::Result {
+            id: 1,
+            ok: true,
+            preview: (0..5).map(|n| n.to_string()).collect(),
+            lines: 5,
+        };
+        let progress = Op::Progress {
+            id: 1,
+            lines: vec!["a".into(), "b".into()],
+            state: "running".into(),
+        };
+        assert_eq!(item_rows(std::slice::from_ref(&tool), 40), 1);
+        assert_eq!(
+            item_rows(&[tool.clone(), result], 40),
+            4,
+            "a result's preview, three lines at most"
+        );
+        assert_eq!(item_rows(&[tool, progress], 40), 3);
+        // Two rows each: a stretch of four rows is two of them, back from the end.
+        let mut shown = Shown::default();
+        for id in 1..=5 {
+            shown.record(&text_add(id, "x"));
+        }
+        assert_eq!(item_rows(&shown.items[0].1, 40), 2, "calibration");
+        assert_eq!(shown.back_from(5, 4, 40), 3);
+        assert_eq!(shown.back_from(2, 40, 40), 0, "no further than the first");
+    }
+
+    #[test]
+    fn each_request_the_relay_makes_has_its_own_id_and_a_refusal_of_one_is_said() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let a = request_id(&to_claude(&client(&mut r, r#"{"t":"tout","i":"b1"}"#))[0]);
+        let b = request_id(&to_claude(&client(&mut r, r#"{"t":"tout","i":"b2"}"#))[0]);
+        assert_ne!(a, b);
+        // Both outstanding, each answered to its own task.
+        let answer = |rid: &str, out: &str| {
+            format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{rid}","response":{{"output":"{out}"}}}}}}"#
+            )
+        };
+        let fx = line(&mut r, epoch, 1, &answer(&b, "two"));
+        assert_eq!(sent(&fx), [r#"{"i":"b2","t":"tout","x":"two"}"#]);
+        let fx = line(&mut r, epoch, 2, &answer(&a, "one"));
+        assert_eq!(sent(&fx), [r#"{"i":"b1","t":"tout","x":"one"}"#]);
+        // A model claude will not switch to is said, not left to look like nothing happened.
+        let id = request_id(&to_claude(&client(&mut r, r#"{"t":"model","m":"x"}"#))[0]);
+        let refused = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{id}","error":"no such model"}}}}"#
+        );
+        let fx = line(&mut r, epoch, 3, &refused);
+        assert_eq!(sent(&fx), [r#"{"t":"err","x":"no such model"}"#]);
+        // Another's request refused is not this relay's to say.
+        let theirs = r#"{"type":"control_response","response":{"subtype":"error","request_id":"other-1","error":"no"}}"#;
+        assert!(sent(&line(&mut r, epoch, 4, theirs)).is_empty());
+    }
+
+    #[test]
+    fn a_conversation_that_ends_says_so_once_and_an_earlier_ones_end_says_nothing() {
+        let mut r = relay();
+        client(&mut r, r#"{"t":"hi","v":1}"#);
+        let (first, _) = opened(&mut r, 1);
+        let (second, _) = opened(&mut r, 1);
+        assert_ne!(first, second);
+        let gone = |r: &mut Relay, epoch: u64, why: &str| {
+            r.handle(
+                Input::ConvGone {
+                    epoch,
+                    why: why.into(),
+                },
+                Instant::now(),
+            )
+        };
+        assert!(gone(&mut r, first, "").is_empty(), "the first is long gone");
+        // claude ended: nothing to add.
+        assert_eq!(sent(&gone(&mut r, second, ""))[0], r#"{"t":"end","x":""}"#);
+        // One that never said its slot: the reason ssh gave, or that it did not answer.
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"}}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        assert_eq!(
+            sent(&gone(&mut r, epoch, "ssh: no route"))[0],
+            r#"{"t":"end","x":"ssh: no route"}"#
+        );
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"}}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        assert_eq!(
+            sent(&gone(&mut r, epoch, ""))[0],
+            r#"{"t":"end","x":"the container did not answer"}"#
+        );
+    }
+
+    #[test]
+    fn a_ping_is_answered_with_a_pong_alone_at_home_and_in_a_conversation() {
+        let mut r = relay();
+        assert_eq!(
+            sent(&client(&mut r, r#"{"t":"ping"}"#)),
+            [r#"{"t":"pong"}"#]
+        );
+        opened(&mut r, 1);
+        assert_eq!(
+            sent(&client(&mut r, r#"{"t":"ping"}"#)),
+            [r#"{"t":"pong"}"#]
+        );
+    }
+
+    #[test]
+    fn a_stored_conversation_is_resumed_under_its_title_and_pis_is_left_to_a_terminal() {
+        let mut r = relay();
+        let mut stored = row("", "Fix the build");
+        stored.key = RowKey::Conversation {
+            id: "c0ffee".into(),
+            cwd: "/w/app".into(),
+            harness: crate::harness::Harness::Claude,
+        };
+        r.handle(snap("claude-sessions", vec![stored]), Instant::now());
+        let open = |r: &mut Relay, key: &str| {
+            client(
+                r,
+                &format!(r#"{{"t":"open","c":"claude-sessions","k":{key}}}"#),
+            )
+        };
+        let fx = open(&mut r, r#"{"conversation":"c0ffee","cwd":"/w/app"}"#);
+        let Some(Effect::Open { args, .. }) = fx.last() else {
+            panic!("no open: {fx:?}");
+        };
+        assert_eq!(
+            args,
+            &["remote", "resume", "c0ffee", "/w/app", "Fix the build"]
+        );
+        let fx = open(&mut r, r#"{"conversation":"beef","cwd":"/w"}"#);
+        let Some(Effect::Open { args, .. }) = fx.last() else {
+            panic!("no open: {fx:?}");
+        };
+        assert_eq!(args[4], "beef", "untitled: its id");
+        let fx = open(
+            &mut r,
+            r#"{"conversation":"c0ffee","cwd":"/w/app","harness":"pi"}"#,
+        );
+        assert_eq!(
+            sent(&fx).last().unwrap(),
+            r#"{"t":"err","x":"pi opens only in a terminal"}"#
+        );
+    }
+
+    #[test]
+    fn a_client_without_a_size_is_sent_everything_and_one_with_a_size_is_sent_the_end() {
+        let more = |fx: &[Effect]| sent(fx).iter().any(|l| l.contains(r#""t":"more""#));
+        for (w, rows) in [(0, 5), (40, 0)] {
+            let mut r = relay();
+            let (_, fx) = opened_lazy(&mut r, w, rows, 1);
+            assert!(!more(&fx), "{w}x{rows} is no size: {:?}", sent(&fx));
+        }
+        let mut r = relay();
+        let (_, fx) = opened_lazy(&mut r, 40, 5, 1);
+        assert!(more(&fx), "calibration: {:?}", sent(&fx));
+    }
+
+    #[test]
+    fn a_lazy_client_that_reconnects_is_reset_even_on_the_same_run() {
+        let mut r = relay();
+        let fx = client(
+            &mut r,
+            r#"{"t":"re","c":"claude-sessions","s":"claude-3","run":"run-1","n":4,"w":40,"r":5}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        r.handle(
+            Input::Conv {
+                epoch,
+                line: r#"{"slot":"claude-3"}"#.into(),
+            },
+            Instant::now(),
+        );
+        let fx = r.handle(
+            Input::Conv {
+                epoch,
+                line: r#"{"next":5,"run":"run-1"}"#.into(),
+            },
+            Instant::now(),
+        );
+        assert_eq!(sent(&fx)[0], r#"{"t":"reset"}"#);
+    }
+
+    #[test]
+    fn remote_control_is_turned_off_when_claude_says_it_is_on_and_on_otherwise() {
+        let asks_on = |lines: &[&str]| -> bool {
+            let mut r = relay();
+            let (epoch, _) = opened(&mut r, 1);
+            for (n, l) in lines.iter().enumerate() {
+                line(&mut r, epoch, n as u64 + 1, l);
+            }
+            to_claude(&client(&mut r, r#"{"t":"rc"}"#))[0].contains(r#""enabled":true"#)
+        };
+        let state =
+            |s: &str| format!(r#"{{"type":"system","subtype":"bridge_state","state":"{s}"}}"#);
+        assert!(asks_on(&[]), "calibration");
+        assert!(!asks_on(&[&state("connected")]));
+        assert!(asks_on(&[&state("connected"), &state("disconnected")]));
+        assert!(
+            asks_on(&[r#"{"type":"system","subtype":"init","session_id":"s"}"#]),
+            "another system line says nothing of it"
+        );
+        assert!(
+            asks_on(&[r#"{"type":"user","subtype":"bridge_state","state":"connected"}"#]),
+            "nor does a line that is not claude's system line"
+        );
+    }
+
+    #[test]
+    fn the_model_list_is_sent_from_the_answer_to_its_own_request() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let id = request_id(&to_claude(&client(&mut r, r#"{"t":"models"}"#))[0]);
+        let other = r#"{"type":"control_response","response":{"subtype":"success","request_id":"x-1","response":{}}}"#;
+        assert!(sent(&line(&mut r, epoch, 1, other)).is_empty());
+        let answer = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"models":[{{"value":"opus","displayName":"Opus","description":"big"}}]}}}}}}"#
+        );
+        let fx = line(&mut r, epoch, 2, &answer);
+        assert_eq!(
+            sent(&fx),
+            [r#"{"c":[],"m":[{"d":"Opus","v":"opus","x":"big"}],"t":"models"}"#]
+        );
+    }
+
+    #[test]
+    fn a_lazy_client_opening_an_empty_log_still_hears_where_it_stands_once() {
+        let mut r = relay();
+        let (_, fx) = opened_lazy(&mut r, 40, 5, 1);
+        let said = sent(&fx);
+        assert_eq!(
+            said.iter().filter(|l| l.contains(r#""t":"n""#)).count(),
+            1,
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_lazy_client_gets_the_conversations_state_and_meta_and_one_line_number() {
+        let mut r = relay();
+        let fx = client(
+            &mut r,
+            r#"{"t":"open","c":"claude-sessions","k":{"slot":"claude-3"},"w":40,"r":5}"#,
+        );
+        let Some(Effect::Open { epoch, .. }) = fx.into_iter().last() else {
+            panic!("no open");
+        };
+        let conv = |r: &mut Relay, l: &str| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: l.into(),
+                },
+                Instant::now(),
+            )
+        };
+        conv(&mut r, r#"{"slot":"claude-3"}"#);
+        conv(&mut r, r#"{"next":4,"run":"run-1"}"#);
+        line(
+            &mut r,
+            epoch,
+            1,
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"opus","permissionMode":"default"}"#,
+        );
+        line(
+            &mut r,
+            epoch,
+            2,
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"isReplay":true}"#,
+        );
+        let fx = line(&mut r, epoch, 3, &reply(3));
+        let said = sent(&fx);
+        assert!(said[0].contains(r#""t":"meta""#), "{said:?}");
+        assert!(said.iter().any(|l| l.contains(r#""t":"st""#)), "{said:?}");
+        assert_eq!(
+            said.iter().filter(|l| l.contains(r#""t":"n""#)).count(),
+            1,
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_lazy_client_hears_nothing_of_items_older_than_it_holds() {
+        let mut r = relay();
+        // 40 by 5: five screens is 25 rows, and each reply takes 2.
+        let (epoch, _) = opened_lazy(&mut r, 40, 5, 32);
+        line(
+            &mut r,
+            epoch,
+            1,
+            r#"{"type":"assistant","message":{"id":"m0","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 60"}}]}}"#,
+        );
+        let mut fx = Vec::new();
+        for n in 2..32 {
+            fx = line(&mut r, epoch, n, &reply(n));
+        }
+        assert_eq!(
+            sent(&fx).last().unwrap(),
+            r#"{"m":true,"t":"more"}"#,
+            "there is more above, with no history"
+        );
+        // The long-running call's result, live: its item is not one the client holds.
+        line(
+            &mut r,
+            epoch,
+            32,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}"#,
+        );
+        let fx = r.tick(Instant::now() + Duration::from_secs(1));
+        assert!(
+            !sent(&fx).iter().any(|l| l.contains(r#""t":"res""#)),
+            "{:?}",
+            sent(&fx)
+        );
+    }
+
+    #[test]
+    fn live_ops_go_together_a_tenth_of_a_second_after_the_first() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let t0 = Instant::now();
+        let at = |r: &mut Relay, n: u64, body: &str, now: Instant| {
+            r.handle(
+                Input::Conv {
+                    epoch,
+                    line: format!("{n}\t{body}\n"),
+                },
+                now,
+            )
+        };
+        at(&mut r, 1, r#"{"type":"keep_alive"}"#, t0);
+        assert_eq!(r.deadline(), None, "nothing to send");
+        at(&mut r, 2, &reply(2), t0);
+        assert_eq!(r.deadline(), Some(t0 + BATCH));
+        at(&mut r, 3, &reply(3), t0 + BATCH / 2);
+        assert_eq!(r.deadline(), Some(t0 + BATCH), "not put off by the next");
+    }
+
+    #[test]
+    fn every_action_the_client_takes_reaches_claude_as_claude_codes_would() {
+        let mut r = relay();
+        let (epoch, _) = opened(&mut r, 1);
+        let subtype = |r: &mut Relay, l: &str| -> String {
+            let said = to_claude(&client(r, l));
+            let v = parse(said.first().expect(l)).unwrap();
+            v.get("request")
+                .and_then(|q| q.get("subtype"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            subtype(&mut r, r#"{"t":"mode","m":"plan"}"#),
+            "set_permission_mode"
+        );
+        assert_eq!(subtype(&mut r, r#"{"t":"esc"}"#), "interrupt");
+        assert_eq!(subtype(&mut r, r#"{"t":"exit"}"#), "end_session");
+        assert_eq!(subtype(&mut r, r#"{"t":"models"}"#), "initialize");
+        let fx = client(&mut r, r#"{"t":"full","id":7}"#);
+        assert_eq!(sent(&fx), [r#"{"id":7,"t":"full","x":""}"#]);
+        let fx = client(&mut r, r#"{"t":"wf","i":"w1"}"#);
+        assert_eq!(sent(&fx), [r#"{"t":"err","x":"no such workflow"}"#]);
+        // Don't ask again: allowed, with the rules claude suggested.
+        line(&mut r, epoch, 1, ASK);
+        let said = to_claude(&client(&mut r, r#"{"t":"perm","r":"p1","a":"a"}"#));
+        assert!(said[0].contains(r#""behavior":"allow""#), "{said:?}");
+        assert!(said[0].contains(r#""updatedPermissions":[]"#), "{said:?}");
+        // A question answered carries its answers; one declined is denied.
+        line(
+            &mut r,
+            epoch,
+            2,
+            r#"{"type":"control_request","request_id":"q1","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"Which?","options":[{"label":"Red"},{"label":"Blue"}]}]}}}"#,
+        );
+        let said = to_claude(&client(
+            &mut r,
+            r#"{"t":"ans","r":"q1","a":{"Which?":"Blue"}}"#,
+        ));
+        assert!(said[0].contains(r#""behavior":"allow""#), "{said:?}");
+        assert!(said[0].contains(r#""Which?":"Blue""#), "{said:?}");
+        let said = to_claude(&client(&mut r, r#"{"t":"ans","r":"q1"}"#));
+        assert!(said[0].contains(r#""behavior":"deny""#), "{said:?}");
+    }
+
+    #[test]
+    fn only_the_end_of_a_long_output_crosses_and_from_a_whole_character_and_line() {
+        // Its only line start is its end: all of what fits.
+        let one = "x".repeat(5000) + "\n";
+        assert_eq!(output_tail(&one), one[one.len() - OUTPUT_TAIL..]);
+        // The cut falls just before a line: that line, whole.
+        let cut = "x".repeat(100) + "\n" + &"y".repeat(OUTPUT_TAIL - 1);
+        assert_eq!(output_tail(&cut), "y".repeat(OUTPUT_TAIL - 1));
+        // In the middle of a character: from the next one.
+        let wide = "€".repeat(2000);
+        let tail = output_tail(&wide);
+        assert!(
+            tail.len() <= OUTPUT_TAIL && tail.len() > OUTPUT_TAIL - 3,
+            "{}",
+            tail.len()
+        );
+        assert!(wide.ends_with(&tail));
+    }
+
+    #[test]
+    fn the_view_of_one_agent_hears_nothing_of_another() {
+        let mut r = relay();
+        let (epoch, _) = opened_lazy(&mut r, 40, 10, 5);
+        let agent = |id: &str, task: &str| {
+            [
+                format!(
+                    r#"{{"type":"assistant","message":{{"id":"m{id}","content":[{{"type":"tool_use","id":"{id}","name":"Agent","input":{{"description":"d","prompt":"p","run_in_background":true}}}}]}}}}"#
+                ),
+                format!(
+                    r#"{{"type":"system","subtype":"task_started","task_id":"{task}","tool_use_id":"{id}","description":"d","task_type":"local_agent"}}"#
+                ),
+            ]
+        };
+        let mut n = 0;
+        for l in agent("tu_a", "ag1")
+            .iter()
+            .chain(agent("tu_b", "ag2").iter())
+        {
+            n += 1;
+            line(&mut r, epoch, n, l);
+        }
+        client(&mut r, r#"{"t":"fg","i":"ag1"}"#);
+        line(
+            &mut r,
+            epoch,
+            5,
+            r#"{"type":"assistant","parent_tool_use_id":"tu_b","message":{"id":"s1","content":[{"type":"tool_use","id":"tu_r","name":"Read","input":{"file_path":"/other"}}]}}"#,
+        );
+        let fx = r.tick(Instant::now() + Duration::from_secs(1));
+        assert!(
+            !sent(&fx)
+                .iter()
+                .any(|l| l.contains("fgo") && l.contains("/other")),
+            "{:?}",
+            sent(&fx)
+        );
+        // Calibration: viewed, it is that agent's.
+        let fx = client(&mut r, r#"{"t":"fg","i":"ag2"}"#);
+        assert!(sent(&fx)[0].contains("/other"), "{:?}", sent(&fx));
+    }
+
+    #[test]
+    fn a_side_questions_answer_is_its_last_json_line_else_the_last_thing_it_said() {
+        let said = |out: &str, err: &str| side_answer(out.as_bytes(), err.as_bytes());
+        assert_eq!(said("noise\n{\"answer\":\"42\"}\n", ""), Ok("42".into()));
+        assert_eq!(
+            said("{\"error\":\"no model\"}\n", "x"),
+            Err("no model".into())
+        );
+        assert_eq!(
+            said("", "Warning: added host\n  ssh: no route  \n\n  \n"),
+            Err("ssh: no route".into())
+        );
+        assert_eq!(said("", " \n"), Err("the container did not answer".into()));
+        assert_eq!(worth_saying("  why \n"), Some("why".into()));
+        assert_eq!(worth_saying(" \t"), None);
     }
 }

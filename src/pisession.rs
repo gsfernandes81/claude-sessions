@@ -28,6 +28,7 @@ use crate::harness::Harness;
 use crate::json::{self, Value};
 use crate::store::{self, Conversation};
 use crate::transcript::Titles;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -36,20 +37,6 @@ use std::path::{Path, PathBuf};
 const HEAD: u64 = 1024 * 1024;
 /// How much of its end is read for its name and last timestamp.
 const TAIL: u64 = 256 * 1024;
-
-/// pi's agent directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
-pub fn agent_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Path::new(&home).join(".pi/agent")
-}
-
-/// Where every project's sessions are, each in its own `--<cwd>--` directory.
-pub fn sessions_dir() -> PathBuf {
-    agent_dir().join("sessions")
-}
 
 /// The directory name pi keeps a session started in `cwd` under.
 pub fn dir_name(cwd: &str) -> String {
@@ -69,12 +56,25 @@ pub fn dir_name(cwd: &str) -> String {
 }
 
 /// Where pi keeps sessions, and whether in one flat directory: `$PI_CODING_AGENT_SESSION_DIR`
-/// when it names one, else [`sessions_dir`] with a directory per cwd.
+/// when it names one, else `sessions` in pi's agent directory — `$PI_CODING_AGENT_DIR`, else
+/// `~/.pi/agent` — with a directory per cwd.
 fn layout() -> (PathBuf, bool) {
-    match std::env::var_os("PI_CODING_AGENT_SESSION_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => (PathBuf::from(d), true),
-        None => (sessions_dir(), false),
+    layout_from(|k| std::env::var_os(k))
+}
+
+/// [`layout`] from `env`; a variable set but empty is unset, as pi reads it.
+fn layout_from(env: impl Fn(&str) -> Option<OsString>) -> (PathBuf, bool) {
+    let var = |k: &str| env(k).filter(|v| !v.is_empty());
+    if let Some(d) = var("PI_CODING_AGENT_SESSION_DIR") {
+        return (PathBuf::from(d), true);
     }
+    let agent = var("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = var("HOME").unwrap_or_else(|| "/tmp".into());
+            Path::new(&home).join(".pi/agent")
+        });
+    (agent.join("sessions"), false)
 }
 
 /// The directory the sessions of `cwd` are in, given the layout: the flat directory itself,
@@ -325,7 +325,7 @@ fn head(path: &Path) -> Option<(Header, Option<String>, bool)> {
     Some((h?, prompt, exchange))
 }
 
-/// A `message` entry's role, cheaply: the line is parsed only when it may be one.
+/// A `message` entry's role, `user`, `assistant` or `other`, cheaply: the line is parsed only when it may be one.
 fn message_role(line: &str) -> Option<&'static str> {
     if !line.contains("\"message\"") {
         return None;
@@ -334,11 +334,11 @@ fn message_role(line: &str) -> Option<&'static str> {
     if v.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
+    // Only these two make an exchange; `toolResult` and `system` are read alike.
     match v.get("message")?.get("role")?.as_str()? {
         "user" => Some("user"),
         "assistant" => Some("assistant"),
-        "toolResult" => Some("toolResult"),
-        _ => Some("system"),
+        _ => Some("other"),
     }
 }
 
@@ -459,6 +459,7 @@ mod tests {
         );
         assert_eq!(read(&p).unwrap().title, "dns records");
         assert_eq!(titles(&p).custom.as_deref(), Some("dns records"));
+        assert_eq!(titles_cached(&p).custom.as_deref(), Some("dns records"));
         let p = d.write(
             "--workspace--",
             "cleared.jsonl",
@@ -580,5 +581,131 @@ mod tests {
             .find(|c| c.id.ends_with('1'))
             .unwrap();
         assert_eq!(named.title, "dns records");
+    }
+
+    #[test]
+    fn a_long_system_prompt_or_long_tool_output_hides_neither_the_prompt_nor_the_name() {
+        // pi's first entry carries its whole system prompt, many kilobytes; a turn's tool
+        // output after a name can be as long. Both are well within what is read.
+        let big = "x".repeat(16 * 1024);
+        let system = SYSTEM.replace("You are", &big);
+        let tool = TOOL.replace("\"ok\"", &format!("\"{big}\""));
+        let d = Dir::new("long");
+        let p = d.write(
+            "--workspace--",
+            "long.jsonl",
+            &lines(&[HEADER, &system, PROMPT, REPLY]),
+        );
+        assert_eq!(read(&p).unwrap().title, "fix the dns records");
+        let p = d.write(
+            "--workspace--",
+            "named.jsonl",
+            &lines(&[HEADER, PROMPT, NAMED, &tool]),
+        );
+        assert_eq!(titles(&p).custom.as_deref(), Some("dns records"));
+        assert_eq!(read(&p).unwrap().title, "dns records");
+        // A header with a field this version does not know, however long, still says the id.
+        let id = "a1b2c3d4-0000-4000-8000-000000000001";
+        let forked = HEADER.replace("\"cwd\"", &format!("\"parentSession\":\"/{big}\",\"cwd\""));
+        d.write("--workspace--", "forked.jsonl", &lines(&[&forked, PROMPT]));
+        let layout = (d.0.clone(), false);
+        std::fs::remove_file(d.0.join("--workspace--/long.jsonl")).unwrap();
+        std::fs::remove_file(d.0.join("--workspace--/named.jsonl")).unwrap();
+        assert_eq!(
+            conversation_path_in(&layout, "/workspace", id),
+            Some(d.0.join("--workspace--/forked.jsonl"))
+        );
+    }
+
+    #[test]
+    fn a_reply_alone_is_an_exchange_and_the_first_prompt_with_words_is_the_title() {
+        let d = Dir::new("order");
+        let p = d.write("--workspace--", "reply.jsonl", &lines(&[HEADER, REPLY]));
+        assert!(has_exchange(&p));
+        assert_eq!(read(&p).unwrap().title, "(no title yet)");
+        // A reply before the prompt, and a pasted image before the words: the words title it.
+        let image = r#"{"type":"message","id":"u0","parentId":null,"timestamp":"2026-10-30T10:00:00.500Z","message":{"role":"user","content":[{"type":"image","data":"…"}]}}"#;
+        for (name, body) in [
+            ("late.jsonl", lines(&[HEADER, REPLY, PROMPT])),
+            ("image.jsonl", lines(&[HEADER, image, PROMPT])),
+        ] {
+            let p = d.write("--workspace--", name, &body);
+            assert_eq!(read(&p).unwrap().title, "fix the dns records", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_session_too_long_to_settle_is_taken_as_a_conversation() {
+        // Nothing but a header and system entries for longer than is read: it may hold a
+        // conversation further on, and a resume that finds none is cheap.
+        let d = Dir::new("huge");
+        let system = SYSTEM.replace("You are", &"x".repeat(64 * 1024));
+        let mut body = vec![HEADER];
+        body.extend(std::iter::repeat_n(system.as_str(), 20));
+        let p = d.write("--workspace--", "huge.jsonl", &lines(&body));
+        assert!(std::fs::metadata(&p).unwrap().len() > HEAD);
+        assert!(has_exchange(&p));
+        // Calibration: the same, short, is no exchange.
+        let p = d.write("--workspace--", "short.jsonl", &lines(&body[..3]));
+        assert!(!has_exchange(&p));
+    }
+
+    #[test]
+    fn only_jsonl_files_are_sessions() {
+        // A copy kept beside a session, with its header and messages, is not one.
+        let d = Dir::new("bak");
+        let id = "a1b2c3d4-0000-4000-8000-000000000001";
+        d.write("--workspace--", "kept.jsonl.bak", &lines(&[HEADER, PROMPT]));
+        let layout = (d.0.clone(), false);
+        assert_eq!(conversation_path_in(&layout, "/workspace", id), None);
+        let cache = store::Cached::new();
+        assert!(in_workspace_in(&cache, &layout, "/workspace").is_empty());
+        // Calibration: renamed to .jsonl, it is found and listed.
+        std::fs::rename(
+            d.0.join("--workspace--/kept.jsonl.bak"),
+            d.0.join("--workspace--/kept.jsonl"),
+        )
+        .unwrap();
+        assert!(conversation_path_in(&layout, "/workspace", id).is_some());
+        assert_eq!(in_workspace_in(&cache, &layout, "/workspace").len(), 1);
+    }
+
+    #[test]
+    fn sessions_are_where_pis_variables_say_else_under_home() {
+        fn env<'a>(set: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+            move |k| {
+                set.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        }
+        let home = [("HOME", "/home/dev")];
+        assert_eq!(
+            layout_from(env(&home)),
+            (PathBuf::from("/home/dev/.pi/agent/sessions"), false)
+        );
+        let agent = [("HOME", "/home/dev"), ("PI_CODING_AGENT_DIR", "/d/pi")];
+        assert_eq!(
+            layout_from(env(&agent)),
+            (PathBuf::from("/d/pi/sessions"), false)
+        );
+        let flat = [
+            ("PI_CODING_AGENT_DIR", "/d/pi"),
+            ("PI_CODING_AGENT_SESSION_DIR", "/s"),
+        ];
+        assert_eq!(layout_from(env(&flat)), (PathBuf::from("/s"), true));
+        // Set but empty is unset.
+        let empty = [
+            ("HOME", "/home/dev"),
+            ("PI_CODING_AGENT_DIR", ""),
+            ("PI_CODING_AGENT_SESSION_DIR", ""),
+        ];
+        assert_eq!(layout_from(env(&empty)), layout_from(env(&home)));
+        assert_eq!(
+            layout_from(env(&[])),
+            (PathBuf::from("/tmp/.pi/agent/sessions"), false)
+        );
+        // The live reading is the same function of this process's own environment.
+        assert_eq!(layout(), layout_from(|k| std::env::var_os(k)));
     }
 }

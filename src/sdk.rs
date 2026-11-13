@@ -846,7 +846,7 @@ fn message(t: &str, origin: Option<&Value>) -> Option<Message> {
     ]
     .into_iter()
     .find(|(name, ..)| opens(t, name))?;
-    let (attrs, inner) = t[1 + name.len()..].split_once('>')?;
+    let (attrs, inner) = t.strip_prefix('<')?.strip_prefix(name)?.split_once('>')?;
     let close = format!("</{name}>");
     let inner = inner.rfind(&close).map_or(inner, |i| &inner[..i]);
     let inner = inner.strip_prefix('\n').unwrap_or(inner).trim_end();
@@ -1637,6 +1637,27 @@ mod input_tests {
             );
         }
     }
+
+    #[test]
+    fn an_answer_that_neither_allows_nor_denies_is_a_refusal() {
+        let odd = answer("r6", obj(vec![("behavior", Value::string("ask"))]));
+        assert_eq!(
+            classify(&logged(&odd)),
+            Msg::Input(Input::Answer {
+                request_id: "r6".into(),
+                how: "refused".into(),
+                answers: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn remote_control_names_the_session_only_when_turning_it_on() {
+        let has_name = |v: Value| crate::json::to_line(&v).contains(r#""name":"dev""#);
+        assert!(has_name(remote_control("c", true, "dev")));
+        assert!(!has_name(remote_control("c", false, "dev")));
+        assert!(!crate::json::to_line(&remote_control("c", true, "")).contains(r#""name""#));
+    }
 }
 
 #[cfg(test)]
@@ -2224,5 +2245,173 @@ mod tests {
             to_line(&refuse("r3", "not served")),
             r#"{"response":{"error":"not served","request_id":"r3","subtype":"error"},"type":"control_response"}"#
         );
+    }
+
+    /// Standard base64, padded, for building signatures.
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..=chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            }
+        }
+        while out.len() % 4 != 0 {
+            out.push('=');
+        }
+        out
+    }
+
+    #[test]
+    fn base64_reads_every_byte_back() {
+        let all: Vec<u8> = (0..=255).collect();
+        let text = base64_encode(&all);
+        assert!(text.contains('+') && text.contains('/'), "{text}");
+        assert_eq!(base64_decode(&text), Some(all));
+    }
+
+    #[test]
+    fn a_signatures_kind_is_found_past_fixed_width_fields_and_long_ones() {
+        // A length-delimited field: key, length as a varint, body.
+        fn field(n: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![n << 3 | 2];
+            let mut len = body.len();
+            while len >= 0x80 {
+                out.push((len as u8 & 0x7f) | 0x80);
+                len >>= 7;
+            }
+            out.push(len as u8);
+            out.extend_from_slice(body);
+            out
+        }
+        // Field 9, two hundred bytes long, so its length takes two bytes; then the kind.
+        let mut inner = field(9, &[7; 200]);
+        inner.extend(field(8, b"narration"));
+        // Before field 2, a 64-bit field (1) and a 32-bit one (3).
+        let mut outer = vec![1 << 3 | 1, 1, 2, 3, 4, 5, 6, 7, 8, 3 << 3 | 5, 1, 2, 3, 4];
+        outer.extend(field(2, &field(1, &inner)));
+        let sig = base64_encode(&outer);
+        assert_eq!(block_kind(&sig).as_deref(), Some("narration"));
+    }
+
+    #[test]
+    fn a_status_line_is_a_mode_change_only_when_it_says_no_status() {
+        assert_eq!(
+            read(
+                r#"{"type":"system","subtype":"status","status":"compacting","permissionMode":"default"}"#
+            ),
+            Msg::Status(Some("compacting".into()))
+        );
+        assert_eq!(
+            read(r#"{"type":"system","subtype":"status","status":null,"permissionMode":""}"#),
+            Msg::Status(None)
+        );
+        assert_eq!(
+            read(r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan"}"#),
+            Msg::ModeChanged("plan".into())
+        );
+    }
+
+    #[test]
+    fn a_teammates_message_is_who_sent_it_and_only_an_agents_takes_its_handback_report() {
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<teammate-message teammate_id=\"lead\">\nShip it.\n</teammate-message>"},"isReplay":true}"#
+            ),
+            Msg::Message(Message {
+                from: "lead".into(),
+                body: "Ship it.".into(),
+                inline: false,
+            })
+        );
+        // An attribute whose name only ends like `from-name` is not it.
+        assert_eq!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":"<cross-session-message data-from-name=\"wrong\" from-name=\"infra\">\nPinned.\n</cross-session-message>"},"origin":{"handbackReportText":"not this"},"isReplay":true}"#
+            ),
+            Msg::Message(Message {
+                from: "infra".into(),
+                body: "Pinned.".into(),
+                inline: true,
+            })
+        );
+        // A message as a text block of its own.
+        assert!(matches!(
+            read(
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<agent-message from-name=\"Explore\">\nDone.\n</agent-message>"}]}}"#
+            ),
+            Msg::Message(Message { ref from, .. }) if from == "Explore"
+        ));
+    }
+
+    #[test]
+    fn a_prompt_that_quotes_a_message_below_its_first_line_is_a_prompt() {
+        let typed = r#"look at this\n<agent-message from-name=\"x\">\nhi\n</agent-message>"#;
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{typed}"}},"isReplay":true}}"#
+        );
+        assert!(matches!(read(&line), Msg::Prompt(_)), "{:?}", read(&line));
+    }
+
+    #[test]
+    fn a_command_wrapper_is_a_prompt_typed_only_when_replayed() {
+        let line = |replay: bool| {
+            format!(
+                r#"{{"type":"user","message":{{"role":"user","content":"<command-name>/usage</command-name>"}},"isReplay":{replay}}}"#
+            )
+        };
+        assert_eq!(read(&line(true)), Msg::Prompt("/usage".into()));
+        assert!(matches!(read(&line(false)), Msg::UserText(_)));
+    }
+
+    #[test]
+    fn a_shells_whole_output_replaces_only_a_lone_persisted_result() {
+        let said = r#","tool_use_result":{"stdout":"whole output","stderr":""}"#;
+        let results = |parts: &str| match read(&format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{parts}]}}{said}}}"#
+        )) {
+            Msg::ToolResults(r) => r.into_iter().map(|r| r.text).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        let plain = r#"{"type":"tool_result","tool_use_id":"a","content":"short"}"#;
+        let persisted = r#"{"type":"tool_result","tool_use_id":"b","content":"<persisted-output>\nPreview (first 2KB):\nline 1\n</persisted-output>"}"#;
+        assert_eq!(results(plain), ["short"]);
+        assert_eq!(results(persisted), ["whole output"]);
+        let two = results(&format!("{plain},{persisted}"));
+        assert_eq!(two[0], "short");
+        assert_ne!(two[1], "whole output", "which result it was is not said");
+    }
+
+    #[test]
+    fn claude_codes_bookkeeping_in_a_transcript_is_noise_and_only_a_questions_result_is_answers() {
+        let h =
+            |l: &str| classify(&parse(&format!(r#"{{"type":"_history","line":{l}}}"#)).unwrap());
+        for flag in ["isMeta", "isCompactSummary", "isSidechain"] {
+            assert_eq!(
+                h(&format!(
+                    r#"{{"type":"user","{flag}":true,"message":{{"role":"user","content":"hi"}}}}"#
+                )),
+                Msg::Noise,
+                "{flag}"
+            );
+        }
+        let result = |r: &str| {
+            h(&format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t","content":"ok"}}]}},"toolUseResult":{r}}}"#
+            ))
+        };
+        assert!(matches!(
+            result(r#"{"questions":[],"answers":{"Which?":"Red"}}"#),
+            Msg::Answered { .. }
+        ));
+        assert!(matches!(
+            result(r#"{"answers":{"Which?":"Red"}}"#),
+            Msg::ToolResults(_)
+        ));
+        assert!(matches!(result(r#"{"questions":[]}"#), Msg::ToolResults(_)));
     }
 }

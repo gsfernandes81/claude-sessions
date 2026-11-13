@@ -241,7 +241,8 @@ pub fn route(fleet: &Fleet, host: &str, peer: &Value, now: u64) -> Route {
     ) {
         return Route::Drop("not a message or a control frame".into());
     }
-    if json::to_line(frame).len() > peer::MAX_LINE {
+    // Measured as it came; the relay measures it again once its `from` is rewritten.
+    if !peer::fits(&json::to_line(frame)) {
         return Route::Drop("over Claude Code's line cap".into());
     }
     if !fleet.slot(host, from_slot).is_some_and(|s| s.live) {
@@ -418,9 +419,25 @@ fn put(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 // ── the router ──────────────────────────────────────────────────────────────
 
+/// One container's agent, as the router talks to it: the hub's connection over ssh
+/// ([`Conn`]), or what a test holds.
+pub trait Agent: Send + Sync {
+    fn tell(&self, v: &Value) -> io::Result<()>;
+}
+
+impl Agent for Conn {
+    fn tell(&self, v: &Value) -> io::Result<()> {
+        Conn::tell(self, v)
+    }
+}
+
+/// Whether the host has room to wake a session: [`host_room`] on the live figures, or what a
+/// test says.
+type Room = Box<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 struct Router {
     fleet: Mutex<Fleet>,
-    conns: Mutex<HashMap<String, Arc<Conn>>>,
+    conns: Mutex<HashMap<String, Arc<dyn Agent>>>,
     /// The roster each agent was last sent, so it is sent again only when it changes.
     sent: Mutex<HashMap<String, Value>>,
     queue: Mutex<Queue>,
@@ -432,9 +449,26 @@ struct Router {
     /// Slots with a message waiting to be woken once the wake in flight has answered, oldest
     /// first, each once.
     to_wake: Mutex<Vec<String>>,
+    room: Room,
+    /// The time, in milliseconds: [`clock::now`], or a test's.
+    now: fn() -> u64,
 }
 
 impl Router {
+    fn new(queue: Queue, room: Room, now: fn() -> u64) -> Router {
+        Router {
+            fleet: Mutex::new(Fleet::default()),
+            conns: Mutex::new(HashMap::new()),
+            sent: Mutex::new(HashMap::new()),
+            queue: Mutex::new(queue),
+            backoff: Mutex::new(HashMap::new()),
+            waking: Mutex::new(HashSet::new()),
+            to_wake: Mutex::new(Vec::new()),
+            room,
+            now,
+        }
+    }
+
     /// One line for `.beat`: the time, how many containers answer, how many messages wait.
     /// Made only by taking every lock the router's work takes, one at a time, so a router
     /// wedged on one stops beating, and infra's health check sees it as stale rather than as
@@ -457,10 +491,15 @@ impl Router {
 /// Where waiting messages are kept: `HUB_QUEUE`, else `$HOME/queue`. A persisted volume, since
 /// every deploy recreates the hub.
 pub fn queue_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("HUB_QUEUE").filter(|d| !d.is_empty()) {
+    queue_dir_from(|k| std::env::var_os(k))
+}
+
+/// [`queue_dir`] from `env`. An empty variable is an unset one.
+fn queue_dir_from(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(d) = env("HUB_QUEUE").filter(|d| !d.is_empty()) {
         return PathBuf::from(d);
     }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| "/".into());
+    let home = env("HOME").unwrap_or_else(|| "/".into());
     PathBuf::from(home).join("queue")
 }
 
@@ -468,7 +507,7 @@ pub fn queue_dir() -> PathBuf {
 pub fn serve() -> io::Result<()> {
     let mut hosts = hub::hosts();
     hosts.retain(|h| {
-        let ok = peer::is_name(h) && h != peer::HUB;
+        let ok = relayable(h);
         if !ok {
             say(&format!(
                 "{h:?} is not relayed: not a name a container may have"
@@ -489,15 +528,11 @@ pub fn serve() -> io::Result<()> {
         queue.len(),
         dir.display()
     ));
-    let router = Arc::new(Router {
-        fleet: Mutex::new(Fleet::default()),
-        conns: Mutex::new(HashMap::new()),
-        sent: Mutex::new(HashMap::new()),
-        queue: Mutex::new(queue),
-        backoff: Mutex::new(HashMap::new()),
-        waking: Mutex::new(HashSet::new()),
-        to_wake: Mutex::new(Vec::new()),
-    });
+    let router = Arc::new(Router::new(
+        queue,
+        Box::new(|| host_room(mem::host_available(), pool_room())),
+        clock::now,
+    ));
     for host in hosts {
         let router = router.clone();
         std::thread::spawn(move || watch(&router, &host));
@@ -522,7 +557,7 @@ pub fn serve() -> io::Result<()> {
         flush(&router);
         if pruned.elapsed() >= Duration::from_secs(3600) {
             pruned = std::time::Instant::now();
-            for item in lock(&router.queue).prune(clock::now()) {
+            for item in lock(&router.queue).prune((router.now)()) {
                 say(&format!(
                     "{} to {}: dropped, kept past {} days",
                     item.from,
@@ -618,7 +653,7 @@ fn rosters(router: &Router) {
 /// Hand on what was waiting for slots now live.
 fn flush(router: &Router) {
     let fleet = lock(&router.fleet).clone();
-    let now = clock::now();
+    let now = (router.now)();
     let backoff = {
         let mut b = lock(&router.backoff);
         b.retain(|_, until| *until > now);
@@ -677,7 +712,7 @@ fn keep(router: &Router, item: Item, why: &str) {
 fn relayed(router: &Router, host: &str, msg: &Value) {
     if let Some(p) = msg.get("peer") {
         let fleet = lock(&router.fleet).clone();
-        match route(&fleet, host, p, clock::now()) {
+        match route(&fleet, host, p, (router.now)()) {
             Route::Deliver(repo, item) => send(router, &repo, item, ""),
             Route::Keep(item) => {
                 let to = item.to.clone();
@@ -714,9 +749,9 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
             to: format!("{host}/{}", s("to")),
             from: s("from"),
             frame: frame.clone(),
-            at: clock::now(),
+            at: (router.now)(),
         };
-        lock(&router.backoff).insert(item.to.clone(), clock::now() + bounce_backoff_ms());
+        lock(&router.backoff).insert(item.to.clone(), (router.now)() + bounce_backoff_ms());
         keep(router, item, &format!("bounced: {}", s("why")));
     } else if let Some(r) = msg.get("relay") {
         if let Some(off) = r.get("off").and_then(Value::as_str) {
@@ -728,19 +763,23 @@ fn relayed(router: &Router, host: &str, msg: &Value) {
         };
         let addr = format!("{host}/{slot}");
         lock(&router.waking).remove(&addr);
-        let ok = w.get("ok").and_then(Value::as_bool) == Some(true);
-        let why = w.get("why").and_then(Value::as_str).unwrap_or("?");
-        say(&if ok {
-            format!("woke {addr} for its waiting messages")
-        } else {
-            format!("did not wake {addr}: {why}")
-        });
+        say(&woke_line(&addr, w));
         let text = wake_notice(&addr, w);
         let senders = lock(&router.queue).senders_for(&addr);
         for sender in senders {
             notify(router, &sender, &text);
         }
         wake_next(router);
+    }
+}
+
+/// The log's line for an agent's answer `w` to a wake of `addr`.
+fn woke_line(addr: &str, w: &Value) -> String {
+    if w.get("ok").and_then(Value::as_bool) == Some(true) {
+        format!("woke {addr} for its waiting messages")
+    } else {
+        let why = w.get("why").and_then(Value::as_str).unwrap_or("?");
+        format!("did not wake {addr}: {why}")
     }
 }
 
@@ -778,10 +817,19 @@ pub const HOST_MARGIN: u64 = 512 * 1024 * 1024;
 /// The pool's memory, where infra mounts it (`CLAUDE_SESSIONS_POOL`): every dev container's
 /// parent cgroup, once infra's pool exists.
 fn pool_room() -> Option<mem::Memory> {
-    let dir = std::env::var("CLAUDE_SESSIONS_POOL")
-        .ok()
-        .filter(|d| !d.is_empty())?;
+    pool_room_in(std::env::var("CLAUDE_SESSIONS_POOL").ok())
+}
+
+/// [`pool_room`] from where the pool is said to be: nowhere, or an empty word, is no pool.
+fn pool_room_in(dir: Option<String>) -> Option<mem::Memory> {
+    let dir = dir.filter(|d| !d.is_empty())?;
     Some(mem::read_at(&dir))
+}
+
+/// Whether the router carries messages for a host by this name: one a container may have
+/// (`peer::is_name`), and never the hub's own address's.
+fn relayable(host: &str) -> bool {
+    peer::is_name(host) && host != peer::HUB
 }
 
 /// Whether the host has room for one more session: its available memory (`/proc/meminfo`)
@@ -847,7 +895,7 @@ fn wake_or_say(router: &Router, fleet: &Fleet, to: &str, sender: &str) {
         }
         // The host's room, before any container's own: each container's ceiling is only
         // that, and together they come to more than the host has.
-        if let Err(why) = host_room(mem::host_available(), pool_room()) {
+        if let Err(why) = (router.room)() {
             drop(waking);
             say(&format!("did not ask to wake {to}: {why}"));
             let text = host_notice(to, &why);
@@ -881,7 +929,7 @@ fn notify(router: &Router, to: &str, text: &str) {
         say(&format!("notice to {to}: dropped, not live"));
         return;
     }
-    let item = notice(to, text, clock::now());
+    let item = notice(to, text, (router.now)());
     let told = lock(&router.conns)
         .get(repo)
         .cloned()
@@ -1061,11 +1109,11 @@ mod tests {
             route(&f, "a", &peer_msg("claude-1", "c/claude-1", "user"), 0),
             Route::Keep(_)
         ));
-        // A control frame is about now.
-        assert!(matches!(
+        // A control frame is about now, and the log says which it was.
+        assert_eq!(
             route(&f, "a", &peer_msg("claude-1", "b/claude-2", "control"), 0),
-            Route::Drop(_)
-        ));
+            Route::Drop("b/claude-2 is not live, and a peer_message_status is about now".into())
+        );
         assert!(matches!(
             route(&f, "a", &peer_msg("claude-1", "b/claude-1", "control"), 0),
             Route::Deliver(..)
@@ -1113,6 +1161,41 @@ mod tests {
                 other => panic!("{p:?} from {host}: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_frame_up_to_claude_codes_inbox_cap_in_characters_is_carried_and_one_past_it_is_not() {
+        let f = fleet();
+        // A frame's line `len` characters long, as Claude Code counts them, of `c`s.
+        let sized_in = |len: usize, c: char| {
+            let mut frame = json::parse(r#"{"type":"user","message":{"content":""}}"#).unwrap();
+            let bare = json::to_line(&frame).len();
+            let mut m = Value::obj();
+            m.set("content", Value::string(c.to_string().repeat(len - bare)));
+            frame.set("message", m);
+            assert_eq!(
+                json::to_line(&frame).encode_utf16().count(),
+                len,
+                "calibration"
+            );
+            let mut p = Value::obj();
+            p.set("from", Value::string("claude-1"));
+            p.set("to", Value::string("b/claude-1"));
+            p.set("frame", frame);
+            route(&f, "a", &p, 0)
+        };
+        let sized = |len: usize| sized_in(len, 'x');
+        // With its newline, as long as the cap and no longer.
+        assert!(matches!(sized(peer::MAX_LINE - 1), Route::Deliver(..)));
+        assert_eq!(
+            sized(peer::MAX_LINE),
+            Route::Drop("over Claude Code's line cap".into())
+        );
+        // In characters, not bytes: these take three each.
+        assert!(matches!(
+            sized_in(peer::MAX_LINE - 1, '中'),
+            Route::Deliver(..)
+        ));
     }
 
     #[test]
@@ -1175,6 +1258,8 @@ mod tests {
                 }),
                 row(RowKey::Slot("claude-3".into()), |r| r.closed = true),
                 row(RowKey::Slot("claude-4".into()), |r| r.archived = true),
+                // Offloaded and not yet marked closed, as an offload in progress reads.
+                row(RowKey::Slot("claude-5".into()), |r| r.offloaded = true),
                 row(RowKey::Slot("pi-1".into()), |_| {}),
                 row(RowKey::Socket("other".into()), |_| {}),
             ],
@@ -1185,7 +1270,50 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![("claude-1".into(), true), ("claude-2".into(), false)]
+            vec![
+                ("claude-1".into(), true),
+                ("claude-2".into(), false),
+                ("claude-5".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slot_is_called_busy_only_while_it_runs_in_a_container_that_answers() {
+        // Every slot's last row said busy: one since offloaded, and one in a container that has
+        // stopped answering, are listed with no status, so not busy.
+        let mut f = Fleet::default();
+        let busy = |name: &str, live: bool| Slot {
+            busy: true,
+            ..slot(name, live)
+        };
+        f.slots.insert(
+            "a".into(),
+            vec![busy("claude-1", true), busy("claude-2", false)],
+        );
+        f.slots.insert("c".into(), vec![busy("claude-1", true)]);
+        f.up.insert("a".into(), true);
+        f.up.insert("c".into(), false);
+        let said = |entries: Vec<Entry>| -> Vec<(String, bool, bool)> {
+            entries
+                .into_iter()
+                .map(|e| (e.addr(), e.live, e.busy))
+                .collect()
+        };
+        assert_eq!(
+            said(f.roster_for("b")),
+            [
+                ("a/claude-1".into(), true, true),
+                ("a/claude-2".into(), false, false),
+                ("c/claude-1".into(), false, false),
+            ]
+        );
+        assert_eq!(
+            said(f.own_for("a")),
+            [
+                ("a/claude-1".into(), true, true),
+                ("a/claude-2".into(), false, false),
+            ]
         );
     }
 
@@ -1270,6 +1398,15 @@ mod tests {
             other.contains("could not be woken (claude-5 is gone)"),
             "{other}"
         );
+        // And the log says which it was.
+        assert_eq!(
+            woke_line("infra/claude-5", &answer(r#""ok":true"#)),
+            "woke infra/claude-5 for its waiting messages"
+        );
+        assert_eq!(
+            woke_line("infra/claude-5", &answer(r#""ok":false,"why":"no-room""#)),
+            "did not wake infra/claude-5: no-room"
+        );
         let down = down_notice("infra/claude-5");
         assert!(
             down.contains("infra, where infra/claude-5 runs, is not answering"),
@@ -1291,6 +1428,11 @@ mod tests {
         let w = peer::Wrapper::parse(content).expect("canonical, or no claude would take it");
         assert_eq!(w.from_name.as_deref(), Some(HUB_ADDR));
         assert_eq!(w.body, "hello");
+        // Like Claude Code's own, the wrapper names the sender's socket as the frame does.
+        assert_eq!(
+            w.from.as_deref(),
+            item.frame.get("from").and_then(Value::as_str)
+        );
         // What the receiving agent writes into the inbox passes the same test.
         let out = peer::rewrite(&item.frame, Path::new("/s/ab.sock"), HUB_ADDR).unwrap();
         assert!(out.get("from").is_some());
@@ -1315,6 +1457,11 @@ mod tests {
             reclaimable: Some(0),
         };
         assert_eq!(host_room(Some(4096 * mb), Some(pool(1024 * mb))), Ok(()));
+        assert_eq!(
+            host_room(Some(4096 * mb), Some(pool(4096 * mb - want))),
+            Ok(()),
+            "exactly enough in the pool too"
+        );
         let why = host_room(Some(4096 * mb), Some(pool(3700 * mb))).unwrap_err();
         assert!(why.contains("pool has 396M free"), "{why}");
         let text = host_notice("b/claude-2", &why);
@@ -1322,6 +1469,40 @@ mod tests {
             text.contains("b/claude-2 is offloaded, and it was not woken: the containers' pool")
         );
         assert!(text.contains("kept"));
+    }
+
+    #[test]
+    fn the_queue_is_kept_where_the_hub_says_else_in_its_home() {
+        let q = |pairs: &[(&str, &str)]| queue_dir_from(peer::tests::env(pairs));
+        assert_eq!(
+            q(&[("HUB_QUEUE", "/data/q"), ("HOME", "/h")]),
+            PathBuf::from("/data/q")
+        );
+        assert_eq!(
+            q(&[("HUB_QUEUE", ""), ("HOME", "/h")]),
+            PathBuf::from("/h/queue"),
+            "an empty variable is an unset one"
+        );
+        assert_eq!(q(&[]), PathBuf::from("/queue"));
+    }
+
+    #[test]
+    fn the_pool_is_read_where_infra_mounts_it_and_hosts_named_as_containers_are_relayed() {
+        assert!(pool_room_in(None).is_none());
+        assert!(
+            pool_room_in(Some(String::new())).is_none(),
+            "an empty word is no pool"
+        );
+        let dir = std::env::temp_dir().join(format!("cs-pool-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("memory.max"), "4294967296\n").unwrap();
+        let pool = pool_room_in(Some(dir.display().to_string())).expect("a pool");
+        assert_eq!(pool.limit, Some(4 << 30));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(relayable("infra-dev"));
+        for not in ["hub", "", "a b", ".x", "a/b"] {
+            assert!(!relayable(not), "{not:?}");
+        }
     }
 
     #[test]
@@ -1341,6 +1522,289 @@ mod tests {
         assert!(q.senders_for("b/claude-9").is_empty());
     }
 
+    /// An agent that hears what the router tells it, or one whose connection has gone.
+    #[derive(Default)]
+    struct Heard {
+        told: Mutex<Vec<Value>>,
+        gone: bool,
+    }
+
+    impl Agent for Heard {
+        fn tell(&self, v: &Value) -> io::Result<()> {
+            if self.gone {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone"));
+            }
+            lock(&self.told).push(v.clone());
+            Ok(())
+        }
+    }
+
+    impl Heard {
+        /// What it was told since last asked, each as its kind and what that holds: a roster
+        /// whole, and anything else under its one key.
+        fn heard(&self) -> Vec<(String, Value)> {
+            std::mem::take(&mut *lock(&self.told))
+                .into_iter()
+                .map(|v| match v {
+                    Value::Obj(m) if m.contains_key("roster") => ("roster".into(), Value::Obj(m)),
+                    Value::Obj(m) => {
+                        assert_eq!(m.len(), 1, "one message, one key: {m:?}");
+                        m.into_iter().next().unwrap()
+                    }
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        }
+    }
+
+    thread_local! {
+        /// The router's clock in these tests: each runs on a thread of its own.
+        static NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(1_000_000) };
+    }
+
+    fn now() -> u64 {
+        NOW.with(|n| n.get())
+    }
+
+    fn at(t: u64) {
+        NOW.with(|n| n.set(t));
+    }
+
+    /// A router over `fleet`, with an agent for each of its containers, and the host's room as
+    /// `room` says.
+    fn router(fleet: Fleet, room: Result<(), String>) -> (Router, BTreeMap<String, Arc<Heard>>) {
+        let r = Router::new(Queue::memory(), Box::new(move || room.clone()), now);
+        let mut agents = BTreeMap::new();
+        for host in fleet.slots.keys() {
+            let a = Arc::new(Heard::default());
+            lock(&r.conns).insert(host.clone(), a.clone() as Arc<dyn Agent>);
+            agents.insert(host.clone(), a);
+        }
+        *lock(&r.fleet) = fleet;
+        (r, agents)
+    }
+
+    fn message() -> Value {
+        let w = peer::Wrapper {
+            from: Some("uds:/tmp/cc-socks/1.sock".into()),
+            body: "hi".into(),
+            ..peer::Wrapper::default()
+        };
+        let mut m = Value::obj();
+        m.set("content", Value::string(w.render()));
+        let mut f = Value::obj();
+        f.set("type", Value::string("user"));
+        f.set("message", m);
+        f
+    }
+
+    fn peer_from(from: &str, to: &str, frame: Value) -> Value {
+        let mut p = Value::obj();
+        p.set("from", Value::string(from));
+        p.set("to", Value::string(to));
+        p.set("frame", frame);
+        let mut v = Value::obj();
+        v.set("peer", p);
+        v
+    }
+
+    fn one(key: &str, pairs: &[(&str, Value)]) -> Value {
+        let mut inner = Value::obj();
+        for (k, v) in pairs {
+            inner.set(k, v.clone());
+        }
+        let mut v = Value::obj();
+        v.set(key, inner);
+        v
+    }
+
+    #[test]
+    fn each_answering_agent_is_sent_its_roster_once_until_it_changes() {
+        let (r, agents) = router(fleet(), Ok(()));
+        rosters(&r);
+        for host in ["a", "b"] {
+            let heard = agents[host].heard();
+            assert_eq!(heard.len(), 1, "{host}: {heard:?}");
+            assert_eq!(heard[0].0, "roster");
+        }
+        assert!(agents["c"].heard().is_empty(), "c is not answering");
+        rosters(&r);
+        assert!(
+            agents["a"].heard().is_empty(),
+            "the same roster is not sent again"
+        );
+        lock(&r.fleet)
+            .slots
+            .get_mut("b")
+            .unwrap()
+            .push(slot("claude-3", true));
+        rosters(&r);
+        assert_eq!(agents["a"].heard().len(), 1, "a changed one is");
+    }
+
+    #[test]
+    fn a_message_handed_on_is_not_kept_and_one_that_cannot_be_is() {
+        let (r, agents) = router(fleet(), Ok(()));
+        relayed(&r, "a", &peer_from("claude-1", "b/claude-1", message()));
+        let heard = agents["b"].heard();
+        assert_eq!(heard.len(), 1);
+        assert_eq!(heard[0].0, "deliver");
+        assert_eq!(
+            lock(&r.queue).len(),
+            0,
+            "handed on, so not kept to be sent again"
+        );
+        // Its agent's connection has gone: a message is kept, a control frame dropped.
+        let gone = Arc::new(Heard {
+            gone: true,
+            ..Heard::default()
+        });
+        lock(&r.conns).insert("b".into(), gone as Arc<dyn Agent>);
+        relayed(&r, "a", &peer_from("claude-1", "b/claude-1", message()));
+        let mut ctl = Value::obj();
+        ctl.set("type", Value::string("control"));
+        relayed(&r, "a", &peer_from("claude-1", "b/claude-1", ctl));
+        let kept: Vec<Item> = lock(&r.queue).take(|_| true);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].is_message());
+    }
+
+    #[test]
+    fn a_bounced_message_is_kept_and_tried_again_after_twice_the_retry() {
+        let (r, agents) = router(fleet(), Ok(()));
+        let backoff = 2 * crate::run::retry().as_millis() as u64;
+        let bounced = |from: &str| {
+            one(
+                "bounce",
+                &[
+                    ("to", Value::string("claude-1")),
+                    ("from", Value::string(from)),
+                    ("frame", message()),
+                    ("why", Value::string("no inbox yet")),
+                ],
+            )
+        };
+        at(1_000_000);
+        relayed(&r, "b", &bounced("a/claude-1"));
+        assert_eq!(lock(&r.queue).len(), 1, "kept");
+        at(1_000_000 + backoff - 1);
+        flush(&r);
+        assert!(agents["b"].heard().is_empty(), "not tried again yet");
+        // Another slot is not held back by it.
+        relayed(&r, "a", &peer_from("claude-1", "b/claude-2", message()));
+        lock(&r.fleet).slots.get_mut("b").unwrap()[1].live = true;
+        flush(&r);
+        let heard = agents["b"].heard();
+        assert!(
+            heard
+                .iter()
+                .any(|(k, v)| k == "deliver"
+                    && v.get("to").and_then(Value::as_str) == Some("claude-2")),
+            "{heard:?}"
+        );
+        at(1_000_000 + backoff);
+        flush(&r);
+        let heard = agents["b"].heard();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(
+            heard[0].1.get("to").and_then(Value::as_str),
+            Some("claude-1")
+        );
+        // A notice the hub sent is never kept, whatever became of it.
+        relayed(&r, "b", &bounced(HUB_ADDR));
+        assert_eq!(lock(&r.queue).len(), 0);
+    }
+
+    /// What `agent` was asked to wake, in order.
+    fn wakes(heard: &[(String, Value)]) -> Vec<String> {
+        heard
+            .iter()
+            .filter(|(k, _)| k == "wake")
+            .map(|(_, v)| v.get("slot").and_then(Value::as_str).unwrap().to_string())
+            .collect()
+    }
+
+    /// The bodies of the hub's notices `agent` was given.
+    fn notices(heard: &[(String, Value)]) -> Vec<String> {
+        heard
+            .iter()
+            .filter(|(k, v)| {
+                k == "deliver" && v.get("from").and_then(Value::as_str) == Some(HUB_ADDR)
+            })
+            .map(|(_, v)| {
+                let content = v
+                    .get("frame")
+                    .and_then(|f| f.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap();
+                peer::Wrapper::parse(content).unwrap().body
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offloaded_slots_are_woken_one_at_a_time_and_each_sender_told_what_came_of_it() {
+        let mut f = fleet();
+        f.slots
+            .get_mut("b")
+            .unwrap()
+            .extend([slot("claude-3", false), slot("claude-4", false)]);
+        let (r, agents) = router(f, Ok(()));
+        let send = |to: &str| relayed(&r, "a", &peer_from("claude-1", to, message()));
+        send("b/claude-2");
+        assert_eq!(wakes(&agents["b"].heard()), ["claude-2"]);
+        // While that wake is in flight, no other is asked for, and none twice.
+        send("b/claude-2");
+        send("b/claude-3");
+        send("b/claude-3");
+        send("b/claude-4");
+        assert!(wakes(&agents["b"].heard()).is_empty());
+        // Its answer: the sender is told, and the next waiting slot is asked to wake.
+        let woke = |slot: &str, ok: bool| {
+            one(
+                "woke",
+                &[
+                    ("slot", Value::string(slot)),
+                    ("ok", Value::Bool(ok)),
+                    ("why", Value::string("no-room")),
+                ],
+            )
+        };
+        // claude-3 comes up meanwhile (the owner opened it), so it is not woken.
+        lock(&r.fleet).slots.get_mut("b").unwrap()[2].live = true;
+        relayed(&r, "b", &woke("claude-2", true));
+        assert_eq!(wakes(&agents["b"].heard()), ["claude-4"]);
+        let told = notices(&agents["a"].heard());
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("b/claude-2 was offloaded, so it has been woken"));
+        relayed(&r, "b", &woke("claude-4", false));
+        assert!(
+            wakes(&agents["b"].heard()).is_empty(),
+            "each asked for once"
+        );
+    }
+
+    #[test]
+    fn a_wake_is_not_asked_for_without_room_on_the_host_or_an_answering_container() {
+        let (r, agents) = router(fleet(), Err("the host has 100M available".into()));
+        relayed(&r, "a", &peer_from("claude-1", "b/claude-2", message()));
+        assert!(wakes(&agents["b"].heard()).is_empty());
+        let told = notices(&agents["a"].heard());
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("it was not woken: the host has 100M available"));
+        assert_eq!(lock(&r.queue).len(), 1, "kept all the same");
+        // To a container that is not answering: kept, and the sender told so.
+        relayed(&r, "a", &peer_from("claude-1", "c/claude-1", message()));
+        let told = notices(&agents["a"].heard());
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("c, where c/claude-1 runs, is not answering"));
+        // A sender no longer live is not told.
+        lock(&r.fleet).slots.get_mut("a").unwrap()[0].live = false;
+        notify(&r, "a/claude-1", "x");
+        assert!(agents["a"].heard().is_empty());
+    }
+
     #[test]
     fn the_beat_says_who_answers_and_what_waits() {
         let mut fleet = fleet();
@@ -1354,15 +1818,8 @@ mod tests {
                 at: 0,
             })
             .unwrap();
-        let router = Router {
-            fleet: Mutex::new(fleet),
-            conns: Mutex::new(HashMap::new()),
-            sent: Mutex::new(HashMap::new()),
-            queue: Mutex::new(queue),
-            backoff: Mutex::new(HashMap::new()),
-            waking: Mutex::new(HashSet::new()),
-            to_wake: Mutex::new(Vec::new()),
-        };
+        let router = Router::new(queue, Box::new(|| Ok(())), clock::now);
+        *lock(&router.fleet) = fleet;
         let line = router.pulse();
         assert!(line.ends_with(" 2/4 answering, 1 waiting\n"), "{line:?}");
         assert!(line.starts_with("20"), "a UTC date first: {line:?}");
@@ -1398,6 +1855,21 @@ mod tests {
         assert_eq!(q.len(), 1);
         let (q2, _) = Queue::open(&dir).unwrap();
         assert_eq!(q2.len(), 1, "taken means gone from disk too");
+        // One kept after a restart is kept beside those from before it, never over one.
+        let _ = fs::remove_dir_all(&dir);
+        {
+            let (mut q, _) = Queue::open(&dir).unwrap();
+            q.push(item("b/claude-2", 1)).unwrap();
+            q.push(item("b/claude-2", 2)).unwrap();
+        }
+        Queue::open(&dir)
+            .unwrap()
+            .0
+            .push(item("b/claude-2", 3))
+            .unwrap();
+        let (mut q, _) = Queue::open(&dir).unwrap();
+        let at: Vec<u64> = q.take(|_| true).iter().map(|i| i.at).collect();
+        assert_eq!(at, [1, 2, 3]);
         // One past the limit is refused; and age prunes.
         let mut m = Queue::memory();
         for i in 0..MAX_QUEUE {

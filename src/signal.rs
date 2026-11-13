@@ -45,7 +45,18 @@ pub enum Sent {
 
 /// Send `sig` to `pid`, but only if it is still the process that started at `start`.
 pub fn send(pid: u32, start: u64, sig: i32) -> io::Result<Sent> {
-    let fd = match pidfd_open(pid) {
+    send_opening(pid, start, sig, pidfd_open)
+}
+
+/// [`send`], with the pidfd opened by `open`, so a test can stand in for a kernel whose
+/// `pidfd_open` answers `ENOSYS`; this one never does.
+fn send_opening(
+    pid: u32,
+    start: u64,
+    sig: i32,
+    open: fn(u32) -> io::Result<OwnedFd>,
+) -> io::Result<Sent> {
+    let fd = match open(pid) {
         Ok(fd) => fd,
         Err(e) if e.raw_os_error() == Some(ENOSYS) => return send_by_kill(pid, start, sig),
         Err(e) => return gone_or(e),
@@ -149,6 +160,38 @@ mod tests {
         assert_eq!(send_by_kill(pid, start, SIGKILL).unwrap(), Sent::Delivered);
         child.wait().expect("reap");
         assert_eq!(send_by_kill(pid, start, SIGTERM).unwrap(), Sent::Gone);
+    }
+
+    #[test]
+    fn a_kernel_without_pidfds_falls_back_to_kill_and_no_other_refusal_does() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let start = procinfo::start_time(pid).expect("readable");
+        let no_pidfds: fn(u32) -> io::Result<OwnedFd> =
+            |_| Err(io::Error::from_raw_os_error(ENOSYS));
+        let refused: fn(u32) -> io::Result<OwnedFd> = |_| Err(io::Error::from_raw_os_error(1));
+        // ENOSYS takes the kill(2) path, which still checks the start time.
+        assert_eq!(
+            send_opening(pid, start, 0, no_pidfds).unwrap(),
+            Sent::Delivered
+        );
+        assert_eq!(
+            send_opening(pid, start + 1, SIGKILL, no_pidfds).unwrap(),
+            Sent::Gone
+        );
+        assert!(
+            procinfo::is_alive(pid, start),
+            "survived the mismatched KILL"
+        );
+        // Any other refusal is an error, and nothing is signalled.
+        let e = send_opening(pid, start, SIGKILL, refused).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(1), "{e}");
+        assert!(procinfo::is_alive(pid, start), "an error signals nobody");
+        child.kill().expect("kill");
+        child.wait().expect("reap");
     }
 
     #[test]

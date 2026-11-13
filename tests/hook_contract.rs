@@ -686,3 +686,146 @@ fn peer_context_exits_zero_and_says_only_its_line() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A field of a record, as a number, read from its file.
+fn record_u64(dir: &std::path::Path, slot: &str, key: &str) -> Option<u64> {
+    let body = std::fs::read_to_string(dir.join(format!("{slot}.json"))).unwrap();
+    let at = body.find(&format!("\"{key}\""))?;
+    let rest = body[at + key.len() + 2..].trim_start_matches([':', ' ']);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[test]
+fn keepalive_keeps_the_slot_it_runs_in_for_what_it_asked_and_zero_ends_it() {
+    let dir = tmpdir("keepalive");
+    live(&dir, "claude-1", own_start());
+    let before = wall_ms();
+    let out = run(&["keepalive", "25m"], &dir, Some("claude-1"), "");
+    let after = wall_ms();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("claude-1: kept alive for 25m;"),
+        "{}",
+        text(&out.stdout)
+    );
+    // Until 25 minutes from when it ran: bracketed by the clock read either side of it.
+    let until = record_u64(&dir, "claude-1", "keep_until_ms").expect("a keep-alive");
+    let asked = 25 * 60_000;
+    assert!(
+        (before + asked..=after + asked).contains(&until),
+        "{before} {until} {after}"
+    );
+
+    let out = run(&["keepalive", "0"], &dir, Some("claude-1"), "");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with("claude-1: keep-alive ended;"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(record_u64(&dir, "claude-1", "keep_until_ms"), None);
+
+    // Outside a slot, or past the cap, nothing is set and it says why.
+    let out = run(&["keepalive", "25m"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("not inside a claude-sessions slot"));
+    let out = run(&["keepalive", "13h"], &dir, Some("claude-1"), "");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(record_u64(&dir, "claude-1", "keep_until_ms"), None);
+}
+
+#[test]
+fn skill_prints_the_skill_it_names_keepalive_by_default_and_refuses_another() {
+    // An image needs only the binary: `skill` is how it gets the text `install` writes.
+    let dir = tmpdir("skill");
+    let shipped = include_str!("../skills/keepalive/SKILL.md");
+    for args in [&["skill"][..], &["skill", "keepalive"][..]] {
+        let out = run(args, &dir, None, "");
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), shipped, "{args:?}");
+    }
+    let out = run(&["skill", "mail-send"], &dir, None, "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains(r#"no skill "mail-send": keepalive"#),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn the_remote_client_answers_its_version_and_its_usage_by_either_name() {
+    // `claude-remote` is a link to this binary; called by that name, it is the client.
+    let dir = tmpdir("client");
+    let link = dir.join("claude-remote");
+    std::os::unix::fs::symlink(BIN, &link).unwrap();
+    let version = format!("claude-remote {}\n", env!("CARGO_PKG_VERSION"));
+    for (prog, args) in [
+        (link.as_os_str(), &["--version"][..]),
+        (BIN.as_ref(), &["client", "--version"][..]),
+    ] {
+        let out = Command::new(prog).args(args).env_clear().output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", text(&out.stderr));
+        assert_eq!(text(&out.stdout), version, "{args:?}");
+    }
+    // With no ssh name, it says how to call it and fails, by either name.
+    for (prog, args) in [(link.as_os_str(), &[][..]), (BIN.as_ref(), &["client"][..])] {
+        let out = Command::new(prog).args(args).env_clear().output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            text(&out.stderr).contains("usage: claude-remote <ssh name>"),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn remote_answers_why_on_its_first_line_when_it_cannot_open_a_session() {
+    // The relay reads the first line to learn the slot, or why there is none; none of these
+    // gets as far as starting anything.
+    let dir = tmpdir("remote");
+    let cgroup = dir.join("cgroup");
+    std::fs::create_dir_all(&cgroup).unwrap();
+    let remote = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .arg("remote")
+            .args(args)
+            .env("CLAUDE_SESSIONS_DIR", &dir)
+            // Unknown memory is room, so the refusal is never "no room" on a full machine.
+            .env("CLAUDE_SESSIONS_CGROUP", &cgroup)
+            .env("CLAUDE_SESSIONS_ZMX", "false")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (out.status.code(), text(&out.stdout))
+    };
+    let gone = dir.join("gone").display().to_string();
+    for (args, why) in [
+        (&["frobnicate"][..], "remote takes new [DIR], open SLOT"),
+        (&["new", &gone][..], "gone is not a directory"),
+        (&["open", "claude-9"][..], "claude-9 is gone"),
+        (&["resume", "abc", &gone, "dns"][..], "which is gone"),
+    ] {
+        let (code, said) = remote(args);
+        assert_eq!(code, Some(1), "{args:?}: {said}");
+        assert!(
+            said.starts_with(r#"{"error":""#) && said.contains(why) && said.ends_with("}\n"),
+            "{args:?}: {said}"
+        );
+    }
+    // `/btw` answers on its one line, an error included, and that is the whole exchange.
+    let (code, said) = remote(&["btw", "claude-9"]);
+    assert_eq!(code, Some(0), "{said}");
+    assert_eq!(said, "{\"error\":\"claude-9 is gone\"}\n");
+}
