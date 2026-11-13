@@ -1107,10 +1107,11 @@ fn start(c: &mut Conv, out: &mut Vec<Effect>) {
     ops.extend(c.shown.ops(c.from..c.shown.items.len()));
     ops.extend(c.state_op.iter().cloned());
     ops.extend(c.tasks_op.iter().cloned());
+    let any = !ops.is_empty();
     c.pending = ops;
     flush(c, out);
     // `flush` says nothing for nothing; the client still needs to hear the log is in.
-    if c.shown.items.is_empty() && c.meta_op.is_none() && c.state_op.is_none() {
+    if !any {
         out.push(Effect::Send(msg(
             "n",
             vec![("n", Value::num(c.pending_n as f64))],
@@ -3004,6 +3005,18 @@ mod tests {
         assert_eq!(
             sent(&fx),
             [r#"{"c":[],"m":[{"d":"Opus","v":"opus","x":"big"}],"t":"models"}"#]
+        );
+    }
+
+    #[test]
+    fn a_lazy_client_opening_an_empty_log_still_hears_where_it_stands_once() {
+        let mut r = relay();
+        let (_, fx) = opened_lazy(&mut r, 40, 5, 1);
+        let said = sent(&fx);
+        assert_eq!(
+            said.iter().filter(|l| l.contains(r#""t":"n""#)).count(),
+            1,
+            "{said:?}"
         );
     }
 
