@@ -27,8 +27,9 @@ pub fn human(bytes: u64) -> String {
 }
 
 /// Milliseconds since the epoch as a civil UTC date: `(year, month, day, hour, minute,
-/// second, millisecond)`. Days to civil date as in Howard Hinnant's `civil_from_days`.
-fn civil(ms: u64) -> (i64, i64, i64, u64, u64, u64, u64) {
+/// second)`, the milliseconds dropped. Days to civil date as in Howard Hinnant's
+/// `civil_from_days`.
+fn civil(ms: u64) -> (i64, i64, i64, u64, u64, u64) {
     let (days, rem) = ((ms / 86_400_000) as i64, ms % 86_400_000);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -46,13 +47,12 @@ fn civil(ms: u64) -> (i64, i64, i64, u64, u64, u64, u64) {
         rem / 3_600_000,
         rem / 60_000 % 60,
         rem / 1_000 % 60,
-        rem % 1_000,
     )
 }
 
 /// `ms` as a `Date:` header reads: `2026-10-28T03:15:00Z`, whole seconds.
 pub fn utc(ms: u64) -> String {
-    let (y, m, d, h, mi, s, _) = civil(ms);
+    let (y, m, d, h, mi, s) = civil(ms);
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
