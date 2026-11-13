@@ -1512,7 +1512,11 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
                 let last = i >= c.entries.len();
                 out.push(Vec::new());
                 // Still running: the calls not yet summarised are said as under way, with
-                // the one running under them.
+                // the one running under them. Claude summarises a step only once its calls
+                // have answered (the owner, 2026-11-13: each step gets its own summary, often
+                // later, standing in for a long command), so the running call is always in
+                // the last, unsummarised step; were one summarised first, its steps would be
+                // folded into this heading.
                 let running = open
                     .filter(|_| last && busy)
                     .map(|call| match steps.last() {
