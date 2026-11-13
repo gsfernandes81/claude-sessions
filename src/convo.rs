@@ -1699,11 +1699,19 @@ fn status_line(place: &str, f: &crate::statusline::Figures, w: usize) -> Line {
     ];
     let mut out: Line = Vec::new();
     let mut left = w.saturating_sub(1);
+    // Cut once, where the room runs out: what comes after is gone, not another `…` each.
     for (t, st) in parts {
-        let t = cut(&t, left);
-        left -= width(&t).min(left);
-        if !t.is_empty() {
-            out.push((t, st));
+        if left == 0 {
+            break;
+        }
+        let c = cut(&t, left);
+        let short = c != t;
+        left -= width(&c).min(left);
+        if !c.is_empty() {
+            out.push((c, st));
+        }
+        if short {
+            break;
         }
     }
     out
@@ -5504,18 +5512,24 @@ mod tests {
             format!("  {figs}, {}", f.place()),
             format!("  {figs}"),
         ];
-        // From 33: narrower, a squeezed line cut short still gets a `…` for every part after
-        // the cut, which runs into the last column.
-        for w in 33..=120 {
+        for w in 1..=120 {
             let got = plain(&status_line(place, &f, w));
             match forms.iter().find(|l| width(l) < w) {
                 Some(want) => assert_eq!(&got, want, "at {w}"),
                 None => {
-                    assert!(got.starts_with("  RAM "), "squeezed at {w}: {got:?}");
+                    // Squeezed, and cut once where the room runs out.
+                    if w > 8 {
+                        assert!(got.starts_with("  RAM "), "squeezed at {w}: {got:?}");
+                    }
                     assert!(width(&got) < w, "at {w}: {got:?}");
+                    assert!(got.matches('…').count() <= 1, "at {w}: {got:?}");
                 }
             }
         }
+        assert_eq!(
+            plain(&status_line(place, &f, 25)),
+            "  RAM 0.9/2.0G, Swap 0.…"
+        );
     }
 
     #[test]
