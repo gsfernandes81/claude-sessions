@@ -185,15 +185,19 @@ fn wrapped_by(text: &str, first: &str, rest: &str, w: usize, st: St) -> Vec<Line
 }
 
 /// Claude Code's hint lines: whole segments joined by ` · `, a line ending ` ·` where it
-/// breaks.
+/// breaks. A segment that is not the last joins a line only with room for that ` ·` after
+/// it: landing closer to the edge, no segment could follow it there, so the line would end
+/// with one. A segment too wide for a line of its own is clipped at the edge.
 fn hints(segs: &[&str], indent: &str, w: usize) -> Vec<Line> {
     let room = w.saturating_sub(width(indent));
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for seg in segs {
+    for (i, seg) in segs.iter().enumerate() {
+        let joined = width(&cur) + 3 + width(seg);
+        let tail = if i + 1 < segs.len() { 2 } else { 0 };
         if cur.is_empty() {
             cur = seg.to_string();
-        } else if width(&cur) + 3 + width(seg) <= room {
+        } else if joined + tail <= room {
             cur = format!("{cur} · {seg}");
         } else {
             lines.push(format!("{cur} ·"));
@@ -203,7 +207,7 @@ fn hints(segs: &[&str], indent: &str, w: usize) -> Vec<Line> {
     lines.push(cur);
     lines
         .into_iter()
-        .map(|l| line(format!("{indent}{l}"), fg(GREY)))
+        .map(|l| clip(line(format!("{indent}{l}"), fg(GREY)), w))
         .collect()
 }
 
@@ -5039,6 +5043,21 @@ mod tests {
 
     #[test]
     fn hint_lines_break_between_hints_and_never_run_past_the_width() {
+        // A hint that would end within two cells of the edge, with one after it, goes down:
+        // the line would end ` ·` and run past.
+        let at = |w: usize| -> Vec<String> {
+            hints(&["aaaa", "bbbb", "cc"], "", w)
+                .iter()
+                .map(plain)
+                .collect()
+        };
+        assert_eq!(at(11), ["aaaa ·", "bbbb · cc"]);
+        assert_eq!(at(13), ["aaaa · bbbb ·", "cc"], "calibration: room for it");
+        assert_eq!(
+            at(16),
+            ["aaaa · bbbb · cc"],
+            "calibration: and for the last"
+        );
         let segs = ["Enter to select", "Esc to cancel"];
         for w in 10..60 {
             let got: Vec<String> = hints(&segs, "   ", w).iter().map(plain).collect();
@@ -5046,7 +5065,13 @@ mod tests {
             if width(one) <= w {
                 assert_eq!(got, [one], "at {w}");
             } else {
-                assert_eq!(got, ["   Enter to select ·", "   Esc to cancel"], "at {w}");
+                // A hint wider than the line, ` ·` and all, is clipped at the edge.
+                let at_w = |l: &str| l.chars().take(w).collect::<String>();
+                assert_eq!(
+                    got,
+                    [at_w("   Enter to select ·"), at_w("   Esc to cancel")],
+                    "at {w}"
+                );
             }
         }
     }
