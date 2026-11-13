@@ -119,11 +119,10 @@ exclude_re = [
     'src/client\.rs:.*: replace App::dial with \(\)$',
     # The phone client's renderer (src/convo.rs, 2026-11-09). A loop's index that only moves
     # forward: stalled, the suite hangs, which cargo-mutants can only report as a timeout.
-    # Each is the walk over the transcript, the prompt's characters or a word's; the column
-    # picks soft_wrap's and wrap's from the counters beside them.
+    # Each is the walk over the transcript or the prompt's characters; the column picks
+    # soft_wrap's from the counters beside it.
     'src/convo\.rs:.*: replace \+= with [-*]= in (transcript|slash_runs)$',
     'src/convo\.rs:\d+:19: replace \+= with [-*]= in soft_wrap$',
-    'src/convo\.rs:\d+:34: replace > with < in wrap$',
     # The same, where only a character wider than the whole row tells them apart: soft_wrap
     # refusing to break before a row's first character, which would leave it empty forever.
     'src/convo\.rs:\d+:49: replace > with >= in soft_wrap$',

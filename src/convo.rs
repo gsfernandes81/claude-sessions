@@ -135,17 +135,22 @@ pub fn wrap(s: &str, w: usize) -> Vec<String> {
         if !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
         }
-        // A word wider than the line: broken at the width.
+        // A word wider than the line: broken at the width, until what is left fits. A
+        // character wider than the whole line takes one of its own, since nothing narrower
+        // can hold it.
         let mut rest = word;
-        while width(rest) > w {
+        loop {
             let mut taken = 0;
             let mut at = 0;
             for (i, c) in rest.char_indices() {
-                if taken + cw(c) > w {
+                if at > 0 && taken + cw(c) > w {
                     break;
                 }
                 taken += cw(c);
                 at = i + c.len_utf8();
+            }
+            if at == rest.len() {
+                break;
             }
             lines.push(rest[..at].to_string());
             rest = &rest[at..];
@@ -4992,6 +4997,10 @@ mod tests {
         assert!(!is_current("claude-opus-5-5", "fable", "Fable 5.1"));
         assert_eq!(wrap("a bb ccc", 4), ["a bb", "ccc"]);
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        // A character wider than the line takes one of its own rather than none forever.
+        assert_eq!(wrap("中", 1), ["中"]);
+        assert_eq!(wrap("a中b", 1), ["a", "中", "b"]);
+        assert_eq!(wrap("中中", 3), ["中", "中"], "calibration: two cells each");
         assert_eq!(cut("Write the numbers", 10), "Write the…");
         assert_eq!(
             tools_summary(&[("Bash", "a"), ("Read", "b"), ("Bash", "c")], false),
