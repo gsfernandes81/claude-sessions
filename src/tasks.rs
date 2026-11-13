@@ -518,8 +518,8 @@ fn shell_details(t: &Task, v: &View, w: usize, h: usize) -> Vec<Line> {
             // The box fits the screen with its hint, rather than running off the bottom
             // as Claude Code's does at 24 rows; nine lines where there is room.
             // Around the lines: the box's edges, its blank row, `Showing`, a blank and the
-            // hint; and three rows of the transcript left above.
-            let fixed = out.len() + 6 + tail.len() + 3;
+            // hint; and four rows of the transcript left above, as the list leaves.
+            let fixed = out.len() + 5 + tail.len() + 4;
             let shown = h.saturating_sub(fixed).clamp(1, OUTPUT_LINES);
             let all: Vec<&str> = text
                 .strip_suffix('\n')
@@ -2108,6 +2108,10 @@ mod tests {
             "the hint wraps"
         );
         assert_eq!(wide.len(), narrow.len());
+        // Four rows of the transcript left above, as the list leaves, where the box is not
+        // at its most lines.
+        assert_eq!(narrow.len(), 26 - 4);
+        assert_eq!(draw(&c, &v, 40, 20, NOW).len(), 20 - 4);
     }
 
     #[test]
