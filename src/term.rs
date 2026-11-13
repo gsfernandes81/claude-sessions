@@ -398,7 +398,7 @@ fn parse_csi(b: &[u8]) -> Parsed {
     let word = fields
         .next()
         .flatten()
-        .is_some_and(|m| m > 1 && (m - 1) & 0b110 != 0);
+        .is_some_and(|m| m.saturating_sub(1) & 0b110 != 0);
     let key = match fin {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
@@ -1155,6 +1155,29 @@ mod tests {
         want.extend("half more".chars().map(Key::Char));
         want.push(Key::PasteEnd);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_bracketed_paste_fed_one_byte_at_a_time_is_the_same_paste() {
+        // A read can hold nothing but the start of the end marker, or of a line break.
+        let paste = "\x1b[200~a\r\nb\x1b[201~n".as_bytes();
+        let mut d = Decoder::new();
+        let mut got = Vec::new();
+        for b in paste {
+            got.extend(d.feed(std::slice::from_ref(b)));
+        }
+        got.extend(d.timeout());
+        let mut want = vec![Key::PasteStart];
+        want.extend(chars("a\nb"));
+        want.extend([Key::PasteEnd, Key::Char('n')]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_modifier_of_zero_is_no_modifier() {
+        // Malformed, since xterm's modifiers start at 1, and read as a plain arrow rather
+        // than as a word or a crash.
+        assert_eq!(decode(b"\x1b[1;0C\x1b[1;0D"), vec![Key::Right, Key::Left]);
     }
 
     #[test]
