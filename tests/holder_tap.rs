@@ -163,3 +163,39 @@ fn a_tap_carries_lines_both_ways_stamps_the_slot_and_an_answer_clears_its_mark()
     holder.wait().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_holder_that_hangs_up_on_the_tap_unheard_is_a_failure_the_tap_says() {
+    let root = std::env::temp_dir().join(format!("cs-holder-reset-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("registry")).unwrap();
+    // A holder that takes the connection, hears one byte of the tap's hello and goes, the
+    // rest unread: the kernel resets the connection rather than ending it.
+    let listener =
+        std::os::unix::net::UnixListener::bind(root.join("registry/claude-7.sock")).unwrap();
+    let holder = std::thread::spawn(move || {
+        use std::io::Read;
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut one = [0u8; 1];
+        conn.read_exact(&mut one).unwrap();
+    });
+    let mut tap = Command::new(BIN);
+    tap.args(["tap", "claude-7"])
+        .env("CLAUDE_SESSIONS_DIR", root.join("registry"))
+        .env("CLAUDE_CONFIG_DIR", root.join("config"))
+        .env("HOME", &root)
+        .current_dir(&root)
+        // Input kept open: its end would be a clean end of its own.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut tap = tap.spawn().unwrap();
+    let input = tap.stdin.take();
+    holder.join().unwrap();
+    let out = tap.wait_with_output().unwrap();
+    drop(input);
+    // Said on stderr, where the relay takes the reason the conversation went.
+    assert!(!out.status.success(), "{}", out.status);
+    assert!(!out.stderr.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -851,12 +851,10 @@ pub fn tap(slot: &str, from: u64, run: &str) -> io::Result<()> {
     let mut buf = [0u8; 16 * 1024];
     let mut stdout = io::stdout().lock();
     loop {
-        let n = match from_holder.read(&mut buf) {
-            Ok(n) => n,
-            // Shut down from the input side while a read was waiting.
-            Err(e) if e.kind() == io::ErrorKind::NotConnected => 0,
-            Err(e) => return Err(e),
-        };
+        // An error is the holder gone mid-line (a reset), said on stderr for the relay. Shut
+        // down from the input side while a read was waiting reads as an end, not ENOTCONN:
+        // Linux's Unix sockets give 0 once reading is shut down (measured 2026-11-13).
+        let n = from_holder.read(&mut buf)?;
         if n == 0 {
             return Ok(());
         }
