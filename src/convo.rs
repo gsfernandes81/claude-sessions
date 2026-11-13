@@ -2404,13 +2404,19 @@ fn plan_dialog(
 /// `room` rows of `body` from row `top` (held to the last screenful), with `↑ n more` and
 /// `↓ n more` in place of a row where there is more above or below.
 fn scrolled(body: Vec<Line>, top: usize, room: usize) -> Vec<Line> {
+    scrolled_at(body, top, room, " ")
+}
+
+/// `body` from row `top` in `room` rows, with `pad` before its ↑ and ↓ rows: scrolled to the
+/// end, the ↑ row takes one of them and the last row is in view.
+fn scrolled_at(body: Vec<Line>, top: usize, room: usize, pad: &str) -> Vec<Line> {
     if body.len() <= room {
         return body;
     }
     let top = top.min(body.len().saturating_sub(room - 1));
     let mut out = Vec::new();
     if top > 0 {
-        out.push(line(format!(" ↑ {top} more"), fg(GREY)));
+        out.push(line(format!("{pad}↑ {top} more"), fg(GREY)));
     }
     let mut shown = room - usize::from(top > 0);
     if body.len() > top + shown {
@@ -2419,7 +2425,7 @@ fn scrolled(body: Vec<Line>, top: usize, room: usize) -> Vec<Line> {
     let below = body.len().saturating_sub(top + shown);
     out.extend(body.into_iter().skip(top).take(shown));
     if below > 0 {
-        out.push(line(format!(" ↓ {below} more"), fg(GREY)));
+        out.push(line(format!("{pad}↓ {below} more"), fg(GREY)));
     }
     out
 }
@@ -2849,19 +2855,7 @@ fn btw_dialog(
     };
     // What the transcript keeps above: a few rows, as a dialog leaves on a phone.
     let room = h.saturating_sub(out.len() + 5).max(3);
-    let top = top.min(body.len().saturating_sub(room));
-    if top > 0 {
-        out.push(line(format!("   ↑ {top} more"), fg(GREY)));
-    }
-    let mut shown = room - usize::from(top > 0);
-    if body.len() > top + shown {
-        shown -= 1;
-    }
-    let below = body.len().saturating_sub(top + shown);
-    out.extend(body.into_iter().skip(top).take(shown));
-    if below > 0 {
-        out.push(line(format!("   ↓ {below} more"), fg(GREY)));
-    }
+    out.extend(scrolled_at(body, top, room, "   "));
     out.push(Vec::new());
     out.extend(hints(&["Space, Enter or Esc to dismiss"], "   ", w));
     out
@@ -5816,6 +5810,9 @@ mod tests {
                         assert_eq!(shown.len(), n, "whole, {ctx}: {rows:?}");
                     } else {
                         assert_eq!(above == 0, top == 0, "{ctx}: {rows:?}");
+                    }
+                    if top == 99 {
+                        assert_eq!(below, 0, "scrolled to the end, {ctx}: {rows:?}");
                     }
                 }
             }
