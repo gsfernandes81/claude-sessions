@@ -1183,7 +1183,8 @@ pub fn strip(
 
 /// Whether a strip row's name, `lead` cells, and its counts overflow `w` columns.
 fn overflows(lead: usize, right: &str, w: usize) -> bool {
-    lead + 2 + width(right) > w
+    // The two cells after the name, and at least one before the counts.
+    lead + 2 + 1 + width(right) > w
 }
 
 fn run_only(t: &Task, now: u64) -> String {
@@ -2169,12 +2170,11 @@ mod tests {
     fn what_does_not_fit_in_the_strip_goes_the_counts_before_the_time() {
         let mut a = task("a", "agent", "survey", "general-purpose", "running");
         a.tokens = 48_100;
-        // `  ◯ general-purpose  ` and `1m 0s · ↓ 48.1k tokens` meet at 43 columns. At 43
-        // itself the counts are kept and the line cut a cell short (reported 2026-11-08), so
-        // it is left out here.
-        for w in (30..=42).chain(44..=70) {
+        // `  ◯ general-purpose  `, a cell, then `1m 0s · ↓ 48.1k tokens`: 44 columns. At 43
+        // the counts were once kept and the line cut a cell short.
+        for w in 30..=70 {
             let got = text(&strip(std::slice::from_ref(&a), None, None, w, NOW));
-            let want = if w < 43 {
+            let want = if w < 44 {
                 " 1m 0s"
             } else {
                 " 1m 0s · ↓ 48.1k tokens"

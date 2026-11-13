@@ -99,10 +99,6 @@ exclude_re = [
     # drafts.rs and tasks.rs (2026-11-08). The drafts file exactly at its cap: telling `>`
     # from `>=` needs a file of exactly 4 MiB, a size only the serializer's arithmetic gives.
     'src/drafts\.rs:.*: replace > with >= in save$',
-    # The strip's counts at the one width where they meet the name: the mutant is the fix
-    # for an off-by-one there (the counts are kept and the line cut a cell short), reported
-    # to the owner rather than pinned; drop this when it is fixed.
-    'src/tasks\.rs:.*: replace > with >= in overflows$',
     # client.rs: the second Left's window and two minutes' quiet compared with or without
     # their bounds (timing only); a selection's empty span on a row, which draws and copies the
     # same as none; base64's bytes packed with `|`, whose bits do not overlap; `date` failing,
