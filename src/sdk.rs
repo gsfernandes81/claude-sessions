@@ -61,6 +61,11 @@ pub enum Msg {
     /// A local command's output, `<local-command-stdout>…</local-command-stdout>`: what
     /// `/model`, `/compact` and the like answer with.
     LocalOutput(String),
+    /// A shell command the owner ran with `!`, as claude echoes a `bash_command`
+    /// (`<bash-input>`), or as the conversation holds it once the holder has added it.
+    BashInput(String),
+    /// What that command printed (`<bash-stdout>`, `<bash-stderr>`), or why it was not run.
+    BashOutput { stdout: String, stderr: String },
     /// Any other `user` line's text: a compaction's summary, `[Request interrupted by user]`.
     UserText(String),
     /// `can_use_tool` for anything but a question: claude waits for allow or deny.
@@ -731,6 +736,56 @@ fn local_output(t: &str) -> Option<String> {
     })
 }
 
+/// A shell command run with `!`, or what it printed, from the tags Claude Code keeps them in:
+/// `<bash-input>`, then `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr>`, each
+/// escaped as Claude Code escapes them (`&amp;`, `&lt;`, `&gt;`). A `<bash-exit-code>` after
+/// them, which `bash_command`'s adds, is not drawn, as Claude Code draws none.
+fn bash(t: &str) -> Option<Msg> {
+    let inner = |name: &str| -> Option<String> {
+        let open = format!("<{name}>");
+        let from = t.find(&open)? + open.len();
+        let to = t[from..]
+            .find(&format!("</{name}>"))
+            .map_or(t.len(), |n| from + n);
+        Some(unescape(t[from..to].trim_start_matches('\n').trim_end()))
+    };
+    if t.starts_with("<bash-input>") {
+        return Some(Msg::BashInput(inner("bash-input")?));
+    }
+    if t.starts_with("<bash-stdout>") || t.starts_with("<bash-stderr>") {
+        return Some(Msg::BashOutput {
+            stdout: inner("bash-stdout").unwrap_or_default(),
+            stderr: inner("bash-stderr").unwrap_or_default(),
+        });
+    }
+    None
+}
+
+/// Claude Code's own unescaping of a shell command's tags: `&amp;`, `&lt;` and `&gt;` only.
+fn unescape(t: &str) -> String {
+    t.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// A replay of a `<bash-…>` row, as the holder reads claude's lines: the row's uuid and
+/// whether it is the command (`<bash-input>`), with its text as claude wrote it.
+pub fn bash_echo(v: &Value) -> Option<(String, bool, String)> {
+    if s(v, "type") != "user" || v.get("isReplay").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let t = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)?;
+    match bash(t)? {
+        Msg::BashInput(_) => Some((s(v, "uuid"), true, t.to_string())),
+        // Not run: refused, blank or too long, so there is nothing to add.
+        _ if t.starts_with("<bash-stderr>Not run: ") => None,
+        _ => Some((s(v, "uuid"), false, t.to_string())),
+    }
+}
+
 /// The tags Claude Code wraps what it hands the model as a user message in, which it never
 /// shows as typed (2.1.311's own list): a line that opens with one is not a prompt the owner
 /// typed, so it is never drawn as one. Those the view draws are read before this list is.
@@ -964,6 +1019,9 @@ fn user(v: &Value) -> Msg {
         Some(Value::Str(t)) => {
             if let Some(m) = message(t, origin) {
                 return Msg::Message(m);
+            }
+            if let Some(bash) = bash(t) {
+                return bash;
             }
             if let Some(out) = local_output(t) {
                 return Msg::LocalOutput(out);
@@ -1227,6 +1285,9 @@ pub enum Input {
         uuid: String,
         text: String,
     },
+    /// A line added to the conversation without a turn (`shouldQuery: false`), by its uuid:
+    /// the holder's copy of a `!` command, whose echo is not drawn again.
+    Note(String),
     /// An interrupt, an end, a rename: claude says what came of each itself.
     Other,
 }
@@ -1268,6 +1329,9 @@ fn input(line: &Value) -> Input {
         ("control_request", "set_permission_mode") => {
             Input::Mode(req.map(|r| s(r, "mode")).unwrap_or_default())
         }
+        ("user", _) if line.get("shouldQuery").and_then(Value::as_bool) == Some(false) => {
+            Input::Note(s(line, "uuid"))
+        }
         ("user", _) if !s(line, "uuid").is_empty() => Input::Say {
             uuid: s(line, "uuid"),
             text: line
@@ -1303,6 +1367,27 @@ pub fn initialize(request_id: &str) -> Value {
 /// lines name, so an interrupt that catches it unanswered can hand it back to the view.
 pub fn prompt(text: &str, uuid: &str) -> Value {
     let mut v = user_text(text);
+    v.set("uuid", Value::string(uuid));
+    v
+}
+
+/// A shell command the owner typed after `!`, run by claude beside the conversation, never by
+/// the model: echoed at once as `<bash-input>`, then answered with what it printed
+/// (2.1.311's `bash_command`, measured 2026-11-15).
+pub fn bash_command(command: &str, uuid: &str) -> Value {
+    obj(vec![
+        ("type", Value::string("bash_command")),
+        ("command", Value::string(command)),
+        ("uuid", Value::string(uuid)),
+    ])
+}
+
+/// A line added to the conversation without starting a turn (`shouldQuery: false`), which
+/// the model reads with the next prompt: how a `!` command and its output join the
+/// conversation, as Claude Code's own `!` adds them. claude echoes it under `uuid`.
+pub fn note(text: &str, uuid: &str) -> Value {
+    let mut v = user_text(text);
+    v.set("shouldQuery", Value::Bool(false));
     v.set("uuid", Value::string(uuid));
     v
 }

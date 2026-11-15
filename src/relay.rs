@@ -301,7 +301,10 @@ fn item_rows(ops: &[Op], w: usize) -> usize {
             | Item::Text(t)
             | Item::Narration(t)
             | Item::Note(t)
-            | Item::Notice(t) => 1 + text_rows(t),
+            | Item::Notice(t)
+            | Item::Bash(t) => 1 + text_rows(t),
+            // Collapsed, as it is drawn until Ctrl+O: three lines and a count.
+            Item::BashOut { .. } => 4,
             Item::Tool { .. } => 1,
             Item::Agent { .. } => 3,
             Item::Permission { .. } | Item::Ask { .. } => 4,
@@ -907,6 +910,14 @@ impl Relay {
                 } else if c.reducer.shell_running() {
                     c.background_wanted = true;
                 }
+            }
+            // A shell command typed after `!`: run by claude beside the conversation, and added
+            // to it by the holder once it has printed, as Claude Code's own `!` adds it.
+            "bash" => {
+                let uuid = s(v, "u")
+                    .filter(|u| u.len() == 36)
+                    .unwrap_or_else(crate::launch::fresh_session_id);
+                to(sdk::bash_command(&s(v, "x").unwrap_or_default(), &uuid));
             }
             // Up on the phone: prompts waiting behind the turn leave claude's queue.
             "unqueue" => {
@@ -1681,6 +1692,22 @@ mod tests {
 
     fn is_background(line: &str) -> bool {
         line.contains(r#""subtype":"background_tasks""#)
+    }
+
+    #[test]
+    fn a_bang_command_goes_to_claude_as_its_bash_command() {
+        let mut r = relay();
+        opened(&mut r, 1);
+        let sent = to_claude(&client(
+            &mut r,
+            r#"{"t":"bash","x":"git status","u":"00000000-0000-4000-8000-000000000003"}"#,
+        ));
+        assert_eq!(
+            sent,
+            [
+                r#"{"command":"git status","type":"bash_command","uuid":"00000000-0000-4000-8000-000000000003"}"#
+            ]
+        );
     }
 
     #[test]

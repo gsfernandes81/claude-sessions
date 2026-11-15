@@ -170,6 +170,10 @@ pub enum Item {
         request_id: String,
         questions: Vec<Question>,
     },
+    /// A shell command the owner ran with `!`, beside the conversation.
+    Bash(String),
+    /// What it printed, on its standard output and error.
+    BashOut { stdout: String, stderr: String },
     /// A line of its own: a local command's output, an interruption, an error.
     Note(String),
     /// A background task's notice, which claude hands the model as a prompt: drawn as a note,
@@ -237,6 +241,10 @@ pub struct Reducer {
     /// What started each background shell, monitor or agent: tool name and command or
     /// type, by tool-use id, until its task is heard of or its result comes.
     calls: HashMap<String, (String, String)>,
+    /// The uuids of the latest lines the holder added to the conversation without a turn, read
+    /// from its log: claude echoes them (not always), and a `!` command already drawn is not
+    /// drawn twice.
+    notes: std::collections::VecDeque<String>,
 }
 
 /// A background task, and the tool call that started it.
@@ -811,6 +819,15 @@ impl Reducer {
     /// One line from claude.
     pub fn feed(&mut self, v: &Value) -> Out {
         let mut out = Out::default();
+        if v.get("type").and_then(Value::as_str) == Some("user")
+            && let Some(i) = v
+                .get("uuid")
+                .and_then(Value::as_str)
+                .and_then(|u| self.notes.iter().position(|n| n == u))
+        {
+            self.notes.remove(i);
+            return out;
+        }
         // A subagent's own messages are drawn by Claude Code as progress under its agent call,
         // its tool calls as the last few of them, not as the conversation's.
         if let Some(parent) = sdk::parent_tool_use_id(v) {
@@ -1106,6 +1123,15 @@ impl Reducer {
                     self.add(&mut out, Item::Note(text.trim().to_string()));
                 }
             }
+            Msg::BashInput(command) => {
+                self.add(&mut out, Item::Bash(command));
+            }
+            Msg::BashOutput { stdout, stderr } => {
+                // Colours a command printed (`ls --color`) are the terminal's; the view draws
+                // its own.
+                let (stdout, stderr) = (strip_ansi(&stdout), strip_ansi(&stderr));
+                self.add(&mut out, Item::BashOut { stdout, stderr });
+            }
             Msg::UserText(text) => {
                 if std::mem::take(&mut self.after_compact) {
                     // The compaction's summary, for the model; Claude Code draws a marker.
@@ -1316,6 +1342,13 @@ impl Reducer {
                     self.said_order.retain(|u| self.said.contains_key(u));
                     self.said_order.push(uuid.clone());
                     self.said.insert(uuid, (text, "sent".into()));
+                }
+                sdk::Input::Note(uuid) => {
+                    // An echo that never came goes in time, rather than growing this for ever.
+                    if self.notes.len() == 64 {
+                        self.notes.pop_front();
+                    }
+                    self.notes.push_back(uuid);
                 }
                 sdk::Input::Other => {}
             },
@@ -1764,6 +1797,13 @@ impl Item {
                 ("sm", Value::Bool(true)),
             ]),
             Item::Note(x) => obj(vec![k("note"), ("x", Value::string(x.clone()))]),
+            // An older client skips both.
+            Item::Bash(x) => obj(vec![k("bash"), ("x", Value::string(x.clone()))]),
+            Item::BashOut { stdout, stderr } => obj(vec![
+                k("bout"),
+                ("o", Value::string(stdout.clone())),
+                ("e", Value::string(stderr.clone())),
+            ]),
             // A note to a client that does not know the flag.
             Item::Notice(x) => obj(vec![
                 k("note"),
@@ -2411,6 +2451,85 @@ mod tests {
                 r#"{"id":1,"k":"note","t":"add","tn":true,"x":"Agent \"Review\" finished"}"#,
                 r#"{"s":"working","t":"st"}"#,
             ]
+        );
+    }
+
+    #[test]
+    fn a_bang_command_is_drawn_once_live_and_once_from_the_transcript() {
+        // As 2.1.311 echoes a `bash_command` (measured 2026-11-15), escaped as it escapes.
+        let input = r#"{"type":"user","message":{"role":"user","content":"<bash-input>printf \"a&lt;b&gt;&amp;c\\nline2\\n\"; ls --color</bash-input>"},"parent_tool_use_id":null,"uuid":"396f2d6c-7e21-4a50-8869-8136dabf7f7e","isReplay":true}"#;
+        let output = r#"{"type":"user","message":{"role":"user","content":"<bash-stdout>a&lt;b&gt;&amp;c\nline2\n\u001b[34mdir\u001b[0m</bash-stdout><bash-stderr>warn</bash-stderr><bash-exit-code>0</bash-exit-code>"},"parent_tool_use_id":null,"uuid":"729030e8-f7fd-4f1d-8c23-0ce0703f15b2","isReplay":true}"#;
+        let wanted = [
+            r#"{"id":1,"k":"bash","t":"add","x":"printf \"a<b>&c\\nline2\\n\"; ls --color"}"#,
+            r#"{"e":"warn","id":2,"k":"bout","o":"a<b>&c\nline2\ndir","t":"add"}"#,
+        ];
+        // The holder then adds both to the conversation, logged as a view's lines are, and
+        // claude echoes each under the uuid it was given: not drawn again.
+        let v = |l: &str| crate::json::parse(l).unwrap();
+        let text = |l: &str| {
+            let m = v(l);
+            let c = m.get("message").and_then(|m| m.get("content"));
+            c.and_then(Value::as_str).unwrap_or_default().to_string()
+        };
+        let note = |l: &str, u: &str| {
+            format!(
+                r#"{{"type":"_in","line":{}}}"#,
+                crate::json::to_line(&sdk::note(&text(l), u))
+            )
+        };
+        let echo = |l: &str, u: &str| {
+            let mut e = v(l);
+            e.set("uuid", Value::string(u));
+            crate::json::to_line(&e)
+        };
+        let (n1, n2) = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-1111-4111-8111-111111111111",
+        );
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                input,
+                output,
+                &note(input, n1),
+                &note(output, n2),
+                &format!(
+                    r#"{{"type":"command_lifecycle","command_uuid":"{n1}","state":"queued"}}"#
+                ),
+                &echo(input, n1),
+                &echo(output, n2),
+            ],
+        );
+        assert_eq!(wire(&o.ops), wanted);
+        assert!(
+            r.waiting_prompts().is_empty(),
+            "a note is not a prompt on its way"
+        );
+        // A resume reads the holder's two lines from the transcript, where bash_command's
+        // own never went.
+        let history = |l: &str| {
+            let mut h = v(l);
+            h.set("isReplay", Value::Null);
+            format!(
+                r#"{{"type":"_history","line":{}}}"#,
+                crate::json::to_line(&h)
+            )
+        };
+        let mut r = Reducer::new();
+        let o = feed_all(&mut r, &[&history(input), &history(output)]);
+        assert_eq!(wire(&o.ops), wanted);
+        // Refused: why, in its place.
+        let mut r = Reducer::new();
+        let o = feed_all(
+            &mut r,
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"<bash-stderr>Not run: no command was given.</bash-stderr>"},"isReplay":true}"#,
+            ],
+        );
+        assert_eq!(
+            wire(&o.ops),
+            [r#"{"e":"Not run: no command was given.","id":1,"k":"bout","o":"","t":"add"}"#]
         );
     }
 

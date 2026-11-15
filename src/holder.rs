@@ -83,6 +83,9 @@ pub const HEADLESS: [&str; 10] = [
 /// found artifacts missing from remote sessions.
 pub const ENTRYPOINT: &str = "ssh-remote";
 
+/// How many of its own lines' uuids the holder remembers, to know claude's echo of each.
+const NOTES: usize = 64;
+
 /// How long a tap has to say where it got to before the holder drops it.
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 
@@ -186,9 +189,29 @@ struct Log {
     /// The models a view asked claude to switch to, by request id, until claude answers:
     /// one it accepts is saved as the default (`save_default_model`).
     models: HashMap<String, String>,
+    /// The `!` command claude last echoed, as it wrote it, until what it printed comes.
+    bash: Option<String>,
+    /// The uuids of the lines this holder added to the conversation, the latest `NOTES`:
+    /// claude echoes them too (not always: 2.1.311 left out one whose text it had just
+    /// written), and they are not added again.
+    notes: std::collections::VecDeque<String>,
 }
 
 impl Log {
+    fn new(file: File) -> Log {
+        Log {
+            file,
+            offsets: Vec::new(),
+            end: 0,
+            closed: false,
+            answered: HashSet::new(),
+            open: HashSet::new(),
+            models: HashMap::new(),
+            bash: None,
+            notes: std::collections::VecDeque::new(),
+        }
+    }
+
     /// Append one line, newline-ended, and number it.
     fn append(&mut self, line: &[u8]) -> io::Result<()> {
         self.file.write_all(line)?;
@@ -238,6 +261,36 @@ impl Log {
         }
     }
 
+    /// Note a `!` command's echo (`sdk::bash_echo`): once what it printed comes, the two lines
+    /// to add to the conversation, since claude runs a `bash_command` beside it, where
+    /// Claude Code's own `!` adds the command and its output for the model to read with the
+    /// next prompt.
+    fn bash_echoed(&mut self, (uuid, input, text): (String, bool, String)) -> Vec<Value> {
+        if let Some(i) = self.notes.iter().position(|n| *n == uuid) {
+            self.notes.remove(i);
+            return Vec::new();
+        }
+        if input {
+            self.bash = Some(text);
+            return Vec::new();
+        }
+        let Some(command) = self.bash.take() else {
+            return Vec::new();
+        };
+        [command, text]
+            .iter()
+            .map(|t| {
+                let uuid = crate::launch::fresh_session_id();
+                // An echo that never came goes in time, rather than growing this for ever.
+                if self.notes.len() == NOTES {
+                    self.notes.pop_front();
+                }
+                self.notes.push_back(uuid.clone());
+                sdk::note(t, &uuid)
+            })
+            .collect()
+    }
+
     /// A request answered or withdrawn: true when it was open and was the last one.
     fn settled(&mut self, request_id: &str) -> bool {
         self.open.remove(request_id) && self.open.is_empty()
@@ -276,15 +329,7 @@ pub fn serve(
     // slot's name is free when it starts.
     let _ = std::fs::remove_file(&paths.sock);
     let listener = UnixListener::bind(&paths.sock)?;
-    let mut log = Log {
-        file: log_file,
-        offsets: Vec::new(),
-        end: 0,
-        closed: false,
-        answered: HashSet::new(),
-        open: HashSet::new(),
-        models: HashMap::new(),
-    };
+    let mut log = Log::new(log_file);
     // A resume: the conversation so far is its transcript up to here, since claude sends none
     // of it again; claude appends to the same file from now on.
     let history = history.and_then(|p| {
@@ -355,17 +400,33 @@ pub fn serve(
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let msg = std::str::from_utf8(&line)
+        let parsed = std::str::from_utf8(&line)
             .ok()
-            .and_then(|l| json::parse(l.trim()).ok())
-            .map(|v| sdk::classify(&v));
-        let (settled, model) = {
+            .and_then(|l| json::parse(l.trim()).ok());
+        let msg = parsed.as_ref().map(sdk::classify);
+        let (settled, model, notes) = {
             let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
             log.append(&line)?;
             let model = msg.as_ref().and_then(|m| log.model_answered(m));
-            (msg.as_ref().is_some_and(|m| log.asked(m)), model)
+            let notes = match parsed.as_ref().and_then(sdk::bash_echo) {
+                Some(echo) => log.bash_echoed(echo),
+                None => Vec::new(),
+            };
+            (msg.as_ref().is_some_and(|m| log.asked(m)), model, notes)
         };
         shared.grew.notify_all();
+        if !notes.is_empty() {
+            // Written as a view's lines are, logged first; on a thread of their own, since
+            // claude may be writing a long line meanwhile that only this loop reads.
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                for note in &notes {
+                    if from_view(note, &shared).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         if let Some(model) = model {
             // Best effort, as the session has switched either way: a settings file this
             // cannot read is left alone rather than written over.
@@ -1134,15 +1195,7 @@ mod tests {
 
     #[test]
     fn a_model_claude_accepts_from_a_view_is_saved_and_one_it_refuses_is_not() {
-        let mut log = Log {
-            file: File::create(scratch("models").join("l")).unwrap(),
-            offsets: Vec::new(),
-            end: 0,
-            closed: false,
-            answered: HashSet::new(),
-            open: HashSet::new(),
-            models: HashMap::new(),
-        };
+        let mut log = Log::new(File::create(scratch("models").join("l")).unwrap());
         let v = |l: &str| json::parse(l).unwrap();
         let msg = |l: &str| sdk::classify(&v(l));
         let ok = |id: &str| {
@@ -1277,16 +1330,52 @@ mod tests {
     }
 
     #[test]
-    fn the_amber_mark_goes_when_the_last_open_prompt_is_answered_or_withdrawn() {
-        let mut log = Log {
-            file: File::create(scratch("open").join("l")).unwrap(),
-            offsets: Vec::new(),
-            end: 0,
-            closed: false,
-            answered: HashSet::new(),
-            open: HashSet::new(),
-            models: HashMap::new(),
+    fn a_bang_command_joins_the_conversation_once_it_has_printed_and_only_once() {
+        let mut log = Log::new(File::create(scratch("bash").join("l")).unwrap());
+        let v = |l: &str| json::parse(l).unwrap();
+        let echo = |l: &str| sdk::bash_echo(&v(l)).expect(l);
+        // As 2.1.311 echoes a `bash_command` (measured 2026-11-15).
+        let input = r#"{"type":"user","message":{"role":"user","content":"<bash-input>echo a &gt; b</bash-input>"},"uuid":"u-in","isReplay":true}"#;
+        let output = r#"{"type":"user","message":{"role":"user","content":"<bash-stdout></bash-stdout><bash-stderr></bash-stderr><bash-exit-code>0</bash-exit-code>"},"uuid":"u-out","isReplay":true}"#;
+        assert!(
+            log.bash_echoed(echo(input)).is_empty(),
+            "not until it printed"
+        );
+        let notes = log.bash_echoed(echo(output));
+        let content = |n: &Value| {
+            let c = n.get("message").and_then(|m| m.get("content"));
+            c.and_then(Value::as_str).unwrap_or_default().to_string()
         };
+        assert_eq!(
+            notes.iter().map(content).collect::<Vec<_>>(),
+            [
+                "<bash-input>echo a &gt; b</bash-input>",
+                "<bash-stdout></bash-stdout><bash-stderr></bash-stderr><bash-exit-code>0</bash-exit-code>",
+            ],
+            "as claude wrote them"
+        );
+        for n in &notes {
+            assert_eq!(n.get("shouldQuery").and_then(Value::as_bool), Some(false));
+        }
+        // claude echoes them under their uuids: they are not added again.
+        for n in &notes {
+            let mut e = v(input);
+            e.set("message", n.get("message").unwrap().clone());
+            e.set("uuid", n.get("uuid").unwrap().clone());
+            assert!(log.bash_echoed(echo(&json::to_line(&e))).is_empty());
+        }
+        assert!(log.notes.is_empty());
+        // A command claude would not run has nothing to add, and is no echo.
+        let refused = r#"{"type":"user","message":{"role":"user","content":"<bash-stderr>Not run: no command was given.</bash-stderr>"},"uuid":"u-no","isReplay":true}"#;
+        assert_eq!(sdk::bash_echo(&v(refused)), None);
+        // Nor is anything a view typed that only looks like one.
+        let typed = r#"{"type":"user","message":{"role":"user","content":"<bash-input>x</bash-input>"},"uuid":"u-t"}"#;
+        assert_eq!(sdk::bash_echo(&v(typed)), None);
+    }
+
+    #[test]
+    fn the_amber_mark_goes_when_the_last_open_prompt_is_answered_or_withdrawn() {
+        let mut log = Log::new(File::create(scratch("open").join("l")).unwrap());
         let msg = |l: &str| sdk::classify(&json::parse(l).unwrap());
         let ask = |id: &str, tool: &str| {
             msg(&format!(

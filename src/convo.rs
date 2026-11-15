@@ -27,6 +27,10 @@ pub const PURPLE: u32 = 0xaf_87ff;
 pub const TEAL: u32 = 0x48_968c;
 /// The rules around the prompt while an agent is in view, Claude Code's `0891b2`.
 pub const AGENT_TEAL: u32 = 0x08_91b2;
+/// A shell command run with `!`: Claude Code's `bashBorder`, for the `!` and the prompt's
+/// rules in shell mode, and its `bashMessageBackgroundColor`, the command's band.
+pub const PINK: u32 = 0xfd_5db1;
+pub const BASH_BAND: u32 = 0x41_3c41;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct St {
@@ -258,6 +262,13 @@ pub enum Entry {
         answers: Vec<(String, String)>,
     },
     Note(String),
+    /// A shell command the owner ran with `!`, and what it printed on its standard output and
+    /// error: drawn as Claude Code draws them, the output under the command.
+    Bash(String),
+    BashOut {
+        stdout: String,
+        stderr: String,
+    },
     /// A message another agent sent: who from, what it said, and whether Claude Code puts its
     /// words on the collapsed line (a peer session's).
     Message {
@@ -495,6 +506,17 @@ impl Convo {
     }
 
     /// The prompt or question now waiting, if any: the newest unresolved one.
+    /// Whether a `!` command is running: the last of them has printed nothing yet.
+    pub fn bash_running(&self) -> bool {
+        matches!(
+            self.entries
+                .iter()
+                .rev()
+                .find(|e| matches!(e, Entry::Bash(_) | Entry::BashOut { .. })),
+            Some(Entry::Bash(_))
+        )
+    }
+
     pub fn waiting(&self) -> Option<&Entry> {
         self.entries.iter().rev().find(|e| {
             matches!(
@@ -553,6 +575,11 @@ impl Convo {
                         Entry::Note(s(v, "x"))
                     }
                     "compact" => Entry::Compacted,
+                    "bash" => Entry::Bash(s(v, "x")),
+                    "bout" => Entry::BashOut {
+                        stdout: s(v, "o"),
+                        stderr: s(v, "e"),
+                    },
                     "msg" => Entry::Message {
                         from: s(v, "n"),
                         body: s(v, "x"),
@@ -1314,6 +1341,9 @@ impl Ui {
 #[derive(Debug, Clone)]
 pub struct Ui {
     pub input: String,
+    /// Shell mode: `!` typed first in the prompt, as in Claude Code, so what is sent runs as a
+    /// shell command rather than going to Claude.
+    pub bash: bool,
     /// The cursor, in chars into `input`.
     pub cursor: usize,
     /// Rows scrolled back from the bottom; 0 follows the conversation.
@@ -1358,6 +1388,7 @@ impl Ui {
     pub fn new() -> Ui {
         Ui {
             input: String::new(),
+            bash: false,
             cursor: 0,
             scroll: 0,
             dialog: None,
@@ -1399,6 +1430,79 @@ fn prompt_lines(text: &str, lead: &str, w: usize) -> Vec<Line> {
             let pad = w.saturating_sub(width(&plain(&l)));
             l.push((" ".repeat(pad), band));
             l
+        })
+        .collect()
+}
+
+/// A `!` command as Claude Code 2.1.311 draws it: `! ` in its `bashBorder`, the command after
+/// it, on the band of its own.
+fn bash_lines(command: &str, w: usize) -> Vec<Line> {
+    let band = St {
+        bg: Some(BASH_BAND),
+        ..PLAIN
+    };
+    wrapped(command, "! ", "  ", w, band)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut l)| {
+            if i == 0 {
+                if let Some((t, _)) = l.first_mut() {
+                    *t = t.strip_prefix("! ").unwrap_or(t).to_string();
+                }
+                l.insert(
+                    0,
+                    (
+                        "! ".into(),
+                        St {
+                            fg: Some(PINK),
+                            ..band
+                        },
+                    ),
+                );
+            }
+            let pad = w.saturating_sub(width(&plain(&l)));
+            l.push((" ".repeat(pad), band));
+            l
+        })
+        .collect()
+}
+
+/// How many of a shell's rows show until Ctrl+O, as Claude Code's: three, or four when that
+/// is all there is.
+const BASH_ROWS: usize = 3;
+
+/// What a `!` command printed, under it: its output, then its errors in red, each cut to
+/// `BASH_ROWS` rows with a count of the rest until Ctrl+O, as Claude Code's are; `(No output)`
+/// when it printed nothing.
+fn bash_out_lines(stdout: &str, stderr: &str, expanded: bool, w: usize) -> Vec<Line> {
+    let room = w.saturating_sub(5).max(10);
+    let mut rows: Vec<(String, St)> = Vec::new();
+    for (text, st) in [(stdout, PLAIN), (stderr, fg(RED))] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let all: Vec<String> = text.split('\n').flat_map(|l| wrap(l, room)).collect();
+        let keep = if expanded || all.len() <= BASH_ROWS + 1 {
+            all.len()
+        } else {
+            BASH_ROWS
+        };
+        rows.extend(all[..keep].iter().map(|r| (r.clone(), st)));
+        if keep < all.len() {
+            rows.push((
+                format!("… +{} lines (ctrl+o to expand)", all.len() - keep),
+                fg(GREY),
+            ));
+        }
+    }
+    if rows.is_empty() {
+        rows.push(("(No output)".into(), fg(GREY)));
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, (text, st))| {
+            let lead = if i == 0 { "  ⎿  " } else { "     " };
+            vec![(lead.to_string(), PLAIN), (text, st)]
         })
         .collect()
 }
@@ -1546,6 +1650,20 @@ pub fn transcript(c: &Convo, w: usize) -> (Vec<Line>, Option<usize>) {
             Entry::Text(text) => {
                 out.push(Vec::new());
                 out.extend(assistant_text(text, w));
+            }
+            Entry::Bash(command) => {
+                out.push(Vec::new());
+                out.extend(bash_lines(command, w));
+                // Until it has printed, as Claude Code says of a command under way.
+                let printed = c.entries[i + 1..]
+                    .iter()
+                    .find(|e| matches!(e, Entry::Bash(_) | Entry::BashOut { .. }));
+                if !matches!(printed, Some(Entry::BashOut { .. })) {
+                    out.push(vec![("  ⎿  ".into(), PLAIN), ("Running…".into(), fg(GREY))]);
+                }
+            }
+            Entry::BashOut { stdout, stderr } => {
+                out.extend(bash_out_lines(stdout, stderr, c.expanded, w));
             }
             // As Claude Code 2.1.311 draws one for a model without the hint turned off:
             // `· summary` in its `subtle` grey after the text (a no-break space there, a plain
@@ -1755,7 +1873,7 @@ pub fn suggestions(ui: &Ui) -> Vec<Command> {
     let Some(query) = ui.input.strip_prefix('/') else {
         return Vec::new();
     };
-    if ui.suggest_off || ui.dialog.is_some() || query.contains(char::is_whitespace) {
+    if ui.bash || ui.suggest_off || ui.dialog.is_some() || query.contains(char::is_whitespace) {
         return Vec::new();
     }
     let mut all = ui.catalog.clone();
@@ -2061,6 +2179,12 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
         out.push(vec![(" ".repeat(pad), PLAIN), (t, fg(GREY))]);
     }
     let title = c.meta.title.trim();
+    // Shell mode takes Claude Code's `bashBorder` for the rules, as its prompt box does.
+    let rules = match (agent, ui.bash) {
+        (Some(_), _) => AGENT_TEAL,
+        (None, true) => PINK,
+        (None, false) => RULE,
+    };
     if let Some(a) = agent {
         // An agent in view: Claude Code's teal rules, its description on the top one.
         let label = cut(&a.description, w.saturating_sub(6));
@@ -2078,13 +2202,13 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             ("─".into(), fg(AGENT_TEAL)),
         ]);
     } else if title.is_empty() || width(title) + 4 > w {
-        out.push(rule(w, "─", fg(RULE)));
+        out.push(rule(w, "─", fg(rules)));
     } else {
         let left = w - width(title) - 3;
         out.push(vec![
-            ("─".repeat(left), fg(RULE)),
+            ("─".repeat(left), fg(rules)),
             (format!(" {title} "), fg(GREY)),
-            ("─".into(), fg(RULE)),
+            ("─".into(), fg(rules)),
         ]);
     }
     // The prompt, soft-wrapped as Claude Code's is, with the cursor's place. With an agent
@@ -2099,13 +2223,18 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     let (rows, cur) = soft_wrap(&chars, ui.cursor.min(chars.len()), room);
     // A slash command claude or this client knows, anywhere in the prompt, in Claude Code's
     // lavender (its `permission` colour, read off its screen on 2026-11-02).
-    let slash = slash_runs(&chars, &c.meta.commands);
+    let slash = if ui.bash {
+        Vec::new()
+    } else {
+        slash_runs(&chars, &c.meta.commands)
+    };
     let first = out.len();
     let shown = (h / 2).max(1);
     let top = (cur.0 + 1).saturating_sub(shown);
     let end = (top + shown).min(rows.len());
     for (i, &(a, b)) in rows.iter().enumerate().take(end).skip(top) {
         let mut l: Line = match i {
+            0 if ui.bash && agent.is_none() => vec![("! ".into(), fg(PINK))],
             0 => vec![("❯ ".into(), PLAIN)],
             _ if i == top => vec![("↑ ".into(), fg(GREY))],
             _ if i + 1 == end && end < rows.len() => vec![("↓ ".into(), fg(GREY))],
@@ -2132,7 +2261,12 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
     }
     // A command chosen from the list, a space after it: its argument hint, grey, as Claude
     // Code shows it.
-    if let Some(cmd) = ui.input.strip_prefix('/').and_then(|r| r.strip_suffix(' ')) {
+    let typed = if ui.bash {
+        None
+    } else {
+        ui.input.strip_prefix('/')
+    };
+    if let Some(cmd) = typed.and_then(|r| r.strip_suffix(' ')) {
         let hint = ui
             .catalog
             .iter()
@@ -2154,11 +2288,7 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
         }
     }
     let cursor = (first + cur.0 - top, 2 + cur.1);
-    out.push(rule(
-        w,
-        "─",
-        fg(if agent.is_some() { AGENT_TEAL } else { RULE }),
-    ));
+    out.push(rule(w, "─", fg(rules)));
     let place = format!("{}/{}", c.host, c.slot);
     let first_foot = match (&ui.link, &ui.status, &ui.load) {
         (Link::Down { since, not_sent }, _, _) => {
@@ -2202,6 +2332,9 @@ fn input_box(c: &Convo, ui: &Ui, w: usize, h: usize) -> (Vec<Line>, (usize, usiz
             ),
             fg(GREY),
         ));
+    } else if ui.bash && agent.is_none() {
+        // Claude Code's footer in shell mode, in place of the mode line.
+        foot.push(("  ! for shell mode".into(), fg(PINK)));
     } else if ui.paste_hint.is_some() && agent.is_none() {
         // Claude Code's hint after a paste went in as a stand-in, in its mode line's place.
         foot.push((format!("  {PASTE_HINT}"), fg(GREY)));
@@ -4207,6 +4340,131 @@ mod tests {
         let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
         assert!(got.iter().any(|l| l == "❯ hello there"), "{got:?}");
         assert_eq!(got.iter().filter(|l| l.ends_with("hello there")).count(), 1);
+    }
+
+    #[test]
+    fn a_bang_command_and_its_output_are_drawn_as_claude_codes_at_40_and_80() {
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"bash","x":"ls"}"#,
+            ],
+        );
+        let t0 = Instant::now();
+        for w in [40, 80] {
+            let f = draw(&c, &Ui::new(), w, 24, t0);
+            let got = text(&f);
+            let at = got.iter().position(|l| l == "! ls").expect("the command");
+            assert_eq!(got[at + 1], "  ⎿  Running…", "until it printed, at {w}");
+            // `! ` in Claude Code's bashBorder, all of it on the bash band, to the edge.
+            let row = &f.lines[at];
+            assert_eq!(
+                row[0],
+                (
+                    "! ".to_string(),
+                    St {
+                        fg: Some(PINK),
+                        bg: Some(BASH_BAND),
+                        ..PLAIN
+                    }
+                )
+            );
+            assert!(
+                row.iter().all(|(_, st)| st.bg == Some(BASH_BAND)),
+                "{row:?}"
+            );
+            assert_eq!(width(&plain(row)), w);
+        }
+        assert!(c.bash_running());
+        feed(
+            &mut c,
+            &[r#"{"t":"add","id":2,"k":"bout","o":"a\nb\nc\nd\ne\nf","e":"oops"}"#],
+        );
+        assert!(!c.bash_running());
+        for w in [40, 80] {
+            let f = draw(&c, &Ui::new(), w, 24, t0);
+            let got = text(&f);
+            let at = got.iter().position(|l| l == "! ls").unwrap();
+            assert_eq!(
+                got[at + 1..at + 6],
+                [
+                    "  ⎿  a",
+                    "     b",
+                    "     c",
+                    "     … +3 lines (ctrl+o to expand)",
+                    "     oops",
+                ],
+                "at {w}"
+            );
+            assert_eq!(f.lines[at + 5][1].1, fg(RED), "errors in Claude Code's red");
+        }
+        // Ctrl+O: the whole of it.
+        c.expanded = true;
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        let at = got.iter().position(|l| l == "! ls").unwrap();
+        assert_eq!(got[at + 6], "     f");
+        assert_eq!(got[at + 7], "     oops");
+        // Nothing printed, as Claude Code says it.
+        let mut c = convo();
+        feed(
+            &mut c,
+            &[
+                &meta("", "default"),
+                r#"{"t":"add","id":1,"k":"bash","x":"true"}"#,
+                r#"{"t":"add","id":2,"k":"bout","o":"","e":""}"#,
+            ],
+        );
+        let got = text(&draw(&c, &Ui::new(), 40, 24, t0));
+        let at = got.iter().position(|l| l == "! true").unwrap();
+        assert_eq!(got[at + 1], "  ⎿  (No output)");
+    }
+
+    #[test]
+    fn shell_mode_takes_claude_codes_bash_border_and_says_so_under_the_prompt() {
+        let mut c = convo();
+        feed(&mut c, &[&meta("", "default")]);
+        let mut ui = Ui::new();
+        ui.bash = true;
+        ui.input = "/usr/bin/ls".into();
+        ui.cursor = ui.input.chars().count();
+        ui.catalog = vec![Command {
+            name: "usage".into(),
+            about: String::new(),
+            hint: String::new(),
+        }];
+        for w in [40, 80] {
+            let f = draw(&c, &ui, w, 24, Instant::now());
+            let got = text(&f);
+            let at = got
+                .iter()
+                .position(|l| l == "! /usr/bin/ls")
+                .expect("the prompt");
+            assert_eq!(f.lines[at][0], ("! ".to_string(), fg(PINK)));
+            assert!(
+                f.lines[at][1..].iter().all(|(_, st)| *st == PLAIN),
+                "no slash colour"
+            );
+            assert!(
+                f.lines[at - 1].iter().all(|(_, st)| st.fg == Some(PINK)),
+                "the rule above"
+            );
+            assert!(
+                f.lines[at + 1].iter().all(|(_, st)| st.fg == Some(PINK)),
+                "and below"
+            );
+            let foot = got
+                .iter()
+                .position(|l| l.starts_with("  ! for shell mode"))
+                .expect("the hint");
+            assert_eq!(f.lines[foot][0].1, fg(PINK));
+            assert!(
+                !got.iter().any(|l| l.contains("/mode to change")),
+                "{got:?}"
+            );
+        }
+        assert!(suggestions(&ui).is_empty(), "a path is not a slash command");
     }
 
     #[test]

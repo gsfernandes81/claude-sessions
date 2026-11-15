@@ -829,6 +829,7 @@ impl App {
                 let n = t.chars().count();
                 (t, n)
             }
+            None if ui.bash => (format!("!{}", ui.input), ui.cursor + 1),
             None => (ui.input.clone(), ui.cursor),
         };
         // Only the pastes still standing in it: Ctrl+C clears the prompt and not them.
@@ -874,6 +875,7 @@ impl App {
                         ui.cursor = d.cursor;
                         ui.pastes = d.pastes.clone();
                         ui.last_paste = None;
+                        bash_mode(ui);
                         kept = d;
                     }
                 }
@@ -1381,13 +1383,41 @@ impl App {
                     Key::Esc => {
                         if ui.scroll > 0 {
                             ui.scroll = 0;
-                        } else if c.state != "idle" || !c.pending.is_empty() {
+                        } else if c.state != "idle" || !c.pending.is_empty() || c.bash_running() {
                             // A turn, or a prompt not yet taken in: claude says what came of it,
                             // and a prompt it caught unanswered comes back to the input (`back`).
                             out.push(App::msg("esc", vec![]));
                         }
                     }
                     Key::Enter if backslash_newline(ui) => {}
+                    Key::Enter if ui.bash && ui.input.trim().is_empty() => {}
+                    // Shell mode: the command runs beside the conversation, then joins it for
+                    // Claude to read, as Claude Code's `!` does; the prompt is Claude's again.
+                    Key::Enter if ui.bash => {
+                        let typed = std::mem::take(&mut ui.input);
+                        let command = expand_pastes(&typed, &ui.pastes);
+                        ui.bash = false;
+                        ui.pastes.clear();
+                        ui.last_paste = None;
+                        ui.paste_hint = None;
+                        ui.cursor = 0;
+                        ui.scroll = 0;
+                        self.history.push(format!("!{command}"));
+                        self.touched = true;
+                        self.history_at = None;
+                        self.draft = None;
+                        out.push(App::msg(
+                            "bash",
+                            vec![
+                                ("x", Value::string(command.trim())),
+                                ("u", Value::string(crate::launch::fresh_session_id())),
+                            ],
+                        ));
+                    }
+                    // Backspace on an empty prompt leaves shell mode, as in Claude Code.
+                    Key::Char('\x7f' | '\x08') if ui.bash && ui.input.is_empty() => {
+                        ui.bash = false;
+                    }
                     Key::Enter => {
                         let typed = std::mem::take(&mut ui.input);
                         let text = expand_pastes(&typed, &ui.pastes);
@@ -1444,6 +1474,7 @@ impl App {
                     Key::Up | Key::Down => {
                         let room = term::size().map_or(38, |(w, _)| (w as usize).saturating_sub(2));
                         if !row_step(ui, k == Key::Up, room) {
+                            unbash(ui);
                             history_step(
                                 ui,
                                 k == Key::Up,
@@ -1451,6 +1482,7 @@ impl App {
                                 &mut self.history_at,
                                 &mut self.draft,
                             );
+                            bash_mode(ui);
                         }
                     }
                     Key::PageUp | Key::WheelUp => {
@@ -1473,6 +1505,7 @@ impl App {
             if ui.input != before {
                 ui.suggest = 0;
                 ui.suggest_off = false;
+                bash_mode(ui);
             }
         }
         if leave {
@@ -1497,6 +1530,7 @@ impl App {
                     if ui.input.is_empty() {
                         ui.input = last.clone();
                         ui.cursor = ui.input.chars().count();
+                        bash_mode(ui);
                     }
                 }
             }
@@ -2153,6 +2187,27 @@ fn entities(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&amp;", "&")
+}
+
+/// Shell mode from what the prompt holds: a `!` first turns it on and is taken out, as Claude
+/// Code's prompt does with a `!` typed, pasted or recalled.
+fn bash_mode(ui: &mut Ui) {
+    if ui.bash {
+        return;
+    }
+    if let Some(rest) = ui.input.strip_prefix('!') {
+        ui.input = rest.to_string();
+        ui.cursor = ui.cursor.saturating_sub(1);
+        ui.bash = true;
+    }
+}
+
+/// Shell mode as its `!` again, for stepping through what was sent, which keeps it as text.
+fn unbash(ui: &mut Ui) {
+    if std::mem::take(&mut ui.bash) {
+        ui.input.insert(0, '!');
+        ui.cursor += 1;
+    }
 }
 
 /// A prompt an interrupt caught unanswered, back in the input as Claude Code hands it back:
@@ -3864,6 +3919,52 @@ mod tests {
             app.key(Key::Char(ch), Instant::now());
         }
         app.key(Key::Enter, Instant::now());
+    }
+
+    #[test]
+    fn a_bang_first_is_shell_mode_and_backspace_on_nothing_leaves_it() {
+        let mut app = app_in(&[]);
+        let now = Instant::now();
+        let ui = |app: &App| match &app.screen {
+            Screen::Conv { ui, .. } => (ui.bash, ui.input.clone(), ui.cursor),
+            _ => panic!("not in the conversation"),
+        };
+        app.key(Key::Char('!'), now);
+        assert_eq!(ui(&app), (true, String::new(), 0), "the `!` is the mode");
+        app.key(Key::Char('/'), now);
+        app.key(Key::Char('l'), now);
+        assert_eq!(ui(&app), (true, "/l".into(), 2), "a path, not a command");
+        app.key(Key::Char('\x7f'), now);
+        app.key(Key::Char('\x7f'), now);
+        assert!(ui(&app).0, "emptied, still shell mode");
+        app.key(Key::Char('\x7f'), now);
+        assert_eq!(
+            ui(&app),
+            (false, String::new(), 0),
+            "Backspace on nothing leaves it"
+        );
+        // Enter on nothing in shell mode sends nothing and stays.
+        app.key(Key::Char('!'), now);
+        app.key(Key::Enter, now);
+        assert_eq!(ui(&app), (true, String::new(), 0));
+        // Sent, it is remembered with its `!`; with the link down it is not sent, and comes
+        // back as it was typed, shell mode and all.
+        app.key(Key::Char('\x7f'), now);
+        type_in(&mut app, "!git status");
+        assert_eq!(app.history.last().map(String::as_str), Some("!git status"));
+        assert_eq!(ui(&app), (true, "git status".into(), 10));
+        // Up recalls it so too, from a prompt for Claude.
+        app.key(Key::Char('\x15'), now);
+        app.key(Key::Char('\x7f'), now);
+        assert_eq!(ui(&app), (false, String::new(), 0));
+        app.key(Key::Up, now);
+        assert_eq!(ui(&app), (true, "git status".into(), 10));
+        app.key(Key::Down, now);
+        assert_eq!(
+            ui(&app),
+            (false, String::new(), 0),
+            "back to what was typed"
+        );
     }
 
     const TASKS: &str = r#"{"t":"tasks","l":[{"i":"b1","k":"shell","d":"Ticks","c":"for i in 1 2; do echo $i; done","st":"running","t0":1000},{"i":"m1","k":"monitor","d":"Watch it","c":"tail -f x","st":"running"}]}"#;

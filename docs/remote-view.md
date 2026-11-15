@@ -126,6 +126,7 @@ these lines, and its tests hold the exact shapes):
 | compact | `/compact` as a user message | `system/status` compacting, the `SessionStart:compact` hooks, `system/compact_boundary {pre_tokens, post_tokens}`, the summary as a `user` line, `<local-command-stdout>Compacted`, a `result` |
 | interrupt | `interrupt` | `{still_queued:[]}`, then a `user` line `[Request interrupted by user]` and `result/error_during_execution` |
 | exit | `end_session` | success; the process exits |
+| shell (`!`) | `{type:"bash_command", command, uuid}` | run by claude in a one-shot `/bin/sh -c` in the session's directory, **beside the conversation**, which never sees it (measured 2026-11-15): `command_lifecycle` started and completed, then two `user` replay rows, `<bash-input>` at once and `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr><bash-exit-code>N</bash-exit-code>` once it has printed, escaped (`&amp;`, `&lt;`, `&gt;`). A blank one gets `<bash-stderr>Not run: …</bash-stderr>`; an `interrupt` kills it (`[interrupted]`, 130). Neither row reaches the transcript. So the holder adds both to the conversation, as Claude Code's own `!` does, each as a `user` line with `shouldQuery: false`: appended with no turn (an empty `system/init` and `result` with `num_turns: 0`; queued behind a turn under way), in the transcript, and read by the model with the next prompt. Under `--replay-user-messages` claude echoes such a line, under the uuid it was sent with — though not always: one whose text it had just written was not echoed. |
 
 **It is verbose.** One small session wrote 177 KB: the `initialize` answer, a `system/init`
 listing every tool and command before every turn, two lines per hook run, thinking-token
@@ -375,6 +376,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `close` | back home; the conversation keeps running |
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
      | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client; while a shell command runs, followed by claude's `background_tasks`, once claude can move it |
+     | `bash {x, u}` | a shell command typed after `!`: claude's `bash_command` with `u`; the holder adds it and what it printed to the conversation (above) |
      | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
      | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in — for a shell command, once claude can move it — else its `interrupt` with `send_now` |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told; `n` without `x` stops the turn (`interrupt`), as Claude Code's No does, and with it the turn goes on |
@@ -391,7 +393,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `hub {h}` · `snap {c, s}` · `down {c, x}` | the home: the hub's header, a container's snapshot, one not answering; only while no conversation is open, and only when one reads differently |
      | `open {c, s, run}` · `reset` | a conversation is open; `reset` first when the client's run is stale |
      | `back {x, u, q}` | an interrupt caught a prompt (claude's `command_lifecycle` `cancelled`, by its uuid `u`): its text, and whether another waited behind it; an older client skips it |
-     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them, and `ch`, the model as chosen (`default` or an alias), only once known; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text; claude's summary of a step's tool calls is `sum {id, x, g}` on each call it covers, `g` the step's first, which an older client skips |
+     | `add` · `app` · `set` · `res` · `done` · `st` · `meta` · `prog` | the reducer's ops (`reduce.rs`); a question's `done` carries `a`, its answers keyed by question, which an older client ignores; `meta` carries `u5` and `u7`, the 5-hour and weekly usage `{p, r}` (percent used, reset in epoch seconds), only once claude has read them, and `ch`, the model as chosen (`default` or an alias), only once known; another agent's message is `add` of kind `msg` (`n` who from, `x` what it said, `i` true for a peer session's, whose words go on the collapsed line); a subagent or workflow is `add` of kind `agent` (`n` its type or `Workflow`, `a` its description), and `prog {id, p, st}` replaces the lines under it, `st` being `running`, `completed`, `failed` or `stopped`; an older client skips both; the server's narration between tool calls (below) is `add` of kind `text` with `sm` true, which an older client draws as text; claude's summary of a step's tool calls is `sum {id, x, g}` on each call it covers, `g` the step's first, which an older client skips; a `!` command is `add` of kind `bash` (`x` the command) and what it printed `add` of kind `bout` (`o` its output, `e` its errors), which an older client skips |
      | `n {n}` | after each batch: every op of lines up to `n` has been sent |
      | `models {m, c}` · `full {id, x}` · `err {x}` · `end {x}` | answers, a refusal, the conversation's command gone |
      | `btw {x}` or `btw {e}` | a side question's answer, or why there is none; only to the conversation it was asked in |
@@ -513,6 +515,21 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        shift while selecting for native copy`. The menu ignores a release or a drag.
      - A name typed whole in the suggestion list is that command on Enter: headless claude
        lists `design:ux-copy` and no `copy`, so `/copy` once became it.
+     - **`!` runs a shell command**, as in Claude Code (owner, 2026-11-15). A `!` first in the
+       prompt — typed, pasted or recalled — puts it in shell mode and is taken out: `! ` for
+       `❯ `, the rules and `! for shell mode` in place of the mode line in Claude Code's
+       `bashBorder`, `fd5db1`, and no slash commands. Backspace on an empty prompt leaves it;
+       Enter sends `bash` and the prompt is Claude's again; what was sent is remembered with
+       its `!`, and so is a draft. The transcript draws it as 2.1.311 does: `! command` on its
+       `bashMessageBackgroundColor`, `413c41`, then `⎿  Running…` until it has printed, then
+       its output, its errors in red, each cut to three rows (four when that is all) and
+       `… +N lines (ctrl+o to expand)`, or `(No output)`; the exit code is not drawn, as
+       Claude Code draws none. Esc while it runs interrupts it. It runs in the session's
+       directory each time — a `cd` does not carry to the next, where Claude Code's runs
+       through its Bash tool's shell and does. The reducer's items are `bash {x}` and
+       `bout {o, e}`, which an older client skips; the holder's own lines are logged as `_in`
+       with `shouldQuery: false`, so the reducer draws neither their echo nor the transcript's
+       copy twice.
      - A slash command claude or the phone knows is lavender in the prompt, wherever it is,
        as Claude Code draws it (`b1b9f9`, its `permission` colour); `/` before an unknown name
        is text. claude's commands come in the meta op's `sc`, from its init's `slash_commands`.
