@@ -83,9 +83,6 @@ pub const HEADLESS: [&str; 10] = [
 /// found artifacts missing from remote sessions.
 pub const ENTRYPOINT: &str = "ssh-remote";
 
-/// How many of its own lines' uuids the holder remembers, to know claude's echo of each.
-const NOTES: usize = 64;
-
 /// How long a tap has to say where it got to before the holder drops it.
 const HELLO_WAIT: Duration = Duration::from_secs(5);
 
@@ -189,12 +186,6 @@ struct Log {
     /// The models a view asked claude to switch to, by request id, until claude answers:
     /// one it accepts is saved as the default (`save_default_model`).
     models: HashMap<String, String>,
-    /// The `!` command claude last echoed, as it wrote it, until what it printed comes.
-    bash: Option<String>,
-    /// The uuids of the lines this holder added to the conversation, the latest `NOTES`:
-    /// claude echoes them too (not always: 2.1.311 left out one whose text it had just
-    /// written), and they are not added again.
-    notes: std::collections::VecDeque<String>,
 }
 
 impl Log {
@@ -207,8 +198,6 @@ impl Log {
             answered: HashSet::new(),
             open: HashSet::new(),
             models: HashMap::new(),
-            bash: None,
-            notes: std::collections::VecDeque::new(),
         }
     }
 
@@ -261,36 +250,6 @@ impl Log {
         }
     }
 
-    /// Note a `!` command's echo (`sdk::bash_echo`): once what it printed comes, the two lines
-    /// to add to the conversation, since claude runs a `bash_command` beside it, where
-    /// Claude Code's own `!` adds the command and its output for the model to read with the
-    /// next prompt.
-    fn bash_echoed(&mut self, (uuid, input, text): (String, bool, String)) -> Vec<Value> {
-        if let Some(i) = self.notes.iter().position(|n| *n == uuid) {
-            self.notes.remove(i);
-            return Vec::new();
-        }
-        if input {
-            self.bash = Some(text);
-            return Vec::new();
-        }
-        let Some(command) = self.bash.take() else {
-            return Vec::new();
-        };
-        [command, text]
-            .iter()
-            .map(|t| {
-                let uuid = crate::launch::fresh_session_id();
-                // An echo that never came goes in time, rather than growing this for ever.
-                if self.notes.len() == NOTES {
-                    self.notes.pop_front();
-                }
-                self.notes.push_back(uuid.clone());
-                sdk::note(t, &uuid)
-            })
-            .collect()
-    }
-
     /// A request answered or withdrawn: true when it was open and was the last one.
     fn settled(&mut self, request_id: &str) -> bool {
         self.open.remove(request_id) && self.open.is_empty()
@@ -307,6 +266,11 @@ struct Shared {
     run: String,
     claude: Mutex<ChildStdin>,
     slot: String,
+    /// The owner's `!` shell (`bang.rs`), and one command at a time in it.
+    shell: Mutex<crate::bang::Shell>,
+    bang: Mutex<()>,
+    /// Where claude was started: where the owner's shell starts.
+    home: PathBuf,
 }
 
 /// Run claude headless under this holder until it exits, serving taps meanwhile. Returns
@@ -372,6 +336,9 @@ pub fn serve(
         run,
         claude: Mutex::new(stdin),
         slot: slot.to_string(),
+        shell: Mutex::new(crate::bang::Shell::default()),
+        bang: Mutex::new(()),
+        home: cwd.clone(),
     });
 
     // Typed into the session: read, and dropped.
@@ -404,29 +371,13 @@ pub fn serve(
             .ok()
             .and_then(|l| json::parse(l.trim()).ok());
         let msg = parsed.as_ref().map(sdk::classify);
-        let (settled, model, notes) = {
+        let (settled, model) = {
             let mut log = shared.log.lock().unwrap_or_else(|e| e.into_inner());
             log.append(&line)?;
             let model = msg.as_ref().and_then(|m| log.model_answered(m));
-            let notes = match parsed.as_ref().and_then(sdk::bash_echo) {
-                Some(echo) => log.bash_echoed(echo),
-                None => Vec::new(),
-            };
-            (msg.as_ref().is_some_and(|m| log.asked(m)), model, notes)
+            (msg.as_ref().is_some_and(|m| log.asked(m)), model)
         };
         shared.grew.notify_all();
-        if !notes.is_empty() {
-            // Written as a view's lines are, logged first; on a thread of their own, since
-            // claude may be writing a long line meanwhile that only this loop reads.
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                for note in &notes {
-                    if from_view(note, &shared).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
         if let Some(model) = model {
             // Best effort, as the session has switched either way: a settings file this
             // cannot read is left alone rather than written over.
@@ -535,6 +486,20 @@ fn serve_tap(conn: UnixStream, shared: &Arc<Shared>) -> io::Result<()> {
                     if lock(&out).write_all(line.as_bytes()).is_err() {
                         break;
                     }
+                    continue;
+                }
+                // A `!` command: the holder's to run, as Claude Code runs its own.
+                if v.get("type").and_then(Value::as_str) == Some("bash_command") {
+                    if log_in(&v, &shared).is_err() {
+                        break;
+                    }
+                    let command = v
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let shared = Arc::clone(&shared);
+                    std::thread::spawn(move || bang(&command, &shared));
                     continue;
                 }
                 if from_view(&v, &shared).is_err() {
@@ -701,22 +666,108 @@ fn from_view(v: &Value, shared: &Shared) -> io::Result<()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .model_asked(v);
+    // Esc stops a `!` command too, as Claude Code's does.
+    let req = v.get("request");
+    if req.and_then(|r| r.get("subtype")).and_then(Value::as_str) == Some("interrupt") {
+        crate::bang::stop(&shared.shell);
+    }
     // Logged first, so whatever claude does with it comes after it in the log.
-    let mut logged = Value::obj();
-    logged.set("type", Value::string("_in"));
-    logged.set("line", v.clone());
-    shared
-        .log
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .append(json::to_line(&logged).as_bytes())?;
-    shared.grew.notify_all();
+    log_in(v, shared)?;
     claude.write_all(format!("{}\n", json::to_line(v)).as_bytes())?;
     drop(claude);
     if settled {
         prompt_answered(&shared.slot);
     }
     Ok(())
+}
+
+/// A line a view sent, into the log as `{"type":"_in","line":…}`.
+fn log_in(v: &Value, shared: &Shared) -> io::Result<()> {
+    let mut logged = Value::obj();
+    logged.set("type", Value::string("_in"));
+    logged.set("line", v.clone());
+    log_line(&logged, shared)
+}
+
+/// A line of the holder's own into the log, for every tap.
+fn log_line(v: &Value, shared: &Shared) -> io::Result<()> {
+    shared
+        .log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(json::to_line(v).as_bytes())?;
+    shared.grew.notify_all();
+    Ok(())
+}
+
+/// A `!` command a view sent, run as Claude Code 2.1.311 runs one (`bang.rs`), one at a time.
+/// The view sees it as claude's own replay rows would show it: the command at once, what it
+/// printed when it ends, written into the log by the holder (`"by":"holder"`). Then it joins
+/// the conversation as Claude Code's does: the command and its output, the output a prompt
+/// Claude answers unless `respondToBashCommands` is false or it was interrupted, in which
+/// case Claude Code's caveat goes first and no turn starts. When the shell has moved, Claude
+/// is told, since its own Bash tool has not.
+fn bang(command: &str, shared: &Shared) {
+    let _one = lock(&shared.bang);
+    let row = |text: &str| {
+        let mut v = sdk::user_text(text);
+        v.set("isReplay", Value::Bool(true));
+        v.set("uuid", Value::string(crate::launch::fresh_session_id()));
+        v.set("by", Value::string("holder"));
+        v
+    };
+    if command.trim().is_empty() {
+        let _ = log_line(
+            &row("<bash-stderr>Not run: no command was given.</bash-stderr>"),
+            shared,
+        );
+        return;
+    }
+    let input = crate::bang::input_text(command);
+    let _ = log_line(&row(&input), shared);
+    let env = |k: &str| std::env::var(k).ok();
+    let before = lock(&shared.shell).cwd.clone();
+    let ran = crate::bang::run(
+        command,
+        &shared.shell,
+        &crate::bang::program(&env, &|p| p.is_file()),
+        &shared.home,
+        &shared.log_path.with_extension("bang"),
+        crate::bang::timeout(&env),
+    );
+    let after = lock(&shared.shell).cwd.clone();
+    let output = crate::bang::output_text(&ran);
+    let _ = log_line(&row(&output), shared);
+    let respond = !ran.interrupted && responds(&settings_layers(&shared.home));
+    let mut notes: Vec<(String, bool)> = Vec::new();
+    if !respond {
+        notes.push((crate::bang::CAVEAT.into(), false));
+    }
+    notes.push((input, false));
+    let (before, after) = (
+        before.unwrap_or(shared.home.clone()),
+        after.unwrap_or(shared.home.clone()),
+    );
+    if after != before {
+        notes.push((crate::bang::moved_text(&after), false));
+    }
+    notes.push((output, respond));
+    for (text, query) in notes {
+        let note = sdk::note(&text, &crate::launch::fresh_session_id(), query);
+        if from_view(&note, shared).is_err() {
+            break;
+        }
+    }
+}
+
+/// `respondToBashCommands`, as Claude Code reads it: the highest settings layer that sets it,
+/// else true.
+fn responds(layers: &[(bool, Value)]) -> bool {
+    layers
+        .iter()
+        .rev()
+        .find_map(|(_, v)| v.get("respondToBashCommands").and_then(Value::as_bool))
+        .unwrap_or(true)
 }
 
 /// Claude Code's settings files that can set `model` or `effortLevel`, lowest precedence
@@ -1330,47 +1381,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bang_command_joins_the_conversation_once_it_has_printed_and_only_once() {
-        let mut log = Log::new(File::create(scratch("bash").join("l")).unwrap());
-        let v = |l: &str| json::parse(l).unwrap();
-        let echo = |l: &str| sdk::bash_echo(&v(l)).expect(l);
-        // As 2.1.311 echoes a `bash_command` (measured 2026-11-15).
-        let input = r#"{"type":"user","message":{"role":"user","content":"<bash-input>echo a &gt; b</bash-input>"},"uuid":"u-in","isReplay":true}"#;
-        let output = r#"{"type":"user","message":{"role":"user","content":"<bash-stdout></bash-stdout><bash-stderr></bash-stderr><bash-exit-code>0</bash-exit-code>"},"uuid":"u-out","isReplay":true}"#;
-        assert!(
-            log.bash_echoed(echo(input)).is_empty(),
-            "not until it printed"
-        );
-        let notes = log.bash_echoed(echo(output));
-        let content = |n: &Value| {
-            let c = n.get("message").and_then(|m| m.get("content"));
-            c.and_then(Value::as_str).unwrap_or_default().to_string()
-        };
-        assert_eq!(
-            notes.iter().map(content).collect::<Vec<_>>(),
-            [
-                "<bash-input>echo a &gt; b</bash-input>",
-                "<bash-stdout></bash-stdout><bash-stderr></bash-stderr><bash-exit-code>0</bash-exit-code>",
-            ],
-            "as claude wrote them"
-        );
-        for n in &notes {
-            assert_eq!(n.get("shouldQuery").and_then(Value::as_bool), Some(false));
-        }
-        // claude echoes them under their uuids: they are not added again.
-        for n in &notes {
-            let mut e = v(input);
-            e.set("message", n.get("message").unwrap().clone());
-            e.set("uuid", n.get("uuid").unwrap().clone());
-            assert!(log.bash_echoed(echo(&json::to_line(&e))).is_empty());
-        }
-        assert!(log.notes.is_empty());
-        // A command claude would not run has nothing to add, and is no echo.
-        let refused = r#"{"type":"user","message":{"role":"user","content":"<bash-stderr>Not run: no command was given.</bash-stderr>"},"uuid":"u-no","isReplay":true}"#;
-        assert_eq!(sdk::bash_echo(&v(refused)), None);
-        // Nor is anything a view typed that only looks like one.
-        let typed = r#"{"type":"user","message":{"role":"user","content":"<bash-input>x</bash-input>"},"uuid":"u-t"}"#;
-        assert_eq!(sdk::bash_echo(&v(typed)), None);
+    fn claude_answers_a_bang_command_unless_the_settings_say_not_to() {
+        let layer = |l: &str| (false, json::parse(l).unwrap());
+        assert!(responds(&[]), "Claude Code's default");
+        assert!(!responds(&[layer(r#"{"respondToBashCommands":false}"#)]));
+        // The highest layer that says wins, as for any setting.
+        assert!(responds(&[
+            layer(r#"{"respondToBashCommands":false}"#),
+            layer(r#"{"model":"opus"}"#),
+            layer(r#"{"respondToBashCommands":true}"#),
+        ]));
     }
 
     #[test]

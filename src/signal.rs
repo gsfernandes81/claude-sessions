@@ -71,6 +71,17 @@ pub fn send(pid: u32, start: u64, sig: i32) -> io::Result<Sent> {
     }
 }
 
+/// Send `sig` to every process in the group a child of ours leads. Only before that child is
+/// reaped: until then its pid, and so the group's id, cannot be anyone else's.
+pub fn send_group(leader: u32, sig: i32) -> io::Result<()> {
+    // SAFETY: plain kill(2) to a negative pid, the group of a child not yet waited for.
+    if unsafe { kill(-(leader as i32), sig) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// A kernel before 5.3, which has no pidfds: the same start-time check, then `kill(2)`, which
 /// leaves the window a pidfd closes but is the best that kernel offers.
 fn send_by_kill(pid: u32, start: u64, sig: i32) -> io::Result<Sent> {

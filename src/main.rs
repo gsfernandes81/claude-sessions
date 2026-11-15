@@ -42,6 +42,7 @@ macro_rules! warn {
 mod activity;
 mod agent;
 mod archive;
+mod bang;
 mod bind;
 mod client;
 mod clock;

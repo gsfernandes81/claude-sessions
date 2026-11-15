@@ -2474,7 +2474,7 @@ mod tests {
         let note = |l: &str, u: &str| {
             format!(
                 r#"{{"type":"_in","line":{}}}"#,
-                crate::json::to_line(&sdk::note(&text(l), u))
+                crate::json::to_line(&sdk::note(&text(l), u, false))
             )
         };
         let echo = |l: &str, u: &str| {

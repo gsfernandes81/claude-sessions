@@ -126,7 +126,8 @@ these lines, and its tests hold the exact shapes):
 | compact | `/compact` as a user message | `system/status` compacting, the `SessionStart:compact` hooks, `system/compact_boundary {pre_tokens, post_tokens}`, the summary as a `user` line, `<local-command-stdout>Compacted`, a `result` |
 | interrupt | `interrupt` | `{still_queued:[]}`, then a `user` line `[Request interrupted by user]` and `result/error_during_execution` |
 | exit | `end_session` | success; the process exits |
-| shell (`!`) | `{type:"bash_command", command, uuid}` | run by claude in a one-shot `/bin/sh -c` in the session's directory, **beside the conversation**, which never sees it (measured 2026-11-15): `command_lifecycle` started and completed, then two `user` replay rows, `<bash-input>` at once and `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr><bash-exit-code>N</bash-exit-code>` once it has printed, escaped (`&amp;`, `&lt;`, `&gt;`). A blank one gets `<bash-stderr>Not run: …</bash-stderr>`; an `interrupt` kills it (`[interrupted]`, 130). Neither row reaches the transcript. So the holder adds both to the conversation, as Claude Code's own `!` does, each as a `user` line with `shouldQuery: false`: appended with no turn (an empty `system/init` and `result` with `num_turns: 0`; queued behind a turn under way), in the transcript, and read by the model with the next prompt. Under `--replay-user-messages` claude echoes such a line, under the uuid it was sent with — though not always: one whose text it had just written was not echoed. |
+| shell (`!`) | `{type:"bash_command", command, uuid}` | 2.1.311's own, measured 2026-11-15, and **not what the view uses**: claude runs it in a one-shot `/bin/sh -c` in the session's directory, beside the conversation, which never sees it, so a `cd` is lost; it writes `<bash-input>` and then `<bash-stdout>…</bash-stdout><bash-stderr>…</bash-stderr><bash-exit-code>N</bash-exit-code>` as `user` replay rows, escaped (`&amp;`, `&lt;`, `&gt;`), neither of them in the transcript. (A gated mode that runs it through the Bash tool, where a `cd` carries, needs a cloud worker; `set_cwd` is `/cd`, which relocates the session and its transcript.) The holder runs the view's `!` itself (*`!` runs a shell command*, below). |
+| add to the conversation | `user` with `shouldQuery` | `false`: appended with no turn (an empty `system/init` and a `result` with `num_turns: 0`; queued behind a turn under way), in the transcript, read by the model with the next prompt; `true`: a turn, as a prompt. Under `--replay-user-messages` claude echoes such a line under the uuid it was sent with — not always: of two sent together, the second was not echoed. |
 
 **It is verbose.** One small session wrote 177 KB: the `initialize` answer, a `system/init`
 listing every tool and command before every turn, two lines per hook run, thinking-token
@@ -376,7 +377,7 @@ the owner had already spoken (above). Two items need the owner, and both are moc
      | `close` | back home; the conversation keeps running |
      | `offload {c, k}` · `archive {c, k}` | the home's `c`: the container's agent's `offload` or `close`, as the door sends them; answered `did {ok, x}` |
      | `say {x, u}` | a prompt or slash command, `/compact` included; sent to claude with `u`, the uuid the phone keeps it pending by, or the relay's own from an older client; while a shell command runs, followed by claude's `background_tasks`, once claude can move it |
-     | `bash {x, u}` | a shell command typed after `!`: claude's `bash_command` with `u`; the holder adds it and what it printed to the conversation (above) |
+     | `bash {x, u}` | a shell command typed after `!`: sent as a `bash_command` with `u`, which the holder runs (`bang.rs`) and a holder from before that passes to claude |
      | `unqueue {u}` | Up: claude's `cancel_async_message` for each uuid, prompts waiting behind the turn taken back to edit |
      | `now` | Ctrl+X Ctrl+S: the prompts waiting behind the turn go now — claude's `background_tasks` (Ctrl+B) while a tool call runs, so the turn takes them in — for a shell command, once claude can move it — else its `interrupt` with `send_now` |
      | `perm {r, a}` | `a` is `y`, `a` (always) or `n`, with `x` for what claude is told; `n` without `x` stops the turn (`interrupt`), as Claude Code's No does, and with it the turn goes on |
@@ -524,12 +525,35 @@ the owner had already spoken (above). Two items need the owner, and both are moc
        `bashMessageBackgroundColor`, `413c41`, then `⎿  Running…` until it has printed, then
        its output, its errors in red, each cut to three rows (four when that is all) and
        `… +N lines (ctrl+o to expand)`, or `(No output)`; the exit code is not drawn, as
-       Claude Code draws none. Esc while it runs interrupts it. It runs in the session's
-       directory each time — a `cd` does not carry to the next, where Claude Code's runs
-       through its Bash tool's shell and does. The reducer's items are `bash {x}` and
-       `bout {o, e}`, which an older client skips; the holder's own lines are logged as `_in`
-       with `shouldQuery: false`, so the reducer draws neither their echo nor the transcript's
-       copy twice.
+       Claude Code draws none. The reducer's items are `bash {x}` and `bout {o, e}`, which an
+       older client skips.
+     - **The holder runs it** (`bang.rs`), as 2.1.311's `!` runs through its Bash tool (its
+       `bash-mode` handler, read 2026-11-15; owner, "get cds etc working correctly"):
+       - In the user's bash or zsh, picked as Claude Code picks (`CLAUDE_CODE_SHELL`, then
+         `SHELL`, when either is one, else the usual places, else `/bin/sh`), from the
+         directory the last command ended in, read by an EXIT trap, so a `cd` carries to the
+         next and `OLDPWD` makes `cd -` go back. The first starts where claude did, and so
+         does one after its directory has gone, or the holder has restarted.
+       - Stdin is `/dev/null`; output goes to files beside the log, so a job left running with
+         `&` holds nothing open and is not killed. Each stream is cut at 30,000 characters,
+         the Bash tool's `BASH_MAX_OUTPUT_LENGTH` default. The Bash tool's timeout applies,
+         two minutes or `BASH_DEFAULT_TIMEOUT_MS`; Esc (the relay's `interrupt`) or the
+         timeout kills the command's process group, saying `[interrupted]` or
+         `Command timed out after 2m` in its errors.
+       - One at a time. The view sees the holder's own rows in the log, in the shape claude's
+         replay rows have, marked `"by":"holder"`: the command at once, what it printed when
+         it ends.
+       - Then it joins the conversation as Claude Code's does: the command, then its output,
+         which Claude answers (`shouldQuery: true`) unless `respondToBashCommands` is false in
+         the settings, the highest layer that sets it, or the command was interrupted; then no
+         turn starts, and Claude Code's `<local-command-caveat>` goes first. Each is logged as
+         `_in`, so the reducer draws neither claude's echo nor, on a resume, the transcript's
+         copy twice.
+       - **Unlike Claude Code**, where `!` and the Bash tool share one shell, a headless
+         claude's Bash tool keeps its own directory. So when a command leaves the shell
+         somewhere new, Claude is told, in a `<system-reminder>` before the output, that the
+         owner's commands now run there and its own Bash has not moved; the view draws none of
+         it.
      - A slash command claude or the phone knows is lavender in the prompt, wherever it is,
        as Claude Code draws it (`b1b9f9`, its `permission` colour); `/` before an unknown name
        is text. claude's commands come in the meta op's `sc`, from its init's `slash_commands`.
